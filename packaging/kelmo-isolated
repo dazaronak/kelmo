@@ -1,0 +1,64 @@
+#!/bin/sh
+# shellcheck disable=SC1007  # `CDPATH= cd` is a prefix assignment for cd alone: with CDPATH set, cd prints the
+# directory it landed in, and that text would land in the $( ) whose value is the runtime directory.
+set -eu
+runtime_json=false
+for runtime_arg in "$@"; do
+    [ "$runtime_arg" != '--json' ] || runtime_json=true
+done
+runtime_fail() {
+    if [ "${1-}" = python ]; then
+        if [ "$runtime_json" = true ]; then
+            printf '%s\n' '{"schema_version":1,"ok":false,"error":{"code":"E_ISOLATION","message":"The isolated launcher requires Homebrew Python 3.12 or /usr/bin/python3.12 or 3.13."}}'
+        else
+            printf '%s\n' 'E_ISOLATION: The isolated launcher requires Homebrew Python 3.12 or /usr/bin/python3.12 or 3.13.' >&2
+        fi
+        exit 1
+    fi
+    if [ "$runtime_json" = true ]; then
+        printf '%s\n' '{"schema_version":1,"ok":false,"error":{"code":"E_ISOLATION","message":"Runtime launcher is unavailable."}}'
+    else
+        printf '%s\n' 'E_ISOLATION: Runtime launcher is unavailable.' >&2
+    fi
+    exit 1
+}
+runtime_entry=$0
+case "$runtime_entry" in
+    */*) ;;
+    *) runtime_entry=$(command -v "$runtime_entry") || runtime_fail ;;
+esac
+runtime_hops=0
+while [ -L "$runtime_entry" ]; do
+    runtime_hops=$((runtime_hops + 1))
+    [ "$runtime_hops" -le 40 ] || runtime_fail
+    runtime_bin=$(CDPATH= cd -- "${runtime_entry%/*}" && pwd -P) || runtime_fail
+    runtime_entry=$(/usr/bin/readlink "$runtime_entry") || runtime_fail
+    case "$runtime_entry" in
+        /*) ;;
+        *) runtime_entry="$runtime_bin/$runtime_entry" ;;
+    esac
+done
+runtime_bin=$(CDPATH= cd -- "${runtime_entry%/*}" && pwd -P) || runtime_fail
+[ -x "$runtime_bin/python" ] || runtime_fail
+[ -r "$runtime_bin/../share/kelmo/bootstrap.py" ] || runtime_fail
+runtime_python="$runtime_bin/python"
+runtime_hops=0
+while [ -L "$runtime_python" ]; do
+    runtime_hops=$((runtime_hops + 1))
+    [ "$runtime_hops" -le 40 ] || runtime_fail
+    runtime_python_dir=$(CDPATH= cd -- "${runtime_python%/*}" && pwd -P) || runtime_fail
+    runtime_python=$(/usr/bin/readlink "$runtime_python") || runtime_fail
+    case "$runtime_python" in
+        /*) ;;
+        *) runtime_python="$runtime_python_dir/$runtime_python" ;;
+    esac
+done
+runtime_python_dir=$(CDPATH= cd -- "${runtime_python%/*}" && pwd -P) || runtime_fail
+runtime_python="$runtime_python_dir/${runtime_python##*/}"
+case "$runtime_python" in
+    /usr/bin/python3.12|/usr/bin/python3.13) ;;
+    /opt/homebrew/Cellar/python@3.12/*/Frameworks/Python.framework/Versions/3.12/bin/python3.12) ;;
+    /usr/local/Cellar/python@3.12/*/Frameworks/Python.framework/Versions/3.12/bin/python3.12) ;;
+    *) runtime_fail python ;;
+esac
+exec "$runtime_python" -I -S "$runtime_bin/../share/kelmo/bootstrap.py" "$@"

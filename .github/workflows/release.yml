@@ -1,0 +1,50 @@
+name: Release
+
+# Push a tag vX.Y.Z whose version matches pyproject.toml. The full CI runs first; the exact wheel and sdist it
+# built and tested are then published to PyPI through Trusted Publishing (no API token is stored anywhere).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      actions: read
+
+  publish:
+    name: Publish to PyPI
+    needs: checks
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kelmo/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the tested distributions
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: kelmo-dist
+          path: dist/
+      - name: Check that the tag names the built version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -- dist/kelmo-*.whl
+          test "$#" -eq 1
+          version=$(basename "$1" | cut -d- -f2)
+          if [ "v$version" != "$TAG" ]; then
+            echo "Tag $TAG does not match the built version $version (pyproject.toml)." >&2
+            exit 1
+          fi
+          ls -l dist/
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

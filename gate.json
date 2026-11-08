@@ -1,0 +1,235 @@
+{
+  "title": "kelmo gate",
+  "needs": {
+    "macos": {
+      "capability": "file:/System/Library/CoreServices/SystemVersion.plist",
+      "because": "the seatbelt the runtime builds is macOS's: tests/test_runtime_macos.py asks a confined child for the network, a private file, a write to its code, a child process and a hard link, so a Mac run measures that file and every other host reports its section absent"
+    },
+    "interpreter": {
+      "capability": "python",
+      "because": "this suite is the locked environment pyproject.toml and uv.lock fix: run-tests.sh takes this folder's own .venv/bin/python when uv sync has built one and the PATH python3 otherwise (GATE_PYTHON overrides both), and an interpreter that carries none of the modules below measures none of the sections that need them, so the header says which interpreter measured the suite"
+    },
+    "src": {
+      "capability": "dir:src",
+      "because": "tests/ import kelmo from src/, and test children start with cwd inside tests/, so PYTHONPATH has to carry the absolute path and not the name"
+    },
+    "pytest": {
+      "capability": "module:pytest",
+      "because": "the suite is run by pytest, which is in the dev group of pyproject.toml; the three CI-excluded lanes are unittest files pytest also collects"
+    },
+    "ruff": {
+      "capability": "module:ruff",
+      "because": "the lint the suite cannot replace: it saw an undefined json in a helper no test called, and it is a dev-group module of the same locked environment"
+    },
+    "fastmcp": {
+      "capability": "module:fastmcp",
+      "because": "src/kelmo/mcp.py builds the stdio server the MCP cases drive, and tests/test_mcp.py imports it"
+    },
+    "sqlite-vec": {
+      "capability": "module:sqlite_vec",
+      "because": "src/kelmo/store/db.py loads the vec0 extension when a case opens a database, so every case that stores or searches stops at the load"
+    },
+    "fastembed": {
+      "capability": "module:fastembed",
+      "because": "src/kelmo/store/memory/embed.py builds the embedding model the vector cases rank with"
+    },
+    "networkx": {
+      "capability": "module:networkx",
+      "because": "the graph service and its navigation cases build the wiki graph through networkx"
+    },
+    "numpy": {
+      "capability": "module:numpy",
+      "because": "the embedding and vector-search cases carry numpy arrays through the store"
+    },
+    "python-frontmatter": {
+      "capability": "module:frontmatter",
+      "because": "the wiki compiler reads and writes page front-matter, and the wiki cases assert on it"
+    },
+    "markdown-it-py": {
+      "capability": "module:markdown_it",
+      "because": "the wiki compiler parses the page body with markdown-it before it builds the graph"
+    },
+    "pyyaml": {
+      "capability": "module:yaml",
+      "because": "the config and settings cases read YAML files, and the installer writes them"
+    },
+    "shellcheck": {
+      "capability": "command:shellcheck",
+      "because": "a gate that never lints its own folder re-accumulates what a sweep removes, and the installed launcher is shell a person types every day"
+    },
+    "bash32": {
+      "capability": "bash32",
+      "because": "the host is macOS bash 3.2 and Kelmo promises 3.2-compatible shell, so a launcher that only parses under bash 4 is broken there and not here"
+    },
+    "modeldir": {
+      "capability": "env-dir:KELMO_GATE_MODEL_DIR,KELMO_MODEL_DIR",
+      "holding": [
+        "config.json",
+        "model.onnx",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json"
+      ],
+      "because": "docs/TARGET-STATE.md 1.4 requires a named directory holding the five pinned model files, and every frozen scenario starts by importing them into a vault; explicitly name it with KELMO_GATE_MODEL_DIR or KELMO_MODEL_DIR (the first set variable wins). No deployment path is assumed. The five-file probe still decides, so a directory of the right name holding other files stays a SKIP that says so"
+    },
+    "prefix": {
+      "capability": "env-dir:KELMO_TEST_PREFIX",
+      "holding": ["bin/kelmo"],
+      "answers": ["bin/kelmo", "version", "--json"],
+      "because": "tests/test_installed_cli.py runs the launcher a pip-installed runtime ships, and the file defaults to .venv, which is a uv virtualenv whose bin/kelmo console script only reports E_RUNTIME; the lane runs when the launcher answers version, and is a SKIP that says so otherwise"
+    },
+    "bwrap": {
+      "capability": "any:file:/usr/bin/bwrap|file:libexec/bwrap",
+      "because": "src/kelmo/linux_runtime.py:41-43 looks at exactly these two paths and raises IsolationError when it finds neither, so the failure names the tool and not the code"
+    },
+    "userns": {
+      "capability": "probe:unshare -U -r true",
+      "because": "bubblewrap builds its sandbox from an unprivileged user namespace, so the binary alone does not say whether installing it here would measure the Linux lane",
+      "costs": "whether installing bubblewrap on this host would measure the Linux kernel boundary at all: a host that refuses the unprivileged user namespace would only move the red from 'no bubblewrap' to 'cannot create a namespace'"
+    }
+  },
+  "sections": [
+    {
+      "name": "syntax (bash -n, and under bash 3.2 too)",
+      "kind": "syntax",
+      "files": ["*.sh", "tests", "packaging"],
+      "shebang": true
+    },
+    {
+      "name": "lint (ruff check . over the Python tree)",
+      "kind": "command",
+      "label": "ruff check .",
+      "argv": ["$interpreter", "-m", "ruff", "check", "."],
+      "needs": ["interpreter", "ruff"],
+      "leaves": "every ruff finding in src, tests and packaging, including the undefined-name class a test never executes"
+    },
+    {
+      "name": "lint (shellcheck -s bash -S warning over the same shell files)",
+      "kind": "shellcheck",
+      "files": ["*.sh", "tests", "packaging"],
+      "shebang": true,
+      "needs": ["shellcheck"],
+      "leaves": "every shellcheck finding, warning or worse, on the installed launcher, the acceptance harness and this gate itself"
+    },
+    {
+      "name": "the source suite (docs/TARGET-STATE.md 1.4: pytest over tests/)",
+      "kind": "runner",
+      "label": "the source suite",
+      "runners": [
+        {
+          "label": "pytest tests",
+          "argv": [
+            "$interpreter",
+            "tools/pytest_shards.py",
+            "tests",
+            "-q",
+            "-ra",
+            "--ignore=tests/test_runtime.py",
+            "--ignore=tests/test_runtime_macos.py",
+            "--ignore=tests/test_linux_runtime.py",
+            "--ignore=tests/test_installed_cli.py"
+          ]
+        }
+      ],
+      "covers": ["tests"],
+      "exclude": [
+        "tests/test_runtime.py",
+        "tests/test_runtime_macos.py",
+        "tests/test_linux_runtime.py",
+        "tests/test_installed_cli.py"
+      ],
+      "env": { "PYTHONPATH": "$src", "KELMO_MODEL_DIR": "$modeldir" },
+      "needs": [
+        "interpreter",
+        "src",
+        "pytest",
+        "fastmcp",
+        "sqlite-vec",
+        "fastembed",
+        "networkx",
+        "numpy",
+        "python-frontmatter",
+        "markdown-it-py",
+        "pyyaml"
+      ],
+      "counts": "^(?:(?P<failed>[0-9]+) failed, )?(?P<passed>[0-9]+) passed(?:, (?P<skipped>[0-9]+) skipped)?",
+      "fail_line": "^(?:FAILED|ERROR|SUBFAILED[^ ]*) ",
+      "skip_line": "^SKIPPED \\[",
+      "scratch": "^INTERNALERROR |^UsageError|^ERROR: file or directory not found",
+      "timeout": 2700,
+      "leaves": "the whole source suite: the CLI, the service, the wiki compiler, the graph, sessions, quota, removal, the installer and the launcher, and every file under tests/ the claim walks, tests/store/ included",
+      "skip_leaves": "the whole suite: these cases are one locked environment, and an interpreter that carries none of its locked packages measures none of them",
+      "skipped_leaves": "the wheel and sdist artifact acceptance in tests/test_distribution.py, which skips itself unless KELMO_TEST_WHEEL and KELMO_TEST_SDIST name freshly built artifacts"
+    },
+    {
+      "name": "the acceptance harness (tests/acceptance/run.sh: A01..A10)",
+      "kind": "runner",
+      "label": "acceptance",
+      "runners": [
+        {
+          "label": "tests/acceptance/run.sh",
+          "argv": ["bash", "tests/acceptance/run.sh"]
+        }
+      ],
+      "env": {
+        "KELMO_PYTHON": "$interpreter",
+        "KELMO_MODEL_DIR": "$modeldir"
+      },
+      "needs": [
+        "interpreter",
+        "modeldir",
+        "sqlite-vec",
+        "fastembed",
+        "numpy",
+        "networkx",
+        "markdown-it-py",
+        "python-frontmatter",
+        "fastmcp"
+      ],
+      "counts": "^acceptance: (?P<passed>[0-9]+) passed, (?P<failed>[0-9]+) failed$",
+      "fail_line": "^FAIL A[0-9]+",
+      "timeout": 900,
+      "leaves": "all ten frozen scenarios of docs/TARGET-STATE.md Part 2, which every one of them starts by importing the five pinned model files into a vault"
+    },
+    {
+      "name": "the lanes CI keeps out of the source suite (the runtime builder and the Linux kernel boundary)",
+      "kind": "unittest",
+      "label": "the excluded lanes",
+      "tests": ["tests/test_runtime.py", "tests/test_linux_runtime.py"],
+      "bound": [
+        {
+          "id": "tests.test_linux_runtime.LinuxRuntimeTests.test_kernel_boundary",
+          "need": "bwrap",
+          "reason": "linux_runtime.execute() builds the sandbox through bubblewrap, which this gate asked for at both paths src/kelmo/linux_runtime.py looks at; the lane is measured on the Linux hosts the runtime is built for, and it is the only place this folder measures that another process's arguments are unreadable"
+        }
+      ],
+      "timeout": 300,
+      "leaves": "the runtime command builder and the Linux kernel boundary: unshare-all, NoNewPrivs, CapEff, the hidden host /proc/TARGET/environ, the hidden host /proc/TARGET/cmdline and the single /proc/net/route entry"
+    },
+    {
+      "name": "the installed CLI lane (the launcher over a pip-installed prefix)",
+      "kind": "unittest",
+      "label": "the installed CLI",
+      "tests": ["tests/test_installed_cli.py"],
+      "needs": ["prefix"],
+      "env": { "KELMO_MODEL_DIR": "$modeldir" },
+      "timeout": 300,
+      "leaves": "the installed runtime as a pip-installed prefix: the CLI and stdio MCP graph navigation a person gets after install.py, the wheel-vs-installed byte comparison, and the hiding path - `kelmo forget` through the installed launcher, read back through its own hybrid search, list, show, trace and status. The launcher bytes themselves are exercised in the source suite by tests/test_user_launcher.py"
+    },
+    {
+      "name": "the macOS kernel boundary (the seatbelt a confined child runs under)",
+      "kind": "unittest",
+      "label": "the macOS lane",
+      "tests": ["tests/test_runtime_macos.py"],
+      "needs": ["macos"],
+      "timeout": 120,
+      "leaves": "that a child confined by the runtime's seatbelt is denied TCP and UDP, the private canary's content and metadata, a write to its code, a child process and a hard link, while it can still write its scratch directory"
+    }
+  ],
+  "unmeasured": [
+    "the wheel and sdist build lanes docs/CI.md runs (the artifacts job and the four installed lanes): this gate never builds an artifact, so unless KELMO_TEST_WHEEL and KELMO_TEST_SDIST name freshly built ones the two parity cases in tests/test_distribution.py skip themselves and the gate names them under the suite section",
+    "the native launchd/systemd service lifecycle, clean-machine bootstrap and real Claude/Codex provider acceptance stay separate from these checks, as docs/CI.md says",
+    "CI collects none of the three lane files sections 6 and 8 run through unittest (tests/test_runtime.py, tests/test_linux_runtime.py, tests/test_runtime_macos.py): its source job ignores them, so this gate alone measures them, and a pytest-only fixture added to them would run nowhere",
+    "whether a confined macOS runtime hides another process's arguments is measured nowhere: the seatbelt policy macos_policy() builds does not deny the same-UID KERN_PROCARGS2 read (a Mac run of this folder read SYNTHETIC_ONLY=test-value out of another process's arguments), docs/RUNTIME-SECURITY.md keeps that same-UID gap open and calls native macOS an unverified host-credential boundary, and the claim that process arguments are unreadable belongs to the Linux adapter and is measured only by tests/test_linux_runtime.py::test_kernel_boundary, which is BOUND wherever the host refuses unshare(CLONE_NEWUSER)"
+  ]
+}

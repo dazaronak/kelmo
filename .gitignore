@@ -1,0 +1,12 @@
+/_docs/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+local-data/
+.env*
+!.env.example

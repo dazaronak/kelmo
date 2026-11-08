@@ -1,0 +1,575 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kelmo:wiki-file-contract:3.0:records",
+  "type": "object",
+  "properties": {
+    "version": {
+      "const": 3
+    },
+    "authority_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+    },
+    "facts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "fact_key": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 400,
+            "pattern": "^[^\\r\\n]*$"
+          },
+          "status": {
+            "enum": ["active", "backlog", "in-progress", "shipped", "retired"]
+          },
+          "expected_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "replaces": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$"
+          },
+          "note_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "ark_id": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "previous_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "owner": {
+            "enum": ["rule-policy", "semantic-editor", "legacy-import"]
+          },
+          "protected": {
+            "type": "boolean"
+          },
+          "mandatory": {
+            "type": "boolean"
+          },
+          "evidence_resolution": {
+            "enum": ["exact", "unresolved"]
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "archive_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                },
+                "version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "content_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "source_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                }
+              },
+              "required": [
+                "archive_id",
+                "version",
+                "content_sha256",
+                "source_id"
+              ],
+              "additionalProperties": false
+            },
+            "uniqueItems": true
+          },
+          "compatibility": {
+            "type": "object"
+          },
+          "role": {
+            "enum": ["unresolved", "constraint", "state", "history"]
+          },
+          "index_target": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "fact_key",
+          "target",
+          "text",
+          "status",
+          "expected_revision",
+          "replaces",
+          "id",
+          "note_id",
+          "ark_id",
+          "revision",
+          "previous_revision",
+          "owner",
+          "protected",
+          "mandatory",
+          "evidence_resolution",
+          "evidence_refs",
+          "compatibility"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "notes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "filename": {
+            "type": "string"
+          },
+          "ark_id": {
+            "type": "string"
+          },
+          "evidence_resolution": {
+            "enum": ["exact", "unresolved"]
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "archive_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                },
+                "version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "content_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "source_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                }
+              },
+              "required": [
+                "archive_id",
+                "version",
+                "content_sha256",
+                "source_id"
+              ],
+              "additionalProperties": false
+            },
+            "uniqueItems": true
+          },
+          "compatibility": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "filename",
+          "ark_id",
+          "evidence_resolution",
+          "evidence_refs",
+          "compatibility"
+        ],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      }
+    },
+    "pages": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "urn:kelmo:wiki-file-contract:3.0:page"
+      },
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "actions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "subject_kind": {
+            "enum": ["feature", "topic", "person", "task"]
+          },
+          "subject_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "kind": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "in-progress",
+              "completed",
+              "cancelled",
+              "unresolved"
+            ]
+          },
+          "owner": {
+            "const": "state-api"
+          },
+          "accepted_event": {
+            "type": "object",
+            "properties": {
+              "event_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+              },
+              "event_order": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "occurred_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "Z$"
+              },
+              "ingested_at": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "Z$"
+              },
+              "transition": {
+                "enum": [
+                  "pending",
+                  "in-progress",
+                  "completed",
+                  "cancelled",
+                  "unresolved"
+                ]
+              },
+              "evidence_ref": {
+                "type": "object",
+                "properties": {
+                  "archive_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                  },
+                  "version": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "content_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "source_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                  }
+                },
+                "required": [
+                  "archive_id",
+                  "version",
+                  "content_sha256",
+                  "source_id"
+                ],
+                "additionalProperties": false
+              },
+              "evidence_mark": {
+                "enum": ["PRODUCER", "REQUESTER"]
+              },
+              "correction_of": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "operation_receipt_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+              }
+            },
+            "required": [
+              "event_id",
+              "event_order",
+              "occurred_at",
+              "ingested_at",
+              "transition",
+              "evidence_ref",
+              "evidence_mark",
+              "correction_of",
+              "operation_receipt_id"
+            ],
+            "additionalProperties": false
+          },
+          "revision": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "previous_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "compatibility": {
+            "type": "object"
+          },
+          "feature_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "repository_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "work_revision": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40,64}$"
+          },
+          "remote_ref": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "artifact_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          }
+        },
+        "required": [
+          "action_id",
+          "subject_kind",
+          "subject_id",
+          "kind",
+          "state",
+          "owner",
+          "accepted_event",
+          "revision",
+          "previous_revision",
+          "compatibility"
+        ],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+      }
+    },
+    "narratives": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "narrative_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "page_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "archive_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                },
+                "version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "content_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "source_id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                }
+              },
+              "required": [
+                "archive_id",
+                "version",
+                "content_sha256",
+                "source_id"
+              ],
+              "additionalProperties": false
+            },
+            "uniqueItems": true
+          },
+          "depends_on": {
+            "type": "object",
+            "properties": {
+              "facts": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "actions": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "propertyNames": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+                }
+              }
+            },
+            "required": ["facts", "actions"],
+            "additionalProperties": false
+          },
+          "state": {
+            "enum": ["current", "stale"]
+          },
+          "revision": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "previous_revision": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "compatibility": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "narrative_id",
+          "page_id",
+          "text",
+          "evidence_refs",
+          "depends_on",
+          "state",
+          "revision",
+          "previous_revision",
+          "compatibility"
+        ],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+      }
+    },
+    "redirects": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+      }
+    },
+    "compatibility": {
+      "type": "object"
+    },
+    "session_applications": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "version",
+    "authority_id",
+    "facts",
+    "notes",
+    "pages",
+    "actions",
+    "narratives",
+    "redirects",
+    "compatibility"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "archive_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+        }
+      },
+      "required": ["archive_id", "version", "content_sha256", "source_id"],
+      "additionalProperties": false
+    }
+  }
+}

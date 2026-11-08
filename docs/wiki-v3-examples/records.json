@@ -1,0 +1,840 @@
+{
+  "actions": {
+    "demo.action.book-workshop": {
+      "accepted_event": {
+        "correction_of": null,
+        "event_id": "demo.event.workshop-booked",
+        "event_order": 5,
+        "evidence_mark": "REQUESTER",
+        "evidence_ref": {
+          "archive_id": "demo.archive.workshop",
+          "content_sha256": "39c82b2f5d7d74c54405201932e47f575d71fa6f4c019a67b4f787ae72a8fa28",
+          "source_id": "demo-source-workshop-booked",
+          "version": 2
+        },
+        "ingested_at": "2030-01-03T11:01:00Z",
+        "occurred_at": "2030-01-03T11:00:00Z",
+        "operation_receipt_id": "demo.operation.workshop-booked",
+        "transition": "completed"
+      },
+      "action_id": "demo.action.book-workshop",
+      "compatibility": {},
+      "kind": "book",
+      "owner": "state-api",
+      "previous_revision": "90f7ce75a7253761da8ad336bf03df0d63484f6a50fe9dc184fb90bea763fc0e",
+      "revision": "fb827fa845d14298d454200c553e163d12866707691fd40d3e90242aff52ed34",
+      "state": "completed",
+      "subject_id": "demo.subject.paper-workshop",
+      "subject_kind": "task"
+    },
+    "demo.action.preview-deploy": {
+      "accepted_event": {
+        "correction_of": null,
+        "event_id": "demo.event.preview-deploy",
+        "event_order": 1,
+        "evidence_mark": "PRODUCER",
+        "evidence_ref": {
+          "archive_id": "demo.archive.events",
+          "content_sha256": "01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970",
+          "source_id": "demo-source-events",
+          "version": 1
+        },
+        "ingested_at": "2030-01-02T10:01:00Z",
+        "occurred_at": "2030-01-02T10:00:00Z",
+        "operation_receipt_id": "demo.operation.deploy",
+        "transition": "pending"
+      },
+      "action_id": "demo.action.preview-deploy",
+      "artifact_id": "demo.artifact.preview-build",
+      "compatibility": {},
+      "environment": "sandbox",
+      "feature_id": "demo.feature.update-preview",
+      "kind": "deploy",
+      "owner": "state-api",
+      "previous_revision": null,
+      "repository_id": "demo.repo.harbor-web",
+      "revision": "5d82ee8cdd98ab7c94285f31e26830c027a126c2f3a579e8056c0f807f2199c8",
+      "state": "pending",
+      "subject_id": "demo.feature.update-preview",
+      "subject_kind": "feature",
+      "work_revision": "1111111111111111111111111111111111111111"
+    },
+    "demo.action.preview-merge": {
+      "accepted_event": {
+        "correction_of": null,
+        "event_id": "demo.event.preview-merge",
+        "event_order": 2,
+        "evidence_mark": "PRODUCER",
+        "evidence_ref": {
+          "archive_id": "demo.archive.events",
+          "content_sha256": "01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970",
+          "source_id": "demo-source-events",
+          "version": 1
+        },
+        "ingested_at": "2030-01-02T10:01:00Z",
+        "occurred_at": "2030-01-02T10:00:00Z",
+        "operation_receipt_id": "demo.operation.merge",
+        "transition": "pending"
+      },
+      "action_id": "demo.action.preview-merge",
+      "compatibility": {},
+      "feature_id": "demo.feature.update-preview",
+      "kind": "merge",
+      "owner": "state-api",
+      "previous_revision": null,
+      "remote_ref": "origin/main",
+      "repository_id": "demo.repo.harbor-web",
+      "revision": "789b55e42f81e52eb69b9f79815af3d903819937a28f252cfd551a045373d1df",
+      "state": "pending",
+      "subject_id": "demo.feature.update-preview",
+      "subject_kind": "feature",
+      "work_revision": "1111111111111111111111111111111111111111"
+    },
+    "demo.action.preview-push": {
+      "accepted_event": {
+        "correction_of": null,
+        "event_id": "demo.event.preview-push",
+        "event_order": 3,
+        "evidence_mark": "PRODUCER",
+        "evidence_ref": {
+          "archive_id": "demo.archive.events",
+          "content_sha256": "01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970",
+          "source_id": "demo-source-events",
+          "version": 1
+        },
+        "ingested_at": "2030-01-02T10:01:00Z",
+        "occurred_at": "2030-01-02T10:00:00Z",
+        "operation_receipt_id": "demo.operation.push",
+        "transition": "completed"
+      },
+      "action_id": "demo.action.preview-push",
+      "compatibility": {},
+      "feature_id": "demo.feature.update-preview",
+      "kind": "push",
+      "owner": "state-api",
+      "previous_revision": null,
+      "remote_ref": "origin/preview",
+      "repository_id": "demo.repo.harbor-web",
+      "revision": "12c71ae106833396ec077282cde0c351b3aba64f1f3a88183a87f0f765f45061",
+      "state": "completed",
+      "subject_id": "demo.feature.update-preview",
+      "subject_kind": "feature",
+      "work_revision": "1111111111111111111111111111111111111111"
+    }
+  },
+  "authority_id": "demo.authority.harbor",
+  "compatibility": {},
+  "facts": {
+    "demo.agent.confirmation": {
+      "ark_id": "demo.archive.design",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.design",
+          "expected_revision": null,
+          "fact_key": "demo.agent.confirmation",
+          "id": "e2dd2ccf1271",
+          "note_id": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "previous_revision": null,
+          "replaces": [],
+          "revision": "b774059ab0d3f8c107878d74d78c2739afffba151457c9c0b2fa2e56945d0860",
+          "role": "constraint",
+          "status": "active",
+          "target": "projects/harbor-demo/harbor-demo.md",
+          "text": "Sailing edits require a visible entry-by-entry preview and an explicit user confirmation."
+        },
+        "reason": "Existing identity/content imported; added delivery/protection flags do not erase original field absence.",
+        "source_locator": "/facts/demo.agent.confirmation"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.design",
+          "content_sha256": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "source_id": "demo-source-design",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "expected_revision": null,
+      "fact_key": "demo.agent.confirmation",
+      "id": "e2dd2ccf1271",
+      "mandatory": false,
+      "note_id": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+      "owner": "semantic-editor",
+      "previous_revision": "b774059ab0d3f8c107878d74d78c2739afffba151457c9c0b2fa2e56945d0860",
+      "protected": false,
+      "replaces": [],
+      "revision": "e1e3db55c662fe17fb1fbdd1121a090f0a8c9e402d819696bac54d4f2e475cb5",
+      "role": "constraint",
+      "status": "active",
+      "target": "projects/harbor-demo/harbor-demo.md",
+      "text": "Sailing edits require a visible entry-by-entry preview and an explicit user confirmation."
+    },
+    "demo.agent.scope": {
+      "ark_id": "demo.archive.design",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.design",
+          "expected_revision": null,
+          "fact_key": "demo.agent.scope",
+          "id": "a3f1d773688a",
+          "note_id": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "previous_revision": null,
+          "replaces": [],
+          "revision": "ffe810912aa9918ccf74c9560af02b4716b498dc3b56031b8ca3324fa15c0471",
+          "role": "constraint",
+          "status": "active",
+          "target": "projects/harbor-demo/sailing-schedule.md",
+          "text": "Harbor Demo Sailing Schedule reads the open sailing context and proposes timetable-row updates."
+        },
+        "reason": "Existing identity/content imported; added delivery/protection flags do not erase original field absence.",
+        "source_locator": "/facts/demo.agent.scope"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.design",
+          "content_sha256": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "source_id": "demo-source-design",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "expected_revision": null,
+      "fact_key": "demo.agent.scope",
+      "id": "a3f1d773688a",
+      "mandatory": false,
+      "note_id": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+      "owner": "semantic-editor",
+      "previous_revision": "ffe810912aa9918ccf74c9560af02b4716b498dc3b56031b8ca3324fa15c0471",
+      "protected": false,
+      "replaces": [],
+      "revision": "9eda62ac73ed938a8d3957677a9ed69fe6ee78637cdebe9b2260d59e76fa06f5",
+      "role": "constraint",
+      "status": "active",
+      "target": "projects/harbor-demo/sailing-schedule.md",
+      "text": "Harbor Demo Sailing Schedule reads the open sailing context and proposes timetable-row updates."
+    },
+    "demo.legacy.release": {
+      "ark_id": "demo.archive.unmatched-handbook",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.unmatched-handbook",
+          "expected_revision": "39070e1fecc4c3dc823d23e7c5f3923e4cd6934ffb9ae5c01a52be5a332b066a",
+          "fact_key": "demo.legacy.release",
+          "id": "563c9bdf7908",
+          "note_id": "9b7643448f8bc8f8dfe2a4dad8bb115f2250ff1e8defc061866e884ea1f47795",
+          "previous_revision": "39070e1fecc4c3dc823d23e7c5f3923e4cd6934ffb9ae5c01a52be5a332b066a",
+          "replaces": [],
+          "revision": "c46a70609571f5440689d8f348eefdf8d9d61308ef593eb4f19fd848b21c2abd",
+          "role": "state",
+          "status": "shipped",
+          "target": "projects/harbor-demo/sailing-schedule.md",
+          "text": "An old handbook says \"the preview release is shipped\"; it does not identify a repository, environment or release action."
+        },
+        "legacy_history": [
+          {
+            "ark_id": "demo.archive.unmatched-handbook",
+            "expected_revision": null,
+            "fact_key": "demo.legacy.release",
+            "id": "563c9bdf7908",
+            "note_id": "4bf3f1886db4f17d829ed9a6a59f5a44f5d4f7605efc807626acc166606d11ff",
+            "previous_revision": null,
+            "replaces": [],
+            "revision": "ea904294491c42e5135b067bcdadc1ef23f0f2d0dd325e3d0d5884e88cb06438",
+            "role": "state",
+            "status": "backlog",
+            "target": "projects/harbor-demo/sailing-schedule.md",
+            "text": "An old notebook proposes a preview release."
+          },
+          {
+            "ark_id": "demo.archive.unmatched-handbook",
+            "expected_revision": "ea904294491c42e5135b067bcdadc1ef23f0f2d0dd325e3d0d5884e88cb06438",
+            "fact_key": "demo.legacy.release",
+            "id": "563c9bdf7908",
+            "note_id": "aa37cecba3d9abb2b2a2802a2964b8765b5137bea2a3473e2495b38928ee89e0",
+            "previous_revision": "ea904294491c42e5135b067bcdadc1ef23f0f2d0dd325e3d0d5884e88cb06438",
+            "replaces": [],
+            "revision": "39070e1fecc4c3dc823d23e7c5f3923e4cd6934ffb9ae5c01a52be5a332b066a",
+            "role": "state",
+            "status": "shipped",
+            "target": "projects/harbor-demo/sailing-schedule.md",
+            "text": "An old handbook says \"the preview release is shipped\"."
+          },
+          {
+            "ark_id": "demo.archive.unmatched-handbook",
+            "expected_revision": "39070e1fecc4c3dc823d23e7c5f3923e4cd6934ffb9ae5c01a52be5a332b066a",
+            "fact_key": "demo.legacy.release",
+            "id": "563c9bdf7908",
+            "note_id": "9b7643448f8bc8f8dfe2a4dad8bb115f2250ff1e8defc061866e884ea1f47795",
+            "previous_revision": "39070e1fecc4c3dc823d23e7c5f3923e4cd6934ffb9ae5c01a52be5a332b066a",
+            "replaces": [],
+            "revision": "c46a70609571f5440689d8f348eefdf8d9d61308ef593eb4f19fd848b21c2abd",
+            "role": "state",
+            "status": "shipped",
+            "target": "projects/harbor-demo/sailing-schedule.md",
+            "text": "An old handbook says \"the preview release is shipped\"; it does not identify a repository, environment or release action."
+          }
+        ],
+        "reason": "Exact archive version and action identity remain unresolved.",
+        "source_locator": "/facts/demo.legacy.release"
+      },
+      "evidence_refs": [],
+      "evidence_resolution": "unresolved",
+      "expected_revision": "39070e1fecc4c3dc823d23e7c5f3923e4cd6934ffb9ae5c01a52be5a332b066a",
+      "fact_key": "demo.legacy.release",
+      "id": "563c9bdf7908",
+      "mandatory": false,
+      "note_id": "9b7643448f8bc8f8dfe2a4dad8bb115f2250ff1e8defc061866e884ea1f47795",
+      "owner": "legacy-import",
+      "previous_revision": "c46a70609571f5440689d8f348eefdf8d9d61308ef593eb4f19fd848b21c2abd",
+      "protected": false,
+      "replaces": [],
+      "revision": "670572e5289626779168d298f0f8aacac814182fb3099b1885ce4488c4f4f3f7",
+      "role": "state",
+      "status": "shipped",
+      "target": "projects/harbor-demo/sailing-schedule.md",
+      "text": "An old handbook says \"the preview release is shipped\"; it does not identify a repository, environment or release action."
+    },
+    "demo.person.sketchbook": {
+      "ark_id": "demo.archive.person",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.person",
+          "expected_revision": null,
+          "fact_key": "demo.person.sketchbook",
+          "id": "e35da660ac01",
+          "note_id": "879b7df9f9b4dfeb1118b6afc2f9d76d6f76b0a8db5d533296717d2883dee732",
+          "previous_revision": null,
+          "replaces": [],
+          "revision": "6f9dc4105ee99d8bbb9c1b251f48ea19f3adaed01bbdacab2f0e71aaf91e1d58",
+          "role": "history",
+          "status": "active",
+          "target": "person.md",
+          "text": "The fictional project owner uses a paper notebook for sketching interface ideas."
+        },
+        "reason": "Existing identity/content imported; added delivery/protection flags do not erase original field absence.",
+        "source_locator": "/facts/demo.person.sketchbook"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.person",
+          "content_sha256": "879b7df9f9b4dfeb1118b6afc2f9d76d6f76b0a8db5d533296717d2883dee732",
+          "source_id": "demo-source-person",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "expected_revision": null,
+      "fact_key": "demo.person.sketchbook",
+      "id": "e35da660ac01",
+      "mandatory": true,
+      "note_id": "879b7df9f9b4dfeb1118b6afc2f9d76d6f76b0a8db5d533296717d2883dee732",
+      "owner": "semantic-editor",
+      "previous_revision": "6f9dc4105ee99d8bbb9c1b251f48ea19f3adaed01bbdacab2f0e71aaf91e1d58",
+      "protected": false,
+      "replaces": [],
+      "revision": "ffadc6545c18013f4e03ec838fe506c91f00649ea3cd684f706700286b2805f8",
+      "role": "history",
+      "status": "active",
+      "target": "person.md",
+      "text": "The fictional project owner uses a paper notebook for sketching interface ideas."
+    },
+    "demo.preview.behavior": {
+      "ark_id": "demo.archive.design",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.design",
+          "expected_revision": null,
+          "fact_key": "demo.preview.behavior",
+          "id": "9716c005794e",
+          "note_id": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "previous_revision": null,
+          "replaces": [],
+          "revision": "29ee2dc5cb812f70b06884abaca57f5221c5978a7c6c70b222d0a3e2bc93ce5f",
+          "role": "constraint",
+          "status": "active",
+          "target": "projects/harbor-demo/update-preview.md",
+          "text": "The preview lists each proposed entry change before confirmation; cancelling the preview leaves the sailing unchanged."
+        },
+        "reason": "Existing identity/content imported; added delivery/protection flags do not erase original field absence.",
+        "source_locator": "/facts/demo.preview.behavior"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.design",
+          "content_sha256": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "source_id": "demo-source-design",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "expected_revision": null,
+      "fact_key": "demo.preview.behavior",
+      "id": "9716c005794e",
+      "mandatory": false,
+      "note_id": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+      "owner": "semantic-editor",
+      "previous_revision": "29ee2dc5cb812f70b06884abaca57f5221c5978a7c6c70b222d0a3e2bc93ce5f",
+      "protected": false,
+      "replaces": [],
+      "revision": "4db80ccc70322ad84e3b95be10a818bec439a73523239fca746c66908bd41eef",
+      "role": "constraint",
+      "status": "active",
+      "target": "projects/harbor-demo/update-preview.md",
+      "text": "The preview lists each proposed entry change before confirmation; cancelling the preview leaves the sailing unchanged."
+    },
+    "demo.project.purpose": {
+      "ark_id": "demo.archive.promotion",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.promotion",
+          "expected_revision": null,
+          "fact_key": "demo.project.purpose",
+          "id": "5a4bcbb3ab5a",
+          "note_id": "bae2292b9226ae5c004169a1e72354fc8cd47cea5722c5b1a7d3692273285874",
+          "previous_revision": null,
+          "replaces": [],
+          "revision": "db79ec4c4568fac405d14f56d9222b6ce32d9b3a3159a9b41fc9ba3e6e6baa37",
+          "role": "constraint",
+          "status": "active",
+          "target": "projects/harbor-demo/harbor-demo.md",
+          "text": "Harbor Demo connects a fictional web sailing page and tablet. Both repository bindings use the same sailing update preview feature."
+        },
+        "reason": "Existing identity/content imported; added delivery/protection flags do not erase original field absence.",
+        "source_locator": "/facts/demo.project.purpose"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.promotion",
+          "content_sha256": "bae2292b9226ae5c004169a1e72354fc8cd47cea5722c5b1a7d3692273285874",
+          "source_id": "demo-source-original-promotion",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "expected_revision": null,
+      "fact_key": "demo.project.purpose",
+      "id": "5a4bcbb3ab5a",
+      "mandatory": false,
+      "note_id": "bae2292b9226ae5c004169a1e72354fc8cd47cea5722c5b1a7d3692273285874",
+      "owner": "semantic-editor",
+      "previous_revision": "db79ec4c4568fac405d14f56d9222b6ce32d9b3a3159a9b41fc9ba3e6e6baa37",
+      "protected": false,
+      "replaces": [],
+      "revision": "7fddf385eb8c25de6c1f37187c15b28fd5bb7a9dc5bea199d8cd08050dabade7",
+      "role": "constraint",
+      "status": "active",
+      "target": "projects/harbor-demo/harbor-demo.md",
+      "text": "Harbor Demo connects a fictional web sailing page and tablet. Both repository bindings use the same sailing update preview feature."
+    },
+    "demo.rule.message-approval": {
+      "ark_id": "demo.archive.policy",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.policy",
+          "expected_revision": null,
+          "fact_key": "demo.rule.message-approval",
+          "id": "72aed01c5a5e",
+          "note_id": "750d79851f70084076a1fc81b1c898878ba872ba6e2baff8af9594f084d5e374",
+          "previous_revision": null,
+          "replaces": [],
+          "revision": "77cc822629eed1831c4747a43b70333229e29a97d6b71232e1a9e302b0938976",
+          "role": "constraint",
+          "status": "active",
+          "target": "person.md",
+          "text": "Before a timetable change is posted, show the exact rows to the harbour office and wait for explicit approval. Local reversible drafts may be prepared without that approval; approval of a draft does not authorize posting."
+        },
+        "reason": "Existing identity/content imported; added delivery/protection flags do not erase original field absence.",
+        "source_locator": "/facts/demo.rule.message-approval"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.policy",
+          "content_sha256": "750d79851f70084076a1fc81b1c898878ba872ba6e2baff8af9594f084d5e374",
+          "source_id": "demo-source-policy",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "expected_revision": null,
+      "fact_key": "demo.rule.message-approval",
+      "id": "72aed01c5a5e",
+      "mandatory": true,
+      "note_id": "750d79851f70084076a1fc81b1c898878ba872ba6e2baff8af9594f084d5e374",
+      "owner": "rule-policy",
+      "previous_revision": "77cc822629eed1831c4747a43b70333229e29a97d6b71232e1a9e302b0938976",
+      "protected": true,
+      "replaces": [],
+      "revision": "4a8262e0af62ab395c23ac4dd9f05c89e39e327f0a713daf037e29d451348f66",
+      "role": "constraint",
+      "status": "active",
+      "target": "person.md",
+      "text": "Before a timetable change is posted, show the exact rows to the harbour office and wait for explicit approval. Local reversible drafts may be prepared without that approval; approval of a draft does not authorize posting."
+    }
+  },
+  "narratives": {
+    "demo.narrative.agent": {
+      "compatibility": {},
+      "depends_on": {
+        "actions": {},
+        "facts": {
+          "demo.agent.confirmation": "e1e3db55c662fe17fb1fbdd1121a090f0a8c9e402d819696bac54d4f2e475cb5",
+          "demo.agent.scope": "9eda62ac73ed938a8d3957677a9ed69fe6ee78637cdebe9b2260d59e76fa06f5",
+          "demo.legacy.release": "670572e5289626779168d298f0f8aacac814182fb3099b1885ce4488c4f4f3f7",
+          "demo.preview.behavior": "4db80ccc70322ad84e3b95be10a818bec439a73523239fca746c66908bd41eef"
+        }
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.design",
+          "content_sha256": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "source_id": "demo-source-design",
+          "version": 1
+        }
+      ],
+      "narrative_id": "demo.narrative.agent",
+      "page_id": "demo.topic.sailing-schedule",
+      "previous_revision": null,
+      "revision": "6e64ac4b6149039f592ad7cc29fc8c2c276f2f0a29b05a86f03614487f223a67",
+      "state": "current",
+      "text": "The scheduler opens inside a fictional sailing page. It uses the visible sailing context to prepare a proposed timetable-row update. The user sees each entry change before confirming it. This topic groups the preview feature and preserves a release claim whose action identity is unknown."
+    },
+    "demo.narrative.preview": {
+      "compatibility": {},
+      "depends_on": {
+        "actions": {
+          "demo.action.preview-deploy": "5d82ee8cdd98ab7c94285f31e26830c027a126c2f3a579e8056c0f807f2199c8",
+          "demo.action.preview-merge": "789b55e42f81e52eb69b9f79815af3d903819937a28f252cfd551a045373d1df",
+          "demo.action.preview-push": "12c71ae106833396ec077282cde0c351b3aba64f1f3a88183a87f0f765f45061"
+        },
+        "facts": {
+          "demo.legacy.release": "670572e5289626779168d298f0f8aacac814182fb3099b1885ce4488c4f4f3f7",
+          "demo.preview.behavior": "4db80ccc70322ad84e3b95be10a818bec439a73523239fca746c66908bd41eef"
+        }
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.design",
+          "content_sha256": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "source_id": "demo-source-design",
+          "version": 1
+        },
+        {
+          "archive_id": "demo.archive.events",
+          "content_sha256": "01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970",
+          "source_id": "demo-source-events",
+          "version": 1
+        }
+      ],
+      "narrative_id": "demo.narrative.preview",
+      "page_id": "demo.feature.update-preview",
+      "previous_revision": null,
+      "revision": "3045447a2811cd3467c68a7b1ed3f9a7c5f0a6d0ee5959d273b852f4d0b295a3",
+      "state": "current",
+      "text": "The preview gives the user a chance to inspect each proposed value and cancel without changing the sailing. Push, merge and sandbox deployment are tracked separately. The action panel supplies their current state; the older handbook claim cannot close any of those actions."
+    }
+  },
+  "notes": {
+    "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c": {
+      "ark_id": "demo.archive.design",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.design",
+          "filename": "demo-source-design.md"
+        },
+        "source_locator": "/notes/938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.design",
+          "content_sha256": "938e9c7262d30a0269e441df256979fe11e86c29362722bf62c14bd5831cb48c",
+          "source_id": "demo-source-design",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "filename": "demo-source-design.md"
+    },
+    "4bf3f1886db4f17d829ed9a6a59f5a44f5d4f7605efc807626acc166606d11ff": {
+      "ark_id": "demo.archive.unmatched-handbook",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.unmatched-handbook",
+          "filename": "demo-old-handbook-revision-1.md"
+        },
+        "reason": "Historical archive version unresolved; identity retained."
+      },
+      "evidence_refs": [],
+      "evidence_resolution": "unresolved",
+      "filename": "demo-old-handbook-revision-1.md"
+    },
+    "750d79851f70084076a1fc81b1c898878ba872ba6e2baff8af9594f084d5e374": {
+      "ark_id": "demo.archive.policy",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.policy",
+          "filename": "demo-source-policy.md"
+        },
+        "source_locator": "/notes/750d79851f70084076a1fc81b1c898878ba872ba6e2baff8af9594f084d5e374"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.policy",
+          "content_sha256": "750d79851f70084076a1fc81b1c898878ba872ba6e2baff8af9594f084d5e374",
+          "source_id": "demo-source-policy",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "filename": "demo-source-policy.md"
+    },
+    "879b7df9f9b4dfeb1118b6afc2f9d76d6f76b0a8db5d533296717d2883dee732": {
+      "ark_id": "demo.archive.person",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.person",
+          "filename": "demo-person-notebook.md"
+        },
+        "source_locator": "/notes/879b7df9f9b4dfeb1118b6afc2f9d76d6f76b0a8db5d533296717d2883dee732"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.person",
+          "content_sha256": "879b7df9f9b4dfeb1118b6afc2f9d76d6f76b0a8db5d533296717d2883dee732",
+          "source_id": "demo-source-person",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "filename": "demo-person-notebook.md"
+    },
+    "9b7643448f8bc8f8dfe2a4dad8bb115f2250ff1e8defc061866e884ea1f47795": {
+      "ark_id": "demo.archive.unmatched-handbook",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.unmatched-handbook",
+          "filename": "demo-old-handbook.md"
+        },
+        "source_locator": "/notes/9b7643448f8bc8f8dfe2a4dad8bb115f2250ff1e8defc061866e884ea1f47795"
+      },
+      "evidence_refs": [],
+      "evidence_resolution": "unresolved",
+      "filename": "demo-old-handbook.md"
+    },
+    "aa37cecba3d9abb2b2a2802a2964b8765b5137bea2a3473e2495b38928ee89e0": {
+      "ark_id": "demo.archive.unmatched-handbook",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.unmatched-handbook",
+          "filename": "demo-old-handbook-revision-2.md"
+        },
+        "reason": "Historical archive version unresolved; identity retained."
+      },
+      "evidence_refs": [],
+      "evidence_resolution": "unresolved",
+      "filename": "demo-old-handbook-revision-2.md"
+    },
+    "01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970": {
+      "ark_id": "demo.archive.events",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.events",
+          "filename": "demo-source-events.md"
+        },
+        "source_locator": "/notes/01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.events",
+          "content_sha256": "01b8e8934ecf30aa6680b89757b5a6e64b1640c3e66dbe17ed4be70e31e2c970",
+          "source_id": "demo-source-events",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "filename": "demo-source-events.md"
+    },
+    "bae2292b9226ae5c004169a1e72354fc8cd47cea5722c5b1a7d3692273285874": {
+      "ark_id": "demo.archive.promotion",
+      "compatibility": {
+        "legacy_fields": {
+          "ark_id": "demo.archive.promotion",
+          "fact_check_receipt_ids": [
+            "3fe37117e101b4a0d9df6ae525f7437f"
+          ],
+          "filename": "demo-purpose-promotion.md"
+        },
+        "source_locator": "/notes/bae2292b9226ae5c004169a1e72354fc8cd47cea5722c5b1a7d3692273285874"
+      },
+      "evidence_refs": [
+        {
+          "archive_id": "demo.archive.promotion",
+          "content_sha256": "bae2292b9226ae5c004169a1e72354fc8cd47cea5722c5b1a7d3692273285874",
+          "source_id": "demo-source-original-promotion",
+          "version": 1
+        }
+      ],
+      "evidence_resolution": "exact",
+      "filename": "demo-purpose-promotion.md"
+    }
+  },
+  "pages": {
+    "person.md": {
+      "aliases": [
+        "Harbor demo rules"
+      ],
+      "category": "you",
+      "compatibility": {
+        "legacy_fields": {
+          "category": "you",
+          "kind": "topic",
+          "parent": "",
+          "priority": "",
+          "revision": "fefd292f15d4281e57890b5d592eda906a0ab453131cd275bf8d0c27573f6b0d",
+          "summary": "Fictional mandatory rules for this example authority.",
+          "title": "Harbor Demo rules"
+        },
+        "source_locator": "/pages/person.md"
+      },
+      "kind": "topic",
+      "layout": "person",
+      "links": [
+        "demo.project.harbor"
+      ],
+      "page_id": "demo.person",
+      "parent": "",
+      "previous_revision": "fefd292f15d4281e57890b5d592eda906a0ab453131cd275bf8d0c27573f6b0d",
+      "priority": "",
+      "repositories": [],
+      "revision": "56e12b6f5952b4b23b397eecca24ac6922992a1021d869efc30c29788c3122ca",
+      "summary": "All fictional person facts, protected rules and general action context.",
+      "tags": [
+        "fictional",
+        "harbor-demo"
+      ],
+      "title": "Harbor Demo person context"
+    },
+    "projects/harbor-demo/harbor-demo.md": {
+      "aliases": [
+        "Harbor Demo"
+      ],
+      "category": "projects",
+      "compatibility": {
+        "legacy_fields": {
+          "category": "projects",
+          "kind": "hub",
+          "parent": "",
+          "priority": "",
+          "revision": "d6cf7f18ea4b035a2b4b554fed508e68fb3c4962a62eb9bec8a93a333721b39c",
+          "summary": "Fictional web and tablet project: current actions and links to detail.",
+          "title": "Harbor Demo current map"
+        },
+        "source_locator": "/pages/projects~1harbor-demo~1harbor-demo.md"
+      },
+      "kind": "hub",
+      "layout": "project-map",
+      "links": [
+        "demo.topic.sailing-schedule",
+        "demo.feature.update-preview",
+        "demo.person"
+      ],
+      "page_id": "demo.project.harbor",
+      "parent": "",
+      "previous_revision": "d6cf7f18ea4b035a2b4b554fed508e68fb3c4962a62eb9bec8a93a333721b39c",
+      "priority": "",
+      "repositories": [
+        "demo.repo.harbor-web",
+        "demo.repo.harbor-tablet"
+      ],
+      "revision": "a01ece993706057c28da2bd9079e930dd519c31114509ecba15271786b8a42d4",
+      "summary": "Fictional web and tablet project: current actions and links to detail.",
+      "tags": [
+        "fictional",
+        "harbor-demo"
+      ],
+      "title": "Harbor Demo current map"
+    },
+    "projects/harbor-demo/sailing-schedule.md": {
+      "aliases": [
+        "Harbor sailing schedule app"
+      ],
+      "category": "projects",
+      "compatibility": {
+        "legacy_fields": {
+          "category": "projects",
+          "kind": "topic",
+          "parent": "projects/harbor-demo/harbor-demo.md",
+          "priority": "",
+          "revision": "1db46e4f7c83087cc2be4fb2bfb8214fb61d645ab8e45abf62ddface6e7ec57a",
+          "summary": "Sailing context, proposed entry updates and unresolved legacy release evidence.",
+          "summary_assessed_by": "demo.legacy.assessor",
+          "summary_input_hash": "93fe85515d27857fc4945170b47dfc6f681fd6f39c0d8e2ba20bc0346ecd3bee",
+          "title": "Harbor Demo Sailing Schedule"
+        },
+        "source_locator": "/pages/projects~1harbor-demo~1sailing-schedule.md"
+      },
+      "kind": "topic",
+      "layout": "topic",
+      "links": [
+        "demo.feature.update-preview",
+        "demo.project.harbor"
+      ],
+      "page_id": "demo.topic.sailing-schedule",
+      "parent": "projects/harbor-demo/harbor-demo.md",
+      "previous_revision": "1db46e4f7c83087cc2be4fb2bfb8214fb61d645ab8e45abf62ddface6e7ec57a",
+      "priority": "",
+      "repositories": [
+        "demo.repo.harbor-web",
+        "demo.repo.harbor-tablet"
+      ],
+      "revision": "be0fb243147f5b4854ea1a3c295a39f7c0558952f83e6d056a8f3794dd68e395",
+      "summary": "Sailing context, proposed entry updates and unresolved legacy release evidence.",
+      "tags": [
+        "fictional",
+        "harbor-demo"
+      ],
+      "title": "Harbor Demo Sailing Schedule"
+    },
+    "projects/harbor-demo/update-preview.md": {
+      "aliases": [
+        "Harbor update preview"
+      ],
+      "category": "projects",
+      "compatibility": {
+        "legacy_fields": {
+          "category": "projects",
+          "kind": "work",
+          "parent": "projects/harbor-demo/sailing-schedule.md",
+          "priority": "H2",
+          "revision": "e4ca7ddc7a6806b315ff5b5c2daa86931dda4c78f09b53c06417510abf1c747c",
+          "summary": "Review and confirm timetable-row changes before applying them.",
+          "title": "Sailing update preview"
+        },
+        "source_locator": "/pages/projects~1harbor-demo~1update-preview.md"
+      },
+      "feature_id": "demo.feature.update-preview",
+      "kind": "work",
+      "layout": "feature",
+      "links": [
+        "demo.topic.sailing-schedule",
+        "demo.project.harbor"
+      ],
+      "page_id": "demo.feature.update-preview",
+      "parent": "projects/harbor-demo/sailing-schedule.md",
+      "previous_revision": "e4ca7ddc7a6806b315ff5b5c2daa86931dda4c78f09b53c06417510abf1c747c",
+      "priority": "H2",
+      "repositories": [
+        "demo.repo.harbor-web",
+        "demo.repo.harbor-tablet"
+      ],
+      "revision": "4a83106e5166ef0b0e1ea1a052a898e371ff920a757c73cba30a66fb60b461c9",
+      "summary": "Review and confirm timetable-row changes before applying them.",
+      "tags": [
+        "fictional",
+        "harbor-demo"
+      ],
+      "title": "Sailing update preview"
+    }
+  },
+  "redirects": {},
+  "version": 3
+}

@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+# A runner's preinstalled Python can lack SQLite extension support, which sqlite-vec needs.
+env:
+  UV_MANAGED_PYTHON: "1"
+
+jobs:
+  source:
+    name: Source (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pushes and pull requests: one Linux job. Release tags, the weekly run and a manual run: both
+        # operating systems on the lowest and highest supported Python.
+        include: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && '[{"os":"ubuntu-24.04","python":"3.12"},{"os":"ubuntu-24.04","python":"3.13"},{"os":"macos-26","python":"3.12"},{"os":"macos-26","python":"3.13"}]' || '[{"os":"ubuntu-24.04","python":"3.13"}]') }}
+    steps:
+      - name: Prepare synthetic environment
+        run: |
+          synthetic_home="$RUNNER_TEMP/kelmo-home"
+          mkdir -p "$synthetic_home"
+          {
+            echo "HOME=$synthetic_home"
+            echo "GIT_CONFIG_GLOBAL=$synthetic_home/.gitconfig"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+            echo "GIT_AUTHOR_NAME=Kelmo CI"
+            echo "GIT_AUTHOR_EMAIL=kelmo-ci@example.invalid"
+            echo "GIT_COMMITTER_NAME=Kelmo CI"
+            echo "GIT_COMMITTER_EMAIL=kelmo-ci@example.invalid"
+          } >> "$GITHUB_ENV"
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.3"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync locked dependencies
+        run: uv sync --locked --dev --python ${{ matrix.python }}
+      - name: Check lock file
+        run: uv lock --check
+      - name: Lint
+        run: uv run --locked --python ${{ matrix.python }} ruff check .
+      - name: Test default source profile
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+        # The same sharded run the gate uses: four pytest processes on a four-core runner.
+        run: >-
+          uv run --locked --python ${{ matrix.python }} python tools/pytest_shards.py tests -q -ra
+          --ignore=tests/test_runtime.py
+          --ignore=tests/test_runtime_macos.py
+          --ignore=tests/test_linux_runtime.py
+          --ignore=tests/test_installed_cli.py
+
+  artifacts:
+    name: Build and inspect artifacts
+    needs: source
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact-id: ${{ steps.distributions.outputs.artifact-id }}
+    steps:
+      - name: Prepare synthetic environment
+        run: |
+          synthetic_home="$RUNNER_TEMP/kelmo-home"
+          mkdir -p "$synthetic_home"
+          {
+            echo "HOME=$synthetic_home"
+            echo "GIT_CONFIG_GLOBAL=$synthetic_home/.gitconfig"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+            echo "GIT_AUTHOR_NAME=Kelmo CI"
+            echo "GIT_AUTHOR_EMAIL=kelmo-ci@example.invalid"
+            echo "GIT_COMMITTER_NAME=Kelmo CI"
+            echo "GIT_COMMITTER_EMAIL=kelmo-ci@example.invalid"
+          } >> "$GITHUB_ENV"
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.3"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync locked dependencies
+        run: uv sync --locked --dev --python 3.12
+      - name: Build wheel and source distribution
+        run: uv build --no-sources
+      - name: Inspect distribution contents
+        run: |
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          source=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          test -n "$wheel"
+          test -n "$source"
+          KELMO_TEST_WHEEL="$wheel" KELMO_TEST_SDIST="$source" \
+            uv run --locked pytest tests/test_distribution.py
+      - name: Upload distributions
+        id: distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kelmo-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  installed-launcher:
+    name: Fresh installed launcher (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: [source, artifacts]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pushes and pull requests: one Linux job. Release tags, the weekly run and a manual run: both
+        # operating systems on the lowest and highest supported Python.
+        include: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && '[{"os":"ubuntu-24.04","python":"3.12"},{"os":"ubuntu-24.04","python":"3.13"},{"os":"macos-26","python":"3.12"},{"os":"macos-26","python":"3.13"}]' || '[{"os":"ubuntu-24.04","python":"3.13"}]') }}
+    steps:
+      - name: Prepare synthetic environment
+        run: |
+          synthetic_home="$RUNNER_TEMP/kelmo-home"
+          mkdir -p "$synthetic_home"
+          {
+            echo "HOME=$synthetic_home"
+            echo "GIT_CONFIG_GLOBAL=$synthetic_home/.gitconfig"
+            echo "GIT_CONFIG_NOSYSTEM=1"
+            echo "GIT_AUTHOR_NAME=Kelmo CI"
+            echo "GIT_AUTHOR_EMAIL=kelmo-ci@example.invalid"
+            echo "GIT_COMMITTER_NAME=Kelmo CI"
+            echo "GIT_COMMITTER_EMAIL=kelmo-ci@example.invalid"
+          } >> "$GITHUB_ENV"
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.3"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sync locked test dependencies
+        run: uv sync --locked --dev --no-install-project --python ${{ matrix.python }}
+      - name: Download immutable distributions
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          artifact-ids: ${{ needs.artifacts.outputs.artifact-id }}
+          path: ${{ runner.temp }}/dist
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          digest-mismatch: error
+      - name: Install fresh runtime
+        run: |
+          set -- "$RUNNER_TEMP"/dist/*.whl
+          test "$#" -eq 1
+          test -f "$1"
+          uv venv --python ${{ matrix.python }} "$RUNNER_TEMP/fresh-runtime"
+          uv export --locked --no-dev --no-emit-project --no-hashes \
+            --output-file "$RUNNER_TEMP/constraints.txt"
+          uv pip install --python "$RUNNER_TEMP/fresh-runtime/bin/python" \
+            --constraints "$RUNNER_TEMP/constraints.txt" "$1"
+      - name: Test installed launcher
+        working-directory: ${{ runner.temp }}
+        env:
+          KELMO_TEST_PREFIX: ${{ runner.temp }}/fresh-runtime
+          PYTHONPATH: ${{ runner.temp }}/fresh-runtime/lib/python${{ matrix.python }}/site-packages
+        run: |
+          set -- "$RUNNER_TEMP"/dist/*.whl
+          export KELMO_TEST_WHEEL="$1"
+          set -- "$RUNNER_TEMP"/dist/*.tar.gz
+          export KELMO_TEST_SDIST="$1"
+          "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+
+          prefix = Path(os.environ["KELMO_TEST_PREFIX"]).resolve()
+          for name in ("kelmo", "kelmo.store"):
+              spec = importlib.util.find_spec(name)
+              assert spec is not None and spec.submodule_search_locations, name
+              for location in spec.submodule_search_locations:
+                  assert Path(location).resolve().is_relative_to(prefix), (name, location)
+          PY
+          "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest --import-mode=importlib --noconftest \
+            "$GITHUB_WORKSPACE/tests/test_installed_cli.py" \
+            "$GITHUB_WORKSPACE/tests/test_distribution.py"

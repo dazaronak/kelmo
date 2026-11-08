@@ -1,0 +1,167 @@
+{
+  "contract_version": "adoption/1",
+  "base_revision": "1c23f568a9ef0ab2f6846f7cdd236859d841ec13",
+  "synthetic": true,
+  "archive_versions": [
+    {
+      "evidence": {
+        "archive_id": "record-history",
+        "version": 1,
+        "content_sha256": "ddc3b1a784062726b82ffe5b581b62a2570608da1123bb891f125214d243b9da",
+        "source_id": "source-v1"
+      },
+      "content": "Original synthetic claim.",
+      "hidden": false,
+      "superseded_by": null,
+      "owning_operation": null
+    },
+    {
+      "evidence": {
+        "archive_id": "record-history",
+        "version": 2,
+        "content_sha256": "b3225a92132252fddf0588a2267a13dda8c323b1dd851a57b3d38ce6d8c7c89e",
+        "source_id": "source-v2"
+      },
+      "content": "Corrected synthetic claim.",
+      "hidden": false,
+      "superseded_by": null,
+      "owning_operation": null
+    },
+    {
+      "evidence": {
+        "archive_id": "record-hidden",
+        "version": 1,
+        "content_sha256": "118fccb57340f8199c84f47cf21cac82fa1ccebb6f5141aaed7dad40dcc5ea2d",
+        "source_id": "source-hidden"
+      },
+      "content": "Hidden retained evidence.",
+      "hidden": true,
+      "superseded_by": "record-replacement",
+      "owning_operation": "operation-hidden"
+    },
+    {
+      "evidence": {
+        "archive_id": "record-replacement",
+        "version": 1,
+        "content_sha256": "bfdefb8d4157b678abf4512523a21c6faf9259e1c492c74a57bf2b461eaf718c",
+        "source_id": "source-replacement"
+      },
+      "content": "Visible replacement evidence.",
+      "hidden": false,
+      "superseded_by": null,
+      "owning_operation": null
+    }
+  ],
+  "protected_rule": {
+    "text": "Preserve all conditions except when an explicit requester rule-change source authorizes a replacement.",
+    "mandatory_delivery": true,
+    "protected": true
+  },
+  "wiki_relative": "knowledge/wiki",
+  "knowledge_git_relative": ".",
+  "pages": [
+    "person.md",
+    "projects/synthetic/map.md",
+    "projects/synthetic/features/shared-feature.md"
+  ],
+  "actions": [
+    {
+      "action_id": "task-1",
+      "subject_kind": "task",
+      "subject_id": "sample-task",
+      "kind": "book",
+      "expected_revision": null,
+      "event_order": 1,
+      "transition": "completed",
+      "evidence_ref": {
+        "archive_id": "record-history",
+        "version": 2,
+        "content_sha256": "b3225a92132252fddf0588a2267a13dda8c323b1dd851a57b3d38ce6d8c7c89e",
+        "source_id": "source-v2"
+      },
+      "feature_id": null,
+      "repository_id": null,
+      "environment": null,
+      "correction_of": null,
+      "work_revision": null
+    },
+    {
+      "action_id": "push-1",
+      "subject_kind": "feature",
+      "subject_id": "shared-feature",
+      "kind": "push",
+      "expected_revision": null,
+      "event_order": 2,
+      "transition": "completed",
+      "evidence_ref": {
+        "archive_id": "record-history",
+        "version": 2,
+        "content_sha256": "b3225a92132252fddf0588a2267a13dda8c323b1dd851a57b3d38ce6d8c7c89e",
+        "source_id": "source-v2"
+      },
+      "feature_id": "shared-feature",
+      "repository_id": "synthetic-repo",
+      "environment": null,
+      "correction_of": null,
+      "work_revision": "synthetic-revision",
+      "remote_ref": "origin/test"
+    },
+    {
+      "action_id": "deployment-1",
+      "subject_kind": "feature",
+      "subject_id": "shared-feature",
+      "kind": "deploy",
+      "expected_revision": null,
+      "event_order": 3,
+      "transition": "completed",
+      "evidence_ref": {
+        "archive_id": "record-history",
+        "version": 2,
+        "content_sha256": "b3225a92132252fddf0588a2267a13dda8c323b1dd851a57b3d38ce6d8c7c89e",
+        "source_id": "source-v2"
+      },
+      "feature_id": "shared-feature",
+      "repository_id": "synthetic-repo",
+      "environment": "test",
+      "correction_of": null,
+      "work_revision": "synthetic-revision",
+      "artifact_id": "synthetic-artifact"
+    }
+  ],
+  "receipt": {
+    "operation_id": "operation-hidden",
+    "idempotency_key": "operation-hidden",
+    "source_id": "source-hidden",
+    "outcome": "archived",
+    "evidence_refs": [
+      {
+        "archive_id": "record-hidden",
+        "version": 1,
+        "content_sha256": "118fccb57340f8199c84f47cf21cac82fa1ccebb6f5141aaed7dad40dcc5ea2d",
+        "source_id": "source-hidden"
+      }
+    ],
+    "old_revision": null,
+    "new_revision": null,
+    "generation": null
+  },
+  "wiki_files": {
+    "person.md": "# Synthetic rules\n\nPreserve all conditions except when an explicit requester rule-change source authorizes a replacement.\n",
+    "projects/synthetic/map.md": "# Synthetic project\n\n[[projects/synthetic/features/shared-feature]]\n",
+    "projects/synthetic/features/shared-feature.md": "# Shared feature\n\nPush and deployment have separate action IDs.\n"
+  },
+  "generation_manifest": {
+    "registry_sha256": "31e0acf6efc4c06634f70e9827d2d10a625374a7a32e9002e5572c5d4c49c069",
+    "page_artifacts": {
+      "person.md": "bf38f2c37bbe1798406c3f587d3494799218261f3a7f7c29e19f44d606ff83d1",
+      "projects/synthetic/map.md": "4469c4c7f3a2f1363dd36da9c311dd6327c863c221f1d090cbbfe4c8682372fd",
+      "projects/synthetic/features/shared-feature.md": "43556c702e9611752413422a4781298e9cc26d6058446ffad96ba460e8dd2670"
+    },
+    "derived_index_baseline": "synthetic-record-index/1"
+  },
+  "generation": {
+    "authority_id": "synthetic-authority",
+    "publication_id": 7,
+    "manifest_sha256": "a8cc6d314d06e2f0d393bce49492ea799490d857b6b75ede0168e4d5357fe21f"
+  }
+}

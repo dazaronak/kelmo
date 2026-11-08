@@ -1,0 +1,1484 @@
+{
+  "$defs": {
+    "census": {
+      "additionalProperties": false,
+      "properties": {
+        "adoption_units": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "authorization": {
+                "enum": [
+                  "proposal-only",
+                  "accepted"
+                ]
+              },
+              "expected_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "locator": {
+                "type": "string"
+              },
+              "operation": {
+                "const": "adopt"
+              },
+              "output_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "replacement_region": {
+                "pattern": "^.+#(?:bytes:(0|[1-9][0-9]*):(0|[1-9][0-9]*)|span:[a-z-]+:(0|[1-9][0-9]*):[a-z-]+:(0|[1-9][0-9]*))$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "unit_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "unit_id",
+              "source_id",
+              "locator",
+              "expected_sha256",
+              "operation",
+              "replacement_region",
+              "authorization",
+              "output_sha256"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "baseline": {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "additionalProperties": false,
+              "properties": {
+                "authority_id": {
+                  "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                  "type": "string"
+                },
+                "manifest_sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "publication_id": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "authority_id",
+                "publication_id",
+                "manifest_sha256"
+              ],
+              "type": "object"
+            },
+            "registry_sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "repository_head": {
+              "pattern": "^[0-9a-f]{40}$",
+              "type": "string"
+            },
+            "writer_epoch": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "repository_head",
+            "generation",
+            "registry_sha256",
+            "writer_epoch"
+          ],
+          "type": "object"
+        },
+        "census_id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+          "type": "string"
+        },
+        "issuer": {
+          "additionalProperties": false,
+          "properties": {
+            "authority_id": {
+              "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+              "type": "string"
+            },
+            "controller_id": {
+              "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+              "type": "string"
+            },
+            "example_only": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "authority_id",
+            "controller_id"
+          ],
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "scope": {
+          "additionalProperties": false,
+          "properties": {
+            "adoption_unit_ids": {
+              "items": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "output_paths": {
+              "items": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "page_ids": {
+              "items": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "page_ids",
+            "output_paths",
+            "adoption_unit_ids"
+          ],
+          "type": "object"
+        },
+        "sources": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "root": {
+                "enum": [
+                  "repository",
+                  "reference",
+                  "packet",
+                  "review"
+                ]
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "source_id",
+              "root",
+              "path",
+              "sha256"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "units": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "allowed_dispositions": {
+                "items": {
+                  "enum": [
+                    "mapped",
+                    "retained-evidence",
+                    "unresolved"
+                  ]
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "delivery": {
+                "enum": [
+                  "startup+compact",
+                  "detail",
+                  "evidence"
+                ]
+              },
+              "destination": {
+                "type": "string"
+              },
+              "locator": {
+                "type": "string"
+              },
+              "operation": {
+                "enum": [
+                  "preserve",
+                  "project",
+                  "adopt"
+                ]
+              },
+              "owner": {
+                "enum": [
+                  "registry",
+                  "managed",
+                  "unmanaged",
+                  "archive"
+                ]
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "unit": {
+                "enum": [
+                  "field",
+                  "bytes",
+                  "claim"
+                ]
+              },
+              "unit_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "unit_id",
+              "source_id",
+              "locator",
+              "unit",
+              "sha256",
+              "destination",
+              "owner",
+              "operation",
+              "allowed_dispositions"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "census_id",
+        "issuer",
+        "baseline",
+        "scope",
+        "sources",
+        "units",
+        "adoption_units"
+      ],
+      "type": "object"
+    },
+    "page-catalog": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+          "type": "string"
+        },
+        "catalog_id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+          "type": "string"
+        },
+        "pages": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "aliases": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "uniqueItems": true
+              },
+              "page_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "parent": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "page_id",
+              "parent",
+              "aliases"
+            ],
+            "type": "object"
+          },
+          "type": "object"
+        },
+        "redirects": {
+          "additionalProperties": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "schema_version": {
+          "const": 1
+        }
+      },
+      "required": [
+        "schema_version",
+        "catalog_id",
+        "authority_id",
+        "pages",
+        "redirects"
+      ],
+      "type": "object"
+    },
+    "page-catalog-pin": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+          "type": "string"
+        },
+        "catalog_id": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "catalog_id",
+        "authority_id",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "source-baseline": {
+      "properties": {
+        "artifacts": {
+          "items": {
+            "properties": {
+              "sha256": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "sha256"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "authority_id": {
+          "type": "string"
+        },
+        "publication_id": {
+          "type": "integer"
+        },
+        "registry_sha256": {
+          "type": "string"
+        },
+        "repository_head": {
+          "type": "string"
+        },
+        "writer_epoch": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifacts",
+        "authority_id",
+        "publication_id",
+        "repository_head",
+        "writer_epoch",
+        "registry_sha256"
+      ],
+      "type": "object"
+    },
+    "source-evidence": {
+      "items": {
+        "properties": {
+          "archive_id": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "source_id": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          },
+          "supersedes": {
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "visibility": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "archive_id",
+          "version",
+          "content_sha256",
+          "source_id",
+          "content"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "source-history": {
+      "additionalProperties": {
+        "items": {
+          "$ref": "urn:kelmo:wiki-file-contract:3.0:worker-manifest#/$defs/source-legacy-fact"
+        },
+        "type": "array"
+      },
+      "type": "object"
+    },
+    "source-legacy-fact": {
+      "properties": {
+        "ark_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fact_key": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "index_target": {
+          "type": "string"
+        },
+        "note_id": {
+          "type": "string"
+        },
+        "previous_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fact_key",
+        "id",
+        "note_id",
+        "target",
+        "text",
+        "status",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "source-origin": {
+      "properties": {
+        "authority_id": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "machine_tag": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority_id",
+        "client_id",
+        "machine_tag"
+      ],
+      "type": "object"
+    },
+    "source-owning": {
+      "items": {
+        "properties": {
+          "evidence_ref": {
+            "additionalProperties": false,
+            "properties": {
+              "archive_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "content_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "version": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "archive_id",
+              "version",
+              "content_sha256",
+              "source_id"
+            ],
+            "type": "object"
+          },
+          "operation_receipt_id": {
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "urn:kelmo:wiki-file-contract:3.0:worker-manifest#/$defs/source-origin"
+          },
+          "outcome": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_receipt_id",
+          "outcome",
+          "origin",
+          "evidence_ref"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "source-registry": {
+      "properties": {
+        "facts": {
+          "additionalProperties": {
+            "$ref": "urn:kelmo:wiki-file-contract:3.0:worker-manifest#/$defs/source-legacy-fact"
+          },
+          "type": "object"
+        },
+        "notes": {
+          "additionalProperties": {
+            "properties": {
+              "ark_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "filename": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "type": "object"
+        },
+        "pages": {
+          "additionalProperties": {
+            "properties": {
+              "category": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "parent": {
+                "type": "string"
+              },
+              "priority": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "category",
+              "kind",
+              "parent",
+              "priority",
+              "title",
+              "summary",
+              "revision"
+            ],
+            "type": "object"
+          },
+          "type": "object"
+        },
+        "version": {
+          "enum": [
+            1,
+            2
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "facts",
+        "notes"
+      ],
+      "type": "object"
+    },
+    "source-state": {
+      "properties": {
+        "actions": {
+          "additionalProperties": {
+            "$ref": "urn:kelmo:wiki-file-contract:3.0:records#/properties/actions/additionalProperties"
+          },
+          "type": "object"
+        },
+        "history": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "urn:kelmo:wiki-file-contract:3.0:records#/properties/actions/additionalProperties"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "receipts": {
+          "items": {
+            "properties": {
+              "accepted_state": {
+                "type": "string"
+              },
+              "action_id": {
+                "type": "string"
+              },
+              "attribution": {
+                "properties": {
+                  "assigned_by": {
+                    "type": "string"
+                  },
+                  "principal_id": {
+                    "type": "string"
+                  },
+                  "source_kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "assigned_by",
+                  "principal_id",
+                  "source_kind"
+                ],
+                "type": "object"
+              },
+              "evidence_mark": {
+                "type": "string"
+              },
+              "evidence_ref": {
+                "additionalProperties": false,
+                "properties": {
+                  "archive_id": {
+                    "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                    "type": "string"
+                  },
+                  "content_sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "source_id": {
+                    "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                    "type": "string"
+                  },
+                  "version": {
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "archive_id",
+                  "version",
+                  "content_sha256",
+                  "source_id"
+                ],
+                "type": "object"
+              },
+              "operation_receipt_id": {
+                "type": "string"
+              },
+              "origin": {
+                "$ref": "urn:kelmo:wiki-file-contract:3.0:worker-manifest#/$defs/source-origin"
+              },
+              "outcome": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation_receipt_id",
+              "outcome",
+              "origin",
+              "evidence_ref",
+              "action_id",
+              "accepted_state",
+              "evidence_mark",
+              "attribution"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "subject_bindings": {
+          "additionalProperties": {
+            "properties": {
+              "context_page_id": {
+                "type": "string"
+              },
+              "subject_kind": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject_kind"
+            ],
+            "type": "object"
+          },
+          "type": "object"
+        },
+        "trusted_bindings": {
+          "additionalProperties": {
+            "properties": {
+              "authority_id": {
+                "type": "string"
+              },
+              "machine_tag": {
+                "type": "string"
+              },
+              "principal_id": {
+                "type": "string"
+              },
+              "role": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "authority_id",
+              "machine_tag",
+              "principal_id",
+              "role"
+            ],
+            "type": "object"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "actions",
+        "history",
+        "receipts",
+        "trusted_bindings",
+        "subject_bindings"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:kelmo:wiki-file-contract:3.0:worker-manifest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "baseline": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "additionalProperties": false,
+          "properties": {
+            "authority_id": {
+              "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+              "type": "string"
+            },
+            "manifest_sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "publication_id": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "authority_id",
+            "publication_id",
+            "manifest_sha256"
+          ],
+          "type": "object"
+        },
+        "registry_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "repository_head": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "writer_epoch": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "repository_head",
+        "generation",
+        "registry_sha256",
+        "writer_epoch"
+      ],
+      "type": "object"
+    },
+    "changes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "entity": {
+            "enum": [
+              "page",
+              "fact",
+              "narrative",
+              "action"
+            ]
+          },
+          "expected_revision": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "proposed_revision": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "validation": {
+            "enum": [
+              "deterministic-import",
+              "semantic-promotion",
+              "narrative-edit",
+              "page-projection",
+              "state-import"
+            ]
+          }
+        },
+        "required": [
+          "entity",
+          "id",
+          "expected_revision",
+          "proposed_revision",
+          "validation"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pass",
+              "fail",
+              "not_run"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "contract": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "version": {
+          "const": "wiki-file-contract/3.0-proposal.2"
+        }
+      },
+      "required": [
+        "version",
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "coverage": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "destination": {
+                "type": "string"
+              },
+              "disposition": {
+                "enum": [
+                  "mapped",
+                  "retained-evidence",
+                  "unresolved"
+                ]
+              },
+              "locator": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "unit": {
+                "enum": [
+                  "field",
+                  "bytes",
+                  "claim"
+                ]
+              },
+              "unit_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "unit_id",
+              "source_id",
+              "locator",
+              "unit",
+              "sha256",
+              "disposition",
+              "destination",
+              "reason"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "totals": {
+          "additionalProperties": false,
+          "properties": {
+            "discarded": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "input": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mapped": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "retained_evidence": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unresolved": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "input",
+            "mapped",
+            "retained_evidence",
+            "unresolved",
+            "discarded"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "items",
+        "totals"
+      ],
+      "type": "object"
+    },
+    "fact_checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "fact_key": {
+            "type": "string"
+          },
+          "verified_match": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "fact_key",
+          "verified_match"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "fixture": {
+      "type": "object"
+    },
+    "inputs": {
+      "additionalProperties": false,
+      "properties": {
+        "census": {
+          "additionalProperties": false,
+          "properties": {
+            "locator": {
+              "type": "string"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "source_id": {
+              "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_id",
+            "locator",
+            "sha256"
+          ],
+          "type": "object"
+        },
+        "evidence_refs": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "archive_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "content_sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "version": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "archive_id",
+              "version",
+              "content_sha256",
+              "source_id"
+            ],
+            "type": "object"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "files": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "root": {
+                "enum": [
+                  "repository",
+                  "reference",
+                  "packet",
+                  "review"
+                ]
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "source_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "source_id",
+              "root",
+              "path",
+              "sha256"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "state_receipts": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "action_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              },
+              "operation_receipt_id": {
+                "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "action_id",
+              "operation_receipt_id"
+            ],
+            "type": "object"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "files",
+        "evidence_refs",
+        "census",
+        "state_receipts"
+      ],
+      "type": "object"
+    },
+    "kind": {
+      "const": "wiki-proposal"
+    },
+    "losses": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "locator": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "source_id": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "locator",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "outputs": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "expected_sha256": {
+                "anyOf": [
+                  {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "path": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "target": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "target",
+              "sha256",
+              "expected_sha256"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "type": "object"
+    },
+    "producer": {
+      "enum": [
+        "page-worker",
+        "dreaming",
+        "migration"
+      ]
+    },
+    "proposal_id": {
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+      "type": "string"
+    },
+    "review": {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "enum": [
+            "not_requested",
+            "pending",
+            "accepted",
+            "rejected"
+          ]
+        },
+        "protected_rules": {
+          "enum": [
+            "pending",
+            "accepted",
+            "rejected"
+          ]
+        },
+        "semantic_preservation": {
+          "enum": [
+            "pending",
+            "accepted",
+            "rejected"
+          ]
+        }
+      },
+      "required": [
+        "semantic_preservation",
+        "protected_rules",
+        "approval"
+      ],
+      "type": "object"
+    },
+    "revision_map": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "disposition": {
+            "enum": [
+              "mapped",
+              "retained-evidence",
+              "unresolved"
+            ]
+          },
+          "entity": {
+            "enum": [
+              "page",
+              "fact",
+              "narrative",
+              "action"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "new_revision": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "old_revision": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity",
+          "id",
+          "old_revision",
+          "new_revision",
+          "disposition"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "scope": {
+      "additionalProperties": false,
+      "properties": {
+        "adoption_unit_ids": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "output_paths": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "page_ids": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "page_ids",
+        "output_paths",
+        "adoption_unit_ids"
+      ],
+      "type": "object"
+    },
+    "status": {
+      "const": "proposed"
+    },
+    "unresolved": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "blocks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "locator": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "source_id": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id",
+          "locator",
+          "reason",
+          "blocks"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "proposal_id",
+    "producer",
+    "status",
+    "contract",
+    "baseline",
+    "scope",
+    "inputs",
+    "outputs",
+    "changes",
+    "coverage",
+    "losses",
+    "unresolved",
+    "revision_map",
+    "checks",
+    "review",
+    "fact_checks"
+  ],
+  "type": "object"
+}

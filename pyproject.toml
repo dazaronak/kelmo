@@ -1,0 +1,203 @@
+[build-system]
+requires = ["hatchling==1.29.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kelmo"
+version = "0.1.0"
+description = "Long-term memory for coding agents: a searchable archive, a self-maintained wiki and a startup context"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.14"
+authors = [{ name = "Dzmitry Azaronak" }]
+keywords = ["memory", "coding-agents", "mcp", "claude-code", "codex", "wiki", "sqlite"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
+dependencies = [
+  "fastmcp>=3.0,<4",
+  "sqlite-vec>=0.1.7,<0.2",
+  "fastembed>=0.4,<1",
+  "networkx>=3.2,<4",
+  "numpy>=1.26,<3",
+  "python-frontmatter>=1.1,<2",
+  "markdown-it-py>=4,<5",
+  "pyyaml>=6,<7",
+  "jsonschema>=4.26,<5",
+  "referencing>=0.37,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/dazaronak/kelmo"
+Documentation = "https://github.com/dazaronak/kelmo/tree/main/docs"
+Issues = "https://github.com/dazaronak/kelmo/issues"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.6,<1"]
+
+[tool.hatch.build]
+exclude = [
+  "/.git",
+  "/_docs",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kelmo"]
+
+[tool.hatch.build.targets.wheel.shared-scripts]
+"packaging/kelmo" = "kelmo"
+
+[tool.hatch.build.targets.wheel.shared-data]
+"packaging/gate.py" = "share/kelmo/gate.py"
+"src/kelmo/bootstrap.py" = "share/kelmo/bootstrap.py"
+"src/kelmo/runtime.py" = "share/kelmo/runtime.py"
+"src/kelmo/linux_runtime.py" = "share/kelmo/linux_runtime.py"
+"src/kelmo/entry.py" = "share/kelmo/entry.py"
+"src/kelmo/interface.py" = "share/kelmo/interface.py"
+"src/kelmo/model_store.py" = "share/kelmo/model_store.py"
+"src/kelmo/config.py" = "share/kelmo/config.py"
+"src/kelmo/hot.py" = "share/kelmo/hot.py"
+"src/kelmo/session_settings.py" = "share/kelmo/session_settings.py"
+"src/kelmo/errors.py" = "share/kelmo/errors.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+# The rules this code is written against; a newer ruff's wider default set is not the contract.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.uv]
+build-constraint-dependencies = [
+  "hatchling==1.29.0",
+  "packaging==26.0",
+  "pathspec==1.0.4",
+  "pluggy==1.6.0",
+  "trove-classifiers==2026.1.14.14",
+]
+constraint-dependencies = [
+  "aiofile==3.9.0",
+  "annotated-doc==0.0.4",
+  "annotated-types==0.7.0",
+  "anyio==4.15.1",
+  "attrs==26.1.0",
+  "authlib==1.9.1",
+  "beartype==0.22.9",
+  "cachetools==7.0.5",
+  "caio==0.9.25",
+  "certifi==2026.10.19",
+  "cffi==2.0.0",
+  "charset-normalizer==3.4.7",
+  "click==8.3.3",
+  "colorama==0.4.6",
+  "cryptography==50.0.0",
+  "cyclopts==4.10.2",
+  "dnspython==2.9.0",
+  "docstring-parser==0.18.0",
+  "docutils==0.22.4",
+  "email-validator==2.3.0",
+  "exceptiongroup==1.3.1",
+  "fastembed==0.8.0",
+  "fastmcp-slim==3.4.11",
+  "fastmcp==3.4.11",
+  "filelock==4.2.4",
+  "flatbuffers==25.12.19",
+  "fsspec==2026.9.0",
+  "griffelib==2.0.2",
+  "h11==0.16.0",
+  "hf-xet==1.4.3",
+  "httpcore==1.0.9",
+  "httpx-sse==0.4.3",
+  "httpx==0.28.1",
+  "huggingface-hub==1.10.1",
+  "idna==3.15",
+  "importlib-metadata==8.7.1",
+  "iniconfig==2.3.0",
+  "jaraco-classes==3.4.0",
+  "jaraco-context==6.1.2",
+  "jaraco-functools==4.4.0",
+  "jeepney==0.9.0",
+  "joserfc==1.7.7",
+  "jsonref==1.1.0",
+  "jsonschema-path==0.4.5",
+  "jsonschema-specifications==2025.9.1",
+  "jsonschema==4.26.0",
+  "keyring==25.7.0",
+  "librt==0.9.0",
+  "loguru==0.7.3",
+  "markdown-it-py==4.0.0",
+  "mcp==1.30.0",
+  "mdurl==0.1.2",
+  "mmh3==5.2.1",
+  "more-itertools==11.0.2",
+  "mpmath==1.3.0",
+  "mypy-extensions==1.1.0",
+  "mypy==1.20.1",
+  "networkx==3.6.1",
+  "numpy==2.4.4",
+  "onnxruntime==1.24.4",
+  "openapi-pydantic==0.5.1",
+  "opentelemetry-api==1.45.1",
+  "packaging==26.0",
+  "pathable==0.5.0",
+  "pathspec==1.0.4",
+  "pillow==12.3.0",
+  "platformdirs==4.9.6",
+  "pluggy==1.6.0",
+  "protobuf==7.34.1",
+  "py-key-value-aio==0.4.4",
+  "py-rust-stemmers==0.1.5",
+  "pycparser==3.0",
+  "pydantic-core==2.46.0",
+  "pydantic-settings==2.14.2",
+  "pydantic==2.13.0",
+  "pygments==2.20.0",
+  "pyjwt==2.15.1",
+  "pyperclip==1.11.0",
+  "pytest-asyncio==1.3.0",
+  "pytest==9.0.3",
+  "python-dotenv==1.2.2",
+  "python-frontmatter==1.1.0",
+  "python-multipart==0.0.31",
+  "pywin32-ctypes==0.2.3",
+  "pywin32==311",
+  "pyyaml==6.0.3",
+  "referencing==0.37.0",
+  "requests==2.33.1",
+  "rich-rst==1.3.2",
+  "rich==15.0.0",
+  "rpds-py==0.30.0",
+  "ruff==0.15.10",
+  "secretstorage==3.5.0",
+  "shellingham==1.5.4",
+  "sqlite-vec==0.1.9",
+  "sse-starlette==3.3.4",
+  "starlette==1.3.1",
+  "sympy==1.14.0",
+  "tokenizers==0.22.2",
+  "tqdm==4.67.3",
+  "typer==0.24.1",
+  "typing-extensions==4.16.0",
+  "typing-inspection==0.4.2",
+  "uncalled-for==0.3.1",
+  "urllib3==2.8.0",
+  "uvicorn==0.44.0",
+  "watchfiles==1.1.1",
+  "websockets==16.0",
+  "win32-setctime==1.2.0",
+  "zipp==3.23.1",
+]

@@ -1,0 +1,39 @@
+#!/bin/sh
+# shellcheck disable=SC1007  # `CDPATH= cd` is a prefix assignment for cd alone: with CDPATH set, cd prints the
+# directory it landed in, and that text would land in the $( ) whose value is the runtime directory.
+set -eu
+runtime_json=false
+for runtime_arg in "$@"; do
+    [ "$runtime_arg" != '--json' ] || runtime_json=true
+done
+runtime_fail() {
+    if [ "$runtime_json" = true ]; then
+        printf '%s\n' '{"schema_version":1,"ok":false,"error":{"code":"E_RUNTIME","message":"Installed runtime is unavailable."}}'
+    else
+        printf '%s\n' 'E_RUNTIME: Installed runtime is unavailable.' >&2
+    fi
+    exit 1
+}
+runtime_entry=$0
+case "$runtime_entry" in
+    */*) ;;
+    *) runtime_entry=$(command -v "$runtime_entry") || runtime_fail ;;
+esac
+runtime_hops=0
+runtime_readlink=/usr/bin/readlink
+[ -x "$runtime_readlink" ] || runtime_readlink=/bin/readlink
+while [ -L "$runtime_entry" ]; do
+    runtime_hops=$((runtime_hops + 1))
+    [ "$runtime_hops" -le 40 ] || runtime_fail
+    runtime_bin=$(CDPATH= cd -- "${runtime_entry%/*}" && pwd -P) || runtime_fail
+    [ -x "$runtime_readlink" ] || runtime_fail
+    runtime_entry=$("$runtime_readlink" "$runtime_entry") || runtime_fail
+    case "$runtime_entry" in
+        /*) ;;
+        *) runtime_entry="$runtime_bin/$runtime_entry" ;;
+    esac
+done
+runtime_bin=$(CDPATH= cd -- "${runtime_entry%/*}" && pwd -P) || runtime_fail
+[ -x "$runtime_bin/python" ] || runtime_fail
+[ -r "$runtime_bin/../share/kelmo/entry.py" ] || runtime_fail
+exec "$runtime_bin/python" -I -S "$runtime_bin/../share/kelmo/entry.py" "$@"

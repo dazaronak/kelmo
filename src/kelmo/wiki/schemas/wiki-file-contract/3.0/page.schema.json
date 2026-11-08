@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kelmo:wiki-file-contract:3.0:page",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "enum": [
+        "work",
+        "topic",
+        "hub",
+        "prose"
+      ]
+    },
+    "category": {
+      "enum": [
+        "projects",
+        "areas",
+        "topics",
+        "people",
+        "you"
+      ]
+    },
+    "parent": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 120,
+      "pattern": "^[^\\r\\n]*$",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[^\\r\\n]*$"
+    },
+    "priority": {
+      "enum": [
+        "H1",
+        "H2",
+        "H3",
+        ""
+      ]
+    },
+    "page_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+    },
+    "layout": {
+      "enum": [
+        "person",
+        "project-map",
+        "topic",
+        "feature",
+        "legacy"
+      ]
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "repositories": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+      },
+      "uniqueItems": true
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+      },
+      "uniqueItems": true
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "previous_revision": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "compatibility": {
+      "type": "object"
+    },
+    "feature_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+    }
+  },
+  "required": [
+    "kind",
+    "category",
+    "parent",
+    "title",
+    "summary",
+    "priority",
+    "page_id",
+    "layout",
+    "aliases",
+    "tags",
+    "repositories",
+    "links",
+    "revision",
+    "previous_revision",
+    "compatibility"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "frontmatter": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,119}$"
+        },
+        "kind": {
+          "enum": [
+            "work",
+            "topic",
+            "hub",
+            "prose"
+          ]
+        },
+        "category": {
+          "enum": [
+            "projects",
+            "areas",
+            "topics",
+            "people",
+            "you"
+          ]
+        },
+        "parent": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120,
+          "pattern": "^[^\\r\\n]*$",
+          "minLength": 1
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 200,
+          "pattern": "^[^\\r\\n]*$"
+        },
+        "priority": {
+          "enum": [
+            "H1",
+            "H2",
+            "H3",
+            ""
+          ]
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "wiki_contract": {
+          "const": "wiki-file-contract/3.0-proposal.2"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "page_id",
+        "kind",
+        "category",
+        "parent",
+        "title",
+        "summary",
+        "priority",
+        "aliases",
+        "tags",
+        "wiki_contract",
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
