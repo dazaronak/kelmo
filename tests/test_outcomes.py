@@ -3,7 +3,7 @@ import json
 import pytest
 
 from test_fact_checks import content
-from kelmo import outcomes
+from kelmo import editor, outcomes
 from kelmo.errors import KelmoError
 from kelmo.service import Service
 from kelmo.wiki import engine
@@ -157,3 +157,31 @@ def test_a_long_reason_names_the_first_facts_and_counts_the_rest(service):
     assert len(reason) <= outcomes.REASON_LIMIT
     assert reason.count('fixture.fact.') == 8
     assert reason.endswith('(+4 more)')
+
+
+LONG_KEYS = ['project.some-page.a-rather-long-fact-key-about-one-thing-' + str(index) for index in range(9)]
+
+
+def test_long_fact_keys_stay_whole_and_the_reason_fits_its_limit():
+    reason = outcomes.fact_reason(LONG_KEYS, 'fact applied: ')
+    assert len(reason) <= outcomes.REASON_LIMIT
+    named = reason.removeprefix('fact applied: ').split(' (+')[0].split(', ')
+    assert set(named) <= set(LONG_KEYS)
+    assert reason.endswith('(+' + str(len(LONG_KEYS) - len(named)) + ' more)')
+    assert outcomes.validate('applied', reason) == ('applied', reason)
+
+
+def test_a_published_proposal_with_long_keys_and_other_changes_fits_its_limit():
+    delta = {name: [] for name in editor.LIMITS}
+    delta['facts'] = [{'fact_key': key} for key in LONG_KEYS]
+    other = next(name for name in editor.LIMITS if name != 'facts')
+    delta[other] = ['one']
+    reason = editor._summary(delta)
+    assert len(reason) <= outcomes.REASON_LIMIT
+    assert reason.startswith('editor proposal published: facts ')
+    assert reason.endswith('more); 1 ' + other)
+
+
+def test_one_key_longer_than_the_limit_is_counted_and_not_cut():
+    key = 'project.page.' + 'x' * outcomes.REASON_LIMIT
+    assert outcomes.fact_reason([key], 'fact applied: ') == 'fact applied: (+1 more)'

@@ -41,14 +41,19 @@ def validate(disposition, reason):
     return disposition, reason
 
 
-def named_facts(keys):
+def named_facts(keys, room=REASON_LIMIT):
+    """The first keys, each whole, as many as `room` characters hold (at most NAMED_FACTS); the rest as a count."""
     keys = sorted(keys)
-    extra = len(keys) - NAMED_FACTS
-    return ', '.join(keys[:NAMED_FACTS]) + ('' if extra <= 0 else ' (+' + str(extra) + ' more)')
+    for count in range(min(len(keys), NAMED_FACTS), 0, -1):
+        extra = len(keys) - count
+        text = ', '.join(keys[:count]) + ('' if not extra else ' (+' + str(extra) + ' more)')
+        if len(text) <= room:
+            return text
+    return '(+' + str(len(keys)) + ' more)' if keys else ''
 
 
-def fact_reason(keys, prefix):
-    return prefix + named_facts(keys)
+def fact_reason(keys, prefix, suffix=''):
+    return prefix + named_facts(keys, REASON_LIMIT - len(prefix) - len(suffix)) + suffix
 
 
 def cause(code):

@@ -539,8 +539,9 @@ def _summary(delta):
     others = [str(len(delta[name])) + ' ' + name for name in LIMITS if name != 'facts' and delta[name]]
     if keys and not others:
         return outcomes.fact_reason(keys, 'fact applied: ')
-    parts = ([outcomes.fact_reason(keys, 'facts ')] if keys else []) + others
-    return 'editor proposal published: ' + ('; '.join(parts) or 'note evidence resolved')
+    if keys:
+        return outcomes.fact_reason(keys, 'editor proposal published: facts ', ''.join('; ' + part for part in others))
+    return 'editor proposal published: ' + ('; '.join(others) or 'note evidence resolved')
 
 
 def _outcome(disposition, reason, code=None):
