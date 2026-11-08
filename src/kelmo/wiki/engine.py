@@ -1983,7 +1983,10 @@ def _commit_registry(vault, registry, title, wiki_root=None, *, _wiki_locked=Fal
                 raise OwnershipConflict('Generated HOT path is not a regular file: ' + str(path))
             content = path.read_text(encoding='utf-8')
             owned = (path in (prior_names | set(legacy)) and re.match(r'\A<!-- kelmo generation [0-9]+ -->\n', content)
-                     or path in legacy and content == legacy[path])
+                     or path in legacy and content == legacy[path]
+                     # An unmodified committed view stays recoverable from the base commit, whoever wrote its header.
+                     or git_blob(data_repository, base + ':' + path.relative_to(data_repository).as_posix())
+                     == content.encode('utf-8'))
             if not owned:
                 raise OwnershipConflict('Generated HOT path is not owned by Kelmo: ' + str(path))
             if path not in generated:

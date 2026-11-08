@@ -102,8 +102,10 @@ hook's output is written and flushed; a record that cannot be written is reporte
 stderr and the next prompt delivers again.
 
 Claude's complete hook output is bounded to 10,000 characters. Mandatory pages
-stay whole; omitted context is named with a read/import instruction. Large
-mandatory memory requires instruction-file imports. Codex hooks use
+are never split; omitted context is named with a read/import instruction. Large
+mandatory memory requires instruction-file imports: the hook says the pages are
+not repeated, names their file, still delivers pending lines, and does not
+resend the notice on later prompts of that session. Codex hooks use
 `additionalContextLimit: 0`; the provider does not shorten their context.
 New or changed Codex hooks still require native trust review through `/hooks`.
 

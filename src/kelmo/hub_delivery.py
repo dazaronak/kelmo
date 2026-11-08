@@ -237,6 +237,10 @@ def unchanged_marker(snapshot, project, current=None):
             'delivered earlier this session. If it is missing from your context,' + where)
 
 
+MANDATORY_OMITTED = ('Mandatory pages exceed the hook limit and are not repeated here. '
+                     'Import them from instruction files, or read ')
+
+
 def assemble(header, mandatory, hub, work, pending, *, provider, pointer, work_pointer=None, mandatory_pointer=None, pending_pointer=None, limit=10000):
     pending = pending or []
     pending_digest = _hash(_encoded(pending))
@@ -261,15 +265,20 @@ def assemble(header, mandatory, hub, work, pending, *, provider, pointer, work_p
     if work and work_source:
         suffix += '; read bound work at ' + work_source
     suffix += '.'
-    if len(required) > limit:
-        raise budget_error('Whole mandatory content exceeds the Claude hook limit')
-    # Prefer the useful, complete pending list over a partial hub; keep an explicit pointer for omissions.
-    tail = ('\n\n' + pending_block if pending_block else '') + suffix
+    def fitted_tail(base):
+        # Prefer the useful, complete pending list over a partial hub; keep an explicit pointer for omissions.
+        tail = ('\n\n' + pending_block if pending_block else '') + suffix
+        if len(base) + len(tail) > limit:
+            tail = ('\n\nPending updates omitted (digest ' + pending_digest + '); read '
+                    + pending_source() + '.' if pending else '') + suffix
+        return tail
+    tail = None if len(required) + len(suffix) > limit else fitted_tail(required)
+    if tail is None or len(required) + len(tail) > limit:
+        # Mandatory pages are never split: they arrive whole or are named, and pending lines still get through.
+        required = header + '\n\n' + MANDATORY_OMITTED + (mandatory_pointer or pointer) + '.'
+        tail = fitted_tail(required)
     if len(required) + len(tail) > limit:
-        tail = ('\n\nPending updates omitted (digest ' + pending_digest + '); read '
-                + pending_source() + '.' if pending else '') + suffix
-    if len(required) + len(tail) > limit:
-        raise budget_error('Whole mandatory content leaves no room for the omission notice')
+        raise budget_error('The omission notice exceeds the Claude hook limit')
     room = limit - len(required) - len(tail) - 2
     excerpt = hub[:max(0, room)].rstrip()
     return required + ('\n\n' + excerpt if excerpt else '') + tail
@@ -423,13 +432,15 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
     context = deliver(snapshot, project, work, pending, provider=provider, current=current, stale=stale,
                       limit=10000 - reserve if provider == 'claude' else 10000, work_path=work_path,
                       work_pointer=work_pointer, pending_pointer=pending_pointer, unlinked=unlinked)
+    # A later prompt cannot fit oversized mandatory pages either, so their notice is not resent every turn.
+    settled = complete or context.startswith(header_line(snapshot, stale) + '\n\n' + MANDATORY_OMITTED)
     for part in (repair, notice):
         if part:
             context += '\n\n' + part
     if state is not None and acknowledge is not None:
         # An unverified or altered import must not suppress current memory; a missing `mode` (stale
         # cache, failed sync) means the same. Hook mode trusts this session's own delivery record.
-        verified = (complete and not selection.get('changed')
+        verified = (settled and not selection.get('changed')
                     and (hook_mode or bool(selection.get('verified'))))
         pending_only = ''
         if hook_mode:
@@ -442,7 +453,7 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
                          marker=unchanged_marker(snapshot, project, installed) if hook_mode else '',
                          pending_only=pending_only)
         context = update['context']
-        if not sync_failed and complete:
+        if not sync_failed and settled:
             acknowledge(update['commit'])
     return context
 

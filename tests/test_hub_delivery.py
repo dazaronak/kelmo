@@ -72,9 +72,18 @@ def test_pending_digest_changes_even_when_only_an_omitted_row_changes():
     assert 'changed outside visible rows' not in after
 
 
-def test_mandatory_over_budget_refuses_instead_of_silently_truncating():
-    with pytest.raises(KelmoError):
-        assemble('header', 'M' * 10000, 'hub', '', [], provider='claude', pointer='mandatory.md')
+def test_mandatory_over_budget_is_named_whole_instead_of_truncated():
+    pending = [{'pending': 'STILL_SHOWN', 'project': 'alpha'}]
+    result = assemble('header', 'M' * 10000, 'hub', '', pending, provider='claude', pointer='alpha.md',
+                      mandatory_pointer='mandatory.md')
+    assert len(result) <= 10000 and 'MM' not in result
+    assert 'not repeated here' in result and 'mandatory.md' in result and 'STILL_SHOWN' in result
+
+
+def test_refuses_only_when_even_the_omission_notice_cannot_fit():
+    with pytest.raises(KelmoError) as failure:
+        assemble('header', 'M' * 10000, 'hub', '', [], provider='claude', pointer='p' * 10000)
+    assert failure.value.code == 'E_BUDGET'
 
 
 def test_refresh_retries_until_output_confirmed_and_never_suppresses_stale(tmp_path):
@@ -284,9 +293,8 @@ def test_oversized_mandatory_points_to_a_file_that_contains_it(tmp_path):
     for name in ('mandatory.md', 'alpha.full.md'):
         content = '<!-- kelmo generation 1 -->\n' + 'M' * 10000
         value['files'][name] = {'text': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}
-    with pytest.raises(KelmoError) as failure:
-        deliver(value, 'alpha', '', [], provider='claude', current=tmp_path)
-    assert any(str(tmp_path / name) in str(failure.value) for name in ('mandatory.md', 'alpha.full.md'))
+    result = deliver(value, 'alpha', '', [], provider='claude', current=tmp_path)
+    assert str(tmp_path / 'mandatory.md') in result and len(result) <= 10000
 
 
 def test_embed_only_persists_published_context_and_hook_keeps_session_context(tmp_path):
@@ -368,15 +376,14 @@ def test_truncated_work_is_not_acknowledged_or_suppressed(tmp_path, monkeypatch)
     assert not callbacks
 
 
-def test_budget_notice_refusal_still_names_mandatory_source(tmp_path):
+def test_mandatory_without_room_for_the_notices_is_named(tmp_path):
     from kelmo.hub_delivery import deliver
     value = snapshot(1, 0)
     content = '<!-- kelmo generation 1 -->\n' + 'M' * 9740
     value['files']['mandatory.md'] = {'text': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}
-    with pytest.raises(KelmoError) as failure:
-        deliver(value, 'alpha', 'W' * 1000, [], provider='claude', current=tmp_path,
-                work_path='projects/alpha/' + 'long-task-' * 30)
-    assert str(tmp_path/'mandatory.md') in str(failure.value)
+    result = deliver(value, 'alpha', 'W' * 1000, [], provider='claude', current=tmp_path,
+                     work_path='projects/alpha/' + 'long-task-' * 30)
+    assert str(tmp_path/'mandatory.md') in result and 'M' * 9740 not in result and len(result) <= 10000
 
 
 def test_omitted_pending_has_an_immutable_readable_source(tmp_path):
@@ -424,25 +431,28 @@ def test_hub_only_omission_does_not_require_pending_storage(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize('size', [9800, 10100])
-def test_mandatory_budget_refusal_names_every_omitted_source(tmp_path, size):
-    from kelmo.hub_delivery import prepare
+def test_oversized_mandatory_keeps_pending_and_is_not_resent_every_prompt(tmp_path, monkeypatch, size):
+    from kelmo import hub_delivery, hub_embed
+    monkeypatch.setattr(hub_embed, 'sync', lambda *args, **kwargs: {'verified': True, 'changed': False, 'mode': 'hook'})
     value = snapshot(1, 0)
     mandatory = '<!-- kelmo generation 1 -->\n' + 'M' * size
     value['files']['mandatory.md'] = {'text': mandatory, 'sha256': hashlib.sha256(mandatory.encode()).hexdigest()}
     directory = install_set(tmp_path / 'hot', value)
     callbacks = []
-    with pytest.raises(KelmoError) as failure:
-        prepare(SimpleNamespace(state=tmp_path), {'session_id': 'test'}, value,
-            'alpha', 'WHOLE_WORK', [{'pending': 'WHOLE_PENDING'}], provider='claude', current=directory,
-            stale=False, acknowledge=callbacks.append)
-    assert failure.value.code == 'E_BUDGET' and not callbacks
-    message = str(failure.value)
-    assert str(directory / 'mandatory.md') in message and str(directory / 'alpha.md') in message
+    args = dict(config=SimpleNamespace(state=tmp_path), payload={'session_id': 'test'}, snapshot=value,
+                project='alpha', work='WHOLE_WORK', pending=[{'pending': 'WHOLE_PENDING'}], provider='claude',
+                current=directory, stale=False, acknowledge=callbacks.append)
+    first = hub_delivery.prepare(**args)
+    assert 'M' * size not in first and len(first) <= 10000
+    assert hub_delivery.MANDATORY_OMITTED in first and str(directory / 'mandatory.md') in first
+    assert 'WHOLE_PENDING' in first and str(directory / 'alpha.md') in first
     copies = list((tmp_path / 'hub-context').glob('*.json'))
-    assert len(copies) == 1 and str(copies[0]) in message
-    assert 'work field' in message and 'pending field' in message
-    saved = json.loads(copies[0].read_text())
-    assert saved['work'] == 'WHOLE_WORK' and saved['pending'][0]['pending'] == 'WHOLE_PENDING'
+    assert len(copies) == 1 and str(copies[0]) in first and 'work field' in first
+    assert json.loads(copies[0].read_text())['work'] == 'WHOLE_WORK'
+    assert len(callbacks) == 1
+    callbacks.pop()()
+    second = hub_delivery.prepare(**args)
+    assert 'unchanged' in second and hub_delivery.MANDATORY_OMITTED not in second
 
 
 def test_unlinked_directory_gets_a_notice_instead_of_a_bare_generation_line():

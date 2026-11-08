@@ -283,6 +283,44 @@ def test_bound_layout_publishes_and_recovers_views(tmp_path, monkeypatch, bounda
     assert pages.KnowledgeReader(engine.Config.load(layout.control)).generation().publication_id == sequence + 1
 
 
+@pytest.mark.parametrize('edited', [False, True])
+def test_published_view_with_another_header_is_regenerated_but_a_local_edit_is_refused(tmp_path, monkeypatch, edited):
+    """A store imported from another writer keeps views whose first line Kelmo did not write."""
+    import copy
+    import re
+    import registry_seed
+    from kelmo.wiki import engine, hot_views
+    from test_nested_layout import enroll, make_layout, page_entry
+    layout = make_layout(tmp_path)
+    toml = layout.control / 'kelmo.toml'
+    toml.write_text(toml.read_text() + '\n[hot]\nviews = true\n')
+    enroll(layout)
+    registry = copy.deepcopy(layout.registry)
+    registry['pages']['projects/viewed/viewed.md'] = page_entry(layout_name='project-map', kind='hub', category='projects',
+                                                                title='Fixture', summary='', priority='', page_id='fixture')
+    original = hot_views.render_all
+
+    def other_header(*args, **kwargs):
+        return {path: re.sub(r'\A<!-- kelmo generation', '<!-- other generation', text)
+                for path, text in original(*args, **kwargs).items()}
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(hot_views, 'render_all', other_header)
+        registry_seed.publish(layout.control, registry, 'chore: Publish fixture map')
+    view = layout.vault / 'knowledge/hot/viewed.md'
+    assert view.read_text().startswith('<!-- other generation ')
+    registry['pages']['projects/second/second.md'] = page_entry(layout_name='project-map', kind='hub', category='projects',
+                                                                title='Second', summary='', priority='', page_id='second')
+    if edited:
+        view.write_text(view.read_text() + 'Edited by hand.\n')
+        with pytest.raises(engine.OwnershipConflict):
+            registry_seed.publish(layout.control, registry, 'chore: Publish second map')
+        assert view.read_text().endswith('Edited by hand.\n')
+    else:
+        registry_seed.publish(layout.control, registry, 'chore: Publish second map')
+        assert view.read_text().startswith('<!-- kelmo generation ')
+
+
 def test_publication_writes_views_in_the_same_commit_and_generation(tmp_path, monkeypatch):
     import registry_seed
     from kelmo import doctor
