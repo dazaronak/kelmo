@@ -1550,7 +1550,10 @@ class Editor:
         union_checks = []
         for operation_id in accepted:
             for name in LIMITS:
-                union[name].extend(slices[operation_id]['delta'][name])
+                # The slice carries no attribution of its own (`split_delta` cut it out); the owner is
+                # re-attached here, so the published intent attributes every item to the note it came from.
+                union[name].extend({**item, 'source_operation_id': operation_id}
+                                   for item in slices[operation_id]['delta'][name])
             union_checks.extend(slices[operation_id]['fact_checks'])
         if not accepted:
             first = next(iter(dispositions.values()))

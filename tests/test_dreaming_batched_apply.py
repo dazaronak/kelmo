@@ -465,3 +465,91 @@ def test_a_batch_stops_at_a_same_project_note_of_another_origin_and_skips_other_
     assert [member[0]['id'] for member in batch_members(_ShapeService(), other, 8)] == ['a', 'c'], \
         'a note of another project keeps its own turn and never holds this batch'
 
+
+
+def facts_of(world):
+    """The facts this fixture's replay published, keyed by their fact key."""
+    return {key: fact for key, fact in world.registry()['facts'].items() if '.replay-' in key}
+
+
+def test_each_published_fact_of_a_batch_cites_the_note_it_came_from(world):
+    """The wiki's evidence for a fact is the note that proposed it, not the batch's lead."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    report = apply_pending(world.service, counted(BatchModel(world)))
+    assert sorted(report['applied']) == sorted(ids), report
+    facts = facts_of(world)
+    assert len(facts) == 3
+    wrong = {key: fact['note_id'][:10] for key, fact in facts.items()
+             if not fact['note_id'].startswith(key.split('.replay-')[1])}
+    assert not wrong, f'facts cite another note: {wrong}'
+    assert all(fact['evidence_refs'][0]['content_sha256'] == fact['note_id'] for fact in facts.values())
+
+
+class AuthorityBatch(BatchModel):
+    """A batch answer where the later source proposes a new fact on the person page.
+
+    The first source of the batch carries the rule-change authority; the later one is ordinary editing.
+    """
+
+    def __init__(self, world, person_source):
+        super().__init__(world)
+        self.person_source = person_source
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        payload = job.payload
+        facts, checks = [], []
+        for block in payload['sources']:
+            on_person = block['operation_id'] == self.person_source
+            evidence = block['evidence']['content_sha256'][:8]
+            key = 'app.habit-' + evidence if on_person else 'app.replay-' + evidence
+            target = 'person.md' if on_person else FEATURE
+            text = 'Files the weekly report on Fridays.' if on_person else block['text'].split('. ')[0]
+            facts.append(dict(fact_key=key, target=target, text=text, status='active', expected_revision=None,
+                              source=block['operation_id']))
+            checks.append({'fact_key': key, 'source': block['operation_id'],
+                           'verified_match': {'result': 'not_found',
+                                              'search_id': self.world.service.reconcile(text, target)['search_id']}})
+        return ModelOutcome('proposal', {'facts': facts, 'fact_checks': checks})
+
+
+def capture_rule_change(world, texts, principal='requester'):
+    """Notes captured under an origin that may carry a rule-change request, archived in capture order."""
+    from kelmo.service import Service
+    ids = []
+    with Service(world.root, bindings=world.bindings, origin=world.origins[principal]) as service:
+        for index, text in enumerate(texts):
+            operation = service.create(text, project='app', selected=[FEATURE, 'person.md'],
+                                       rule_change=(index == 0), idempotency_key='rule-note-' + str(index))
+            world.service.run(operation['id'])
+            ids.append(operation['id'])
+    return ids
+
+
+def test_a_rule_change_authority_reaches_only_the_items_of_its_own_source(world):
+    """A new person-page fact from a source without the authority is not a protected rule."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = capture_rule_change(world, notes(2))
+    report = apply_pending(world.service, AuthorityBatch(world, ids[1]))
+    assert sorted(report['applied']) == sorted(ids), report
+    new = [fact for fact in world.registry()['facts'].values() if fact['fact_key'].startswith('app.habit-')]
+    assert len(new) == 1, [fact['fact_key'] for fact in new]
+    assert new[0]['target'] == 'person.md'
+    assert new[0]['protected'] is False and new[0]['owner'] != 'rule-policy', \
+        'a source without the authority cannot make its fact a protected rule'
+    assert new[0]['note_id'] == world.service.journal.evidence_record(ids[1])['content_sha256'], \
+        'the fact cites the note that proposed it'
+
+
+def test_a_new_person_fact_from_the_authorized_source_of_a_batch_is_still_a_rule(world):
+    """The other half: the source that does carry the authority keeps its person fact protected."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = capture_rule_change(world, notes(2))
+    report = apply_pending(world.service, AuthorityBatch(world, ids[0]))
+    assert sorted(report['applied']) == sorted(ids), report
+    new = [fact for fact in world.registry()['facts'].values() if fact['fact_key'].startswith('app.habit-')]
+    assert len(new) == 1 and new[0]['protected'] is True and new[0]['owner'] == 'rule-policy'
