@@ -49,6 +49,17 @@ def notes(count, project='app'):
             f'{7 + index:02d}:{index:02d} after the audit.' for index in range(count)]
 
 
+PAD = 'The audit recorded the same reading on every shift of that week. '
+SHRINK_BUDGET = 1950
+
+
+def long_notes(count, pads=12, project='app'):
+    """Notes padded with `pads` extra clauses, so the batch view costs more: the two budget tests pick the
+    padding and the budget that make three of them too much for one batch of this fixture."""
+    return [f'{project.title()} note {index}: the {project} pipeline moves to '
+            f'{7 + index:02d}:{index:02d} after the audit. ' + PAD * pads for index in range(count)]
+
+
 class BatchModel:
     """A fake model that answers a batch the way the nightly one does: one proposal naming every source.
 
@@ -102,6 +113,28 @@ class Dispatch:
     def execute(self, job):
         self.jobs.append(job)
         return self.batch.execute(job) if 'sources' in job.payload else self.single(job)
+
+
+class Reconciling(BatchModel):
+    """The batch replay, after one reconciliation round for the first source of the batch.
+
+    A reconciliation receipt is part of the view's cost, so the round that carries it can push the batch
+    over its budget: this is the shrink that happens mid-conversation, after the rows are already open.
+    """
+
+    def __init__(self, world):
+        super().__init__(world)
+        self.asked = False
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        payload = job.payload
+        if 'sources' in payload and not self.asked and not payload['reconciliations']:
+            self.asked = True
+            self.jobs.append(job)
+            return ModelOutcome('reconcile', {'facts': [{'text': payload['sources'][0]['text'].split('. ')[0],
+                                                         'target': FEATURE}]})
+        return super().execute(job)
 
 
 def counted(inner):
@@ -162,6 +195,65 @@ def test_the_oldest_waiting_source_leads_its_batch_and_other_projects_wait_their
     assert [[job.payload['project'], len(job.payload['sources'])] for job in model.inner.jobs] == \
         [['app', 2], ['ops', 2]], 'one batch per project, in the order the notes were captured'
     assert model.inner.jobs[0].payload['sources'][0]['operation_id'] == app[0]
+
+
+def test_a_cross_source_collision_parks_only_the_later_source_and_hints_it_next_pass(world):
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = capture(world, notes(2))
+    before = commits(world)
+    report = apply_pending(world.service, counted(BatchModel(world, shared=True)))
+    assert report['applied'] == [ids[0]] and report['parked'] == [ids[1]]
+    assert world.service.journal.get(ids[1])['error_code'] == 'E_PROPOSAL'
+    assert commits(world) - before == 1, 'the accepted slice publishes; the colliding one does not'
+    again = counted(BatchModel(world))
+    assert apply_pending(world.service, again)['applied'] == [ids[1]]
+    assert again.inner.jobs[0].payload['refusal']['code'] == 'E_PROPOSAL', \
+        'the park reaches the model as that source own hint'
+
+
+def test_the_budget_shrink_drops_the_newest_source_and_it_stays_in_the_pass(world):
+    from kelmo.creation import apply_pending
+    # Measured on this fixture with FEATURE selected (the batch view's `budget.used_tokens`): the fixed
+    # part of the view costs 687, the FEATURE page 272 and each 841-character note 464, so the
+    # three-source view needs 2079 and the two-source one 1886. At SHRINK_BUDGET the batch therefore
+    # shrinks from the newest source, which the same pass then publishes alone.
+    editor_mode(world, budget=SHRINK_BUDGET)
+    ids = capture(world, long_notes(3))
+    before = commits(world)
+    model = counted(BatchModel(world))
+    report = apply_pending(world.service, model)
+    batched = [job for job in model.inner.jobs if 'sources' in job.payload]
+    assert [len(job.payload['sources']) for job in batched] == [2], 'the batch shrank from the newest source'
+    assert sorted(report['applied']) == sorted(ids) and (report['parked'], report['failed']) == ([], [])
+    assert model.calls == 2, 'the dropped source spent no part of the batch call; it got its own conversation'
+    assert commits(world) - before == 2, 'the shrink splits one batch into a batch and a single source'
+    assert ids[2] not in [block['operation_id'] for block in batched[0].payload['sources']]
+    assert [event for event in world.service.trace(ids[2])['events'] if event['stage'] == 'parked'] == [], \
+        'the dropped source spent no attempt of its own: it was never refused under its own key'
+    assert world.outcome(ids[2])['disposition'] == 'applied'
+
+
+def test_a_shrink_inside_the_conversation_drops_the_newest_source_into_its_own_attempt(world):
+    """The shrink the preflight cannot see: a reconciliation round makes the view too big mid-batch."""
+    from kelmo.creation import apply_pending
+    # Measured on this fixture with FEATURE selected at budget 1950 (the batch view's `budget.used_tokens`):
+    # the three padded sources cost 1570 and fit, the same view with one reconciliation receipt costs 1752
+    # and sends no selected page, and the two-source view with that receipt costs 1821 and sends FEATURE.
+    editor_mode(world, budget=SHRINK_BUDGET)
+    texts = long_notes(3, pads=2)
+    ids = capture(world, texts)
+    before = commits(world)
+    model = counted(Reconciling(world))
+    report = apply_pending(world.service, model)
+    batched = [job for job in model.inner.jobs if 'sources' in job.payload]
+    assert [[len(job.payload['sources']), len(job.payload['reconciliations'])] for job in batched] == \
+        [[3, 0], [2, 1]], 'the batch shrank from the newest source after the reconciliation round'
+    assert sorted(report['applied']) == sorted(ids) and (report['parked'], report['failed']) == ([], [])
+    assert commits(world) - before == 2, 'the shrunk batch publishes its two, the dropped source publishes alone'
+    assert ids[2] not in [block['operation_id'] for block in batched[-1].payload['sources']]
+    assert [event for event in world.service.trace(ids[2])['events'] if event['stage'] == 'parked'] == [], \
+        'the source the batch shrank out spends no attempt and is never refused under its own key'
 
 
 def test_a_declined_batch_answer_declines_every_member_without_a_commit(world):

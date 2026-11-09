@@ -353,7 +353,7 @@ def normalize(result, scope, registry, *, rule_change, project, enrollment=None,
     never for edit scope. New page and narrative identities stay outside the shared identity
     namespace. The common publisher repeats the ownership and identity checks on the result.
 
-    `sources` (batched Dreaming apply, docs/working/batched-dreaming.md) is the batch's authority map
+    `sources` (batched Dreaming apply) is the batch's authority map
     in capture order: `{operation_id: {'rule_change': bool, ...}}`. Each proposed item then names the
     source it comes from with `source`, which becomes `source_operation_id` on the delta item; a
     protected rule or person fact changes only under a source whose own entry carries `rule_change`,
@@ -585,10 +585,15 @@ def split_delta(delta, checks, order):
     checks_by_key = {}
     for item in delta['facts']:
         checks_by_key.setdefault(item['fact_key'], item['source_operation_id'])
+    held_checks = set()
     for check in checks:
         owner = checks_by_key.get(check['fact_key'])
-        if owner is not None:
-            slices[owner]['fact_checks'].append(check)
+        if owner is None or check['fact_key'] in held_checks:
+            continue
+        # The reconciliation gate allows one check per fact, so a fact two sources claimed carries the
+        # check of the one that keeps it, never both.
+        held_checks.add(check['fact_key'])
+        slices[owner]['fact_checks'].append(check)
     return {operation_id: {'delta': {name: part[name] for name in LIMITS}, 'fact_checks': part['fact_checks']}
             for operation_id, part in slices.items()}, refusals
 
@@ -734,6 +739,19 @@ def _batch_answered(row):
         return False
     observation = json.loads(row['observation'])
     return 'batch' in observation and 'consulting' not in observation
+
+
+def _own_answer(row):
+    """A request row whose recorded answer is its own single-source one: it settles from that answer.
+
+    Such a row is never leased into a batch — the batch would overwrite an answer its source already
+    paid for — and it is not awaiting a model either, so the settle pass settles it exactly as `edit`
+    would.
+    """
+    if row is None or row['state'] != 'open' or not row['observation']:
+        return False
+    observation = json.loads(row['observation'])
+    return 'consulting' not in observation and 'batch' not in observation
 
 
 class Editor:
@@ -917,7 +935,7 @@ class Editor:
     def edit_batch(self, sources, *, origin, executor, contexts=None):
         """Edit the selected pages from a batch of archived sources: one consultation, one publication.
 
-        Batched Dreaming apply (docs/working/batched-dreaming.md). `sources` is the batch in capture
+        Batched Dreaming apply. `sources` is the batch in capture
         order, each `{'source_operation_id', 'idempotency_key', 'request'}`, where `request` is that
         source's own stored creation request (`project`, `selected`, `budget_tokens`, `rule_change`,
         optional `hint`, `link_pages`, `proposal_digest`). Every member keeps its own request row under
@@ -926,6 +944,11 @@ class Editor:
         order: a refused slice parks alone, a cross-source collision parks the later source, and the
         accepted slices become one batch intent and one commit, prepared on the row of the earliest
         accepted source.
+
+        The batch's budget is read before any row opens (`_preflight_batch`), so a source the budget cannot
+        carry spends no part of the conversation, has no row of this attempt, and the same pass publishes it
+        alone under its own key. A fingerprint names the source its request answers, so one key answers one
+        request whether that source was consulted inside a batch or alone.
 
         Returns `{'lead', 'batch', 'dispositions'}`: `lead` is the source whose row carried the
         consultation, `batch` the sources that took part in it, and each disposition is `applied` or
@@ -972,16 +995,36 @@ class Editor:
         enrollment = self._enrollment(contexts)
         keys = {operation_id: StateCoordinator._request_key('semantic', origin, idem[operation_id])
                 for operation_id in order}
-        fingerprints = {operation_id: _fingerprint({'request': requests[operation_id], 'origin': origin.to_dict(),
-                                                    'key': idem[operation_id]}) for operation_id in order}
+        fingerprints = {operation_id: _fingerprint({'request': {**requests[operation_id],
+                                                                'source_operation_id': operation_id},
+                                                    'origin': origin.to_dict(), 'key': idem[operation_id]})
+                        for operation_id in order}
         rows, settled = self._batch_state(order, keys, fingerprints)
+        # A row that already holds its own single-source answer (a pass that died between the answer and
+        # the settle) is settled from that answer before the batch is consulted, under the worker lock the
+        # publication needs: it is never leased into a batch, which would overwrite an answer its source
+        # already paid for and answer the batch with E_BUSY.
+        own = [operation_id for operation_id in order
+               if operation_id not in settled and _own_answer(rows[operation_id])]
+        if own:
+            with coordinator_lock(self.service.config):
+                self._recover()
+                for operation_id in own:
+                    settled[operation_id] = self._own_answer_disposition(rows[operation_id], operation_id, origin,
+                                                                         requests[operation_id], idem[operation_id],
+                                                                         enrollment)
         live = [operation_id for operation_id in order
                 if operation_id not in settled and not _batch_answered(rows[operation_id])]
+        dropped = {}
         if live:
-            self._answer_batch(live[0], live, origin, requests, keys, idem, fingerprints, enrollment, executor)
+            # The budget is read before any row opens, so a source the batch cannot carry has no request
+            # row of this attempt and the same pass publishes it alone under its own single-source key.
+            sources, live, dropped = self._preflight_batch(live, requests, origin)
+            self._answer_batch(live[0], live, origin, requests, keys, idem, fingerprints, enrollment, executor,
+                               sources, dropped)
         with coordinator_lock(self.service.config):
             self._recover()
-            return self._settle_pass(order, keys, idem, requests, origin, enrollment, fingerprints)
+            return self._settle_pass(order, keys, idem, requests, origin, enrollment, fingerprints, dropped)
 
     def _batch_state(self, order, keys, fingerprints):
         """Each member's request row and the dispositions a replay answers without consulting: receipt or refusal."""
@@ -1001,14 +1044,17 @@ class Editor:
                                          'reason': row['error_message']}
         return rows, settled
 
-    def _settle_pass(self, order, keys, idem, requests, origin, enrollment, fingerprints):
+    def _settle_pass(self, order, keys, idem, requests, origin, enrollment, fingerprints, dropped=None):
         """Settle every member from what its own row holds now, after the shared recovery has run.
 
         A row that finished or was refused replays; a row carrying this batch's answer is settled through
         the batch split; a row carrying an answer of its own (a single-source consultation under the same
         key, or a member of an older batch whose intent already published) is settled from that answer; a
         row still awaiting a model or held by another request is busy, and a row that is gone is dropped.
+        A source the preflight left out of the consultation has no row of this attempt by design: it is
+        dropped with the reason the preflight named, and it stays waiting.
         """
+        dropped = dropped or {}
         rows, dispositions = self._batch_state(order, keys, fingerprints)
         answered = [operation_id for operation_id in order
                     if operation_id not in dispositions and _batch_answered(rows[operation_id])]
@@ -1017,11 +1063,19 @@ class Editor:
                 continue
             row = rows[operation_id]
             if row is None:
-                dispositions[operation_id] = {'disposition': 'dropped', 'code': 'E_CONFLICT',
-                                              'reason': 'its request row is no longer there; requeue the source'}
+                dispositions[operation_id] = dropped.get(
+                    operation_id, {'disposition': 'dropped', 'code': 'E_CONFLICT',
+                                   'reason': 'its request row is no longer there; requeue the source'})
             elif row['state'] == 'prepared':
                 dispositions[operation_id] = {'disposition': 'busy', 'code': 'E_CLAIM',
                                               'reason': 'its own prepared intent publishes before this batch settles it'}
+            elif operation_id in dropped and _awaiting(row):
+                # A row an earlier attempt left open for a source this pass reads alone: its lapsed lease
+                # is ended, the source spends no attempt and keeps its place in the waiting list.
+                observation = json.loads(row['observation'] or '{}')
+                if 'consulting' in observation:
+                    self.journal.action_release(row['operation_id'], observation['consulting'])
+                dispositions[operation_id] = dropped[operation_id]
             elif _awaiting(row):
                 raise KelmoError('E_BUSY', 'Another attempt is still consulting the model for this batch; '
                                           'retry it under the same keys.')
@@ -1054,12 +1108,14 @@ class Editor:
     def _batch_result(self, lead, batch, dispositions):
         return {'lead': lead, 'batch': list(batch), 'dispositions': dispositions}
 
-    def _answer_batch(self, lead, live, origin, requests, keys, idem, fingerprints, enrollment, executor):
+    def _answer_batch(self, lead, live, origin, requests, keys, idem, fingerprints, enrollment, executor,
+                      sources, dropped):
         """Open every member row, lease the lead, consult the model once, record the answer in each row.
 
         The lead row carries the one consulting lease of the one conversation; a member row opened with it
         carries the same token with its lease ended, so a pass that dies mid-batch leaves N open rows and
-        no answer, and the next pass re-consults them under the same keys.
+        no answer, and the next pass re-consults them under the same keys. `sources` and `dropped` come
+        from `_preflight_batch`: the rows opened here are exactly the sources the batch kept.
         """
         token = uuid.uuid4().hex
         lease = {'consulting': token, 'expires_at': time.time() + LEASE_SECONDS}
@@ -1098,11 +1154,6 @@ class Editor:
             elif not self.journal.action_lease(row['operation_id'], token, lease['expires_at']):
                 raise busy
         action_id = row['operation_id']
-        sources, dropped = self._source_batch(live, requests, origin)
-        if lead not in sources:
-            self._release_batch(action_id, live, keys, token)
-            raise KelmoError('E_STATE', 'The batch lead is not an editable archived source: '
-                            + dropped[lead]['reason'])
         try:
             observation = self._consult_batch(live, sources, requests, executor, action_id, token, enrollment,
                                               dropped)
@@ -1142,9 +1193,13 @@ class Editor:
         """Record the batch answer, with each member's own slice, into every member row under the same token.
 
         The recorded member answer carries no consulting lease: it is the row's own answer, and the settle
-        pass reads it even when the lead's row is gone.
+        pass reads it even when the lead's row is gone. A source the consultation itself shrank out is
+        not a member of the answer: its row keeps its lease so the settle pass can end it, and a row left
+        with a slice-less answer would answer every later pass with a drop it could never settle.
         """
         for operation_id in live[1:]:
+            if operation_id not in observation['batch']:
+                continue
             row = self.journal.action_request(keys[operation_id])
             if row is None or row['state'] != 'open':
                 continue
@@ -1173,26 +1228,60 @@ class Editor:
                 dropped[operation_id] = {'disposition': 'dropped', 'code': error.code, 'reason': str(error)}
         return sources, dropped
 
+    def _preflight_batch(self, live, requests, origin):
+        """Read the batch's budget before any request row opens, shrinking from the newest source.
+
+        A source the batch cannot carry must never get a row under this attempt's key: a batch row is
+        fingerprinted by the batch request, while the same key published alone carries the single-source
+        request with its own `source_operation_id`, so a row opened here would answer `E_IDEMPOTENCY` to
+        that source's own attempt instead of letting the pass publish it alone. Returns
+        `(sources, kept, dropped)` — the kept sources are the batch this call consults.
+        """
+        sources, dropped = self._source_batch(live, requests, origin)
+        blocks = [{'operation_id': operation_id,
+                   'text': sources[operation_id]['packet'].content.decode('utf-8'),
+                   'evidence': sources[operation_id]['reference'],
+                   **({'hint': requests[operation_id]['hint']} if requests[operation_id].get('hint') else {})}
+                  for operation_id in live if operation_id in sources]
+        _view, shrunk = self._batch_view(self.service.knowledge, self.service.knowledge.generation(),
+                                         requests[live[0]]['project'],
+                                         list(dict.fromkeys(target for operation_id in live
+                                                            for target in requests[operation_id]['selected'])),
+                                         max(requests[operation_id]['budget_tokens'] for operation_id in live),
+                                         blocks, [], [])
+        for operation_id, entry in shrunk.items():
+            sources.pop(operation_id, None)
+            dropped.setdefault(operation_id, entry)
+        return sources, [operation_id for operation_id in live if operation_id in sources], dropped
+
     def _batch_view(self, reader, generation, project, selected, budget, blocks, expansions, reconciliations):
         """The batch view, shrinking the batch from the newest source while the budget refuses it.
 
         Returns (view, dropped): a dropped source spent no model call and stays waiting, the same greedy
-        shrink `Dreaming._packet` uses for its evidence window. A single source that cannot fit alone is
-        not dropped — it is refused exactly as today, because nothing was sent and nothing is labelled
-        complete.
+        shrink `Dreaming._packet` uses for its evidence window. A source is dropped for either shape of
+        refusal: the budget itself says no, or the budget holds the sources and the person rules but no
+        selected page, which would leave the batch with nothing it may edit. A single source that cannot
+        fit alone is not dropped — it is refused exactly as today, because nothing was sent and nothing is
+        labelled complete.
         """
         kept, dropped = list(blocks), {}
         while len(kept) > 1:
+            reason = None
             try:
-                return views.editor_view(reader, generation, project, selected, budget, sources=kept,
-                                         expansions=expansions, reconciliations=reconciliations), dropped
+                view = views.editor_view(reader, generation, project, selected, budget, sources=kept,
+                                         expansions=expansions, reconciliations=reconciliations)
             except KelmoError as error:
                 if error.code != 'E_BUDGET':
                     raise
-                dropped[kept[-1]['operation_id']] = {'disposition': 'dropped', 'code': 'E_BUDGET',
-                                                     'reason': 'The batch budget cannot hold this source with the '
-                                                               'older ones; it stays waiting.'}
-                kept.pop()
+                reason = str(error)
+            else:
+                if view['scope']:
+                    return view, dropped
+                reason = 'the budget sends no selected page of project ' + project
+            dropped[kept[-1]['operation_id']] = {'disposition': 'dropped', 'code': 'E_BUDGET',
+                                                  'reason': 'The batch budget cannot hold this source with the '
+                                                            'older ones (' + reason + '); it stays waiting.'}
+            kept.pop()
         return views.editor_view(reader, generation, project, selected, budget, sources=kept,
                                  expansions=expansions, reconciliations=reconciliations), dropped
 
