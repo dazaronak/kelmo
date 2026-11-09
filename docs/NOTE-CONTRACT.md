@@ -116,7 +116,11 @@ budget_tokens = 200000
 
 An explicit `--budget-tokens` still wins for that call. A budget that cannot hold
 the source, receipts and mandatory pages fails the operation with `E_BUDGET`
-before anything is sent to the model; nothing is labelled complete.
+before anything is sent to the model; nothing is labelled complete. A request
+whose selected pages do not fit also ends in `E_BUDGET` before the model is
+called, and the refusal names the omitted pages with what each needed and what
+was left. A reconcile round that would crowd out a sent page runs no search:
+the model gets a repair instead.
 
 Sources already archived and waiting for an executor or a recorded quota reset
 do not consume the worker's processing batch. Independent scheduled archive work

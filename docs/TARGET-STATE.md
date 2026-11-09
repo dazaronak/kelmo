@@ -78,7 +78,7 @@ A vault is one directory selected with `--vault`. Two vaults never share state.
 
 Error codes are stable strings starting with `E_` (examples: `E_NOT_INITIALIZED`, `E_NOT_FOUND`, `E_INPUT`, `E_FACT_CHECK`, `E_HOT`, `E_AMBIGUOUS`, `E_PROCESSING`, `E_TRANSCRIPT`). A failure never prints a Python traceback to stdout and never creates storage. Without `--json`, output is human-readable and the exit code is the same.
 
-Operation states, in order of progress: `captured` → `queued` → `archived` → `applied`; side exits `failed`, `needs_resolution`, `needs_review`. `kelmo trace OPERATION_ID` lists the stages in order with timestamps. `kelmo status` counts operations by state and reports `facts` and `archive_records`.
+Operation states, in order of progress: `captured` → `queued` → `archived` → `applied`; side exits `failed`, `needs_resolution`, `needs_review`. `kelmo trace OPERATION_ID` lists the stages in order with timestamps. `kelmo status` counts operations by state and reports `facts`, `archive_records` and `failed_operations`, the newest 20 failed notes with their code, reason and capture time; a shared client sees only its own.
 
 #### Roles and intents
 

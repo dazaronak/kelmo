@@ -171,7 +171,7 @@ Frame and reducer refusals before an intent is prepared settle the request row o
 
 The request settlement, its accepted history and the source outcome of a Git intake are written in one journal transaction (`Journal.action_begin`, `action_finish` and `action_refuse` with `outcome=`). This covers refused, ignored, unresolved, unchanged and published requests. A process death between those writes leaves neither, and recovery writes both together.
 
-A Git intake whose archival operation ended terminally `failed` raises its error code with the operation ID and the repair: fix the cause, run `kelmo queue retry <operation>`, then resubmit the same request. `Service.run` returns a terminal operation unchanged, so resubmitting alone does not retry it. Retry is never automatic, and retry budgets are unchanged. A capture whose spooled source bytes cannot be read is `E_IO` in `captured_git` too, as at the other source reads.
+A Git intake whose archival operation ended terminally `failed` raises its error code with the operation ID and the repair: fix the cause, run `kelmo queue retry <operation>`, then resubmit the same request. `Service.run` returns a terminal operation unchanged, so resubmitting alone does not retry it. Retry is never automatic. `kelmo queue retry` renews the note's editor attempts and its worker retry budget; a retry the daemon or the session worker makes renews neither. A capture whose spooled source bytes cannot be read is `E_IO` in `captured_git` too, as at the other source reads.
 
 A finished request replays before recovery, even while another prepared publication cannot finish. A pending apply keeps the owning operation it recorded and re-verifies that exact receipt; it never switches to a newer duplicate owner.
 
