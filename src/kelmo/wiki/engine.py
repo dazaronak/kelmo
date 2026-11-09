@@ -1139,7 +1139,8 @@ def _evidence_resolved_only(before, after):
             and {k: v for k, v in before.items() if k not in fixed} == {k: v for k, v in after.items() if k not in fixed})
 
 
-def ownership_guard(previous, result, *, action_id=None, rule_change=False, enrollment=None, subjects=None):
+def ownership_guard(previous, result, *, action_id=None, rule_change=False, enrollment=None, subjects=None,
+                    rule_scope=None):
     """The one ownership check of every registry write, whoever proposes it.
 
     Accepted actions, and the panels rendered from them, change only through the prepared StateAPI
@@ -1152,7 +1153,15 @@ def ownership_guard(previous, result, *, action_id=None, rule_change=False, enro
     Every fact on a person page stays in mandatory delivery, and no writer removes a fact:
     retiring one is a status change its owner makes. `subjects` names every enrolled action subject
     with its kind, accepted or not yet materialized, so no write exposes one outside its enrollment.
+
+    `rule_scope` (batched Dreaming apply) replaces the one `rule_change` flag with the identities the
+    write attributes to a rule-change source — `('fact', key)`, `('page', target)`, `('narrative',
+    id)` — so a batch carries a requester authority only over the slice its own source proposed. With
+    no scope supplied the check is the single-flag check.
     """
+    def allowed(kind, name):
+        return rule_change if rule_scope is None else (kind, name) in rule_scope
+
     keys = previous['actions'].keys() | result['actions'].keys()
     if any(previous['actions'].get(key) != result['actions'].get(key) for key in keys - {action_id}):
         raise OwnershipConflict('Ordinary wiki publication cannot modify accepted actions; only a prepared '
@@ -1170,18 +1179,17 @@ def ownership_guard(previous, result, *, action_id=None, rule_change=False, enro
                                   'permitted repair: update the feature enrollment first and pass it to the '
                                   'editor, or drop the link')
     before_person, after_person = person_targets(previous), person_targets(result)
-    if not rule_change:
-        for target in before_person | after_person:
-            if previous['pages'].get(target) != result['pages'].get(target):
-                raise OwnershipConflict('page ' + target + ': a person page changes only through an attributable '
-                                        'rule-change source')
+    for target in sorted(before_person | after_person):
+        if previous['pages'].get(target) != result['pages'].get(target) and not allowed('page', target):
+            raise OwnershipConflict('page ' + target + ': a person page changes only through an attributable '
+                                    'rule-change source')
     for key in sorted(previous['facts'].keys() | result['facts'].keys()):
         before, after = previous['facts'].get(key), result['facts'].get(key)
         if before == after:
             continue
         if after is None:
             raise OwnershipConflict('fact ' + key + ': a publication never removes a fact; retire it instead')
-        if not rule_change and not (before is not None and _evidence_resolved_only(before, after)):
+        if not allowed('fact', key) and not (before is not None and _evidence_resolved_only(before, after)):
             if before is not None and (before['protected'] or before['mandatory'] or before['target'] in before_person):
                 raise OwnershipConflict('fact ' + key + ': protected rules and person facts keep their text, status, '
                                         'conditions and mandatory delivery; only an attributable rule-change '
@@ -1201,7 +1209,7 @@ def ownership_guard(previous, result, *, action_id=None, rule_change=False, enro
         if after is None:
             raise OwnershipConflict('narrative ' + key + ': a publication never removes a narrative')
         # Prose delivered with the person rules is rule text too; a stale label alone is publisher-derived.
-        if not rule_change and {page['page_id'] for page in (before, after) if page} & person_pages and (
+        if not allowed('narrative', key) and {page['page_id'] for page in (before, after) if page} & person_pages and (
                 before is None or any(before[name] != after[name] for name in NARRATIVE_CONTENT)):
             raise OwnershipConflict('narrative ' + key + ': prose on a person page changes only through an '
                                     'attributable rule-change source')
@@ -1247,30 +1255,97 @@ def _resolve_note(registry, reference):
             fact['revision'] = entity_revision(fact)
 
 
+def _intent_sources(intent):
+    """(capture order, {operation_id: cited source}) for one prepared semantic intent.
+
+    A single-source intent cites its source in the intent's own keys, as it always did. A batch intent
+    carries the same fields per member under `sources`, names its lead at the intent's own keys and
+    lists the members in capture order under `batch`, so every reader of an intent still finds the
+    source it cites and each delta item traces to the note it came from. Each member's `rule_change`
+    authority is attributable only to that member, as the single-source check already requires of the
+    one authority.
+    """
+    from kelmo.contracts import EvidenceRef
+    lead = intent['source_operation_id']
+    batch = intent.get('sources')
+    authority = intent.get('rule_change')
+    if authority is not None and authority.get('source_operation_id') != lead:
+        raise OwnershipConflict('A rule change is attributable only to the source the intent cites')
+    if not batch:
+        reference = EvidenceRef.from_dict(intent['evidence_ref']).to_dict()
+        return [lead], {lead: {'reference': reference, 'filename': intent['filename'],
+                               'authority': authority}}
+    order = intent.get('batch')
+    if (not isinstance(batch, dict) or not batch or lead not in batch
+            or not isinstance(order, list) or sorted(order) != sorted(batch) or len(set(order)) != len(order)
+            or order[0] != lead):
+        raise Conflict('A batch intent names its lead and every member once, the lead first, in capture order')
+    cited = {}
+    for operation_id, entry in batch.items():
+        if not isinstance(entry, dict) or not {'evidence_ref', 'filename'} <= entry.keys():
+            raise Conflict('A batch source entry names its evidence and filename')
+        member_authority = entry.get('rule_change')
+        if member_authority is not None and member_authority.get('source_operation_id') != operation_id:
+            raise OwnershipConflict('A rule change is attributable only to the source the intent cites')
+        cited[operation_id] = {'reference': EvidenceRef.from_dict(entry['evidence_ref']).to_dict(),
+                               'filename': entry['filename'], 'authority': member_authority}
+    return order, cited
+
+
+def _cited(cited, intent, change):
+    """The archived source one delta item is attributed to: the intent's own source when it names none."""
+    operation_id = change.get('source_operation_id', intent['source_operation_id'])
+    entry = cited.get(operation_id)
+    if entry is None:
+        raise Conflict('A delta item names a source the intent does not cite: ' + str(operation_id)[:120])
+    return entry
+
+
+def _rule_scope(intent):
+    """The identities one batch intent attributes to a rule-change source, as `ownership_guard` counts them.
+
+    None for a single-source intent, whose one `rule_change` flag covers its whole delta as it does today.
+    """
+    if not intent.get('sources'):
+        return None
+    _, cited = _intent_sources(intent)
+    scope = set()
+    for name in ('pages', 'facts', 'narratives'):
+        for change in intent['delta'].get(name, ()):
+            entry = cited.get(change.get('source_operation_id', intent['source_operation_id']))
+            if entry is None or entry['authority'] is None:
+                continue
+            if name == 'pages' and change.get('expected_revision') is not None:
+                scope.add(('page', change['target']))
+            elif name == 'facts':
+                scope.add(('fact', change['fact_key']))
+            elif name == 'narratives':
+                scope.add(('narrative', change['narrative_id']))
+    return scope
+
+
 def apply_semantic_intent(registry, intent):
     """The only registry transform an editor proposal makes, recomputed from its prepared journal intent.
 
-    Evidence is the one archived source the intent cites, never a claim in the proposal. Owners,
-    protection and mandatory delivery are derived here; a narrative whose fact or action dependency
-    changed becomes stale in the same publication.
+    Evidence is the archived source each delta item names, never a claim in the proposal; a single-source
+    intent cites one source and every item takes it. Owners, protection and mandatory delivery are derived
+    here; a narrative whose fact or action dependency changed becomes stale in the same publication.
     """
-    from kelmo.contracts import EvidenceRef
-    rule_change = intent.get('rule_change')
-    if rule_change is not None and rule_change.get('source_operation_id') != intent['source_operation_id']:
-        raise OwnershipConflict('A rule change is attributable only to the source the intent cites')
-    reference = EvidenceRef.from_dict(intent['evidence_ref']).to_dict()
+    order, cited = _intent_sources(intent)
     delta = intent['delta']
     result = copy.deepcopy(registry)
     person = person_targets(result)
-    note_id = reference['content_sha256']
-    if resolvable_note(result, reference):
-        _resolve_note(result, reference)
-    note = result['notes'].setdefault(note_id, {
-        'filename': intent['filename'], 'ark_id': reference['archive_id'], 'evidence_resolution': 'exact',
-        'evidence_refs': [reference], 'compatibility': {}})
-    if (note['ark_id'], note['evidence_refs']) != (reference['archive_id'], [reference]):
-        raise Conflict('The source is already recorded with different archive evidence; permitted repair: '
-                       'edit from the source that note already cites')
+    for operation_id in order:
+        entry = cited[operation_id]
+        reference = entry['reference']
+        if resolvable_note(result, reference):
+            _resolve_note(result, reference)
+        note = result['notes'].setdefault(reference['content_sha256'], {
+            'filename': entry['filename'], 'ark_id': reference['archive_id'], 'evidence_resolution': 'exact',
+            'evidence_refs': [reference], 'compatibility': {}})
+        if (note['ark_id'], note['evidence_refs']) != (reference['archive_id'], [reference]):
+            raise Conflict('The source is already recorded with different archive evidence; permitted repair: '
+                           'edit from the source that note already cites')
     page_targets, affected_pages = set(), set()
     for change in delta['pages']:
         target = change['target']
@@ -1312,8 +1387,11 @@ def apply_semantic_intent(registry, intent):
         if semantic_noop(result, 'facts', change):
             # Restating a claim never rebinds its owner, evidence or predecessor to this source.
             continue
+        cited_entry = _cited(cited, intent, change)
+        reference = cited_entry['reference']
+        note_id = reference['content_sha256']
         # Under an attributable rule change a new person fact is a protected rule; nothing else grants it.
-        new_rule = rule_change is not None and prior is None and change['target'] in person
+        new_rule = cited_entry['authority'] is not None and prior is None and change['target'] in person
         fact = {'fact_key': key, 'target': change['target'], 'text': change['text'], 'status': change['status'],
                 'expected_revision': change['expected_revision'], 'replaces': [], 'id': digest(key)[:12],
                 'note_id': note_id, 'ark_id': reference['archive_id'],
@@ -1333,6 +1411,7 @@ def apply_semantic_intent(registry, intent):
         result['facts'][key] = fact
     for change in delta['narratives']:
         key = change['narrative_id']
+        reference = _cited(cited, intent, change)['reference']
         prior = result['narratives'].get(key)
         entry = result['pages'].get(change['target'])
         if entry is None or (prior is not None and prior['page_id'] != entry['page_id']):
@@ -1716,7 +1795,7 @@ def _preserve_v3(previous, result, vault, action_operation, semantic_operation=N
             raise OwnershipConflict('Semantic publication differs from its exact prepared journal intent')
         return ownership_guard(previous, result, rule_change=intent.get('rule_change') is not None,
                                enrollment=intent.get('feature_enrollment'),
-                               subjects=intent.get('enrolled_subjects'))
+                               subjects=intent.get('enrolled_subjects'), rule_scope=_rule_scope(intent))
     ownership_guard(previous, result)
     if result != previous:
         raise KelmoError('E_CAPABILITY', 'The registry is written only by StateAPI intents, prepared editor '
@@ -2135,6 +2214,20 @@ def publish_action(vault, operation_id):
     return _with_publication_lock(vault, publish)
 
 
+def _semantic_commit_title(intent, operation_id):
+    """The commit title of one prepared editor intent.
+
+    A single-source intent keeps the title it has always carried. A batch names its lead source, how
+    many notes it carries and lists every source operation id it publishes, so one commit for eight
+    notes still names each note it landed.
+    """
+    batch = intent.get('batch')
+    if not batch:
+        return 'chore(knowledge): Apply editor proposal ' + operation_id[:8]
+    return (f'chore(knowledge): Apply editor proposal {intent["source_operation_id"][:8]} for {len(batch)} sources: '
+            + ', '.join(item[:8] for item in batch))
+
+
 def publish_semantic(vault, operation_id):
     """Publish one prepared editor journal intent; False if its registry is already committed.
 
@@ -2165,7 +2258,7 @@ def publish_semantic(vault, operation_id):
         projected = {path: (hashlib.sha256(before).hexdigest(), after) for path, (before, after) in changes.items()}
         if digest(encoded(result)) != intent['result_digest'] or recorded != projected:
             raise OwnershipConflict('The editor proposal differs from the publisher projection of its prepared intent')
-        _commit_registry(vault, result, 'chore(knowledge): Apply editor proposal ' + operation_id[:8],
+        _commit_registry(vault, result, _semantic_commit_title(intent, operation_id),
                          Config.load(vault).wiki, _wiki_locked=locked, _semantic_operation=operation_id)
         return True
     return _with_publication_lock(vault, publish)
