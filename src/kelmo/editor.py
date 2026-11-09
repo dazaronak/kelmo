@@ -1533,7 +1533,7 @@ class Editor:
                                       outcomes.clipped('the editor applied nothing: ' + observation['declined']))
         if self.service.knowledge.generation() != generation:
             return self._refuse_batch(row, batch, keys, 'E_STALE', 'The knowledge generation moved after the '
-                                  'editor read it; requeue the sources under new requests.')
+                                  'editor read it; requeue the sources under new requests.', dispositions)
         registry = engine.load_registry(self.service.root)
         if _fingerprint(registry) != _fingerprint(self.service.knowledge.registry(generation)):
             self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The working registry differs from the '
@@ -1552,9 +1552,9 @@ class Editor:
             slices, collisions = split_delta(delta, checks, batch)
         except ProposalError as error:
             return self._refuse_batch(row, batch, keys, 'E_PROPOSAL', 'The proposal is malformed or unauthorized: '
-                                      + str(error))
+                                      + str(error), dispositions)
         except engine.OwnershipConflict as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error))
+            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
         for operation_id in batch:
             if collisions.get(operation_id):
                 dispositions[operation_id] = {'disposition': 'refused', 'code': 'E_PROPOSAL',
@@ -1580,19 +1580,23 @@ class Editor:
                                    for item in slices[operation_id]['delta'][name])
             union_checks.extend(slices[operation_id]['fact_checks'])
         if not accepted:
-            first = next(iter(dispositions.values()))
-            return self._refuse_batch(row, batch, keys, first['code'], first['reason'])
+            # The code that parks the batch is the one a refused member actually met. A member this pass
+            # already published settles with a receipt and no code, so it cannot be the batch's refusal.
+            codes = ([d for d in dispositions.values() if d.get('disposition') == 'refused']
+                     or [d for d in dispositions.values() if 'code' in d])
+            first = codes[0] if codes else {'code': 'E_PROPOSAL', 'reason': 'The batch left nothing to publish.'}
+            return self._refuse_batch(row, batch, keys, first['code'], first['reason'], dispositions)
         if not any(union.values()):
             references = [EvidenceRef.from_dict(self.service.journal.evidence_record(operation_id))
                           for operation_id in accepted]
             if any(engine.resolvable_note(registry, reference.to_dict()) for reference in references):
                 return self._refuse_batch(row, accepted, keys, 'E_PROPOSAL',
-                                          'A batch that resolves a legacy note publishes one source at a time.')
+                                          'A batch that resolves a legacy note publishes one source at a time.', dispositions)
             if not observation['complete']:
                 return self._refuse_batch(row, accepted, keys, 'E_BUDGET', 'The model saw incomplete context and '
                                           'proposed nothing; omitted pages: '
                                           + (', '.join(observation['omitted']) or 'none')
-                                          + '. Requeue with a larger budget or fewer selected pages.')
+                                          + '. Requeue with a larger budget or fewer selected pages.', dispositions)
             return self._finish_batch(batch, dispositions, keys, idem, generation,
                                       'the editor proposed no change to the selected pages; the note adds no new '
                                       'fact')
@@ -1618,14 +1622,14 @@ class Editor:
             engine.ownership_guard(registry, result, rule_change=False, enrollment=features, subjects=subjects,
                                    rule_scope=engine._rule_scope(intent))
         except engine.OwnershipConflict as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error))
+            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
         except (engine.WikiProblem, ValueError) as error:
             return self._refuse_batch(row, batch, keys, 'E_PROPOSAL', 'The proposal cannot enter the registry: '
-                                      + str(error))
+                                      + str(error), dispositions)
         try:
             result, changes = engine.semantic_projection(self.service.root, registry, intent)
         except (engine.OwnershipConflict, engine.SemanticRefusal) as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error))
+            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
         except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
             self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The pages could not be rendered: '
                                   + str(error) + '. Repair the page, then retry the same request.')
@@ -1634,7 +1638,7 @@ class Editor:
             engine.check_budget(self.service.root, result)
         except KelmoError as error:
             if error.code == 'E_OWNERSHIP':
-                return self._refuse_batch(row, batch, keys, error.code, str(error))
+                return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
             self._retryable_batch(action_id, batch, error.code, str(error))
         baselines = self._baselines(action_id, publisher, generation, changes)
         references = tuple(EvidenceRef.from_dict(entry['evidence_ref']) for entry in sources.values())
@@ -1684,9 +1688,14 @@ class Editor:
             self._record(operation_id, 'unresolved', message, request=action_id, code=code)
         raise KelmoError(code, message)
 
-    def _refuse_batch(self, row, batch, keys, code, message):
-        """Refuse the whole batch: every member row settles refused under its own key."""
-        dispositions = {}
+    def _refuse_batch(self, row, batch, keys, code, message, settled=None):
+        """Refuse the batch: every member row that is still open settles refused under its own key.
+
+        `settled` carries what the pass already decided for a member: a row that finished published, and
+        its disposition is kept, because a refusal of this attempt must not report a source the batch
+        already published as refused.
+        """
+        dispositions = dict(settled or {})
         if row['state'] in ('open', 'prepared'):
             self.journal.action_refuse(row['operation_id'], code, message,
                                        outcome=_outcome('unresolved', message, code),
@@ -1697,7 +1706,8 @@ class Editor:
                 self.journal.action_refuse(member['operation_id'], code, message,
                                            outcome=_outcome('unresolved', message, code),
                                            result=_result(member['operation_id'], 'unresolved', code))
-            dispositions[operation_id] = {'disposition': 'refused', 'code': code, 'reason': message}
+            if operation_id not in dispositions:
+                dispositions[operation_id] = {'disposition': 'refused', 'code': code, 'reason': message}
         return self._batch_result(batch[0], batch, dispositions)
 
     def _finish_batch(self, batch, dispositions, keys, idem, generation, reason):

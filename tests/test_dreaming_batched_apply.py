@@ -32,8 +32,17 @@ def editor_mode(world, batch_apply=True, max_sources=None, budget=None):
     if budget is not None:
         lines.append('budget_tokens = ' + str(budget))
     toml = world.root / 'kelmo.toml'
-    toml.write_text(toml.read_text(encoding='utf-8') + '\n[editor]\n' + '\n'.join(lines) + '\n',
-                    encoding='utf-8')
+    text = toml.read_text(encoding='utf-8')
+    # The table is replaced, not appended: a case that changes the mode mid-test (a pass under one flag,
+    # the next pass under another) would otherwise write the same table twice and the config refuses it.
+    section = '[editor]\n' + '\n'.join(lines) + '\n'
+    start = text.find('[editor]\n')
+    if start < 0:
+        text += '\n' + section
+    else:
+        end = text.find('\n[', start + 1)
+        text = text[:start] + section + (text[end + 1:] if end >= 0 else '')
+    toml.write_text(text, encoding='utf-8')
     world.service.config = Config.load(world.root)
 
 
@@ -692,6 +701,83 @@ def test_a_crash_after_the_commit_does_not_park_published_notes(world, monkeypat
     assert sorted(report['applied']) == sorted(ids), report
     assert len(model.jobs) == calls, f'the recovery paid {len(model.jobs) - calls} more model calls'
     assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == ['applied'] * 3
+
+
+class BogusCheck(BatchModel):
+    """The batch replay, with a search receipt the journal never issued for the sources named `bogus_for`.
+
+    `bogus_for` holds those sources' evidence hashes (a single-source payload names no operation id, so the
+    evidence is what identifies a source). No reconciliation round was asked for those facts, so
+    `rebind_receipts` has no receipt to restore and the fact-check gate refuses them. `revises = False` keeps
+    the refused answer as recorded instead of sending it back for a repair round.
+    """
+
+    revises = False
+
+    def __init__(self, world, bogus_for):
+        super().__init__(world)
+        self.bogus_for = set(bogus_for)
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        self.jobs.append(job)
+        payload = job.payload
+        blocks = list(payload['sources']) if 'sources' in payload else [dict(payload['source'], operation_id=None)]
+        facts, checks = [], []
+        for block in blocks:
+            text = block['text'].strip().split('. ')[0]
+            evidence = block['evidence']['content_sha256'][:10]
+            target = payload['pages'][0]['target']
+            fact = dict(fact_key=payload['project'] + '.replay-' + evidence, target=target, text=text,
+                        status='active', expected_revision=None)
+            check = {'fact_key': fact['fact_key']}
+            if evidence in self.bogus_for:
+                check['verified_match'] = {'result': 'not_found', 'search_id': 'never-issued'}
+            else:
+                if block['operation_id'] is not None:
+                    fact['source'] = check['source'] = block['operation_id']
+                check['verified_match'] = {'result': 'not_found',
+                                           'search_id': self.world.service.reconcile(text, target)['search_id']}
+            facts.append(fact)
+            checks.append(check)
+        return ModelOutcome('proposal', {'facts': facts, 'fact_checks': checks})
+
+
+def evidence_of(world, operation_id):
+    return world.service.journal.evidence_record(operation_id)['content_sha256'][:10]
+
+
+def test_a_batch_that_accepts_nothing_refuses_with_the_code_its_members_met(world, monkeypatch):
+    """A settled member is not a refusal: the code that parks the batch comes from a refused member.
+
+    The first pass published one note and died before its source was staged, so its finished row is still
+    a member of the next batch. When that batch's own consultation accepts nothing, the batch's refusal must
+    name the code the refused source met: the settled member's disposition carries no code at all, and the
+    source that batch already published keeps its own disposition.
+    """
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world, batch_apply=False)
+    ids = capture(world, notes(2))
+    real = Editor._complete
+
+    def died_after_the_commit(self, operation_id):
+        real(self, operation_id)
+        raise RuntimeError('the process died after the commit, before the source was staged')
+
+    monkeypatch.setattr(Editor, '_complete', died_after_the_commit)
+    with pytest.raises(RuntimeError):
+        apply_pending(world.service, BatchModel(world))
+    assert len(facts_of(world)) == 1, 'the first note published before the crash'
+    assert sorted(waiting_ids(world)) == sorted(ids), 'neither source left the waiting list'
+    monkeypatch.setattr(Editor, '_complete', real)
+    editor_mode(world)
+    report = apply_pending(world.service, BogusCheck(world, {evidence_of(world, ids[1])}))
+    assert report['applied'] == [ids[0]], report
+    assert report['parked'] == [ids[1]], report
+    assert world.outcome(ids[0])['disposition'] == 'applied', world.outcome(ids[0])
+    assert 'E_FACT_CHECK' in world.outcome(ids[1])['reason'], world.outcome(ids[1])
+    assert len(facts_of(world)) == 1, 'the refused source published nothing'
 
 
 def test_a_crash_after_the_intent_is_prepared_publishes_the_batch_on_the_next_pass(world, monkeypatch):
