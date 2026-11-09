@@ -618,3 +618,53 @@ def test_a_member_of_a_batch_the_precheck_refused_before_splitting_still_reports
         ['applied', 'applied', 'unresolved']
     assert json.loads(member_rows(world, ids)[1]['observation'])['slice'] is None, \
         'the precheck stopped before recording any slice, so that row holds no answer of its own'
+
+
+def test_a_crash_after_the_commit_does_not_park_published_notes(world, monkeypatch):
+    """The window between the batch commit and the settling of the other members."""
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    model = BatchModel(world)
+    real = Editor._member_disposition
+
+    def crash(self, *args, **kwargs):
+        raise RuntimeError('the process died after the commit')
+
+    monkeypatch.setattr(Editor, '_member_disposition', crash)
+    with pytest.raises(RuntimeError):
+        apply_pending(world.service, model)
+    assert len(facts_of(world)) == 3, 'the commit landed before the crash'
+    calls = len(model.jobs)
+    monkeypatch.setattr(Editor, '_member_disposition', real)
+    report = apply_pending(world.service, model)
+    assert report['parked'] == [] and report['failed'] == [], report
+    assert sorted(report['applied']) == sorted(ids), report
+    assert len(model.jobs) == calls, f'the recovery paid {len(model.jobs) - calls} more model calls'
+    assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == ['applied'] * 3
+
+
+def test_a_crash_after_the_intent_is_prepared_publishes_the_batch_on_the_next_pass(world, monkeypatch):
+    """The other side of the same window: the intent is prepared, nothing committed yet."""
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    model = BatchModel(world)
+    real = Editor._complete
+
+    def crash(self, *args, **kwargs):
+        raise RuntimeError('the process died before the commit')
+
+    monkeypatch.setattr(Editor, '_complete', crash)
+    with pytest.raises(RuntimeError):
+        apply_pending(world.service, model)
+    assert facts_of(world) == {}, 'nothing committed before the crash'
+    calls = len(model.jobs)
+    monkeypatch.setattr(Editor, '_complete', real)
+    report = apply_pending(world.service, model)
+    assert report['parked'] == [] and report['failed'] == [], report
+    assert sorted(report['applied']) == sorted(ids), report
+    assert len(model.jobs) == calls, f'the recovery paid {len(model.jobs) - calls} more model calls'
+    assert len(facts_of(world)) == 3

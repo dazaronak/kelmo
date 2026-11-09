@@ -1045,6 +1045,14 @@ class Editor:
                                          'reason': row['error_message']}
         return rows, settled
 
+    def _batch_published(self, row):
+        """True when the batch a recorded answer belongs to already committed: its lead row is finished."""
+        lead = json.loads(row['observation'] or '{}').get('batch_lead')
+        if lead is None:
+            return False
+        lead_row = self.journal.action_row(lead)
+        return lead_row is not None and lead_row['state'] == 'finished'
+
     def _settle_pass(self, order, keys, idem, requests, origin, enrollment, fingerprints, dropped=None):
         """Settle every member from what its own row holds now, after the shared recovery has run.
 
@@ -1084,6 +1092,15 @@ class Editor:
                 dispositions[operation_id] = self._own_answer_disposition(row, operation_id, origin,
                                                                           requests[operation_id], idem[operation_id],
                                                                           enrollment)
+        if not answered:
+            return self._batch_result(order[0], [], dispositions)
+        # A batch whose own lead row already finished committed before the pass died. Its members settle
+        # from their own recorded answers: none of them may become the lead of a new consultation, which
+        # would meet E_STALE and refuse the sources that batch already published.
+        for operation_id in list(answered):
+            if self._batch_published(rows[operation_id]):
+                answered.remove(operation_id)
+                dispositions[operation_id] = self._member_disposition(keys[operation_id], idem)
         if not answered:
             return self._batch_result(order[0], [], dispositions)
         lead_row = rows[answered[0]]
@@ -1591,7 +1608,6 @@ class Editor:
                   'evidence_ref': lead_reference.to_dict(), 'filename': sources[publisher]['filename'],
                   'source_id': lead_reference.source_id, 'source_operation_id': publisher,
                   'idempotency_key': idem[publisher], 'batch': accepted, 'sources': sources,
-                  'batch_requests': {operation_id: keys[operation_id] for operation_id in accepted},
                   'rule_change': sources[publisher]['rule_change'],
                   'feature_enrollment': features, 'enrolled_subjects': subjects,
                   'baseline_digest': _fingerprint(registry), 'expected_generation': generation.to_dict(),
