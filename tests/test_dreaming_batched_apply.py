@@ -397,3 +397,27 @@ def test_a_single_source_proposal_still_refuses_the_batch_only_field():
         with pytest.raises(ProposalError) as error:
             normalize({name: [item]}, ['projects/app/notes.md'], registry, rule_change=False, project='app')
         assert 'only one' in str(error.value), name
+
+
+def test_the_apply_limit_bounds_the_sources_a_batched_pass_handles(world):
+    """`limit` is the pass's own ceiling: a batch never reaches past what the pass may still handle."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    capture(world, notes(3))
+    report = apply_pending(world.service, counted(BatchModel(world)), limit=1)
+    handled = sum(len(report[name]) for name in ('applied', 'parked', 'failed', 'deferred'))
+    assert handled <= 1, f'limit=1 handled {handled}'
+    assert len(waiting_ids(world)) == 2, 'the notes the limit left behind stay waiting'
+
+
+def test_a_batched_pass_of_limit_two_publishes_one_batch_of_two(world):
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    capture(world, notes(3))
+    model = counted(BatchModel(world))
+    report = apply_pending(world.service, model, limit=2)
+    handled = sum(len(report[name]) for name in ('applied', 'parked', 'failed', 'deferred'))
+    assert handled == 2, report
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [2], \
+        'the batch is bounded by the limit, not reduced to single sources'
+    assert len(waiting_ids(world)) == 1

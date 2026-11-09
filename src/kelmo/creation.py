@@ -625,8 +625,9 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     last charged attempt (see `park`). A note waits while an older note is still in the intake, and a
     note that meets a held lock or a busy database is retried in its place (see ORDER_WAIT_SECONDS).
     With `[editor] batch_apply` on, the head of the waiting list and the later sources of its project
-    are published as one batch (see `publish_batch`); with the flag off every source goes through
-    `publish` alone, exactly as before. The result counts what happened, by operation id.
+    are published as one batch (see `publish_batch`), never more of them than this pass may still
+    handle; with the flag off every source goes through `publish` alone, exactly as before. The result
+    counts what happened, by operation id.
     """
     if type(limit) is not int or limit < 1:
         raise KelmoError('E_INPUT', 'The apply limit is a positive integer.')
@@ -661,7 +662,7 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
         if moved:
             continue
         try:
-            batch = (batch_members(service, waiting, service.config.batch_max_sources)
+            batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)))
                      if service.config.batch_apply else [])
             if len(batch) > 1:
                 # One conversation and one commit for the head of the waiting list and the later sources
