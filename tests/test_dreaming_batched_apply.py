@@ -703,6 +703,40 @@ def test_a_crash_after_the_commit_does_not_park_published_notes(world, monkeypat
     assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == ['applied'] * 3
 
 
+def test_a_source_dismissed_after_a_batch_committed_is_not_settled_applied(world, monkeypatch):
+    """The one member of a committed batch a person can still dismiss: its row is open, so it refuses.
+
+    The pass that settles a committed batch reads each member's own recorded answer, so a dismissed
+    member must not be settled `applied` from that answer. Dismissal refuses the source's open request
+    rows first, and the next pass replays that refusal instead of the batch answer its row carries.
+    """
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    model = BatchModel(world)
+    real = Editor._member_disposition
+
+    def crash(self, *args, **kwargs):
+        raise RuntimeError('the process died after the commit')
+
+    monkeypatch.setattr(Editor, '_member_disposition', crash)
+    with pytest.raises(RuntimeError):
+        apply_pending(world.service, model)
+    monkeypatch.setattr(Editor, '_member_disposition', real)
+    assert len(facts_of(world)) == 3, 'the batch committed before the crash'
+    calls = len(model.jobs)
+    world.service.editor.dismiss(ids[1], origin=world.origins['editor'], reason='late duplicate')
+    report = apply_pending(world.service, model)
+    assert report['applied'] == [ids[0], ids[2]], report
+    assert report['parked'] == [ids[1]], report
+    assert report['failed'] == [] and report['skipped'] == [], report
+    assert len(model.jobs) == calls, f'the recovery paid {len(model.jobs) - calls} more model calls'
+    assert world.outcome(ids[1])['disposition'] == 'unresolved', world.outcome(ids[1])
+    assert 'E_DISMISSED' in world.outcome(ids[1])['reason'], world.outcome(ids[1])
+    assert len(facts_of(world)) == 3, 'the dismissal settles the source, not the facts the batch published'
+
+
 class BogusCheck(BatchModel):
     """The batch replay, with a search receipt the journal never issued for the sources named `bogus_for`.
 
