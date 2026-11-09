@@ -905,12 +905,21 @@ class Editor:
         enrollment = self._enrollment(contexts)
         request = {'source_operation_id': source_operation_id, 'project': project, 'selected': list(selected),
                    'budget_tokens': budget_tokens, 'rule_change': rule_change}
-        if new_work is not None:
-            if (not isinstance(new_work, dict) or set(new_work) - {'priority'} != NEW_WORK_FIELDS
-                    or new_work['parent'] not in selected):
+        work = new_work
+        if work is not None:
+            if (not isinstance(work, dict) or set(work) - {'priority'} != NEW_WORK_FIELDS
+                    or work['parent'] not in selected):
                 raise KelmoError('E_INPUT', 'A new work page is opened by its creation request.')
-            enrollment = _enroll_work(enrollment, new_work)
-            request['new_work'] = dict(new_work)
+            if work['target'] in selected:
+                # An earlier note opened that page: the request's own target is among the pages to send,
+                # so this one edits the page it finds instead of opening a second one. Nothing is enrolled
+                # and no page creation is injected; `work_opened` names the page so no new one is opened
+                # for the same open work while consulting.
+                request['work_opened'] = work['target']
+                work = None
+            else:
+                enrollment = _enroll_work(enrollment, work)
+                request['new_work'] = dict(work)
         if link_pages:
             request['link_pages'] = True
         if proposal_digest is not None:
@@ -918,7 +927,15 @@ class Editor:
         if hint is not None:
             request['hint'] = dict(hint)
         request_key = StateCoordinator._request_key('semantic', origin, idempotency_key)
-        fingerprint = _fingerprint({'request': request, 'origin': origin.to_dict(), 'key': idempotency_key})
+        # The fingerprint names the request, not the wiki's state at the moment of the attempt: the page a
+        # request opens is carried as its target alone, and left out of the selection. An attempt left open
+        # under one key whose page appears before the retry answers the same request instead of meeting
+        # E_IDEMPOTENCY.
+        identity = {name: value for name, value in request.items() if name not in ('new_work', 'work_opened')}
+        if new_work is not None:
+            identity['new_work'] = {'target': new_work['target']}
+            identity['selected'] = [target for target in identity['selected'] if target != new_work['target']]
+        fingerprint = _fingerprint({'request': identity, 'origin': origin.to_dict(), 'key': idempotency_key})
         row = self.journal.action_request(request_key)
         receipt = StateCoordinator._replay(row, fingerprint)
         if receipt is not None:
@@ -941,7 +958,7 @@ class Editor:
             if _awaiting(row):
                 raise KelmoError('E_BUSY', 'Another attempt is still consulting the model for this request; '
                                           'retry it under the same key.')
-            return self._settle(row, source, origin, idempotency_key, rule_change, enrollment, new_work)
+            return self._settle(row, source, origin, idempotency_key, rule_change, enrollment, work)
 
     def edit_batch(self, sources, *, origin, executor, contexts=None):
         """Edit the selected pages from a batch of archived sources: one consultation, one publication.
@@ -1857,10 +1874,13 @@ class Editor:
         expansions, reconciliations, expanded, repairs, refused = [], [], 0, [], None
         # An earlier attempt's refusal is the first thing the model reads; it is not one of its repairs.
         hinted = [request['hint']] if request.get('hint') else []
-        work = request.get('new_work')
+        # A request whose work page another note already opened edits that page: it opens no page of its
+        # own, and no second one is opened for the same open work while consulting.
+        opened = request.get('work_opened')
+        work = None if opened is not None else request.get('new_work')
         # One work page per source: asked for by the model, or opened by the editor itself when the
         # model declines a source that may still carry open work.
-        opened_by_editor = False
+        opened_by_editor = opened is not None
         # One model conversation per attempt: each round names it, and later rounds carry what changed.
         talk, previous = conversation.key('edit_pages', operation_id, token), None
         for round_number in range(MAX_ROUNDS):
@@ -1905,9 +1925,11 @@ class Editor:
                 reason = outcome.reason or outcomes.cause(outcome.error_code)
                 raise KelmoError(outcome.error_code, 'The editor executor produced no proposal: ' + reason)
             if outcome.kind == 'open_work':
-                if work is not None:
+                open_target = work['target'] if work is not None else opened
+                if open_target is not None:
                     repairs.append({'code': 'E_PROPOSAL', 'reason': 'A work page is already open for this source '
-                                    'at ' + work['target'] + ' (new_work); put its open work there.'})
+                                    'at ' + open_target + ' (new_work): it is sent with its entities; put its '
+                                    'open work there.'})
                     if len(repairs) > MAX_REPAIRS:
                         raise KelmoError('E_PROPOSAL', 'The executor kept asking for a work page after one was opened.')
                     continue

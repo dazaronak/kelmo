@@ -861,3 +861,46 @@ def test_an_oversized_applied_reason_refuses_the_batch_before_the_commit(world, 
     report = apply_pending(world.service, model)
     assert sorted(report['applied']) == sorted(ids), report
     assert len(facts_of(world)) == 3, 'the same notes published once the reason was whole'
+
+
+def test_two_notes_with_the_same_new_work_publish_onto_one_page_in_a_batched_pass(world):
+    """The batched pass reads the same stored request: a work page that exists is edited, not opened again.
+
+    Both requests were captured before either note published. The first opens the page; the second finds
+    it already there, gets it sent, and publishes its own fact on it with its own evidence, while the
+    plain notes of the same project still go as one batch."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    target = 'projects/app/export-rework.md'
+    plain = capture(world, notes(2))
+    work = []
+    for text in ('App note: rework the export queue.', 'App note: the export queue caps retries at three.'):
+        operation = world.service.create(text, project='app', selected=[FEATURE],
+                                         new_work={'slug': 'export-rework', 'title': 'Rework the export'})
+        world.service.run(operation['id'])
+        work.append(operation['id'])
+
+    def single(job):
+        fact = dict(fact_key='app.rework-' + job.payload['source']['evidence']['content_sha256'][:10],
+                    target=target, text=job.payload['source']['text'].split('. ')[0], status='backlog',
+                    expected_revision=None)
+        return world.propose(facts=[fact])
+
+    model = counted(Dispatch(world, single))
+    report = apply_pending(world.service, model)
+    assert sorted(report['applied']) == sorted(plain + work), report
+    assert [len(job.payload['sources']) for job in model.inner.jobs if 'sources' in job.payload] == [2]
+    alone = [job for job in model.inner.jobs if 'source' in job.payload]
+    assert len(alone) == 2 and all(job.payload['omitted'] == [] for job in alone)
+    assert 'new_work' in alone[0].payload and 'new_work' not in alone[1].payload
+    assert target in [page['target'] for page in alone[1].payload['pages']], \
+        'the second note reads the page the first one opened'
+    registry = world.registry()
+    assert registry['pages'][target]['page_id'] == 'projects-app-export-rework', 'one page, not a second one'
+    assert registry['pages'][target]['title'] == 'Rework the export'
+    keys = sorted(key for key in registry['facts'] if registry['facts'][key]['target'] == target)
+    assert len(keys) == 2, 'a fact from each note'
+    evidence = [world.service.journal.evidence_record(operation_id)
+                for operation_id in sorted(work)]
+    assert sorted(registry['facts'][key]['note_id'] for key in keys) == \
+        sorted(ref['content_sha256'] for ref in evidence), 'each fact cites its own note'

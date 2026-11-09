@@ -426,3 +426,92 @@ def test_new_work_priority_is_kept_on_the_page_and_an_invalid_one_is_refused_at_
     result = world.service.run(operation['id'], executor=executor)
     assert result['state'] == 'applied', result.get('outcome')
     assert world.registry()['pages'][WORK]['priority'] == 'H1'
+def test_two_notes_with_the_same_new_work_publish_onto_the_page_the_first_one_opened(world):
+    """A work page that already exists is used, not created again.
+
+    Both requests were captured before either note published, so each carries the same `new_work`.
+    The second note must find the page the first one opened, edit it, and keep its own evidence."""
+    from kelmo.contracts import EvidenceRef
+    first = world.service.create('First: rework the export queue.', project='app',
+                                 new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                                 idempotency_key='same-work-first')
+    second = world.service.create('Second: the queue needs a retry cap.', project='app',
+                                  new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                                  idempotency_key='same-work-second')
+    queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export queue.',
+                 status='backlog', expected_revision=None)
+    opened = Scripted(lambda job: world.propose(facts=[queue]))
+    assert world.service.run(first['id'], executor=opened)['state'] == 'applied'
+    assert world.registry()['pages'][WORK]['page_id'] == 'projects-app-export-rework'
+
+    cap = dict(fact_key='app.export-rework-cap', target=WORK, text='The queue caps retries at three.',
+               status='backlog', expected_revision=None)
+    seen = []
+    later = Scripted(lambda job: seen.append(job.payload) or world.propose(facts=[cap]))
+    result = world.service.run(second['id'], executor=later)
+    assert result['state'] == 'applied', result.get('outcome')
+    assert 'new_work' not in seen[0], 'the page is sent, not opened again'
+    assert WORK in [page['target'] for page in seen[0]['pages']], 'the model reads the page it must edit'
+    assert seen[0]['omitted'] == []
+    assert world.registry()['pages'][WORK]['page_id'] == 'projects-app-export-rework', 'one page, not a second one'
+    def evidence(operation_id):
+        return EvidenceRef.from_dict(world.service.journal.evidence_record(operation_id)).content_sha256
+
+    assert world.fact('app.export-rework')['note_id'] == evidence(first['id'])
+    assert world.fact('app.export-rework-cap')['note_id'] == evidence(second['id'])
+
+
+def test_a_work_page_that_appears_while_an_attempt_is_open_does_not_meet_the_idempotency_guard(world):
+    """An attempt left open under one key still applies after its page appeared.
+
+    The retry carries the same captured request; only the registry moved. Its fingerprint must name the
+    request it answers, not the page the editor now finds already there."""
+    from kelmo.errors import Stopping
+    from kelmo.executor import ModelOutcome
+    first = world.service.create('First: rework the export queue.', project='app',
+                                 new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                                 idempotency_key='same-work-first')
+    second = world.service.create('Second: the queue needs a retry cap.', project='app',
+                                  new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                                  idempotency_key='same-work-second')
+    reconcile = ModelOutcome('reconcile', {'facts': [{'text': 'Rework the export queue.', 'target': WORK}]})
+
+    def stop(job):
+        raise Stopping()
+
+    with pytest.raises(Stopping):
+        world.service.run(first['id'], executor=Scripted(reconcile, stop))
+    assert not world.service.journal.get(first['id'])['terminal']
+
+    cap = dict(fact_key='app.export-rework-cap', target=WORK, text='The queue caps retries at three.',
+               status='backlog', expected_revision=None)
+    assert world.service.run(second['id'], executor=Scripted(
+        lambda job: world.propose(facts=[cap])))['state'] == 'applied'
+    assert WORK in world.registry()['pages']
+
+    queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export queue.',
+                 status='backlog', expected_revision=None)
+    result = world.service.run(first['id'], executor=Scripted(reconcile, lambda job: world.propose(facts=[queue])))
+    assert result['state'] == 'applied', result.get('outcome')
+    assert world.fact('app.export-rework')['text'] == 'Rework the export queue.'
+
+
+def test_a_new_work_target_registered_as_another_page_stays_refused(world):
+    """Resolution needs the same page: a request whose target names another page is still refused."""
+    first = world.service.create('First: rework the export.', project='app',
+                                 new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                                 idempotency_key='other-page-first')
+    second = world.service.create('Second: something else entirely.', project='app',
+                                  new_work={'slug': 'export-rework', 'title': 'A different page'},
+                                  idempotency_key='other-page-second')
+    queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export pipeline.',
+                 status='backlog', expected_revision=None)
+    assert world.service.run(first['id'], executor=Scripted(
+        lambda job: world.propose(facts=[queue])))['state'] == 'applied'
+    other = dict(fact_key='app.export-rework-other', target=WORK, text='Something else.',
+                 status='backlog', expected_revision=None)
+    result = world.service.run(second['id'], executor=Scripted(
+        lambda job: world.propose(facts=[other])))
+    assert (result['state'], result['error_code']) == ('parked', 'E_PROPOSAL')
+    assert world.registry()['pages'][WORK]['title'] == 'Rework the export'
+    assert 'app.export-rework-other' not in world.registry()['facts']

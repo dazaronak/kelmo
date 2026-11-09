@@ -267,15 +267,44 @@ def current_request(registry, request):
     return result
 
 
+def opened_work_page(registry, project, new_work):
+    """The registered page a stored `new_work` already opened, or None when it names another page or none.
+
+    A work page is the same page when its target, parent, title, summary and priority are the ones
+    `new_work_page` would have given it — the same comparison its `existing=` argument makes, page ID
+    aside, because the page is then used as the registry holds it and never re-created under the
+    request's identity. The target must sit in this project's own directory, so a request never resolves
+    onto a page of another project."""
+    if not isinstance(new_work, dict):
+        return None
+    target = new_work.get('target')
+    entry = registry['pages'].get(target)
+    if entry is None or pages.project_of(target) != project:
+        return None
+    if all(new_work.get(name, '') == entry[name] for name in ('parent', 'title', 'summary', 'priority')):
+        return target
+    return None
+
+
 def _editor_request(service, request):
     """The keyword arguments Editor.edit takes from one stored creation request.
 
     The budget is the larger of the stored one and the vault's current `[editor] budget_tokens`: a
     note captured before the budget was raised is edited under the raised budget, not refused under
-    the one that no longer holds the mandatory pages."""
-    request = current_request(engine.load_registry(service.root), request)
+    the one that no longer holds the mandatory pages.
+
+    A `new_work` whose page another note already opened is resolved here, the one place both the
+    single-source and the batched path read a stored request: the request keeps `new_work` and selects
+    that page, which is how the editor tells an opening request from one whose page is already there.
+    A request never rewrites its captured metadata, exactly as `current_request` never does; a target
+    registered as a different page is left unresolved and stays the editor's refusal."""
+    registry = engine.load_registry(service.root)
+    request = current_request(registry, request)
     result = {name: value for name, value in request.items() if name not in ('pending',)}
     result['budget_tokens'] = max(request['budget_tokens'], service.config.editor_budget)
+    opened = opened_work_page(registry, request['project'], request.get('new_work'))
+    if opened is not None and opened not in result['selected']:
+        result['selected'] = [*result['selected'], opened]
     return result
 
 
