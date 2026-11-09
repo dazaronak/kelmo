@@ -866,6 +866,21 @@ def test_queue_retry_reaches_the_server_for_its_own_client_only(shared):
     assert repaired['operation']['id'] == operation_id and repaired['operation']['state'] == 'queued'
 
 
+def test_status_names_only_the_failed_notes_of_the_asking_client(shared):
+    from kelmo.client import ClientService
+    owner, other = ClientService(shared.client('mac-a')), ClientService(shared.client('mac-b'))
+    journal = shared.world.service.journal
+    mine = capture(owner, 'Needs a repair.', 'owner-note.md', 'status-owner')['operation']['id']
+    theirs = capture(other, 'Also needs a repair.', 'other-note.md', 'status-other')['operation']['id']
+    for operation_id in (mine, theirs):
+        journal.stage(operation_id, 'failed', terminal=True, error_code='E_SOURCE')
+    assert [item['id'] for item in owner.status()['failed_operations']] == [mine]
+    assert [item['id'] for item in other.status()['failed_operations']] == [theirs]
+    origin = shared.hub.session('mac-a').origin
+    assert [item['id'] for item in shared.world.service.failed_operations(limit=1, origin=origin)] == [mine], \
+        'another client\'s newer failures do not crowd out this one'
+
+
 def test_an_operation_the_server_does_not_offer_is_never_sent(shared):
     from kelmo.client import ClientService
     client = shared.client()

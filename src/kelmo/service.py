@@ -1035,15 +1035,19 @@ class Service:
     def trace(self, operation_id):
         return self.journal.trace(operation_id)
 
-    def failed_operations(self, limit=FAILED_OPERATIONS_REPORT):
+    def failed_operations(self, limit=FAILED_OPERATIONS_REPORT, origin=None):
         """The notes that stopped failing, newest first: what a shared client and `memory_status` need.
 
         Only `kelmo queue list` showed them before, so a note that failed for days was invisible to the
         agent that wrote it. The reason is the outcome the failure recorded; an older vault without one
-        reports null and the code still names the kind of stop."""
+        reports null and the code still names the kind of stop. With `origin` the report holds only the
+        notes that origin captured, and the limit counts those."""
         rows = self.journal.conn.execute(
             'SELECT id,filename,error_code,created_at FROM operations WHERE state=? '
-            'ORDER BY created_at DESC,id DESC LIMIT ?', ('failed', limit)).fetchall()
+            'ORDER BY created_at DESC,id DESC', ('failed',)).fetchall()
+        if origin is not None:
+            rows = [row for row in rows if self.journal.origin_record(row['id']) == origin.to_dict()]
+        rows = rows[:limit]
         if not rows:
             return []
         has_outcomes = self.journal.conn.execute(

@@ -1607,7 +1607,9 @@ class ClientSession:
 
     def read_status(self):
         writer = self.profile.bindings.writer
-        return dict(self.service.status(), writer='shared', remote_configured=True,
+        # Operation metadata belongs to the origin that captured it.
+        return dict(self.service.status(), failed_operations=self.service.failed_operations(origin=self.origin),
+                    writer='shared', remote_configured=True,
                     writer_id=writer.writer_id, writer_epoch=writer.epoch, fenced=self.profile.fenced,
                     archive_process=self.archive.description, client_id=self.client_id)
 
