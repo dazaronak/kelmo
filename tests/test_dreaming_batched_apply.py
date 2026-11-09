@@ -8,6 +8,7 @@ the single-source pass is `tests/test_dreaming_cost.py`.
 """
 import pytest
 
+from test_dreaming_batched import fact_change, fact_entry, page_entry, registry_with
 from test_editor_scoping import FEATURE, build_world
 
 
@@ -379,3 +380,20 @@ def test_the_batch_shares_its_commit_yet_every_member_keeps_its_own_receipt(worl
     rows = [world.service.journal.action_request(key) for key in keys]
     assert [row['state'] for row in rows] == ['finished'] * 2, 'each member settled on its own row'
     assert rows[0]['receipt'] and rows[0]['receipt'] != rows[1]['receipt'], 'the commit is shared, not the receipt'
+
+
+def test_a_single_source_proposal_still_refuses_the_batch_only_field():
+    """`source_operation_id` is the batch's own attribution: with no batch it is malformed, as before."""
+    from kelmo.editor import ProposalError, normalize
+
+    registry = registry_with(facts=[fact_entry()], pages=page_entry())
+    for name, item in (('facts', fact_change(source_operation_id='someone-else')),
+                       ('pages', dict(page_entry('projects/app/notes.md'), title='Notes cover imports',
+                                      source_operation_id='someone-else')),
+                       ('narratives', dict(narrative_id='app-note-1', target='projects/app/notes.md',
+                                           text='The audit moved the pipeline.', expected_revision=None,
+                                           depends_on={'facts': [], 'actions': []},
+                                           source_operation_id='someone-else'))):
+        with pytest.raises(ProposalError) as error:
+            normalize({name: [item]}, ['projects/app/notes.md'], registry, rule_change=False, project='app')
+        assert 'only one' in str(error.value), name

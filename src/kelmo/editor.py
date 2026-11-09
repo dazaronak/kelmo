@@ -360,7 +360,8 @@ def normalize(result, scope, registry, *, rule_change, project, enrollment=None,
     and the per-list limits are read per source, so a batch of eight small proposals is not refused
     as thirty-odd facts. An identity two sources claim stays allowed here — `split_answer` gives it
     to the earlier one and refuses the later. Without `sources` the answer is today's single-source
-    proposal: no attribution, one rule_change, byte-identical deltas.
+    proposal: no attribution, one rule_change, byte-identical deltas, and an item carrying the batch's own
+    `source_operation_id` is refused as malformed.
     """
     batch = None if sources is None else dict(sources)
 
@@ -368,7 +369,7 @@ def normalize(result, scope, registry, *, rule_change, project, enrollment=None,
         """The item with its attribution resolved: (delta item, source operation id or None)."""
         named = item.get('source')
         if batch is None:
-            if named is not None:
+            if named is not None or 'source_operation_id' in item:
                 raise ProposalError(what + ' names a source, but this request sent only one')
             return item, None
         if named is None:
