@@ -108,6 +108,7 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
     else:
         if not batch or not all(isinstance(item, dict) and {'operation_id', 'text', 'evidence'} <= item.keys()
                                and not item.keys() - {'operation_id', 'text', 'evidence', 'hint'}
+                               and isinstance(item['operation_id'], str) and isinstance(item['text'], str)
                                for item in batch):
             raise KelmoError('E_INPUT', 'A batch view names each source with its operation id, text and evidence.')
         blocks = [{**{'operation_id': item['operation_id'], 'evidence': item['evidence'].to_dict(),

@@ -269,6 +269,18 @@ def test_batch_view_carries_every_source_under_sources(world):
     assert view['bundle'].source_mappings == (first_ref, second_ref)
 
 
+def test_a_batch_view_refuses_a_source_that_names_no_text_or_operation_id(world):
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import views
+    first, first_ref = world.archive('Notes now also cover imports.', key='batch-guard')
+    reader = world.service.knowledge
+    for broken in ({'operation_id': first, 'text': None, 'evidence': first_ref},
+                   {'operation_id': None, 'text': 'Notes also cover exports.', 'evidence': first_ref}):
+        with pytest.raises(KelmoError) as error:
+            views.editor_view(reader, reader.generation(), 'app', [NOTES], 60000, sources=[broken])
+        assert error.value.code == 'E_INPUT'
+
+
 def test_budget_omission_is_named_scoped_and_never_complete(world):
     from kelmo.errors import KelmoError
     from kelmo.wiki import views
