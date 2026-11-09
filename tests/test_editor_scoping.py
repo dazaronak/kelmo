@@ -703,7 +703,10 @@ def test_duplicate_page_updates_are_refused_before_publication(world):
     (detail_page(target='projects/other/export-retries.md'), 'E_PROPOSAL'),
     (detail_page(target=DRAFT, page_id='draft-claim', layout='topic'), 'E_OWNERSHIP'),
     (detail_page(target=OTHER, page_id='archive-claim'), 'E_PROPOSAL'),
-    (detail_page(parent=OTHER), 'E_PROPOSAL'),
+    # The refusal now sends the parent it named, so the model's repeated answer reaches the enrollment
+    # guard instead of stopping at the missing page: the page it hangs from is not one of the pages that
+    # show this feature.
+    (detail_page(parent=OTHER), 'E_BINDING'),
     (detail_page(parent='person.md'), 'E_PROPOSAL'),
     (detail_page(page_id='app-notes'), 'E_PROPOSAL'),
     (detail_page(layout='person'), 'E_PROPOSAL'),
@@ -720,6 +723,74 @@ def test_page_creation_cannot_claim_an_unauthorized_destination(world, page, cod
     assert error.value.code == code
     assert world.registry() == before and world.page(DRAFT) == draft
     assert world.outcome(source)['disposition'] == 'unresolved'
+
+
+def test_a_refusal_names_the_page_that_already_exists_and_sends_it_for_the_repair(world):
+    """The editor's own repair: a creation refused for an existing target gets that page sent next round.
+
+    The refusal names the target and the consult loop adds it to its own expansions, so the model reads
+    the page with its entities and revision and can put the change on it instead of inventing a slug."""
+    from kelmo.editor import MAX_EXPANSIONS
+    source, _ = world.archive('Archive notes cover the export pipeline end to end.', key='existing-target')
+    before = world.registry()
+    stray = dict(target=OTHER, expected_revision=None, page_id='archive-claim', layout='topic',
+                 title='Archive notes', summary='Unrelated notes.', parent=FEATURE)
+
+    def repaired(job):
+        sent = {page['target']: page for page in job.payload['pages']}
+        assert OTHER in sent, 'the refusal sent the page it named, with its entities'
+        fact = dict(fact_key='app.archive-pipeline', target=OTHER,
+                    text='Archive notes cover the export pipeline end to end.', status='active',
+                    expected_revision=None)
+        return world.propose(facts=[fact], pages=[dict(
+            target=OTHER, expected_revision=sent[OTHER]['entry']['revision'],
+            summary='Archive notes cover the export pipeline.')])
+
+    executor = Scripted(proposal(pages=[stray]), repaired)
+    receipt = world.edit(source, executor, key='existing-target')
+    assert receipt.outcome == 'published', receipt
+    refusal = executor.jobs[1].payload['refusal']
+    assert refusal['code'] == 'E_PROPOSAL' and OTHER in refusal['reason']
+    assert set(refusal) == {'code', 'reason'}, 'the model reads a refusal, not the editor internals'
+    assert executor.jobs[1].payload['expansions_left'] == MAX_EXPANSIONS, \
+        'the editor sent the page itself: the model kept its expansions'
+    registry = world.registry()
+    assert registry['pages'][OTHER]['summary'] == 'Archive notes cover the export pipeline.'
+    assert registry['facts']['app.archive-pipeline']['target'] == OTHER
+    assert registry['pages'][FEATURE] == before['pages'][FEATURE]
+
+
+def test_a_refusal_names_the_parent_page_it_needs_and_sends_it_for_the_repair(world):
+    """The same repair for a missing parent: the model gets the page it was told to hang the new one from."""
+    from kelmo.editor import MAX_EXPANSIONS
+    child = 'projects/app/export-retry-log.md'
+    fact = dict(fact_key='app.export-retry-log', target=child,
+                text='Failed exports retry three times, then alert the owner.', status='active',
+                expected_revision=None)
+
+    def page(**fields):
+        entry = dict(target=child, expected_revision=None, page_id='export-retry-log', layout='topic',
+                     title='Export retry log', summary='How the retry log is kept.', parent=FEATURE)
+        entry.update(fields)
+        return entry
+
+    source, _ = world.archive('Failed exports retry three times, then alert the owner.', key='missing-parent')
+
+    def repaired(job):
+        sent = {entry['target'] for entry in job.payload['pages']}
+        assert OTHER in sent, 'the refusal sent the parent it named, with its entities'
+        return world.propose(pages=[page(parent=OTHER)], facts=[fact])
+
+    executor = Scripted(proposal(pages=[page(parent=OTHER)], fact_checks=[]), repaired)
+    receipt = world.edit(source, executor, key='missing-parent', contexts=world.contexts())
+    assert receipt.outcome == 'published', receipt
+    refusal = executor.jobs[1].payload['refusal']
+    assert refusal['code'] == 'E_PROPOSAL' and OTHER in refusal['reason']
+    assert set(refusal) == {'code', 'reason'}
+    assert executor.jobs[1].payload['expansions_left'] == MAX_EXPANSIONS
+    registry = world.registry()
+    assert registry['pages'][child]['parent'] == OTHER
+    assert registry['facts']['app.export-retry-log']['target'] == child
 
 
 def test_concurrent_or_colliding_creation_is_refused(world, monkeypatch):

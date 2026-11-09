@@ -904,3 +904,42 @@ def test_two_notes_with_the_same_new_work_publish_onto_one_page_in_a_batched_pas
                 for operation_id in sorted(work)]
     assert sorted(registry['facts'][key]['note_id'] for key in keys) == \
         sorted(ref['content_sha256'] for ref in evidence), 'each fact cites its own note'
+
+
+def test_a_batch_refusal_sends_the_page_it_names_and_the_batch_publishes_the_repair(world):
+    """The batch path gets the same repair: its next round reads the page the refusal named."""
+    from kelmo.creation import apply_pending
+    from test_editor_scoping import OTHER
+    editor_mode(world)
+    ids = capture(world, notes(2))
+
+    class Claiming(BatchModel):
+        """The batch replay, except its first answer claims a page this vault already registers."""
+
+        def execute(self, job):
+            answer = super().execute(job)
+            payload = job.payload
+            if 'sources' not in payload:
+                return answer
+            if 'refusal' in payload:
+                entry = next(page['entry'] for page in payload['pages'] if page['target'] == OTHER)
+                answer.result['pages'] = [dict(target=OTHER, expected_revision=entry['revision'],
+                                               summary='Archive notes cover the audit.',
+                                               source=payload['sources'][0]['operation_id'])]
+            else:
+                answer.result['pages'] = [dict(target=OTHER, expected_revision=None, page_id='archive-claim',
+                                               layout='topic', title='Archive notes', summary='Unrelated notes.',
+                                               parent=FEATURE, source=payload['sources'][0]['operation_id'])]
+            return answer
+
+    model = counted(Claiming(world))
+    report = apply_pending(world.service, model)
+    assert sorted(report['applied']) == sorted(ids), report
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [2, 2]
+    refusal = model.inner.jobs[1].payload['refusal']
+    assert refusal['code'] == 'E_PROPOSAL' and OTHER in refusal['reason']
+    assert set(refusal) == {'code', 'reason'}, 'the model reads a refusal, not the editor internals'
+    assert OTHER in [page['target'] for page in model.inner.jobs[1].payload['pages']], \
+        'the page the refusal named is sent with its entities'
+    assert model.inner.jobs[1].payload['expansions_left'] == 2, 'the repair spent no expansion of the batch'
+    assert world.registry()['pages'][OTHER]['summary'] == 'Archive notes cover the audit.'

@@ -186,7 +186,15 @@ EDITING_SCHEMA = {
 
 
 class ProposalError(ValueError):
-    """A normalized model answer that does not fit the request; the source stays unresolved."""
+    """A normalized model answer that does not fit the request; the source stays unresolved.
+
+    `send` names registered pages the repair needs in front of the model (the page that already exists,
+    the parent that was not sent). The consult loop sends them as its own expansion; the refusal the model
+    reads stays `{code, reason}`."""
+
+    def __init__(self, message, send=()):
+        super().__init__(message)
+        self.send = list(send)
 
 
 def _fingerprint(value):
@@ -277,6 +285,14 @@ def _plain(item, name, label):
         raise ProposalError(label + ' ' + name + ' carries ' + reason + '; write plain Markdown instead')
 
 
+def _repair_page(registry, project, person, target):
+    """A page a refusal can put in front of the model itself: registered, of this project, not a person page."""
+    if isinstance(target, str) and target in registry['pages'] and target not in person \
+            and pages.project_of(target) == project:
+        return target
+    return None
+
+
 def _created_page(item, scope, registry, project, created, person, enrollment, owner=None, owners=None):
     """One new linked detail page: inside the request project, under a page sent in full.
 
@@ -299,8 +315,18 @@ def _created_page(item, scope, registry, project, created, person, enrollment, o
     claimed_id = (owners or {}).get('page_id', {})
     if target in registry['pages'] or (target in created and (owner is None
                                                               or claimed_target.get(target) == owner)):
+        existing = _repair_page(registry, project, person, target)
+        if existing is not None:
+            raise ProposalError('page ' + existing + ' already exists and is now sent with its entities and '
+                                'revision: put the change on it with its expected_revision, do not create it',
+                                (existing,))
         raise ProposalError('page ' + target + ' is already registered or proposed; a new page needs a new target')
     if item['parent'] not in scope or item['parent'] in person:
+        parent = _repair_page(registry, project, person, item['parent'])
+        if parent is not None:
+            raise ProposalError('page ' + target + ' must hang from a page that was sent in full: ' + parent
+                                + ' is now sent with its entities and revision; hang it from that page',
+                                (parent,))
         raise ProposalError('page ' + target + ' must hang from a non-person page that was sent in full')
     if item['layout'] not in engine.CREATED_LAYOUTS:
         raise ProposalError('page ' + target + ' layout must be topic or feature')
@@ -1435,6 +1461,11 @@ class Editor:
                 problem = self._precheck_batch(refused, registry, requests, _enrolled(enrollment, work))
                 if problem is None or len(repairs) >= MAX_REPAIRS or not getattr(executor, 'revises', True):
                     return refused
+                # The editor's own repair, exactly as in the single-source loop: the page a refusal names is
+                # sent with the next round of this batch, spending none of its expansions.
+                for target in problem.pop('send', ()):
+                    if target not in expansions:
+                        expansions.append(target)
                 repairs.append(problem)
                 continue
             if outcome.kind == 'expand':
@@ -1462,12 +1493,13 @@ class Editor:
                 for operation_id in batch}
 
     def _precheck_batch(self, observation, registry, requests, enrollment):
-        """The settle checks a batch proposal can fail by itself, as `{code, reason}`, or None when it passes.
+        """The settle checks a batch proposal can fail by itself, as `{code, reason, send}`, or None when it passes.
 
         `normalize` runs once over the whole answer (its duplicate detection is what catches two sources
         claiming the same thing), `split_delta` cuts it in capture order, and each slice then meets the
         reconciliation gate with its own receipts. A cross-source collision is named here so the model
-        gets its repair round; a collision still there at settle parks the later source.
+        gets its repair round; a collision still there at settle parks the later source. `send` names the
+        pages the repair needs in front of the model, which the consult loop sends itself.
         """
         batch = list(observation['batch'])
         try:
@@ -1491,7 +1523,7 @@ class Editor:
                                                     'fact_checks': list(part['fact_checks'])}
                                      for operation_id, part in slices.items()}
         except ProposalError as error:
-            return {'code': 'E_PROPOSAL', 'reason': str(error)}
+            return {'code': 'E_PROPOSAL', 'reason': str(error), 'send': error.send}
         except engine.OwnershipConflict as error:
             return {'code': error.code, 'reason': str(error)}
         except KelmoError as error:
@@ -1964,6 +1996,12 @@ class Editor:
                     self._precheck(refused, registry, request, _enrolled(enrollment, work)))
                 if problem is None:
                     return refused
+                # The editor's own repair: a refusal that names a registered page of this project gets that
+                # page sent with the next round, spending none of the model's expansions. The budget still
+                # applies, and the refusal the model reads stays its code and reason.
+                for target in problem.pop('send', ()):
+                    if target not in expansions:
+                        expansions.append(target)
                 repairs.append(problem)
                 continue
             if outcome.kind == 'expand':
@@ -2018,7 +2056,10 @@ class Editor:
         return {'slug': slug, 'title': title[:1].upper() + title[1:]}
 
     def _precheck(self, observation, registry, request, enrollment):
-        """The settle checks a proposal can fail by itself, as `{code, reason}`, or None when it passes."""
+        """The settle checks a proposal can fail by itself, as `{code, reason, send}`, or None when it passes.
+
+        `send` names the registered pages the repair needs in front of the model; the consult loop sends
+        them itself, so a refusal the editor can fix by sending a page costs the model no expansion."""
         try:
             delta, checks = normalize(opened_work(observation['result'], observation.get('new_work')),
                                       observation['scope'], registry, rule_change=request['rule_change'],
@@ -2027,7 +2068,7 @@ class Editor:
             verify_fact_checks(self.journal.conn, registry, delta['facts'],
                                rebind_receipts(checks, delta['facts'], observation['receipts']))
         except ProposalError as error:
-            return {'code': 'E_PROPOSAL', 'reason': str(error)}
+            return {'code': 'E_PROPOSAL', 'reason': str(error), 'send': error.send}
         except engine.OwnershipConflict as error:
             return {'code': error.code, 'reason': str(error)}
         except KelmoError as error:
