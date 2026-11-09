@@ -498,9 +498,11 @@ def test_each_published_fact_of_a_batch_cites_the_note_it_came_from(world):
 
 
 class AuthorityBatch(BatchModel):
-    """A batch answer where the later source proposes a new fact on the person page.
+    """A batch answer where one source proposes a new fact on the person page.
 
-    The first source of the batch carries the rule-change authority; the later one is ordinary editing.
+    That source is ordinary editing (no authority) while the other one of the batch carries the
+    rule-change authority; which one is which is the caller's choice. A single-source payload is answered
+    the way the batch replay answers it, so one executor covers a pass that republishes a source alone.
     """
 
     def __init__(self, world, person_source):
@@ -510,6 +512,8 @@ class AuthorityBatch(BatchModel):
     def execute(self, job):
         from kelmo.executor import ModelOutcome
         payload = job.payload
+        if 'sources' not in payload:
+            return super().execute(job)
         facts, checks = [], []
         for block in payload['sources']:
             on_person = block['operation_id'] == self.person_source
@@ -525,14 +529,19 @@ class AuthorityBatch(BatchModel):
         return ModelOutcome('proposal', {'facts': facts, 'fact_checks': checks})
 
 
-def capture_rule_change(world, texts, principal='requester'):
-    """Notes captured under an origin that may carry a rule-change request, archived in capture order."""
+def capture_rule_change(world, texts, principal='requester', rule_change_at=0):
+    """Notes captured under an origin that may carry a rule-change request, archived in capture order.
+
+    `rule_change_at` is which note asks for the authority; the batch's head is the first note, so
+    `rule_change_at=1` puts the authority on a member rather than on the source that publishes the intent.
+    """
     from kelmo.service import Service
     ids = []
     with Service(world.root, bindings=world.bindings, origin=world.origins[principal]) as service:
         for index, text in enumerate(texts):
             operation = service.create(text, project='app', selected=[FEATURE, 'person.md'],
-                                       rule_change=(index == 0), idempotency_key='rule-note-' + str(index))
+                                       rule_change=(index == rule_change_at),
+                                       idempotency_key='rule-note-' + str(index))
             world.service.run(operation['id'])
             ids.append(operation['id'])
     return ids
@@ -563,6 +572,46 @@ def test_a_new_person_fact_from_the_authorized_source_of_a_batch_is_still_a_rule
     assert sorted(report['applied']) == sorted(ids), report
     new = [fact for fact in world.registry()['facts'].values() if fact['fact_key'].startswith('app.habit-')]
     assert len(new) == 1 and new[0]['protected'] is True and new[0]['owner'] == 'rule-policy'
+
+
+def test_a_prepared_batch_rechecks_the_authority_of_every_member(world, monkeypatch):
+    """The recheck before a batch commit covers the member's authority, not only the publisher's.
+
+    The batch's head carries no rule-change authority; the later member does, and its person fact is what
+    the prepared intent would publish. The member's requester enrollment is withdrawn in the window between
+    the batch's prepare and its commit, which is exactly where `_recheck_rule_change` stands.
+    """
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = capture_rule_change(world, notes(2), rule_change_at=1)
+    bindings = world.service.bindings
+    model = AuthorityBatch(world, ids[1])
+    real = Editor._complete
+    window = []
+
+    def withdrawn(origin):
+        bindings.validate(origin)
+        raise ValueError('This binding cannot attest REQUESTER evidence.')
+
+    def publish(self, operation_id):
+        """The enrollment is gone by the time the prepared batch reaches its publication window."""
+        self.service.bindings.require_requester = withdrawn
+        window.append(operation_id)
+        try:
+            return real(self, operation_id)
+        finally:
+            del self.service.bindings.require_requester
+
+    monkeypatch.setattr(Editor, '_complete', publish)
+    report = apply_pending(world.service, model)
+    assert window, 'the batch never reached its publication window'
+    assert report['applied'] == [], report
+    assert sorted(report['parked']) == sorted(ids), report
+    assert all('E_ORIGIN' in world.outcome(operation_id)['reason'] for operation_id in ids), \
+        [world.outcome(operation_id) for operation_id in ids]
+    assert not [fact for fact in world.registry()['facts'].values() if fact['fact_key'].startswith('app.habit-')], \
+        'a batch that cannot attest its member published no protected rule'
 
 
 class NoRepairs(BatchModel):

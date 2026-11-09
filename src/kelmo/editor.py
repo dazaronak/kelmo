@@ -2109,22 +2109,31 @@ class Editor:
         return self._complete(operation_id)
 
     def _recheck_rule_change(self, operation_id, intent):
-        """A prepared, unpublished rule change still needs its issued requester origin that owns the source."""
-        authority = intent.get('rule_change')
-        if authority is None:
-            return
-        source_id = intent['source_operation_id']
-        try:
-            recorded = Origin.from_dict(authority['origin'])
-            trusted = self.service.bindings.origin(recorded.client_id, recorded.session_id)
-            if trusted != recorded:
-                raise ValueError('The recorded origin differs from current enrollment.')
-            self.service.bindings.require_requester(trusted)
-            if self.service._operation_origin(source_id) is not trusted:
-                raise ValueError('The source owner differs from the rule-change origin.')
-        except (ValueError, KeyError, TypeError, KelmoError) as error:
-            self._refuse(operation_id, source_id, 'E_ORIGIN', 'The prepared rule change lost its requester '
-                         'authority before publication: ' + str(error))
+        """A prepared, unpublished rule change still needs its issued requester origin that owns the source.
+
+        A batch intent carries one authority per member, so every one of them is rechecked: the publisher's
+        own authority is not the batch's, and a member whose enrollment was withdrawn after the prepare must
+        not reach the commit with its protected change.
+        """
+        batch = intent.get('sources')
+        if not batch:
+            authorities = [(intent['source_operation_id'], intent.get('rule_change'))]
+        else:
+            authorities = [(operation_id, entry.get('rule_change')) for operation_id, entry in batch.items()]
+        for source_id, authority in authorities:
+            if authority is None:
+                continue
+            try:
+                recorded = Origin.from_dict(authority['origin'])
+                trusted = self.service.bindings.origin(recorded.client_id, recorded.session_id)
+                if trusted != recorded:
+                    raise ValueError('The recorded origin differs from current enrollment.')
+                self.service.bindings.require_requester(trusted)
+                if self.service._operation_origin(source_id) is not trusted:
+                    raise ValueError('The source owner differs from the rule-change origin.')
+            except (ValueError, KeyError, TypeError, KelmoError) as error:
+                self._refuse(operation_id, source_id, 'E_ORIGIN', 'The prepared rule change lost its requester '
+                             'authority before publication: ' + str(error))
 
     def _complete(self, operation_id):
         """Publish one prepared intent, or recognize its committed generation, then store the receipt."""
