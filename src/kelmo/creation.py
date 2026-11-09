@@ -318,9 +318,22 @@ UNCHARGED_REFUSALS = ('E_STALE', 'E_OUTCOME', 'E_BINDING')
 FREE_STALE_REFUSALS = 5
 
 
+def _budget_events(trace):
+    """The events of this source's current attempt budget: everything after its last `retry_budget_reset`.
+
+    `kelmo queue retry` records that event, and the attempts it renewed must not be spent by the parks an
+    earlier run of the same note accumulated: a retried note gets PARK_ATTEMPTS again, not one."""
+    events = trace['events']
+    reset = max((index for index, event in enumerate(events) if event['stage'] == 'retry_budget_reset'),
+                default=-1)
+    return events[reset + 1:]
+
+
 def _parked(trace):
-    """(parked attempts so far, attempts charged among them, the last parked event's details or None)."""
-    parked = [event for event in trace['events'] if event['stage'] == 'parked']
+    """(parked attempts so far, attempts charged among them, the last parked event's details or None).
+
+    Counted over `_budget_events`, so a retry's reset starts the count again."""
+    parked = [event for event in _budget_events(trace) if event['stage'] == 'parked']
     details = [event.get('details') or event for event in parked]
     free = 0
     charged = 0
@@ -333,11 +346,14 @@ def _parked(trace):
 
 
 def _free_refusal(trace, error):
-    """Whether this refusal is one of the uncharged refusals a note may still spend."""
+    """Whether this refusal is one of the uncharged refusals a note may still spend.
+
+    The FREE_STALE_REFUSALS already spent belong to the current budget: after a `retry_budget_reset` the
+    note has them again."""
     if error.code not in UNCHARGED_REFUSALS:
         return False
     spent = sum((event.get('details') or event).get('error_code') in UNCHARGED_REFUSALS
-                for event in trace['events'] if event['stage'] == 'parked')
+                for event in _budget_events(trace) if event['stage'] == 'parked')
     return spent < FREE_STALE_REFUSALS
 
 
@@ -351,7 +367,8 @@ def park(service, operation_id, error, token, attempts):
     spend none of the source's attempts, so a broken outcome store or a moved enrollment never fails a
     note that the model placed correctly. After PARK_ATTEMPTS charged attempts the refusal is final:
     the source fails and the vault owner is alerted, since a note the model cannot place three times,
-    or one the vault refuses again and again, needs a person.
+    or one the vault refuses again and again, needs a person. Both counts run over the attempts since
+    the source's last `retry_budget_reset`, so `kelmo retry` gives them back.
     """
     reason = outcomes.repair_reason(error.code, error)
     if not _free_refusal(service.trace(operation_id), error) and attempts + 1 >= PARK_ATTEMPTS:
@@ -371,7 +388,9 @@ def _attempt(service, operation_id):
     """(idempotency key, hint, charged attempts) of this source's next editor attempt, from its own trace.
 
     The key counts this source's own queued and parked attempts, so a batch never shares a key between
-    members and a source's attempt accounting stays per source.
+    members and a source's attempt accounting stays per source. The parked part restarts after a
+    `retry_budget_reset` while the queued part counts every queued event the source ever had, so an
+    attempt of a retried note is never the key an earlier attempt already finished under.
     """
     trace = service.trace(operation_id)
     parked, attempts, last = _parked(trace)

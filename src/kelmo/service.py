@@ -992,7 +992,7 @@ class Service:
             if operation['state'] != 'failed':
                 raise KelmoError('E_STATE', 'Only a failed operation can be retried.')
             self.journal.stage(operation_id, 'queued')
-            budget = reset_budget and self.journal.conn.execute(
+            retries = reset_budget and self.journal.conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_retries'").fetchone()
             # A source whose editor request already finished is settled: its facts are published and the
             # retry only records that. Any other source is unsettled again until the attempt settles it.
@@ -1000,9 +1000,14 @@ class Service:
             with self.journal.conn:
                 if not published:
                     outcomes.clear(self.journal.conn, operation_id)
-                if budget:
-                    self.journal.conn.execute('DELETE FROM worker_retries WHERE operation_id=?', (operation_id,))
+                if reset_budget:
+                    # The event is the boundary of the note's editor attempt budget: `kelmo queue retry`
+                    # renews its parked attempts and its free uncharged refusals, and the editor counts
+                    # from here. The daemon's charged requeue passes reset_budget=False, so its own retry
+                    # budget stays and no attempt budget is renewed by it.
                     self.journal.event(operation_id, 'retry_budget_reset')
+                if retries:
+                    self.journal.conn.execute('DELETE FROM worker_retries WHERE operation_id=?', (operation_id,))
             return self.journal.get(operation_id)
 
     def queued(self):

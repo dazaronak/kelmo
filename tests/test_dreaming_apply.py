@@ -370,6 +370,73 @@ def test_an_outcome_refusal_parks_a_note_without_failing_it(world):
     assert (parked_count, charged, last['error_code']) == (creation.PARK_ATTEMPTS + 1, 0, 'E_OUTCOME')
 
 
+def refused_note(world, text, code='E_PROPOSAL'):
+    """One archived note driven through `park` until it fails, with the key of each of its attempts."""
+    from kelmo import creation
+    from kelmo.errors import KelmoError
+    operation = world.service.create(text, project='app', selected=[FEATURE])
+    world.service.run(operation['id'])
+    token = world.service.journal.claim(operation['id'], lease_seconds=60)
+    keys, states = [], []
+    while True:
+        key, _, charged = creation._attempt(world.service, operation['id'])
+        keys.append(key)
+        row = creation.park(world.service, operation['id'], KelmoError(code, 'Synthetic ' + code + '.'),
+                            token, charged)
+        states.append(row['state'])
+        if row['state'] != 'parked':
+            return operation['id'], token, keys, states
+
+
+def test_a_retried_note_gets_its_charged_attempts_back(world):
+    """`kelmo queue retry` records `retry_budget_reset` and the attempt accounting must honour it: a note
+    that had already spent its charged parks gets PARK_ATTEMPTS again, and its new attempts never replay
+    an earlier attempt's request row."""
+    from kelmo import creation
+    from kelmo.errors import KelmoError
+    nightly(world)
+    operation_id, token, keys, states = refused_note(world, 'Exports run at 23:50.')
+    assert states == ['parked'] * (creation.PARK_ATTEMPTS - 1) + ['failed'], states
+    assert len(set(keys)) == len(keys) == creation.PARK_ATTEMPTS, keys
+    retried = world.service.retry(operation_id)
+    assert retried['state'] == 'queued'
+    stages = [event['stage'] for event in world.service.trace(operation_id)['events']]
+    assert stages.count('retry_budget_reset') == 1, stages
+    assert creation._parked(world.service.trace(operation_id))[:2] == (0, 0), \
+        'the parks before the reset are no longer attempts of this note'
+    token = world.service.journal.claim(operation_id, lease_seconds=60)
+    again, states = [], []
+    while True:
+        key, _, charged = creation._attempt(world.service, operation_id)
+        assert key not in keys, 'a retried attempt reuses an old key and would replay its row'
+        assert key not in again
+        again.append(key)
+        row = creation.park(world.service, operation_id, KelmoError('E_PROPOSAL', 'Synthetic E_PROPOSAL.'),
+                            token, charged)
+        states.append(row['state'])
+        if row['state'] != 'parked':
+            break
+    assert states == ['parked'] * (creation.PARK_ATTEMPTS - 1) + ['failed'], states
+    assert len(set(again)) == creation.PARK_ATTEMPTS, again
+
+
+def test_a_retry_renews_the_free_cap_of_a_vault_caused_refusal(world):
+    """The same reset for the uncharged refusals: the FREE_STALE_REFUSALS a note already spent do not
+    carry past its retry, so a note the vault refused again and again is not failed by the old count."""
+    from kelmo import creation
+    from kelmo.errors import KelmoError
+    nightly(world)
+    operation_id, token, _keys, states = refused_note(world, 'Exports run at 23:55.', code='E_STALE')
+    assert states == ['parked'] * (creation.FREE_STALE_REFUSALS + creation.PARK_ATTEMPTS - 1) + ['failed'], states
+    world.service.retry(operation_id)
+    token = world.service.journal.claim(operation_id, lease_seconds=60)
+    _, charged, _ = creation._parked(world.service.trace(operation_id))
+    assert charged == 0
+    row = creation.park(world.service, operation_id, KelmoError('E_STALE', 'Generation moved.'), token, charged)
+    assert row['state'] == 'parked', row
+    assert creation._parked(world.service.trace(operation_id))[:2] == (1, 0)
+
+
 def test_pending_lines_are_delivered_at_startup_until_the_note_is_applied(world):
     from kelmo.creation import apply_pending, pending_summaries
     from kelmo.hot import pending_block

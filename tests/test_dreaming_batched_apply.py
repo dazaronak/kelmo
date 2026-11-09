@@ -1124,3 +1124,28 @@ def test_a_batch_refusal_sends_the_page_it_names_and_the_batch_publishes_the_rep
         'the page the refusal named is sent with its entities'
     assert model.inner.jobs[1].payload['expansions_left'] == 2, 'the repair spent no expansion of the batch'
     assert world.registry()['pages'][OTHER]['summary'] == 'Archive notes cover the audit.'
+
+
+def test_a_retried_note_parks_again_under_the_batch_pass_and_not_at_once(world):
+    """The batch pass spends the same attempt budget as the single-source one, so `kelmo queue retry`
+    renews it there too: a member that had already failed parks on its next refusal after the retry and
+    fails only after the full PARK_ATTEMPTS of the renewed budget."""
+    from kelmo import creation
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    texts = notes(1)
+    ids = capture(world, texts)
+    model = counted(BatchModel(world, broken=texts))
+    states = [apply_pending(world.service, model) and world.service.journal.get(ids[0])['state']
+              for _ in range(creation.PARK_ATTEMPTS)]
+    assert states == ['parked'] * (creation.PARK_ATTEMPTS - 1) + ['failed'], states
+    assert world.service.retry(ids[0])['state'] == 'queued'
+    assert world.service.run(ids[0])['state'] == 'archived', 'the retried note is back in the nightly queue'
+    report = apply_pending(world.service, model)
+    assert report['parked'] == ids and report['failed'] == [], report
+    assert world.service.journal.get(ids[0])['state'] == 'parked'
+    parked, charged, _ = creation._parked(world.service.trace(ids[0]))
+    assert (parked, charged) == (1, 1), 'the retried member spent one attempt of its renewed budget'
+    for _ in range(creation.PARK_ATTEMPTS - 1):
+        apply_pending(world.service, model)
+    assert world.service.journal.get(ids[0])['state'] == 'failed'
