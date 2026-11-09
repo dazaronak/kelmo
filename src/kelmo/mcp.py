@@ -320,8 +320,8 @@ def server(root, service=None, *, report_timings=False):
     @mcp.tool
     def memory_status() -> dict:
         """Processing state: operations by state (captured, queued, archived, applied, failed, needing
-        review), settled outcomes, registered facts and archive counts; a shared client adds its outbox of
-        writes not yet delivered."""
+        review), settled outcomes, the newest failed notes with their error code, reason and capture time,
+        registered facts and archive counts; a shared client adds its outbox of writes not yet delivered."""
         with borrow() as selected, measured('memory_status'):
             return selected.status()
 

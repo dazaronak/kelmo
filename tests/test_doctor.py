@@ -254,3 +254,40 @@ def test_a_note_waiting_over_an_hour_for_a_lock_is_named(tmp_path):
         result = diagnose(root)
     assert result['issues']['long_waits'] == [{'operation_id': operation['id']}]
     assert any('waited over an hour' in warning and operation['id'] in warning for warning in result['warnings'])
+
+
+def test_a_failed_note_is_counted_and_its_age_reported(tmp_path):
+    from kelmo.config import Config
+    from kelmo.doctor import _age_text, _failed_notes
+    root = healthy_vault(tmp_path)
+    with Service(root) as service:
+        stopped = service.capture('Stopped evidence.', 'stopped.md', 'lead')
+        service.journal.stage(stopped['id'], 'failed', terminal=True, error_code='E_PROPOSAL')
+        service.capture('Waiting evidence.', 'waiting.md', 'lead')
+        journal = Config.load(root).internal('.state/journal.sqlite3')
+    assert _failed_notes(journal) == {'count': 1, 'oldest_seconds': pytest.approx(0, abs=60)}
+    import time
+    aged = _failed_notes(journal, clock=lambda: time.time() + 7200)
+    assert aged['count'] == 1 and 7140 < aged['oldest_seconds'] < 7260
+    assert _age_text(7200) == '2.0 hours' and _age_text(90) == '1 minutes'
+    with patch('kelmo.store.memory.embed.embed', return_value=bytes(1536)), \
+            patch('kelmo.doctor._failed_notes', return_value={'count': 9, 'oldest_seconds': 172800.0}):
+        result = diagnose(root)
+    assert result['issues']['failed_notes'] == {'count': 9, 'oldest_seconds': 172800.0}
+    warning = [line for line in result['warnings'] if 'note(s) failed' in line]
+    assert len(warning) == 1
+    assert '9 note(s) failed' in warning[0] and '48.0 hours ago' in warning[0]
+    assert 'queue retry' in warning[0]
+
+
+def test_a_vault_without_failed_notes_warns_about_none(tmp_path):
+    root = healthy_vault(tmp_path)
+    with Service(root) as service:
+        service.capture('Ordinary evidence.', 'ordinary.md', 'lead')
+        before = service.status()
+    with patch('kelmo.store.memory.embed.embed', return_value=bytes(1536)):
+        result = diagnose(root)
+    assert 'failed_notes' not in result['issues']
+    assert not any('note(s) failed' in warning for warning in result['warnings'])
+    assert result['healthy'] is True
+    assert before['failed_operations'] == []

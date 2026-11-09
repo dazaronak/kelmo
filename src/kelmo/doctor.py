@@ -101,6 +101,38 @@ def _long_waits(path, session_jobs, clock=None):
     return waits
 
 
+def _failed_notes(path, clock=None):
+    """How many notes stopped failing, and how long the oldest has waited since it was written.
+
+    Only `kelmo queue list` showed them, so a note that failed for days was invisible to the agent and
+    the person who wrote it. The count is the whole set, not the 20 `status` names."""
+    import time
+    from datetime import datetime
+    now = (clock or time.time)()
+    try:
+        connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute("SELECT created_at FROM operations WHERE state='failed'").fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error):
+        rows = []
+    ages = []
+    for row in rows:
+        try:
+            ages.append(max(0.0, now - datetime.fromisoformat(row['created_at']).timestamp()))
+        except (TypeError, ValueError):
+            continue
+    return {'count': len(rows), 'oldest_seconds': max(ages) if ages else 0.0}
+
+
+def _age_text(seconds):
+    """One waited time a person can read: hours from a day down, minutes below that."""
+    hours = seconds / 3600
+    return f'{hours:.1f} hours' if hours >= 1 else f'{max(0, int(seconds // 60))} minutes'
+
+
 def _stale_git_locks(repository, clock=None):
     """Git lock files in the knowledge repository older than STALE_GIT_LOCK_SECONDS: a crashed Git
     process left them, and every publication waits behind them until a person removes them."""
@@ -348,6 +380,13 @@ def diagnose(root):
         named = [item.get('operation_id') or item.get('session_job_id') for item in waits[:5]]
         warnings.append(f'{len(waits)} note(s) have waited over an hour for their turn; look for a stuck lock '
                         '(.state/*.lock, a Git index.lock) or a stopped worker: ' + ', '.join(named) + '.')
+    stopped = _failed_notes(journal_path) if checks['journal_integrity'] else {'count': 0, 'oldest_seconds': 0.0}
+    if stopped['count']:
+        issues['failed_notes'] = stopped
+        warnings.append(f"{stopped['count']} note(s) failed and are waiting for a person: kelmo queue list names "
+                        'them, kelmo trace <id> and kelmo status name the reason, and kelmo queue retry <id> gives '
+                        'a note its attempts back. The oldest was written ' + _age_text(stopped['oldest_seconds'])
+                        + ' ago.')
 
     registry = None
     registry_path = _internal(config, config.registry_relative)

@@ -185,3 +185,50 @@ def test_a_published_proposal_with_long_keys_and_other_changes_fits_its_limit():
 def test_one_key_longer_than_the_limit_is_counted_and_not_cut():
     key = 'project.page.' + 'x' * outcomes.REASON_LIMIT
     assert outcomes.fact_reason([key], 'fact applied: ') == 'fact applied: (+1 more)'
+
+
+def failing_note(service, monkeypatch, filename):
+    """One note that fails in the archive phase, which is how a real publication failure arrives."""
+    from kelmo.store.errors import ArchiveValidationError
+
+    def refused(*args, **kwargs):
+        raise ArchiveValidationError('Synthetic archive refusal.')
+
+    monkeypatch.setattr(service.archive_api, 'capture', refused)
+    operation = service.capture('Synthetic failing note.', filename, 'lead', 'archive')
+    return service.run(operation['id'])
+
+
+def test_status_names_the_failed_notes_with_their_reason_and_time(service, monkeypatch):
+    first = failing_note(service, monkeypatch, 'first-fault.md')
+    second = failing_note(service, monkeypatch, 'second-fault.md')
+    failed = service.status()['failed_operations']
+    assert [item['id'] for item in failed] == [second['id'], first['id']], 'newest first'
+    for item, operation in zip(failed, (second, first)):
+        assert item['filename'] == operation['filename']
+        assert item['error_code'] == 'E_INPUT'
+        assert item['reason'].startswith('E_INPUT: Synthetic archive refusal.')
+        assert item['created_at'] == operation['created_at']
+    assert service.status()['summary']['failed'] == 2
+
+
+def test_status_reports_only_the_newest_twenty_failed_notes(service, monkeypatch):
+    for index in range(25):
+        failing_note(service, monkeypatch, 'fault-%02d.md' % index)
+    status = service.status()
+    failed = status['failed_operations']
+    assert len(failed) == 20
+    assert status['summary']['failed'] == 25
+    reported = {item['id'] for item in failed}
+    all_failed = [row['id'] for row in service.journal.conn.execute(
+        'SELECT id FROM operations WHERE state=? ORDER BY created_at DESC,id DESC', ('failed',))]
+    assert reported == set(all_failed[:20]), 'the cap keeps the newest'
+    kept = [item['created_at'] for item in failed]
+    assert kept == sorted(kept, reverse=True), 'newest first'
+    dropped = [service.journal.get(operation_id)['created_at'] for operation_id in all_failed[20:]]
+    assert min(kept) >= max(dropped), 'the oldest are the ones left out'
+
+
+def test_a_vault_without_failures_reports_none(service):
+    service.capture('An ordinary note.', 'plain.md', 'reviewer', 'archive')
+    assert service.status()['failed_operations'] == []

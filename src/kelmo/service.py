@@ -88,6 +88,9 @@ TAG = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}')
 DAY = ISO_DAY  # a day only, ASCII digits: times and offsets would compare as text
 # Idempotency key namespaces only StateAPI's coordinator may capture under (Service._state_intake).
 RESERVED_INTAKE_PREFIXES = ('state-capture/', 'state-intake/')
+# How many stopped notes `status` names: enough for a shared client and `memory_status` to see a stretch
+# of failures at a glance, small enough to stay one readable page of output.
+FAILED_OPERATIONS_REPORT = 20
 
 
 class Service:
@@ -1027,6 +1030,30 @@ class Service:
     def trace(self, operation_id):
         return self.journal.trace(operation_id)
 
+    def failed_operations(self, limit=FAILED_OPERATIONS_REPORT):
+        """The notes that stopped failing, newest first: what a shared client and `memory_status` need.
+
+        Only `kelmo queue list` showed them before, so a note that failed for days was invisible to the
+        agent that wrote it. The reason is the outcome the failure recorded; an older vault without one
+        reports null and the code still names the kind of stop."""
+        rows = self.journal.conn.execute(
+            'SELECT id,filename,error_code,created_at FROM operations WHERE state=? '
+            'ORDER BY created_at DESC,id DESC LIMIT ?', ('failed', limit)).fetchall()
+        if not rows:
+            return []
+        has_outcomes = self.journal.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_outcomes'").fetchone() is not None
+        report = []
+        for row in rows:
+            reason = None
+            if has_outcomes:
+                outcome = self.journal.conn.execute('SELECT reason FROM source_outcomes WHERE operation_id=?',
+                                                    (row['id'],)).fetchone()
+                reason = outcome['reason'] if outcome is not None else None
+            report.append({'id': row['id'], 'filename': row['filename'], 'error_code': row['error_code'],
+                           'reason': reason, 'created_at': row['created_at']})
+        return report
+
     def status(self):
         registry = engine.load_registry(self.root)
         counts = {row['state']: row['n'] for row in self.journal.conn.execute(
@@ -1042,6 +1069,7 @@ class Service:
                    'needs_review': counts.get('needs_resolution', 0) + counts.get('needs_review', 0)}
         return {'vault_id': self.config.vault_id, 'operations': counts,
                 'outcomes': settled, 'summary': summary, 'facts': len(registry['facts']),
+                'failed_operations': self.failed_operations(),
                     **self.archive_api.counts(),
                     'archive_contract_version': CONTRACT_VERSION, 'archive_intake_behavior': INTAKE_BEHAVIOR_VERSION,
                     'writer': 'local', 'remote_configured': False, 'deployment_parity_verified': False}
