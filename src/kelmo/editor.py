@@ -702,6 +702,16 @@ def _outcome(disposition, reason, code=None):
     return disposition, outcomes.repair_reason(code, reason) if code else reason
 
 
+def _applied_reason(delta):
+    """The `applied` reason of a publication, validated before the publication exists.
+
+    An outcome the reason store refuses must refuse the note with nothing committed, not fail a
+    publication that already reached the wiki: a bookkeeping failure after the commit leaves the intent
+    prepared and every later note behind it.
+    """
+    return outcomes.validate('applied', _summary(delta))[1]
+
+
 def _result(request, disposition, code=None):
     """The per-request `editor_result` event details, or None when no request row is involved."""
     return None if request is None else {'request': request, 'disposition': disposition, 'code': code}
@@ -1482,6 +1492,14 @@ class Editor:
                                            outcome=_outcome('unresolved', message, code),
                                            result=_result(row['operation_id'], 'unresolved', code))
 
+    def _stored_member_reason(self, row, observation):
+        """The `applied` reason this member's batch stored in its intent, or None when it stored none."""
+        lead = observation.get('batch_lead') or row['operation_id']
+        intent = self.journal.action_intent(lead) or {}
+        sources = intent.get('sources') or {}
+        entry = sources.get(row['source_operation_id']) or {}
+        return entry.get('applied_reason')
+
     def _member_disposition(self, request_key, idem, slice_=None):
         """What one member row of a published batch ended with, settled from its own recorded answer.
 
@@ -1503,7 +1521,10 @@ class Editor:
         generation = Generation.from_dict(observation['generation'])
         slice_ = slice_ if slice_ is not None else (observation.get('slice') or {})
         changed = any(slice_.get('delta', {}).get(name) for name in LIMITS)
-        disposition, reason = (('applied', _summary(slice_.get('delta', {}))) if changed
+        # The reason was validated when the batch was prepared and stored in its intent per source; an
+        # intent from before that check computes it here, exactly as `_complete` does for its own lead.
+        stored = self._stored_member_reason(row, observation)
+        disposition, reason = (('applied', stored or _summary(slice_.get('delta', {}))) if changed
                                else ('archive-only', 'the editor proposed no change to the selected pages; '
                                                      'the note adds no new fact'))
         receipt = OperationReceipt(row['operation_id'], idem[row['source_operation_id']], reference.source_id,
@@ -1601,14 +1622,24 @@ class Editor:
                                       'the editor proposed no change to the selected pages; the note adds no new '
                                       'fact')
         publisher = accepted[0]
+        # The outcome is decided here, before the intent exists: a reason the outcome store refuses
+        # refuses the whole batch with nothing committed, and the sources keep their turn.
+        try:
+            applied_reason = _applied_reason(union)
+            member_reasons = {operation_id: _applied_reason(slices[operation_id]['delta'])
+                              for operation_id in accepted}
+        except KelmoError as error:
+            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
         sources = {operation_id: {'evidence_ref': EvidenceRef.from_dict(
             self.service.journal.evidence_record(operation_id)).to_dict(),
             'filename': self.service.source_packet(operation_id).filename,
             'idempotency_key': idem[operation_id],
+            'applied_reason': member_reasons[operation_id],
             'rule_change': ({'origin': origin.to_dict(), 'source_operation_id': operation_id}
                             if authorities[operation_id]['rule_change'] else None)} for operation_id in accepted}
         lead_reference = EvidenceRef.from_dict(self.service.journal.evidence_record(publisher))
         intent = {'request_kind': 'semantic', 'delta': union, 'fact_checks': union_checks,
+                  'applied_reason': applied_reason,
                   'evidence_ref': lead_reference.to_dict(), 'filename': sources[publisher]['filename'],
                   'source_id': lead_reference.source_id, 'source_operation_id': publisher,
                   'idempotency_key': idem[publisher], 'batch': accepted, 'sources': sources,
@@ -2068,7 +2099,14 @@ class Editor:
                                                  'the note adds no new fact'),
                 result=_result(operation_id, 'archive-only'))
             return receipt
+        # The outcome is decided here, before the intent exists: a reason the outcome store refuses
+        # refuses the note with nothing committed, and the next source keeps its turn.
+        try:
+            applied_reason = _applied_reason(delta)
+        except KelmoError as error:
+            self._refuse(operation_id, source_id, error.code, str(error))
         intent = {'request_kind': 'semantic', 'delta': delta, 'fact_checks': checks,
+                  'applied_reason': applied_reason,
                   'evidence_ref': reference.to_dict(), 'filename': source['packet'].filename,
                   'source_id': reference.source_id, 'source_operation_id': source_id,
                   'idempotency_key': idempotency_key,
@@ -2184,9 +2222,11 @@ class Editor:
         reference = EvidenceRef.from_dict(intent['evidence_ref'])
         receipt = OperationReceipt(operation_id, intent['idempotency_key'], intent['source_id'], 'published',
                                    (reference,), generation=generation)
-        # The receipt, the request result and the applied outcome commit together.
+        # The receipt, the request result and the applied outcome commit together. The reason was
+        # validated when the intent was prepared; an intent from before that check computes it here.
         self.journal.action_finish(operation_id, receipt.to_dict(),
-                                   outcome=_outcome('applied', _summary(intent['delta'])),
+                                   outcome=_outcome('applied', intent.get('applied_reason')
+                                                    or _summary(intent['delta'])),
                                    result=_result(operation_id, 'applied'))
         return receipt
 

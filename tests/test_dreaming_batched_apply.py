@@ -837,3 +837,27 @@ def test_a_crash_after_the_intent_is_prepared_publishes_the_batch_on_the_next_pa
     assert sorted(report['applied']) == sorted(ids), report
     assert len(model.jobs) == calls, f'the recovery paid {len(model.jobs) - calls} more model calls'
     assert len(facts_of(world)) == 3
+
+
+def test_an_oversized_applied_reason_refuses_the_batch_before_the_commit(world, monkeypatch):
+    """The batch path decides its outcome before the commit too, and the sources keep their turn.
+
+    A reason the outcome store refuses must not stop the queue: the batch is refused with nothing
+    prepared and nothing committed, every member parks with that code, and the next pass publishes them."""
+    from kelmo import editor, outcomes
+    from kelmo.creation import apply_pending
+    original = editor._summary
+    monkeypatch.setattr(editor, '_summary', lambda delta: 'outcome reason ' + 'x' * outcomes.REASON_LIMIT)
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    model = BatchModel(world)
+    report = apply_pending(world.service, model)
+    assert report['applied'] == [] and report['failed'] == []
+    assert sorted(report['parked']) == sorted(ids), report
+    assert facts_of(world) == {}, 'nothing was committed'
+    assert world.service.journal.prepared_semantic() == [], 'no intent was prepared'
+    assert all(world.outcome(operation_id)['reason'].startswith('E_OUTCOME: ') for operation_id in ids)
+    monkeypatch.setattr(editor, '_summary', original)
+    report = apply_pending(world.service, model)
+    assert sorted(report['applied']) == sorted(ids), report
+    assert len(facts_of(world)) == 3, 'the same notes published once the reason was whole'

@@ -370,6 +370,48 @@ def test_requested_work_takes_priority_from_the_flag_or_the_note_frontmatter():
         requested_work(SimpleNamespace(new_work=None, title=None, summary=None, priority='H1'))
 
 
+def test_an_oversized_applied_reason_refuses_the_note_before_the_commit(world, monkeypatch):
+    """The outcome of a publication is decided before the commit.
+
+    A reason the outcome store refuses must not stop the queue: the note ends refused with nothing
+    committed, its facts never reach the wiki, and the next note publishes on its turn."""
+    from kelmo import editor, outcomes
+    original = editor._summary
+    monkeypatch.setattr(editor, '_summary', lambda delta: 'outcome reason ' + 'x' * outcomes.REASON_LIMIT)
+    first = world.service.create('Exports moved to 08:00.', project='app', selected=[FEATURE])
+    executor = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run at 08:00.')]))
+    result = world.service.run(first['id'], executor=executor)
+    assert (result['state'], result['error_code'], result['terminal']) == ('parked', 'E_OUTCOME', False)
+    assert world.fact('app.export')['text'] == 'Exports run nightly.', 'nothing was committed'
+    assert world.service.journal.prepared_semantic() == [], 'no intent was prepared'
+    assert world.outcome(first['id'])['reason'].startswith('E_OUTCOME: ')
+    monkeypatch.setattr(editor, '_summary', original)
+    second = world.service.create('Exports moved to 09:00.', project='app', selected=[FEATURE])
+    later = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run at 09:00.')]))
+    assert world.service.run(second['id'], executor=later)['state'] == 'applied'
+    assert world.fact('app.export')['text'] == 'Exports run at 09:00.', 'the next note went on'
+
+
+def test_an_intent_committed_before_its_receipt_finishes_without_a_model_call(world, monkeypatch):
+    """A prepared intent whose wiki commit already happened settles through recovery, not a new request."""
+    operation = world.service.create('Exports now run at 11:00.', project='app', selected=[FEATURE])
+    executor = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run at 11:00.')]))
+    original = world.service.journal.action_finish
+
+    def interrupted(*args, **kwargs):
+        raise RuntimeError('Synthetic crash after the commit and before the receipt')
+
+    monkeypatch.setattr(world.service.journal, 'action_finish', interrupted)
+    with pytest.raises(RuntimeError, match='Synthetic crash'):
+        world.service.run(operation['id'], executor=executor)
+    monkeypatch.setattr(world.service.journal, 'action_finish', original)
+    assert world.fact('app.export')['text'] == 'Exports run at 11:00.', 'the commit already happened'
+    assert world.service.journal.prepared_semantic(), 'its receipt is the part still missing'
+    assert world.service.run(operation['id'], executor=executor)['state'] == 'applied'
+    assert len(executor.jobs) == 1, 'recovery finished it with no second consultation'
+    assert world.outcome(operation['id'])['disposition'] == 'applied'
+
+
 def test_new_work_priority_is_kept_on_the_page_and_an_invalid_one_is_refused_at_capture(world):
     from kelmo.errors import KelmoError
     with pytest.raises(KelmoError, match='H1, H2 or H3'):
