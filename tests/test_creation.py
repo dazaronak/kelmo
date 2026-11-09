@@ -426,6 +426,8 @@ def test_new_work_priority_is_kept_on_the_page_and_an_invalid_one_is_refused_at_
     result = world.service.run(operation['id'], executor=executor)
     assert result['state'] == 'applied', result.get('outcome')
     assert world.registry()['pages'][WORK]['priority'] == 'H1'
+
+
 def test_two_notes_with_the_same_new_work_publish_onto_the_page_the_first_one_opened(world):
     """A work page that already exists is used, not created again.
 
@@ -515,3 +517,58 @@ def test_a_new_work_target_registered_as_another_page_stays_refused(world):
     assert (result['state'], result['error_code']) == ('parked', 'E_PROPOSAL')
     assert world.registry()['pages'][WORK]['title'] == 'Rework the export'
     assert 'app.export-rework-other' not in world.registry()['facts']
+
+
+def test_a_note_declaring_an_unknown_domain_is_refused_before_the_capture(world):
+    """A declared domain is checked when the note is written, not in the archive phase.
+
+    The note that declared `domain: infrastructure` was accepted at capture and failed later, with no
+    reason recorded and the session that wrote it already gone."""
+    from kelmo.errors import KelmoError
+    note = '---\nproject: app\ndomain: infrastructure\n---\n\nExports run nightly at 02:00.\n'
+    with pytest.raises(KelmoError) as raised:
+        world.service.create(note, 'bad-domain.md', project='app', selected=[FEATURE])
+    assert raised.value.code == 'E_INPUT'
+    assert 'domain' in str(raised.value) and 'dev' in str(raised.value) and 'life' in str(raised.value)
+    assert 'infrastructure' in str(raised.value)
+    assert world.service.queue() == [], 'no operation row exists'
+    assert world.service.orphan_sources() == 0, 'no orphan source was spooled'
+
+
+def test_a_note_declaring_an_allowed_domain_keeps_it_through_the_capture(world):
+    """The shared reading is not a filter: a domain the archive accepts still reaches the record."""
+    note = '---\nproject: app\ndomain: life\n---\n\nExports run nightly at 02:00.\n'
+    operation = world.service.create(note, 'life-domain.md', project='app', selected=[FEATURE])
+    assert world.service.source_packet(operation['id']).domain == 'life'
+
+
+def test_a_domain_line_the_packet_cannot_read_is_no_declaration(world):
+    """The capture reads the declared domain exactly as the packet does, no more strictly.
+
+    A `domain:` line in a form the packet cannot read is not a declaration, so it keeps the packet's
+    default instead of being refused under a rule the archive itself does not have."""
+    operation = world.service.create('---\ndomain: [dev, life]\n---\n\nExports run nightly.\n', 'list-domain.md',
+                                     project='app', selected=[FEATURE])
+    assert world.service.source_packet(operation['id']).domain == 'dev'
+
+
+def test_an_archive_phase_failure_records_the_reason_it_stopped(world, monkeypatch):
+    """A failure inside the archive phase leaves a trace a person can read.
+
+    The worker knows which phase broke and what the archive said; without an outcome the only trace is
+    an error code and a phase name in the event log."""
+    from kelmo.store.errors import ArchiveValidationError
+    operation = world.service.create('Exports run nightly at 02:00.', 'archive-fault.md', project='app',
+                                     selected=[FEATURE])
+
+    def refused(*args, **kwargs):
+        raise ArchiveValidationError('Synthetic archive refusal.')
+
+    monkeypatch.setattr(world.service.archive_api, 'capture', refused)
+    result = world.service.run(operation['id'])
+    assert (result['state'], result['error_code'], result['terminal']) == ('failed', 'E_INPUT', True)
+    outcome = world.outcome(operation['id'])
+    assert outcome['disposition'] == 'unresolved'
+    assert outcome['reason'].startswith('E_INPUT: Synthetic archive refusal.')
+    failed = [event for event in world.service.trace(operation['id'])['events'] if event['stage'] == 'failed']
+    assert failed[0]['details']['phase'] == 'archive'

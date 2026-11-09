@@ -13,6 +13,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
+from kelmo.store.config import VALID_DOMAINS
 from kelmo.store.db import init_schema, open_connection
 from kelmo.store.errors import ArchiveEmbeddingError, ArchiveValidationError
 from kelmo.store.memory.store import resolve_valid_from
@@ -41,6 +42,19 @@ def chunk_index_for(config):
 
 ROLES = {'lead', 'collector', 'implementer', 'reviewer', 'unknown'}
 _FRONTMATTER_BLOCK = re.compile(r'\A---\n(.*?)\n---\n', re.DOTALL)
+# The leading frontmatter block, its body excluded: a field is read from the block alone.
+_FRONTMATTER_FIELDS = re.compile(r'\A---\n(.*?)\n---(?:\n|$)', re.DOTALL)
+_DECLARED_DOMAIN = re.compile(r'^domain:\s*([A-Za-z0-9_.-]+)\s*$', re.MULTILINE)
+
+
+def declared_domain(content):
+    """The `domain:` a note declares in its leading frontmatter, or None when it declares none.
+
+    One reading shared by the capture that refuses a bad note and the packet that describes an accepted
+    one, so a value the archive would reject can never be captured first and fail later."""
+    header = _FRONTMATTER_FIELDS.match(content) if isinstance(content, str) else None
+    match = _DECLARED_DOMAIN.search(header[1]) if header else None
+    return match[1] if match else None
 
 
 def _note_text(content):
@@ -324,6 +338,13 @@ class Service:
         one line agents see at startup while the note waits for the editor."""
         from .creation import request
         self._refuse_reserved(idempotency_key)
+        content = _note_text(content)
+        # The declared domain is read exactly as the archive packet reads it, and refused here: a note the
+        # archive would reject must not become an operation that fails in the archive phase with no reason.
+        domain = declared_domain(content)
+        if domain is not None and domain not in VALID_DOMAINS:
+            raise KelmoError('E_INPUT', 'Source declares domain ' + repr(domain) + '; allowed values: '
+                           + ', '.join(sorted(VALID_DOMAINS)) + '.')
         if budget_tokens is None:
             budget_tokens = self.config.editor_budget
         previous = None
@@ -334,7 +355,6 @@ class Service:
                 previous = (saved or {}).get('metadata', {}).get('editor_request')
         selection = request(self, project, selected, rule_change, budget_tokens, new_work, pending,
                             previous=previous)
-        content = _note_text(content)
         return self._capture(content, filename, 'lead', 'create', idempotency_key, None,
                              editor_request=selection)
 
@@ -732,7 +752,7 @@ class Service:
                  and not tag.startswith('role:') and tag != self.config.label]
         return SourcePacket(content.encode('utf-8'), 'raw_note', operation['source_hash'],
                             operation['filename'], operation['created_at'], kind='event',
-                            domain=field('domain', 'dev'), project=field('project', 'default'),
+                            domain=declared_domain(content) or 'dev', project=field('project', 'default'),
                             tags=tuple(tags), valid_from=resolve_valid_from(None, 'raw_note', operation['filename']),
                             require_vectors=bool(operation.get('supersedes')))
 
@@ -773,6 +793,17 @@ class Service:
         return (ref.version == 1 and ref.source_id == operation['source_hash']
                 and ref.content_sha256 == operation['source_hash'] == engine.digest(content)
                 and origin == self._operation_origin(operation_id))
+
+    def _stage_failure(self, operation_id, code, error, phase, claim_token):
+        """Stage a failed attempt and record why it stopped, so a trace explains itself.
+
+        The archive phases fail before any outcome exists, so without a reason here the only trace left
+        is an error code and a phase name in the event log, and the session that wrote the note has
+        already moved on. A failure of the outcome store itself cannot be written into it."""
+        outcome = None if code == 'E_OUTCOME' else ('unresolved', outcomes.repair_reason(code, error))
+        self.journal.stage(operation_id, 'failed', terminal=True, error_code=code,
+                           error_type=type(error).__name__, phase=phase, claim_token=claim_token,
+                           outcome=outcome)
 
     def run(self, operation_id, *, executor=None):
         with self.config.internal('.state/worker.lock').open('a') as lock:
@@ -875,8 +906,7 @@ class Service:
                     self.journal.stage(operation_id, 'needs_resolution', error_code=code, claim_token=claim_token)
                     outcomes.record(self.journal.conn, operation_id, 'unresolved', outcomes.repair_reason(code, error))
                     return self.journal.get(operation_id)
-                self.journal.stage(operation_id, 'failed', terminal=True, error_code=code,
-                                   error_type=type(error).__name__, phase=phase, claim_token=claim_token)
+                self._stage_failure(operation_id, code, error, phase, claim_token)
             finally:
                 self.journal.release(operation_id, claim_token)
             if editor_request is None:
@@ -919,10 +949,7 @@ class Service:
                 code = error.code if isinstance(error, KelmoError) else 'E_PROCESSING'
                 # A refusal raised before the editor opened its request row has no recorded reason yet;
                 # a failed outcome store cannot hold one, so that failure is staged without it.
-                self.journal.stage(operation_id, 'failed', terminal=True, error_code=code,
-                                   error_type=type(error).__name__, phase='editor', claim_token=claim_token,
-                                   outcome=None if code == 'E_OUTCOME'
-                                   else ('unresolved', outcomes.repair_reason(code, error)))
+                self._stage_failure(operation_id, code, error, 'editor', claim_token)
                 return self.journal.get(operation_id)
             self.journal.stage(operation_id, 'applied', terminal=True, archive_id=operation['archive_id'],
                                claim_token=claim_token)
