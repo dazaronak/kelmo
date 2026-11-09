@@ -1389,13 +1389,13 @@ class Editor:
         generation = Generation.from_dict(observation['generation'])
         slice_ = observation.get('slice') or {}
         changed = any(slice_.get('delta', {}).get(name) for name in LIMITS)
-        outcome, disposition = (('applied', _summary(slice_.get('delta', {}))) if changed
-                                else ('archive-only', 'the editor proposed no change to the selected pages; '
-                                                      'the note adds no new fact'))
+        disposition, reason = (('applied', _summary(slice_.get('delta', {}))) if changed
+                               else ('archive-only', 'the editor proposed no change to the selected pages; '
+                                                     'the note adds no new fact'))
         receipt = OperationReceipt(row['operation_id'], idem[row['source_operation_id']], reference.source_id,
                                    'published' if changed else 'unchanged', (reference,), generation=generation)
-        self.journal.action_finish(row['operation_id'], receipt.to_dict(), outcome=_outcome(*outcome),
-                                   result=_result(row['operation_id'], 'applied' if changed else 'archive-only'))
+        self.journal.action_finish(row['operation_id'], receipt.to_dict(), outcome=_outcome(disposition, reason),
+                                   result=_result(row['operation_id'], disposition))
         return {'disposition': disposition, 'receipt': receipt}
 
     def _settle_batch(self, row, live, origin, requests, keys, idem, enrollment, settled):

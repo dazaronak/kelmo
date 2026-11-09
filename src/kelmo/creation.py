@@ -333,6 +333,21 @@ def park(service, operation_id, error, token, attempts):
     return service.journal.get(operation_id)
 
 
+def _attempt(service, operation_id):
+    """(idempotency key, hint, charged attempts) of this source's next editor attempt, from its own trace.
+
+    The key counts this source's own queued and parked attempts, so a batch never shares a key between
+    members and a source's attempt accounting stays per source.
+    """
+    trace = service.trace(operation_id)
+    parked, attempts, last = _parked(trace)
+    queued = sum(event['stage'] == 'queued' for event in trace['events'])
+    key = f'create:{operation_id}:{queued}' + (f':park{parked}' if parked else '')
+    hint = ({'code': last.get('error_code'), 'reason': (service.journal.get(operation_id).get('outcome') or {})
+             .get('reason', '')} if last else None)
+    return key, hint, attempts
+
+
 def publish(service, operation_id, request, executor=None, *, now=False):
     """Run the editor on one archived source: resume its open attempt, or open the next one.
 
@@ -354,12 +369,7 @@ def publish(service, operation_id, request, executor=None, *, now=False):
     if token is None:
         raise KelmoError('E_BUSY', 'This source is already being edited.')
     try:
-        trace = service.trace(operation_id)
-        parked, attempts, last = _parked(trace)
-        queued = sum(event['stage'] == 'queued' for event in trace['events'])
-        key = f'create:{operation_id}:{queued}' + (f':park{parked}' if parked else '')
-        hint = ({'code': last.get('error_code'), 'reason': (service.journal.get(operation_id).get('outcome') or {})
-                 .get('reason', '')} if last else None)
+        key, hint, attempts = _attempt(service, operation_id)
         try:
             service.editor.edit(operation_id, origin=service._operation_origin(operation_id),
                                 idempotency_key=key, executor=executor, contexts=service.context_bindings,
@@ -374,6 +384,135 @@ def publish(service, operation_id, request, executor=None, *, now=False):
         return service.journal.get(operation_id)
     finally:
         service.journal.release(operation_id, token)
+
+
+# A batch failure that names the batch's shape rather than a member's content: only the batch's head is
+# charged for it, because that is the source the editor could not consult. The rest of the batch spent no
+# model call of its own and stays waiting, exactly as a source dropped by the budget shrink does.
+BATCH_SHAPE = ('E_STATE', 'E_ORIGIN', 'E_PERMISSION', 'E_RECEIPT')
+
+
+def _batchable(service, operation, request):
+    """The origin this source may be edited under in a batch, or None when it stays single-source.
+
+    A source is left out of the batch when its own stored request opens a work page (`new_work` belongs
+    to one request and `edit_batch` refuses it), when its quota deferral has not reset, or when its
+    owning origin cannot be read. A batch carries one origin, because a rule change is attributable only
+    to the origin that archived its source.
+    """
+    if request.get('new_work') is not None or service.editor.deferred_until(operation['id']) is not None:
+        return None
+    try:
+        return service._operation_origin(operation['id'])
+    except KelmoError:
+        return None
+
+
+def batch_members(service, waiting, ceiling):
+    """The batch one apply pass takes from the head of its waiting list, in capture order.
+
+    The oldest waiting source names the batch — its project and its owning origin — and later waiting
+    sources of that project and origin join it up to the ceiling. When the head cannot join a batch the
+    pass publishes it alone and the next batch starts with the next pass: a batch never passes an older
+    note, and a source left out keeps its place in the pass's order.
+    """
+    if not waiting or ceiling < 1:
+        return []
+    first, first_request = waiting[0]
+    origin = _batchable(service, first, first_request)
+    if origin is None:
+        return []
+    batch = [(first, first_request, origin)]
+    for operation, request in waiting[1:]:
+        if len(batch) >= ceiling:
+            break
+        if request.get('project') != first_request['project']:
+            continue
+        if _batchable(service, operation, request) != origin:
+            continue
+        batch.append((operation, request, origin))
+    return batch
+
+
+def publish_batch(service, batch, executor):
+    """One model consultation and one publication for a batch of waiting sources of one project.
+
+    Each member is claimed under its own token, so a batch never holds a lock over a source it does not
+    settle and a member held by another attempt simply stays out of this batch. `Editor.edit_batch`
+    consults the model once and settles every member on its own request row; each disposition then
+    reaches that source's journal exactly as a single source's does: `applied` for a receipt (its own or
+    one this pass replayed), `parked`/`failed` for a refusal charged to that source's own attempt count,
+    and nothing at all for a source the batch dropped or left busy — it spends no attempt and stays
+    waiting for the next batch of the same pass.
+
+    Returns {operation_id: {'state': 'applied' | 'parked' | 'failed' | 'deferred' | 'waiting',
+    'code': the refusal or contention code, or None}} for every source of the batch. A `waiting` source
+    spent no attempt: it is still in the waiting list and may join the next batch of the same pass.
+    """
+    claimed, attempts, items, origins = {}, {}, [], {}
+    try:
+        for operation, request, origin in batch:
+            token = service.journal.claim(operation['id'], lease_seconds=3600)
+            if token is None:
+                continue
+            claimed[operation['id']] = token
+            key, hint, charged = _attempt(service, operation['id'])
+            attempts[operation['id']] = charged
+            origins[operation['id']] = origin
+            entry = {'source_operation_id': operation['id'], 'idempotency_key': key,
+                     'request': _editor_request(service, request)}
+            if hint is not None:
+                entry['request']['hint'] = hint
+            items.append(entry)
+        head = items[0]['source_operation_id'] if items else batch[0][0]['id']
+        waiting = {operation['id']: {'state': 'waiting', 'code': 'E_CLAIM'}
+                   for operation, _request, _origin in batch if operation['id'] not in claimed}
+        if not items:
+            return waiting
+        try:
+            result = service.editor.edit_batch(items, origin=origins[head], executor=executor,
+                                               contexts=service.context_bindings)
+        except quota.QuotaWait:
+            return dict(waiting, **{operation_id: {'state': 'deferred', 'code': 'E_QUOTA'}
+                                    for operation_id in claimed})
+        except KelmoError as error:
+            if error.code in UNCHARGED:
+                raise
+            if error.code in BATCH_SHAPE:
+                # The batch itself could not be opened (its head is dismissed, unarchivable, unowned):
+                # only the head is charged for it, exactly as a single source would be.
+                row = park(service, head, error, claimed[head], attempts[head])
+                return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code}
+                                        for operation_id in claimed if operation_id != head},
+                            **{head: {'state': 'failed' if row['state'] == 'failed' else 'parked',
+                                      'code': error.code}})
+            outcome = dict(waiting)
+            for operation_id in claimed:
+                row = park(service, operation_id, error, claimed[operation_id], attempts[operation_id])
+                outcome[operation_id] = {'state': 'failed' if row['state'] == 'failed' else 'parked',
+                                         'code': error.code}
+            return outcome
+        outcome = dict(waiting)
+        for operation, _request, _origin in batch:
+            operation_id = operation['id']
+            if operation_id not in claimed:
+                continue
+            disposition = result['dispositions'].get(operation_id) or {}
+            kind = disposition.get('disposition')
+            if kind in ('applied', 'settled', 'archive-only'):
+                service.journal.stage(operation_id, 'applied', terminal=True, claim_token=claimed[operation_id])
+                outcome[operation_id] = {'state': 'applied', 'code': None}
+            elif kind == 'refused':
+                refusal = KelmoError(disposition['code'], disposition['reason'])
+                row = park(service, operation_id, refusal, claimed[operation_id], attempts[operation_id])
+                outcome[operation_id] = {'state': 'failed' if row['state'] == 'failed' else 'parked',
+                                         'code': disposition['code']}
+            else:
+                outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code')}
+        return outcome
+    finally:
+        for operation_id, token in claimed.items():
+            service.journal.release(operation_id, token)
 
 
 def pending_operations(service, project=None, *, include_unarchived=False, registry=None):
@@ -485,7 +624,9 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     Each source gets one attempt here; a refused one is parked for the next pass or fails after its
     last charged attempt (see `park`). A note waits while an older note is still in the intake, and a
     note that meets a held lock or a busy database is retried in its place (see ORDER_WAIT_SECONDS).
-    The result counts what happened, by operation id.
+    With `[editor] batch_apply` on, the head of the waiting list and the later sources of its project
+    are published as one batch (see `publish_batch`); with the flag off every source goes through
+    `publish` alone, exactly as before. The result counts what happened, by operation id.
     """
     if type(limit) is not int or limit < 1:
         raise KelmoError('E_INPUT', 'The apply limit is a positive integer.')
@@ -520,6 +661,26 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
         if moved:
             continue
         try:
+            batch = (batch_members(service, waiting, service.config.batch_max_sources)
+                     if service.config.batch_apply else [])
+            if len(batch) > 1:
+                # One conversation and one commit for the head of the waiting list and the later sources
+                # of its project; each member still settles on its own row and in its own bucket.
+                outcome = publish_batch(service, batch, executor)
+                moved = False
+                for operation_id, item in outcome.items():
+                    if item['state'] == 'waiting':
+                        continue
+                    seen.add(operation_id)
+                    report[item['state']].append(operation_id)
+                    moved = True
+                if not moved:
+                    # Nothing this batch touched left the waiting list: name the head and move on, so a
+                    # source another attempt holds never spins the pass.
+                    seen.add(operation['id'])
+                    report['skipped'].append({'operation_id': operation['id'],
+                                              'error_code': outcome[operation['id']]['code'] or 'E_BUSY'})
+                continue
             if service.editor.deferred_until(operation['id']) is not None:
                 seen.add(operation['id'])
                 report['deferred'].append(operation['id'])
