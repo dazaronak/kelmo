@@ -1,7 +1,6 @@
-"""Dreaming's apply pass pays one model conversation and one commit per waiting source: the replay
-benchmark that measures it, kept so a batching change can be compared against the same replay.
+"""Dreaming's apply pass: the replay benchmark that measures what it costs, before and after batching.
 
-Run it as a benchmark (one command, the numbers):
+Run it as a benchmark (one command, both figures):
 
     PYTHONPATH=src python tests/test_dreaming_cost.py
 
@@ -16,11 +15,11 @@ here — one page expansion, then a proposal that records the note's own line on
 and counts every `ModelJob` it receives. Nothing here changes the editor or `apply_pending`: the pass
 runs as it is.
 
-The figure the benchmark command prints:
+The single-source figure, printed by the benchmark command with `[editor] batch_apply` off (the default):
 
-    sources=12 published=12 parked=0 model_calls=24 calls_per_published_note=2.00 publications=12
-    payload_tokens=35926
-    payload_context=32806 payload_source=3096 payload_receipts=24 execute_calls=24
+    single  sources=12 published=12 parked=0 model_calls=24 calls_per_published_note=2.00 publications=12
+            payload_tokens=35926
+            payload_context=32806 payload_source=3096 payload_receipts=24 execute_calls=24
 
 so twelve waiting notes across two projects cost twenty-four model calls and twelve commits, and of the
 35926 estimated tokens the payloads carried, 32806 were pages, mandatory rules and the project index —
@@ -28,6 +27,24 @@ re-sent on every call — while 3096 carried the notes themselves. A real model 
 spend its second expansion and its repair rounds (`MAX_EXPANSIONS`, `MAX_REPAIRS`); what this fixture
 reproduces is the multiplier they share — one conversation per source over the same project pages, and one
 commit per source.
+
+The batched figure is the same fixture and the same model behaviour under `[editor] batch_apply = true`,
+printed by the same command beside it:
+
+    batched sources=12 published=12 parked=0 model_calls=4 calls_per_published_note=0.33 publications=2
+            payload_tokens=7516
+            payload_context=3888 payload_source=3624 payload_receipts=4 execute_calls=4
+
+so the same twelve notes cost four model calls and two commits — one batch per project, the app batch
+held to `DEFAULT_BATCH_MAX_SOURCES` (8) and the ops batch of 4 — and the payload they carried was 7516
+estimated tokens against 35926. The notes themselves cost a little more in a batch (3624 against 3096: both
+passes send 24 source blocks, and a batch block names its 36-character `operation_id`, measured here by
+re-costing the same 24 blocks without that key — 22 tokens each, 528 over the pass), while the project
+pages, mandatory rules and index that the single-source pass re-sent on all twenty-four calls are sent four
+times instead (3888 against 32806): the saving is the context, not the notes. `calls_per_published_note` is
+below 1 because a batch publishes more than one note per conversation; the per-source accounting the
+single-source figure shows is unchanged for a source the batch drops or leaves for its own attempt
+(`tests/test_dreaming_batched_apply.py`).
 """
 import sys
 
@@ -77,6 +94,46 @@ class ReplayExecutor:
         return self.world.propose(facts=[fact])
 
 
+class BatchReplay:
+    """A fake model that answers a batch payload the way the nightly one does: one proposal naming every source.
+
+    Used for the batched figure (`[editor] batch_apply = true`): the batch is one conversation, so the
+    expansion round is asked once for the batch and the proposal round carries one fact per member, each
+    naming the source it comes from. A single-source payload (the head of a batch the ceiling left over, or
+    a source the budget shrank out) is answered exactly as `ReplayExecutor` answers it, so one executor
+    covers both paths of a batched pass.
+
+    `jobs` holds every `ModelJob` it received, batch payloads included, so the payload cost of a batched
+    call is read from the same place the single-source figure reads it.
+    """
+
+    def __init__(self, world):
+        self.world, self.jobs = world, []
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        self.jobs.append(job)
+        payload = job.payload
+        wanted = [page for page in PROJECTS[payload['project']]['expand'] if page in payload['expandable']]
+        if payload['expansions_left'] and wanted:
+            return ModelOutcome('expand', {'pages': wanted})
+        blocks = list(payload['sources']) if 'sources' in payload else [payload['source']]
+        facts, checks = [], []
+        for block in blocks:
+            evidence = block['evidence']['content_sha256']
+            fact = dict(fact_key=f"{payload['project']}.replay-{evidence[:10]}",
+                        target=payload['pages'][0]['target'], text=block['text'].strip(), status='active',
+                        expected_revision=None)
+            check = {'fact_key': fact['fact_key'], 'verified_match': {'result': 'not_found',
+                                                                      'search_id': self.world.service.reconcile(
+                                                                          fact['text'], fact['target'])['search_id']}}
+            if 'sources' in payload:
+                fact['source'] = check['source'] = block['operation_id']
+            facts.append(fact)
+            checks.append(check)
+        return ModelOutcome('proposal', {'facts': facts, 'fact_checks': checks})
+
+
 class Counted:
     """The executor `apply_pending` is handed: it counts the `execute` calls made through it, so the fake
     model's own job list can be checked against the calls the editor actually made."""
@@ -106,17 +163,28 @@ def capture(world, counts=COUNTS):
     return texts
 
 
-def measure(world, counts=COUNTS, broken=None):
-    """One `kelmo dream apply` pass over the fixture, with the numbers the pass is measured by."""
-    from kelmo.creation import apply_pending
+def batch_mode(world, max_sources=None):
+    """Write the `[editor]` table the batched pass runs under: nightly mode with `batch_apply` on."""
+    from kelmo.config import Config
+    lines = ['mode = "nightly"', 'batch_apply = true']
+    if max_sources is not None:
+        lines.append('batch_max_sources = ' + str(max_sources))
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[editor]\n' + '\n'.join(lines) + '\n',
+                    encoding='utf-8')
+    world.service.config = Config.load(world.root)
+
+
+def blocks_of(payload):
+    """The source blocks one payload carried: the batch's list, or the one source."""
+    return list(payload['sources']) if 'sources' in payload else [payload['source']]
+
+
+def numbers(world, executor, counted, report, counts, before):
+    """The headline the benchmark prints, read off one finished pass."""
     from kelmo.wiki import views
-    texts = capture(world, counts)
-    executor = ReplayExecutor(world, broken=() if broken is None else (texts[broken],))
-    counted = Counted(executor)
-    before = commits(world.root)
-    report = apply_pending(world.service, counted)
     payloads = [job.payload for job in executor.jobs]
-    source = sum(views._cost(payload['source']) for payload in payloads)
+    source = sum(views._cost(block) for payload in payloads for block in blocks_of(payload))
     receipts = sum(views._cost(payload['reconciliations']) for payload in payloads)
     charged = sum(payload['budget']['used_tokens'] for payload in payloads)
     published = len(report['applied'])
@@ -136,11 +204,36 @@ def measure(world, counts=COUNTS, broken=None):
     }
 
 
+def measure(world, counts=COUNTS, broken=None, batch=False):
+    """One `kelmo dream apply` pass over the fixture, with the numbers the pass is measured by."""
+    from kelmo.creation import apply_pending
+    texts = capture(world, counts)
+    if batch:
+        executor = BatchReplay(world)
+    else:
+        executor = ReplayExecutor(world, broken=() if broken is None else (texts[broken],))
+    counted = Counted(executor)
+    before = commits(world.root)
+    return numbers(world, executor, counted, apply_pending(world.service, counted), counts, before)
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     built = build_world(tmp_path, monkeypatch, other_project=True)
     try:
         yield next(built)
+    finally:
+        built.close()
+
+
+@pytest.fixture
+def batched_world(tmp_path, monkeypatch):
+    """The same fixture under `[editor] mode = "nightly"` with `batch_apply = true`."""
+    built = build_world(tmp_path, monkeypatch, other_project=True)
+    try:
+        world = next(built)
+        batch_mode(world)
+        yield world
     finally:
         built.close()
 
@@ -190,27 +283,54 @@ def test_the_pass_re_reads_the_same_project_pages_for_every_source_it_publishes(
     assert result['payload_context'] > 9 * result['payload_source']
 
 
+def waiting_batches(result):
+    """The size of each batch payload the pass consulted, in the order it consulted them."""
+    return [len(job.payload['sources']) for job in result['executor'].jobs if 'sources' in job.payload]
+
+
+def test_the_batched_pass_publishes_every_waiting_source_of_the_same_fixture(batched_world):
+    result = measure(batched_world, batch=True)
+    report = result['report']
+    assert (len(report['applied']), len(report['parked']), len(report['failed'])) == (12, 0, 0)
+    assert report['stalled'] == [] and report['skipped'] == [] and report['deferred'] == []
+    assert waiting_batches(result) == [8, 8, 4, 4], \
+        'one batch per project, bounded by the ceiling of 8, each consulted twice: expansion then proposal'
+
+
+def test_the_after_figure_is_one_conversation_and_one_commit_per_batch_of_one_project(batched_world):
+    figures = {name: value for name, value in measure(batched_world, batch=True).items()
+               if name in HEADLINE + EXTRA}
+    assert figures == {'sources': 12, 'published': 12, 'parked': 0, 'model_calls': 4,
+                       'calls_per_published_note': 0.33, 'publications': 2, 'payload_tokens': 7516,
+                       'payload_context': 3888, 'payload_source': 3624, 'payload_receipts': 4,
+                       'execute_calls': 4}, \
+        'the batched pass changed shape; re-run the benchmark command and move the figure with it'
+
+
 def main():
     import shutil
     import tempfile
     from pathlib import Path
     scratch = Path(tempfile.mkdtemp(prefix='dreaming-cost-'))
+    results = {}
     try:
         with Patcher() as patcher:
-            built = build_world(scratch, patcher, other_project=True)
-            try:
-                world = next(built)
-                nightly(world)
-                result = measure(world)
-            finally:
-                built.close()
+            for label, batch in (('single', False), ('batched', True)):
+                built = build_world(scratch / label, patcher, other_project=True)
+                try:
+                    world = next(built)
+                    batch_mode(world) if batch else nightly(world)
+                    results[label] = measure(world, batch=batch)
+                finally:
+                    built.close()
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    print(' '.join(f'{name}={result[name]:.2f}' if isinstance(result[name], float)
-                   else f'{name}={result[name]}' for name in HEADLINE))
-    print(' '.join(f'{name}={result[name]}' for name in EXTRA))
-    report = result['report']
-    print('report ' + ' '.join(f'{key}={len(value)}' for key, value in report.items()))
+    for label, result in results.items():
+        print(label + ' ' + ' '.join(f'{name}={result[name]:.2f}' if isinstance(result[name], float)
+                                     else f'{name}={result[name]}' for name in HEADLINE))
+        print(' ' * len(label) + ' ' + ' '.join(f'{name}={result[name]}' for name in EXTRA))
+        print(' ' * len(label) + ' report ' + ' '.join(f'{key}={len(value)}'
+                                                       for key, value in result['report'].items()))
     return 0
 
 
