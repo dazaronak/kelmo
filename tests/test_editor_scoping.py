@@ -865,7 +865,9 @@ def test_fact_promotion_requires_real_reconciliation_receipts(world):
 
     def checked(job):
         [found] = job.payload['reconciliations']
-        assert (found['text'], found['target']) == (IMPORTS['text'], NOTES) and 'candidates' in found
+        assert (found['text'], found['target']) == (IMPORTS['text'], NOTES)
+        assert 'candidates' not in found and found['candidate_keys']
+        assert [item['fact_key'] for item in job.payload['candidates']] == found['candidate_keys']
         return proposal(facts=[IMPORTS], fact_checks=receipt_for(
             IMPORTS, {'result': 'not_found', 'search_id': found['search_id']}))
 
@@ -901,6 +903,136 @@ def test_a_miscopied_search_id_takes_the_receipt_of_the_same_text(world):
     assert receipt.outcome == 'published' and world.fact('app.notes-imports')['text'] == IMPORTS['text']
     [check] = world.service.journal.action_intent(receipt.operation_id)['fact_checks']
     assert check['verified_match']['search_id'] == executor.jobs[1].payload['reconciliations'][0]['search_id']
+
+
+ASKED_TEXTS = ['Notes cover the export pipeline in reading ' + str(index) + '.' for index in range(29)]
+
+
+def search_rows(world):
+    return world.service.journal.conn.execute('SELECT COUNT(*) AS total FROM fact_searches').fetchone()['total']
+
+
+def test_thirty_searches_over_the_same_facts_send_each_candidate_once(world):
+    """The shape of the note that failed with "the budget cannot hold the page index": 30 searches, each
+    carrying the whole text of the facts it matched, charged before any page. A receipt now names its
+    candidates by key and the payload carries each fact once, however many searches returned it."""
+    from kelmo.executor import ModelOutcome
+    from kelmo.wiki import views
+    source, _ = world.archive('Notes now cover the import pipeline.', key='crowded')
+    asks = ModelOutcome('reconcile', {'facts': [{'text': text, 'target': NOTES} for text in ASKED_TEXTS]
+                                     + [{'text': IMPORTS['text'], 'target': NOTES}]})
+
+    def checked(job):
+        receipts, candidates = job.payload['reconciliations'], job.payload['candidates']
+        assert len(receipts) == 30 and all('candidates' not in item for item in receipts)
+        assert all(item['candidate_keys'] for item in receipts)
+        assert len(candidates) == len({item['fact_key'] for item in candidates})
+        assert sum(len(item['candidate_keys']) for item in receipts) > len(candidates)
+        assert [item['fact_key'] for item in candidates] == receipts[0]['candidate_keys']
+        [own] = [item for item in receipts if item['text'] == IMPORTS['text']]
+        return proposal(facts=[IMPORTS], fact_checks=receipt_for(
+            IMPORTS, {'result': 'not_found', 'search_id': own['search_id']}))
+
+    executor = Scripted(asks, checked)
+    receipt = world.edit(source, executor, key='crowded', selected=(NOTES,))
+    assert receipt.outcome == 'published' and world.fact('app.notes-imports')['text'] == IMPORTS['text']
+    payload = executor.jobs[1].payload
+    charged = payload['budget']['receipt_tokens']
+    assert charged == views.receipt_cost(payload['reconciliations'], payload['candidates'])
+    inline = views._cost([dict(item, candidates=[fact for fact in payload['candidates']
+                                                 if fact['fact_key'] in item['candidate_keys']])
+                          for item in payload['reconciliations']])
+    assert charged < inline // 2, 'the same 30 searches no longer repeat the candidate text 30 times'
+    assert payload['budget']['used_tokens'] < payload['budget']['max_tokens'] // 2, \
+        'the receipts of this round no longer crowd the pages out of the budget'
+
+
+def test_thirty_searches_over_the_same_facts_cost_about_what_one_does():
+    """The arithmetic the dedup exists for, measured on a full page of candidates: 30 searches that all
+    return the same 20 facts charge each fact once, so the round costs what one search costs plus the keys
+    the other 29 name — not 30 copies of the same text. Synthetic facts, and `receipt_cost` is exactly what
+    `editor_view` charges and what the consult loop measures a round against."""
+    from kelmo import fact_checks
+    from kelmo.wiki import views
+    facts = [fact_checks.candidate_fact('app.candidate-%02d' % index,
+                                        dict(text='Candidate fact %d records the export pipeline nightly.' % index,
+                                             target=NOTES, revision='r' * 64))
+             for index in range(20)]
+    receipts = [{'text': 'The export pipeline in reading %d.' % index, 'target': NOTES,
+                 'search_id': '0' * 31 + str(index % 10), 'total_facts': 20, 'matched_facts': 20,
+                 'truncated': False, 'method': 'lexical', 'proves_absence': False,
+                 'candidate_keys': [fact['fact_key'] for fact in facts]}
+                for index in range(30)]
+    charged = views.receipt_cost(receipts, facts)
+    assert charged == views.receipt_cost(receipts, ()) + views._cost(facts), \
+        'the candidate text is charged once however many searches named it'
+    assert charged < 5 * views.receipt_cost(receipts[:1], facts), \
+        'thirty searches over the same facts cost about what one does'
+    assert charged < views._cost([dict(item, candidates=facts) for item in receipts]) // 4, \
+        'the shape that crowded the pages out of the budget is gone'
+
+
+def test_a_reconcile_round_past_the_receipt_ceiling_runs_no_search_and_sends_the_repair(world):
+    """Receipts never produce `E_BUDGET`: the ceiling is decided before the searches run, so a round that
+    would pass it costs no searches, leaves the pages sent, and the model gets a repair instead."""
+    from kelmo import outcomes
+    from kelmo.executor import ModelOutcome
+    source, _ = world.archive('Notes now cover the export pipeline in a new reading.', key='ceiling')
+    budget = 1200
+    asks = ModelOutcome('reconcile', {'facts': [{'text': text, 'target': NOTES} for text in ASKED_TEXTS]})
+    executor = Scripted(asks, proposal())
+    receipt = world.edit(source, executor, key='ceiling', selected=(NOTES,), budget=budget)
+    assert receipt.outcome == 'unchanged', 'the ceiling refuses the round, not the note'
+    assert world.outcome(source)['disposition'] == 'archive-only'
+    assert search_rows(world) == 0, 'the searches of a refused round were never run'
+    first, second = executor.jobs
+    assert first.payload['budget']['receipt_ceiling'] == budget // 4
+    assert first.payload['reconciliations'] == [] and 'candidates' not in first.payload
+    refusal = second.payload['refusal']
+    assert refusal['code'] == 'E_PROPOSAL' and set(refusal) == {'code', 'reason'}
+    assert 'may cost at most ' + str(budget // 4) + ' estimated tokens of its ' + str(budget) in refusal['reason']
+    assert 'No search was run: propose with the receipts you already have' in refusal['reason']
+    assert len(refusal['reason']) <= outcomes.REASON_LIMIT
+    assert second.payload['reconciliations'] == [] and 'candidates' not in second.payload
+    assert second.payload['budget']['receipt_tokens'] == first.payload['budget']['receipt_tokens']
+    assert [block['target'] for block in second.payload['pages']] == [NOTES], 'the pages stayed sent'
+
+
+def test_a_fact_check_still_verifies_against_the_search_id_of_its_own_receipt(world):
+    """The dedup is a payload change, not a verification change: a fact is still proved by the receipt
+    issued for its own text and target, and another search's id for the same candidates is refused."""
+    from kelmo.errors import KelmoError
+    from kelmo.executor import ModelOutcome
+    other = 'Notes cover the export pipeline.'
+    source, _ = world.archive('Notes now cover the import pipeline.', key='own-receipt')
+    asks = ModelOutcome('reconcile', {'facts': [{'text': other, 'target': NOTES},
+                                                {'text': IMPORTS['text'], 'target': NOTES}]})
+
+    def receipts_of(job):
+        return [item for item in job.payload['reconciliations'] if item['text'] in (other, IMPORTS['text'])]
+
+    def citing(job, chosen):
+        receipts = receipts_of(job)
+        [own] = [item for item in receipts if item['text'] == IMPORTS['text']]
+        [same_candidates] = [item for item in receipts if item['text'] == other]
+        assert own['candidate_keys'] == same_candidates['candidate_keys'], 'both searches named the same facts'
+        assert own['search_id'] != same_candidates['search_id']
+        assert [item['fact_key'] for item in job.payload['candidates']] == own['candidate_keys']
+        return proposal(facts=[IMPORTS], fact_checks=receipt_for(
+            IMPORTS, {'result': 'not_found', 'search_id': chosen(own, same_candidates)['search_id']}))
+
+    before = world.registry()
+    with pytest.raises(KelmoError) as error:
+        world.edit(source, Scripted(asks, lambda job: citing(job, lambda own, other: other)),
+                   key='other-search', selected=(NOTES,))
+    assert error.value.code == 'E_FACT_CHECK' and world.registry() == before
+
+    executor = Scripted(asks, lambda job: citing(job, lambda own, other: own))
+    receipt = world.edit(source, executor, key='own-search', selected=(NOTES,))
+    assert receipt.outcome == 'published' and world.fact('app.notes-imports')['text'] == IMPORTS['text']
+    [own] = [item for item in executor.jobs[1].payload['reconciliations'] if item['text'] == IMPORTS['text']]
+    [check] = world.service.journal.action_intent(receipt.operation_id)['fact_checks']
+    assert check['verified_match']['search_id'] == own['search_id']
 
 
 def test_prepared_fact_receipts_are_revalidated_before_publication(world, monkeypatch):

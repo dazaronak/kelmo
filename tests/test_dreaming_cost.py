@@ -185,7 +185,11 @@ def numbers(world, executor, counted, report, counts, before):
     from kelmo.wiki import views
     payloads = [job.payload for job in executor.jobs]
     source = sum(views._cost(block) for payload in payloads for block in blocks_of(payload))
-    receipts = sum(views._cost(payload['reconciliations']) for payload in payloads)
+    # A receipt names its candidate facts by key and the payload carries each of them once, so the receipts
+    # of a pass are the receipts plus the candidate text they share: `views.receipt_cost` is what the view
+    # itself charges.
+    receipts = sum(views.receipt_cost(payload['reconciliations'], payload.get('candidates', ()))
+                   for payload in payloads)
     charged = sum(payload['budget']['used_tokens'] for payload in payloads)
     published = len(report['applied'])
     return {

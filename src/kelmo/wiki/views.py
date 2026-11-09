@@ -24,6 +24,16 @@ def _cost(value):
     return estimate(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
+def receipt_cost(reconciliations, candidates=()):
+    """What the reconciliation receipts and the candidate facts they name cost the payload.
+
+    The consult loop measures a reconcile round with this before running it, so the ceiling is decided
+    with no search done and no page left unsent; `editor_view` charges exactly this figure. An empty
+    candidate list costs nothing, because the payload does not carry the key then."""
+    reconciliations, candidates = list(reconciliations), list(candidates)
+    return _cost(reconciliations) + (_cost(candidates) if candidates else 0)
+
+
 def dependencies(registry, target):
     """Registered pages one page depends on: parent, links both ways, narrative and action subjects."""
     entries = registry['pages']
@@ -81,12 +91,18 @@ def _mandatory(reader, generation):
 
 
 def editor_view(reader, generation, project, selected, budget_tokens, *, source_text=None, evidence=None,
-                expansions=(), reconciliations=(), sources=None):
+                expansions=(), reconciliations=(), sources=None, candidates=()):
     """Everything one editor job may read from `generation`, within `budget_tokens` estimated tokens.
 
     `reconciliations` are the fact_checks search receipts already issued for this job; like the
-    source, they are sent whole or the call refuses. `readable` names mandatory dependency pages
-    delivered with their entities: visible for dependencies, never editable scope.
+    source, they are sent whole or the call refuses. Each names its matching facts by key, and
+    `candidates` carries the whole of each one once for the payload, however many searches returned it.
+    `readable` names mandatory dependency pages delivered with their entities: visible for dependencies,
+    never editable scope.
+
+    `fixed_tokens` is what the payload carries before any page and before the receipts: the source, every
+    mandatory rule and the project index. The consult loop reads it to bound the receipts of the next
+    reconcile round, so receipts can never be what pushes the pages out of the budget.
 
     `sources` (batched Dreaming apply) replaces the single source
     with a list of `{'operation_id', 'text', 'evidence'}` (optionally `hint`) in capture order: the
@@ -133,16 +149,25 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
               'summary': entry['summary']}
              for target, entry in sorted(registry['pages'].items()) if pages.project_of(target) == project]
     reconciliations = list(reconciliations)
-    used = (cost + _cost(reconciliations)
-            + sum(_cost(rule) if rule.get('readable') else estimate(rule['target'] + '\n' + rule['content'])
-                  for rule in rules))
+    candidates = list(candidates)
+    charged = receipt_cost(reconciliations, candidates)
+    fixed = (cost
+             + sum(_cost(rule) if rule.get('readable') else estimate(rule['target'] + '\n' + rule['content'])
+                   for rule in rules))
+    used = fixed + charged
     if used > budget_tokens:
         raise KelmoError('E_BUDGET', 'The editor budget cannot hold the archived source, its reconciliation '
                                     'receipts and every mandatory person rule; nothing was sent and nothing is '
                                     'labelled complete.')
-    used += _cost(index)
-    if used > budget_tokens:
+    index_cost = _cost(index)
+    if used + index_cost > budget_tokens:
         raise KelmoError('E_BUDGET', 'The editor budget cannot hold the page index of project ' + project + '.')
+    used += index_cost
+    # What the payload carries before any page: the source, every mandatory rule and the project index,
+    # the receipts excluded. `budget - fixed_tokens` is the room the receipts may still take, and the
+    # consult loop measures each reconcile round against it, so neither budget refusal above can be the
+    # receipts' doing and the pages keep what is left.
+    fixed += index_cost
     required = {rule['target'] for rule in rules}
     sent, snapshots, omitted, unmet = [], [], [], []
     for target in dict.fromkeys([*selected, *expansions]):
@@ -171,8 +196,14 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
                'expandable': [row['target'] for row in index if row['target'] not in scope
                               and row['target'] not in required],
                'budget': {'max_tokens': budget_tokens, 'used_tokens': used,
+                          'receipt_tokens': charged,
                           'metric': 'estimated tokens: UTF-8 bytes / 2.5'}}
+    if candidates:
+        # The whole text of every candidate the receipts name, once for the whole payload: a fact a
+        # second search returned adds no bytes, only its key to that search's own entry.
+        payload['candidates'] = candidates
     if batch is not None:
         payload['sources'] = payload.pop('source')
     return {'bundle': bundle, 'payload': payload, 'scope': scope, 'omitted': omitted,
-            'omitted_budget': unmet, 'used_tokens': used, 'readable': readable}
+            'omitted_budget': unmet, 'used_tokens': used, 'readable': readable,
+            'fixed_tokens': fixed, 'receipt_tokens': charged}

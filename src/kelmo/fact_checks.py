@@ -19,6 +19,11 @@ def binding(text, target):
     return engine.digest(engine.encoded([text, target]))
 
 
+# `search` answers a uuid4 hex for its id. The plan of a round the editor has not run yet carries a
+# placeholder of the same length, so the cost it measures is the cost the receipts will really have.
+PLACEHOLDER_SEARCH_ID = '0' * 32
+
+
 def select_candidates(facts, text, target):
     words = set(re.findall(r'\w+', text.casefold()))
     return sorted(
@@ -33,14 +38,23 @@ def candidate_snapshot(facts, text, target):
     return {key: fact['revision'] for key, fact in select_candidates(facts, text, target)[:20]}
 
 
-def search(connection, facts, text, target):
+def candidate_fact(key, fact):
+    """The whole of one candidate a search returns: what the shared candidate list carries for its key."""
+    return {'fact_key': key, 'text': fact['text'], 'target': fact['target'], 'revision': fact['revision']}
+
+
+def _accepted_text(text):
     if not isinstance(text, str) or not text.strip() or len(text) > 400:
         raise KelmoError('E_INPUT', 'Provide proposed fact text, at most 400 characters.')
+    return text
+
+
+def search(connection, facts, text, target):
+    text = _accepted_text(text)
     ranked = select_candidates(facts, text, target)
     snapshot = engine.digest(engine.encoded(candidate_snapshot(facts, text, target)))
     identity = binding(text, target) + ':' + snapshot
-    candidates = [dict(fact_key=key, text=fact['text'], target=fact['target'],
-                       revision=fact['revision']) for key, fact in ranked[:20]]
+    candidates = [candidate_fact(key, fact) for key, fact in ranked[:20]]
     with connection:
         connection.execute('''INSERT OR IGNORE INTO fact_searches
             (id,binding,snapshot,candidates) VALUES (?,?,?,?)''',
@@ -48,6 +62,19 @@ def search(connection, facts, text, target):
     row = connection.execute('SELECT id,candidates FROM fact_searches WHERE binding=?',
                              (identity,)).fetchone()
     return {'search_id': row['id'], 'candidates': json.loads(row['candidates']),
+            'total_facts': len(facts), 'matched_facts': len(ranked), 'truncated': len(ranked) > 20,
+            'method': 'lexical', 'proves_absence': False}
+
+
+def search_plan(facts, text, target):
+    """What `search` would answer for this text and target, without touching the store.
+
+    The editor measures a reconcile round before running it, so it needs the size of the receipt and of
+    the candidates it would name while no search has happened yet. `search_id` is a uuid4 hex, so the
+    placeholder here has the length the real one will have; the candidates are the ones `search` returns."""
+    ranked = select_candidates(facts, _accepted_text(text), target)
+    return {'search_id': PLACEHOLDER_SEARCH_ID,
+            'candidates': [candidate_fact(key, fact) for key, fact in ranked[:20]],
             'total_facts': len(facts), 'matched_facts': len(ranked), 'truncated': len(ranked) > 20,
             'method': 'lexical', 'proves_absence': False}
 

@@ -149,6 +149,31 @@ class Reconciling(BatchModel):
         return super().execute(job)
 
 
+CEILING_ASK = 'The audit closed every open item of that week.'
+
+
+class CeilingReconciler(BatchModel):
+    """The batch replay after one reconcile round whose receipts would pass the batch's receipt ceiling.
+
+    Every source of the batch asks for the same text, so the round names the same candidate facts once
+    per search: the ceiling decides the round, and the batch keeps the pages it already had.
+    """
+
+    def __init__(self, world):
+        super().__init__(world)
+        self.asked = False
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        payload = job.payload
+        if 'sources' in payload and not self.asked and not payload['reconciliations']:
+            self.asked = True
+            self.jobs.append(job)
+            return ModelOutcome('reconcile', {'facts': [{'text': CEILING_ASK, 'target': FEATURE}
+                                                        for _ in payload['sources']]})
+        return super().execute(job)
+
+
 def counted(inner):
     from test_dreaming_cost import Counted
     return Counted(inner)
@@ -257,10 +282,12 @@ def test_the_budget_shrink_drops_the_newest_source_and_it_stays_in_the_pass(worl
 def test_a_shrink_inside_the_conversation_drops_the_newest_source_into_its_own_attempt(world):
     """The shrink the preflight cannot see: a reconciliation round makes the view too big mid-batch."""
     from kelmo.creation import apply_pending
-    # Measured on this fixture with FEATURE selected at budget 1950 (the batch view's `budget.used_tokens`):
-    # the three padded sources cost 1570 and fit, the same view with one reconciliation receipt costs 1752
-    # and sends no selected page, and the two-source view with that receipt costs 1821 and sends FEATURE.
-    editor_mode(world, budget=SHRINK_BUDGET)
+    # Measured on this fixture with FEATURE selected at budget 2000 (the batch view's `budget.used_tokens`):
+    # the three padded sources cost 1570 and fit, the same view with one reconciliation receipt costs 1788
+    # and sends no selected page (the FEATURE page needs 390), and the two-source view with that receipt
+    # costs 1857 and sends FEATURE. 2000 also leaves the receipt round (492) under the ceiling of 500, so
+    # the round runs and the shrink is the view's, not the ceiling's.
+    editor_mode(world, budget=2000)
     texts = long_notes(3, pads=2)
     ids = capture(world, texts)
     before = commits(world)
@@ -274,6 +301,36 @@ def test_a_shrink_inside_the_conversation_drops_the_newest_source_into_its_own_a
     assert ids[2] not in [block['operation_id'] for block in batched[-1].payload['sources']]
     assert [event for event in world.service.trace(ids[2])['events'] if event['stage'] == 'parked'] == [], \
         'the source the batch shrank out spends no attempt and is never refused under its own key'
+
+
+def test_a_batch_reconcile_past_the_receipt_ceiling_runs_no_search_and_keeps_the_batch(world):
+    """The batch half of the receipt ceiling: the round is refused before its searches run, the model gets
+    the repair, and the batch publishes with the pages it already had — no `E_BUDGET` anywhere in the pass."""
+    from kelmo import outcomes
+    from kelmo.creation import apply_pending
+    from kelmo.fact_checks import binding
+    budget = 1800
+    editor_mode(world, budget=budget)
+    ids = capture(world, notes(3))
+    before = commits(world)
+    model = counted(CeilingReconciler(world))
+    report = apply_pending(world.service, model)
+    batched = [job for job in model.inner.jobs if 'sources' in job.payload]
+    assert [len(job.payload['sources']) for job in batched] == [3, 3], \
+        'the ceiling refused the reconcile round, not the batch: no source was shrunk out'
+    assert sorted(report['applied']) == sorted(ids) and (report['parked'], report['failed']) == ([], [])
+    assert commits(world) - before == 1, 'the batch still publishes its three notes in one commit'
+    first, second = batched
+    assert first.payload['budget']['receipt_ceiling'] == budget // 4
+    assert second.payload['reconciliations'] == [] and 'candidates' not in second.payload
+    refusal = second.payload['refusal']
+    assert refusal['code'] == 'E_PROPOSAL' and set(refusal) == {'code', 'reason'}
+    assert 'may cost at most ' + str(budget // 4) + ' estimated tokens of its ' + str(budget) in refusal['reason']
+    assert 'No search was run: propose with the receipts you already have' in refusal['reason']
+    assert len(refusal['reason']) <= outcomes.REASON_LIMIT
+    asked = world.service.journal.conn.execute('SELECT COUNT(*) AS total FROM fact_searches WHERE binding LIKE ?',
+                                               (binding(CEILING_ASK, FEATURE) + ':%',)).fetchone()
+    assert asked['total'] == 0, 'the refused round ran none of the searches it asked for'
 
 
 def test_a_batch_budget_that_sends_no_page_refuses_without_a_model_call(world):
