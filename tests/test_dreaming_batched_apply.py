@@ -906,6 +906,42 @@ def test_two_notes_with_the_same_new_work_publish_onto_one_page_in_a_batched_pas
         sorted(ref['content_sha256'] for ref in evidence), 'each fact cites its own note'
 
 
+def test_a_batch_member_the_outcome_store_refuses_parks_past_its_attempts(world, monkeypatch):
+    """The batch path shares the bound: a refusal the vault causes does not fail the note it parks.
+
+    Every pass of the batch meets the same E_OUTCOME, so the note would run out of its PARK_ATTEMPTS at
+    once; the first FREE_STALE_REFUSALS of them are not charged, and only past that bound the note fails
+    and the owner is alerted."""
+    import sys
+
+    from kelmo import creation, editor, outcomes
+    from kelmo.config import Config
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    scratch = world.root.parent
+    script = scratch / 'alert.py'
+    script.write_text('import sys\nwith open(sys.argv[1], "a") as out:\n    out.write(sys.stdin.read() + "\\n")\n')
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[alerts]\ncommand = ["' + sys.executable + '", "'
+                      + str(script) + '", "' + str(scratch / 'messages.txt') + '"]\n', encoding='utf-8')
+    world.service.config = Config.load(world.root)
+    ids = capture(world, notes(2))
+    monkeypatch.setattr(editor, '_summary', lambda delta: 'outcome reason ' + 'x' * outcomes.REASON_LIMIT)
+    states = []
+    for _ in range(creation.FREE_STALE_REFUSALS + creation.PARK_ATTEMPTS):
+        report = apply_pending(world.service, counted(BatchModel(world)))
+        states.append((report['parked'], report['failed']))
+        if report['failed']:
+            break
+    assert all(not failed for _parked, failed in states[:-1]), states
+    assert sorted(states[-1][1]) == sorted(ids), states[-1]
+    assert all(sorted(parked) == sorted(ids) for parked, _failed in states[:-1])
+    assert len(states) == creation.FREE_STALE_REFUSALS + creation.PARK_ATTEMPTS
+    lines = (scratch / 'messages.txt').read_text().splitlines()
+    assert len(lines) == 2, lines
+    assert all('could not be placed after' in line for line in lines)
+
+
 def test_a_batch_refusal_sends_the_page_it_names_and_the_batch_publishes_the_repair(world):
     """The batch path gets the same repair: its next round reads the page the refusal named."""
     from kelmo.creation import apply_pending

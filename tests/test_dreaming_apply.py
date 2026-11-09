@@ -315,6 +315,61 @@ def test_stale_refusals_are_free_only_up_to_their_cap(world):
     assert count + 1 == creation.FREE_STALE_REFUSALS + creation.PARK_ATTEMPTS
 
 
+@pytest.mark.parametrize('code', ['E_OUTCOME', 'E_BINDING'])
+def test_an_outcome_or_binding_refusal_is_free_only_up_to_the_same_cap(world, code):
+    """A refusal the vault caused is not the note's fault, but it is not free forever either.
+
+    The first FREE_STALE_REFUSALS of them park without charging the note; past that bound the note runs
+    out of its PARK_ATTEMPTS and fails, and the vault owner is alerted."""
+    import sys
+
+    from kelmo import creation
+    from kelmo.config import Config
+    from kelmo.errors import KelmoError
+    nightly(world)
+    scratch = world.root.parent
+    script = scratch / 'alert.py'
+    script.write_text('import sys\nwith open(sys.argv[1], "a") as out:\n    out.write(sys.stdin.read() + "\\n")\n')
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[alerts]\ncommand = ["' + sys.executable + '", "'
+                      + str(script) + '", "' + str(scratch / 'messages.txt') + '"]\n', encoding='utf-8')
+    world.service.config = Config.load(world.root)
+    operation = world.service.create('Exports run at 23:30.', project='app', selected=[FEATURE])
+    world.service.run(operation['id'])
+    token = world.service.journal.claim(operation['id'], lease_seconds=60)
+    try:
+        for count in range(creation.FREE_STALE_REFUSALS + creation.PARK_ATTEMPTS):
+            _, charged, _ = creation._parked(world.service.trace(operation['id']))
+            result = creation.park(world.service, operation['id'], KelmoError(code, 'Synthetic ' + code + '.'),
+                                   token, charged)
+            if result['state'] == 'failed':
+                break
+    finally:
+        world.service.journal.release(operation['id'], token)
+    assert result['state'] == 'failed'
+    assert count + 1 == creation.FREE_STALE_REFUSALS + creation.PARK_ATTEMPTS
+    assert result['outcome']['reason'].startswith(code + ': ')
+    lines = (scratch / 'messages.txt').read_text().splitlines()
+    assert len(lines) == 1 and 'could not be placed after' in lines[0], lines
+
+
+def test_an_outcome_refusal_parks_a_note_without_failing_it(world):
+    """Repeated bookkeeping refusals keep the note waiting, exactly as a stale generation does."""
+    from kelmo import creation
+    from kelmo.errors import KelmoError
+    nightly(world)
+    operation = world.service.create('Exports run at 23:45.', project='app', selected=[FEATURE])
+    world.service.run(operation['id'])
+    token = world.service.journal.claim(operation['id'], lease_seconds=60)
+    for _ in range(creation.PARK_ATTEMPTS + 1):
+        parked = creation.park(world.service, operation['id'], KelmoError('E_OUTCOME', 'Synthetic E_OUTCOME.'),
+                               token, 0)
+        assert parked['state'] == 'parked'
+    world.service.journal.release(operation['id'], token)
+    parked_count, charged, last = creation._parked(world.service.trace(operation['id']))
+    assert (parked_count, charged, last['error_code']) == (creation.PARK_ATTEMPTS + 1, 0, 'E_OUTCOME')
+
+
 def test_pending_lines_are_delivered_at_startup_until_the_note_is_applied(world):
     from kelmo.creation import apply_pending, pending_summaries
     from kelmo.hot import pending_block

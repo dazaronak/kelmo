@@ -308,11 +308,13 @@ def _editor_request(service, request):
     return result
 
 
-# Refusals another writer causes: the generation moved while the model was consulted. The note is
-# parked and retried with a fresh baseline like any refusal; the first FREE_STALE_REFUSALS of them are
-# not charged, so a busy wiki delays a note without failing it, and a note that is always stale still
-# ends in the owner's alert instead of consulting the model forever.
-UNCHARGED_REFUSALS = ('E_STALE',)
+# Refusals the vault itself causes: the generation moved while the model was consulted (E_STALE), the
+# outcome store refused the reason of a publication (E_OUTCOME), the controller enrollment did not match
+# the pages a proposal would change (E_BINDING). None of them is the note's own content, so the note is
+# parked and retried with a fresh baseline like any refusal; the first FREE_STALE_REFUSALS of them are not
+# charged, so a busy wiki or a broken vault delays a note without failing it, and a note that meets the
+# same refusal forever still ends in the owner's alert instead of consulting the model endlessly.
+UNCHARGED_REFUSALS = ('E_STALE', 'E_OUTCOME', 'E_BINDING')
 FREE_STALE_REFUSALS = 5
 
 
@@ -331,7 +333,7 @@ def _parked(trace):
 
 
 def _free_refusal(trace, error):
-    """Whether this refusal is one of the uncharged stale refusals a note may still spend."""
+    """Whether this refusal is one of the uncharged refusals a note may still spend."""
     if error.code not in UNCHARGED_REFUSALS:
         return False
     spent = sum((event.get('details') or event).get('error_code') in UNCHARGED_REFUSALS
@@ -345,8 +347,11 @@ def park(service, operation_id, error, token, attempts):
     Content refusals (a malformed proposal, a wrong receipt, a stale generation, an executor that
     produced no answer) are never final on their own: the source keeps its archive and outcome
     `unresolved` under state `parked`, and the next pass consults the model again with this refusal
-    as the hint. After PARK_ATTEMPTS charged attempts the refusal is final: the source fails and the
-    vault owner is alerted, since a note the model cannot place three times needs a person.
+    as the hint. The first FREE_STALE_REFUSALS refusals the vault itself causes (UNCHARGED_REFUSALS)
+    spend none of the source's attempts, so a broken outcome store or a moved enrollment never fails a
+    note that the model placed correctly. After PARK_ATTEMPTS charged attempts the refusal is final:
+    the source fails and the vault owner is alerted, since a note the model cannot place three times,
+    or one the vault refuses again and again, needs a person.
     """
     reason = outcomes.repair_reason(error.code, error)
     if not _free_refusal(service.trace(operation_id), error) and attempts + 1 >= PARK_ATTEMPTS:
