@@ -1386,9 +1386,10 @@ class Editor:
                                         for found in reconciliations}}
                 if repairs:
                     refused['repairs'] = [item['code'] for item in repairs]
-                problem = None if len(repairs) >= MAX_REPAIRS or not getattr(executor, 'revises', True) else (
-                    self._precheck_batch(refused, registry, requests, _enrolled(enrollment, work)))
-                if problem is None:
+                # The split runs whatever the repair budget says: it is what records each member's own
+                # slice, and a member whose slice carries an item was published with this batch's commit.
+                problem = self._precheck_batch(refused, registry, requests, _enrolled(enrollment, work))
+                if problem is None or len(repairs) >= MAX_REPAIRS or not getattr(executor, 'revises', True):
                     return refused
                 repairs.append(problem)
                 continue
@@ -1464,8 +1465,14 @@ class Editor:
                                            outcome=_outcome('unresolved', message, code),
                                            result=_result(row['operation_id'], 'unresolved', code))
 
-    def _member_disposition(self, request_key, idem):
-        """What one member row of a published batch ended with, settled from its own recorded answer."""
+    def _member_disposition(self, request_key, idem, slice_=None):
+        """What one member row of a published batch ended with, settled from its own recorded answer.
+
+        `slice_` is the member's slice of the split this call just made; without it the row's own
+        recorded slice is read, which is the only copy a later pass has. A member whose slice carries
+        an item was published with the batch's commit, so it ends `applied` with a published receipt
+        whatever path settled it.
+        """
         row = self.journal.action_request(request_key)
         if row['state'] == 'finished':
             return {'disposition': 'settled', 'receipt': OperationReceipt.from_dict(json.loads(row['receipt']))}
@@ -1477,7 +1484,7 @@ class Editor:
                     'reason': 'its consultation is still held by another attempt'}
         reference = EvidenceRef.from_dict(self.service.journal.evidence_record(row['source_operation_id']))
         generation = Generation.from_dict(observation['generation'])
-        slice_ = observation.get('slice') or {}
+        slice_ = slice_ if slice_ is not None else (observation.get('slice') or {})
         changed = any(slice_.get('delta', {}).get(name) for name in LIMITS)
         disposition, reason = (('applied', _summary(slice_.get('delta', {}))) if changed
                                else ('archive-only', 'the editor proposed no change to the selected pages; '
@@ -1640,7 +1647,8 @@ class Editor:
             raise
         dispositions[publisher] = {'disposition': 'applied', 'receipt': receipt}
         for operation_id in accepted[1:]:
-            dispositions[operation_id] = self._member_disposition(keys[operation_id], idem)
+            dispositions[operation_id] = self._member_disposition(keys[operation_id], idem,
+                                                                  slices[operation_id])
         for operation_id in batch:
             if operation_id in dispositions:
                 continue

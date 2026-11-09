@@ -6,6 +6,8 @@ model conversations and how many commits a pass pays, and what each member sourc
 the batch answer itself (attribution, the split, the collision rule) is `tests/test_dreaming_batched.py`;
 the single-source pass is `tests/test_dreaming_cost.py`.
 """
+import json
+
 import pytest
 
 from test_dreaming_batched import fact_change, fact_entry, page_entry, registry_with
@@ -151,6 +153,14 @@ def commits(world):
 def waiting_ids(world):
     from kelmo.creation import pending_operations
     return [operation['id'] for operation, _request in pending_operations(world.service)]
+
+
+def member_rows(world, ids):
+    """Each member's own request row of the batch that published it."""
+    from kelmo.editor import StateCoordinator
+    keys = [StateCoordinator._request_key('semantic', world.service._operation_origin(operation_id),
+                                          f'create:{operation_id}:1') for operation_id in ids]
+    return [world.service.journal.action_request(key) for key in keys]
 
 
 def test_one_batch_of_one_project_pays_one_conversation_and_one_commit(world):
@@ -553,3 +563,58 @@ def test_a_new_person_fact_from_the_authorized_source_of_a_batch_is_still_a_rule
     assert sorted(report['applied']) == sorted(ids), report
     new = [fact for fact in world.registry()['facts'].values() if fact['fact_key'].startswith('app.habit-')]
     assert len(new) == 1 and new[0]['protected'] is True and new[0]['owner'] == 'rule-policy'
+
+
+class NoRepairs(BatchModel):
+    """The batch replay under an executor that asks for no repair round, the shape `revises = False` has."""
+    revises = False
+
+
+def test_every_member_of_a_published_batch_reports_applied_even_with_repairs_off(world):
+    """The trace a reader sees: a member whose items were published ends `applied` with a published receipt."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    report = apply_pending(world.service, NoRepairs(world))
+    assert sorted(report['applied']) == sorted(ids), report
+    assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == ['applied'] * 3, \
+        'a member whose facts were published is never reported as archive-only'
+    assert [json.loads(row['receipt'])['outcome'] for row in member_rows(world, ids)] == ['published'] * 3
+    for operation_id in ids:
+        own = 'app.replay-' + world.service.journal.evidence_record(operation_id)['content_sha256'][:10]
+        assert own in world.outcome(operation_id)['reason'], world.outcome(operation_id)
+
+
+class CollidingFirst(BatchModel):
+    """The first and the last source of the batch propose the same fact key; the middle one its own."""
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        payload = job.payload
+        facts, checks = [], []
+        for index, block in enumerate(payload['sources']):
+            shared = index != 1
+            evidence = block['evidence']['content_sha256'][:10]
+            key = payload['project'] + '.shared' if shared else payload['project'] + '.own-' + evidence
+            text = block['text'].split('. ')[0] if shared else 'The middle note records its own claim.'
+            fact = dict(fact_key=key, target=payload['pages'][0]['target'], text=text, status='active',
+                        expected_revision=None, source=block['operation_id'])
+            checks.append({'fact_key': key, 'source': block['operation_id'],
+                           'verified_match': {'result': 'not_found',
+                                              'search_id': self.world.service.reconcile(
+                                                  text, fact['target'])['search_id']}})
+            facts.append(fact)
+        return ModelOutcome('proposal', {'facts': facts, 'fact_checks': checks})
+
+
+def test_a_member_of_a_batch_the_precheck_refused_before_splitting_still_reports_applied(world):
+    """The collision the precheck names stops it recording any slice; the settle split still knows each owner."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    report = apply_pending(world.service, CollidingFirst(world))
+    assert report['applied'] == [ids[0], ids[1]] and report['parked'] == [ids[2]], report
+    assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == \
+        ['applied', 'applied', 'unresolved']
+    assert json.loads(member_rows(world, ids)[1]['observation'])['slice'] is None, \
+        'the precheck stopped before recording any slice, so that row holds no answer of its own'
