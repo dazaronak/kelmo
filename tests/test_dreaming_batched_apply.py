@@ -283,7 +283,7 @@ def test_a_batch_the_executor_left_without_a_proposal_charges_every_member_once(
     assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == ['unresolved'] * 3
 
 
-def test_publish_batch_leaves_a_source_another_attempt_holds_out_of_the_batch(world):
+def test_publish_batch_stops_at_a_source_another_attempt_holds(world):
     from kelmo.creation import batch_members, pending_operations, publish_batch
     editor_mode(world)
     ids = capture(world, notes(3))
@@ -296,14 +296,16 @@ def test_publish_batch_leaves_a_source_another_attempt_holds_out_of_the_batch(wo
         outcome = publish_batch(world.service, batch, model)
     finally:
         world.service.journal.release(ids[1], held)
-    assert [len(job.payload['sources']) for job in model.inner.jobs] == [2]
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [1]
     assert [operation_id for block in model.inner.jobs[0].payload['sources']
-            for operation_id in [block['operation_id']]] == [ids[0], ids[2]]
-    assert outcome[ids[1]] == {'state': 'waiting', 'code': 'E_CLAIM'}
-    assert [outcome[operation_id]['state'] for operation_id in (ids[0], ids[2])] == ['applied', 'applied']
+            for operation_id in [block['operation_id']]] == [ids[0]], \
+        'the batch stops at the held source: the newer one waits its own turn'
+    assert [outcome[operation_id] for operation_id in (ids[1], ids[2])] == \
+        [{'state': 'waiting', 'code': 'E_CLAIM'}] * 2, 'neither spent an attempt'
+    assert outcome[ids[0]] == {'state': 'applied', 'code': None}
     row = world.service.journal.get(ids[1])
     assert (row['state'], row['terminal']) == ('archived', False), 'a held source is not touched by the batch'
-    assert waiting_ids(world) == [ids[1]]
+    assert waiting_ids(world) == [ids[1], ids[2]]
 
 
 def test_a_source_that_opens_its_work_page_stays_single_source_in_a_batched_pass(world):
@@ -421,3 +423,45 @@ def test_a_batched_pass_of_limit_two_publishes_one_batch_of_two(world):
     assert [len(job.payload['sources']) for job in model.inner.jobs] == [2], \
         'the batch is bounded by the limit, not reduced to single sources'
     assert len(waiting_ids(world)) == 1
+
+
+class _ShapeEditor:
+    def deferred_until(self, _operation_id):
+        return None
+
+
+class _ShapeService:
+    """The two reads `batch_members` makes of the service: the deferral and the owning origin."""
+
+    editor = _ShapeEditor()
+
+    def __init__(self, origins=None):
+        self.origins = origins or {}
+
+    def _operation_origin(self, operation_id):
+        return self.origins.get(operation_id, 'origin')
+
+
+def _waiting(*specs):
+    return [({'id': operation_id}, dict(project=project, **extra))
+            for operation_id, project, extra in specs]
+
+
+def test_a_batch_never_passes_an_older_note_of_its_own_project():
+    from kelmo.creation import batch_members
+
+    waiting = _waiting(('a', 'app', {}), ('b', 'app', {'new_work': {'slug': 'x'}}), ('c', 'app', {}))
+    assert [member[0]['id'] for member in batch_members(_ShapeService(), waiting, 8)] == ['a'], \
+        'a note that cannot join holds the later notes of its project back'
+
+
+def test_a_batch_stops_at_a_same_project_note_of_another_origin_and_skips_other_projects():
+    from kelmo.creation import batch_members
+
+    service = _ShapeService({'b': 'other'})
+    waiting = _waiting(('a', 'app', {}), ('b', 'app', {}), ('c', 'app', {}))
+    assert [member[0]['id'] for member in batch_members(service, waiting, 8)] == ['a']
+    other = _waiting(('a', 'app', {}), ('b', 'ops', {}), ('c', 'app', {}))
+    assert [member[0]['id'] for member in batch_members(_ShapeService(), other, 8)] == ['a', 'c'], \
+        'a note of another project keeps its own turn and never holds this batch'
+

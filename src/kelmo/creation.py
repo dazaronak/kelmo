@@ -414,7 +414,10 @@ def batch_members(service, waiting, ceiling):
     The oldest waiting source names the batch — its project and its owning origin — and later waiting
     sources of that project and origin join it up to the ceiling. When the head cannot join a batch the
     pass publishes it alone and the next batch starts with the next pass: a batch never passes an older
-    note, and a source left out keeps its place in the pass's order.
+    note, and a source left out keeps its place in the pass's order. A later source of the same project
+    that cannot join (it opens a work page, is deferred, or belongs to another origin) ends the batch
+    there, because the notes after it would overtake it; a source of another project is skipped, since
+    it waits for its own batch anyway.
     """
     if not waiting or ceiling < 1:
         return []
@@ -429,7 +432,7 @@ def batch_members(service, waiting, ceiling):
         if request.get('project') != first_request['project']:
             continue
         if _batchable(service, operation, request) != origin:
-            continue
+            break
         batch.append((operation, request, origin))
     return batch
 
@@ -438,7 +441,8 @@ def publish_batch(service, batch, executor):
     """One model consultation and one publication for a batch of waiting sources of one project.
 
     Each member is claimed under its own token, so a batch never holds a lock over a source it does not
-    settle and a member held by another attempt simply stays out of this batch. `Editor.edit_batch`
+    settle, and a member another attempt holds ends the batch there: the sources after it stay out too,
+    because a batch never passes an older note it could not claim. `Editor.edit_batch`
     consults the model once and settles every member on its own request row; each disposition then
     reaches that source's journal exactly as a single source's does: `applied` for a receipt (its own or
     one this pass replayed), `parked`/`failed` for a refusal charged to that source's own attempt count,
@@ -454,7 +458,7 @@ def publish_batch(service, batch, executor):
         for operation, request, origin in batch:
             token = service.journal.claim(operation['id'], lease_seconds=3600)
             if token is None:
-                continue
+                break
             claimed[operation['id']] = token
             key, hint, charged = _attempt(service, operation['id'])
             attempts[operation['id']] = charged
