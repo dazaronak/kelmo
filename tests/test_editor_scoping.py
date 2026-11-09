@@ -1007,6 +1007,79 @@ def test_incomplete_context_never_settles_an_empty_answer(world):
     assert world.outcome(source)['disposition'] == 'unresolved'
 
 
+def test_a_budget_that_sends_no_selected_page_refuses_before_the_model_is_asked(world):
+    """The shape of the failure we could not read from outside: the only selected page did not fit, nothing
+    was sent, and the model was consulted anyway — then asked to expand the page the budget had omitted."""
+    from kelmo import outcomes
+    from kelmo.errors import KelmoError
+    from kelmo.executor import ModelOutcome
+    from kelmo.wiki import views
+    text = 'Exports now run hourly.'
+    source, ref = world.archive(text, key='starved')
+    reader = world.service.knowledge
+    full = views.editor_view(reader, reader.generation(), 'app', [FEATURE], 60000, source_text=text, evidence=ref)
+    cost = views._cost(full['payload']['pages'][0])
+    budget = full['used_tokens'] - cost
+    executor = Scripted(ModelOutcome('expand', {'pages': [FEATURE]}), proposal())
+    with pytest.raises(KelmoError) as error:
+        world.edit(source, executor, key='starved', budget=budget)
+    assert error.value.code == 'E_BUDGET'
+    assert executor.jobs == [], 'an empty scope is the request refusal, not something the model is asked about'
+    reason = str(error.value)
+    assert ('omitted ' + FEATURE + ': needs ' + str(cost) + ' tokens, 0 of ' + str(budget) + ' left') in reason
+    assert len(reason) <= outcomes.REASON_LIMIT
+    assert world.outcome(source) == {'disposition': 'unresolved',
+                                     'reason': outcomes.repair_reason('E_BUDGET', reason)}
+    [row] = world.service.editor.status(source)['requests']
+    assert (row['state'], row['error_code']) == ('refused', 'E_BUDGET')
+
+
+def test_a_budget_refusal_names_the_page_it_left_out_with_its_numbers(world):
+    """The refusal a model answer still reaches: the context was partial, so the empty answer is refused —
+    with the numbers that make the omission readable instead of a page name and a guess."""
+    from kelmo import outcomes
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import views
+    text = 'Notes now also cover imports.'
+    source, ref = world.archive(text, key='numbers')
+    reader = world.service.knowledge
+    full = views.editor_view(reader, reader.generation(), 'app', [FEATURE, NOTES], 60000, source_text=text,
+                             evidence=ref)
+    notes = next(block for block in full['payload']['pages'] if block['target'] == NOTES)
+    cost = views._cost(notes)
+    budget = full['used_tokens'] - cost
+    executor = Scripted(proposal())
+    with pytest.raises(KelmoError) as error:
+        world.edit(source, executor, key='numbers', selected=(FEATURE, NOTES), budget=budget)
+    assert error.value.code == 'E_BUDGET' and len(executor.jobs) == 1, 'a partial scope is still worth a call'
+    reason = str(error.value)
+    assert ('omitted ' + NOTES + ': needs ' + str(cost) + ' tokens, 0 of ' + str(budget) + ' left') in reason
+    assert 'the model saw incomplete context and proposed nothing' in reason
+    assert len(reason) <= outcomes.REASON_LIMIT
+    assert world.outcome(source)['reason'] == outcomes.repair_reason('E_BUDGET', reason)
+
+
+def test_an_attempt_records_the_budget_it_used_and_what_it_left_out(world):
+    """The numbers belong in the attempt, not only in a refusal: a published note shows how close its
+    context came to the ceiling, which is what a later reading of a failed one compares against."""
+    from kelmo.wiki import views
+    text = 'Exports now run hourly.'
+    source, ref = world.archive(text, key='recorded')
+    reader = world.service.knowledge
+    full = views.editor_view(reader, reader.generation(), 'app', [FEATURE, NOTES], 60000, source_text=text,
+                             evidence=ref)
+    notes = next(block for block in full['payload']['pages'] if block['target'] == NOTES)
+    cost = views._cost(notes)
+    budget = full['used_tokens'] - cost
+    receipt = world.edit(source, Scripted(world.propose(facts=[world.change('app.export', 'Exports run hourly.')])),
+                         key='recorded', selected=(FEATURE, NOTES), budget=budget)
+    assert receipt.outcome == 'published'
+    [row] = world.service.editor.status(source)['requests']
+    budget_used = json.loads(world.service.journal.action_row(row['operation_id'])['observation'])['budget']
+    assert budget_used == {'max_tokens': budget, 'used_tokens': full['used_tokens'] - cost,
+                           'omitted_budget': [{'target': NOTES, 'needs_tokens': cost, 'left_tokens': 0}]}
+
+
 def test_restatement_keeps_predecessor_owner_and_evidence(world):
     source, _ = world.archive('Exports run nightly; notes cover exports and imports.', key='restate')
     before = world.registry()

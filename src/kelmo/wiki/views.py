@@ -5,7 +5,8 @@ full, the project index, then the selected pages and every page the model asked 
 its registry entities with their revisions plus its unmanaged text, so each fact reaches the model
 once (a selected mandatory page is the exception: its full text and its entities are both sent). Pages linked to the selected ones stay index rows until the model asks for them: a project map
 that every page links to costs one page, not its whole project. What the budget cannot hold is named
-in `omitted`; a page is sent whole or not at all, and only sent pages become the editable scope.
+in `omitted`, and `omitted_budget` says for each of them what it needed and what was left; a page is
+sent whole or not at all, and only sent pages become the editable scope.
 The source and the mandatory rules are never trimmed: when they do not fit, the call refuses.
 """
 from __future__ import annotations
@@ -143,7 +144,7 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
     if used > budget_tokens:
         raise KelmoError('E_BUDGET', 'The editor budget cannot hold the page index of project ' + project + '.')
     required = {rule['target'] for rule in rules}
-    sent, snapshots, omitted = [], [], []
+    sent, snapshots, omitted, unmet = [], [], [], []
     for target in dict.fromkeys([*selected, *expansions]):
         page = reader.page(target, generation)
         block = {'target': target, 'selected': target in selected,
@@ -151,6 +152,9 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
         cost = _cost(block)
         if used + cost > budget_tokens:
             omitted.append(target)
+            # What the page needed and what was left after the source, the rules, the receipts and the
+            # index: without these numbers a refusal cannot be read from outside the vault.
+            unmet.append({'target': target, 'needs_tokens': cost, 'left_tokens': budget_tokens - used})
             continue
         sent.append(block)
         snapshots.append(page)
@@ -170,5 +174,5 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
                           'metric': 'estimated tokens: UTF-8 bytes / 2.5'}}
     if batch is not None:
         payload['sources'] = payload.pop('source')
-    return {'bundle': bundle, 'payload': payload, 'scope': scope, 'omitted': omitted, 'used_tokens': used,
-            'readable': readable}
+    return {'bundle': bundle, 'payload': payload, 'scope': scope, 'omitted': omitted,
+            'omitted_budget': unmet, 'used_tokens': used, 'readable': readable}

@@ -30,6 +30,9 @@ MAX_ROUNDS = 5
 MAX_EXPANSIONS = 2
 # Answers a refused proposal may get to fix itself, inside MAX_ROUNDS.
 MAX_REPAIRS = 2
+# Omitted pages a budget refusal names with their numbers; the rest as a count, so the numbers of the
+# pages that matter most survive the 400-character limit of an outcome reason.
+NAMED_OMITTED = 4
 LEASE_SECONDS = 900
 LIMITS = {'facts': 30, 'narratives': 10, 'pages': 10}
 NARRATIVE_LIMIT = 4000
@@ -738,6 +741,66 @@ def _applied_reason(delta):
     return outcomes.validate('applied', _summary(delta))[1]
 
 
+def _omitted_detail(omitted, budget):
+    """Each page the budget could not send, with what it needed and what was left.
+
+    Without these numbers a budget refusal cannot be read from outside the vault: one note failed twice
+    with its only selected page omitted and nothing sent, and the attempt recorded no numbers at all.
+    A page named by target alone (an observation recorded before this detail existed, or the payload's
+    plain `omitted` list) is named without numbers rather than dropped from the reason. At most
+    NAMED_OMITTED pages are named with their numbers and the rest as a count, so a request with many
+    omitted pages still reaches the reader as numbers instead of a reason cut in the middle of them."""
+    parts = []
+    for item in omitted[:NAMED_OMITTED]:
+        if isinstance(item, str):
+            parts.append('omitted ' + item)
+            continue
+        parts.append('omitted ' + item['target'] + ': needs ' + str(item['needs_tokens']) + ' tokens, '
+                     + str(item['left_tokens']) + ' of ' + str(budget)
+                     + ' left after the source, the rules, the receipts and the index')
+    extra = len(omitted) - len(parts)
+    if extra > 0:
+        parts.append('+' + str(extra) + ' more omitted')
+    return '; '.join(parts)
+
+
+def _budget_refusal(omitted, budget, used, scope=(), cause=None):
+    """The refusal of a request whose budget could not send the pages it was asked to edit.
+
+    `cause` names who found it: the consult loops refuse before the model is ever asked (no cause), and
+    settle names the model's empty answer against the numbers the attempt recorded. `scope` says whether
+    the budget sent nothing at all or only part of what the request selected. The reason stays one outcome
+    reason, so it is never cut short of the numbers it exists to carry."""
+    detail = (_omitted_detail(omitted, budget) if omitted else
+              'the attempt recorded no budget numbers' if budget is None else
+              'no page of the request fits ' + str(budget) + ' estimated tokens; '
+              + str(used) + ' were already used')
+    sent = ('none of the selected pages' if not scope
+            else 'only ' + ', '.join(scope) + ' of the selected pages')
+    return outcomes.clipped((cause + '; ' if cause else '') + 'the editor budget sent ' + sent
+                            + ' (' + detail + '). Requeue with a larger budget or fewer selected pages.')
+
+
+def _budget_observation(view, budget):
+    """What this attempt's budget held: the ceiling, what the view used, and what it could not send.
+
+    The numbers belong in the observation, not only in the refusal: an attempt that ended applied still
+    shows how close its context was to the ceiling, and a settle refusal reads its numbers from the row
+    rather than rebuilding the view that already refused."""
+    return {'max_tokens': budget, 'used_tokens': view['used_tokens'], 'omitted_budget': view['omitted_budget']}
+
+
+def _observed_budget_refusal(observation, cause):
+    """The budget refusal of a recorded answer, from the numbers that answer's attempt recorded.
+
+    An answer recorded before the attempt stored its numbers keeps its plain list of omitted targets,
+    named without numbers rather than refused with a reason full of `None`."""
+    budget = observation.get('budget') or {}
+    omitted = budget['omitted_budget'] if budget else observation['omitted']
+    return _budget_refusal(omitted, budget.get('max_tokens'), budget.get('used_tokens'),
+                           scope=observation['scope'], cause=cause)
+
+
 def _result(request, disposition, code=None):
     """The per-request `editor_result` event details, or None when no request row is involved."""
     return None if request is None else {'request': request, 'disposition': disposition, 'code': code}
@@ -1278,6 +1341,7 @@ class Editor:
                       'generation': observation['generation'], 'project': observation['project'],
                       'scope': observation['scope'], 'omitted': observation['omitted'],
                       'readable': observation['readable'], 'complete': observation['complete'],
+                      'budget': observation.get('budget'),
                       'link_pages': observation['link_pages'], 'receipts': observation['receipts'],
                       'slice': observation.get('slices', {}).get(operation_id)}
             if 'declined' in observation:
@@ -1391,6 +1455,10 @@ class Editor:
             for operation_id, entry in shrank.items():
                 sources.pop(operation_id, None)
                 dropped.setdefault(operation_id, entry)
+            if not view['scope']:
+                # The shrink left a batch whose budget sends no page it may edit: the model would only be
+                # asked to expand a page the budget already omitted. Refuse it with the numbers instead.
+                raise KelmoError('E_BUDGET', _budget_refusal(view['omitted_budget'], budget, view['used_tokens']))
             view['payload']['expansions_left'] = MAX_EXPANSIONS - expanded
             if work:
                 view['payload']['new_work'] = {key: work[key] for key in ('target', 'title')}
@@ -1416,6 +1484,7 @@ class Editor:
                         'generation': generation.to_dict(), 'project': project,
                         'declined': outcome.reason or outcomes.cause('E_UNRESOLVED'), 'scope': view['scope'],
                         'omitted': view['omitted'], 'readable': view['readable'],
+                        'budget': _budget_observation(view, budget),
                         'complete': view['bundle'].complete, 'link_pages': link_pages, 'expansions': expansions,
                         'receipts': {}, 'slices': {}}
             if outcome.kind == 'failure':
@@ -1451,6 +1520,7 @@ class Editor:
                            'generation': generation.to_dict(), 'project': project,
                            'scope': view['scope'], 'omitted': view['omitted'], 'readable': view['readable'],
                            'complete': view['bundle'].complete, 'expansions': expansions,
+                           'budget': _budget_observation(view, budget),
                            'result': outcome.result, 'link_pages': link_pages, 'new_work': work,
                            'receipts': {found['search_id']: fact_checks.binding(found['text'], found['target'])
                                         for found in reconciliations}}
@@ -1663,10 +1733,9 @@ class Editor:
                 return self._refuse_batch(row, accepted, keys, 'E_PROPOSAL',
                                           'A batch that resolves a legacy note publishes one source at a time.', dispositions)
             if not observation['complete']:
-                return self._refuse_batch(row, accepted, keys, 'E_BUDGET', 'The model saw incomplete context and '
-                                          'proposed nothing; omitted pages: '
-                                          + (', '.join(observation['omitted']) or 'none')
-                                          + '. Requeue with a larger budget or fewer selected pages.', dispositions)
+                return self._refuse_batch(row, accepted, keys, 'E_BUDGET',
+                                          _observed_budget_refusal(observation, 'the model saw incomplete context '
+                                                                   'and proposed nothing'), dispositions)
             return self._finish_batch(batch, dispositions, keys, idem, generation,
                                       'the editor proposed no change to the selected pages; the note adds no new '
                                       'fact')
@@ -1920,6 +1989,12 @@ class Editor:
                                      request['budget_tokens'], source_text=text,
                                      evidence=source['reference'], expansions=expansions,
                                      reconciliations=reconciliations)
+            if not view['scope']:
+                # Nothing this note may edit fits the budget: the model would be asked to expand a page
+                # the budget already omitted. The refusal is the request's, not the model's, and it is
+                # named by the numbers the view measured.
+                raise KelmoError('E_BUDGET', _budget_refusal(view['omitted_budget'], request['budget_tokens'],
+                                                             view['used_tokens']))
             view['payload']['expansions_left'] = MAX_EXPANSIONS - expanded
             if work:
                 view['payload']['new_work'] = {key: work[key] for key in ('target', 'title')}
@@ -1952,7 +2027,8 @@ class Editor:
                         continue
                 return {'generation': generation.to_dict(), 'project': request['project'],
                         'declined': outcome.reason or outcomes.cause('E_UNRESOLVED'),
-                        'new_work': work, 'scope': view['scope']}
+                        'new_work': work, 'scope': view['scope'],
+                        'budget': _budget_observation(view, request['budget_tokens'])}
             if outcome.kind == 'failure':
                 reason = outcome.reason or outcomes.cause(outcome.error_code)
                 raise KelmoError(outcome.error_code, 'The editor executor produced no proposal: ' + reason)
@@ -1986,6 +2062,7 @@ class Editor:
                 refused = {'generation': generation.to_dict(), 'project': request['project'],
                            'scope': view['scope'], 'omitted': view['omitted'], 'readable': view['readable'],
                            'complete': view['bundle'].complete, 'expansions': expansions,
+                           'budget': _budget_observation(view, request['budget_tokens']),
                            'result': outcome.result, 'link_pages': bool(request.get('link_pages')),
                            'new_work': work,
                            'receipts': {found['search_id']: fact_checks.binding(found['text'], found['target'])
@@ -2151,9 +2228,9 @@ class Editor:
             self._refuse(operation_id, source_id, error.code, str(error))
         if not any(delta.values()) and not engine.resolvable_note(registry, reference.to_dict()):
             if not observation['complete']:
-                self._refuse(operation_id, source_id, 'E_BUDGET', 'The model saw incomplete context and proposed '
-                             'nothing; omitted pages: ' + (', '.join(observation['omitted']) or 'none')
-                             + '. Requeue with a larger budget or fewer selected pages.')
+                self._refuse(operation_id, source_id, 'E_BUDGET',
+                             _observed_budget_refusal(observation, 'the model saw incomplete context and '
+                                                                  'proposed nothing'))
             receipt = OperationReceipt(operation_id, idempotency_key, reference.source_id, 'unchanged',
                                        (reference,), generation=generation)
             self.journal.action_finish(

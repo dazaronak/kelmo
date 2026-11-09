@@ -276,6 +276,94 @@ def test_a_shrink_inside_the_conversation_drops_the_newest_source_into_its_own_a
         'the source the batch shrank out spends no attempt and is never refused under its own key'
 
 
+def test_a_batch_budget_that_sends_no_page_refuses_without_a_model_call(world):
+    """The batch shape of the failure we could not read from outside: the selected page did not fit,
+    nothing was sent, and the model was consulted anyway — then asked to expand the page the budget had
+    already omitted. The refusal is the request's, so it is named by the numbers the view measured."""
+    from kelmo import outcomes
+    from kelmo.contracts import EvidenceRef
+    from kelmo.creation import apply_pending
+    from kelmo.wiki import views
+    ids, texts = [], notes(2)
+    for text in texts:
+        # budget_tokens=1: `_editor_request` takes the larger of the stored budget and the vault's, which
+        # is written below from the measured view, so the notes are captured before the budget is known.
+        operation = world.service.create(text, project='app', selected=[FEATURE], budget_tokens=1)
+        world.service.run(operation['id'])
+        ids.append(operation['id'])
+    reader = world.service.knowledge
+    blocks = [{'operation_id': operation_id, 'text': text,
+               'evidence': EvidenceRef.from_dict(world.service.journal.evidence_record(operation_id))}
+              for operation_id, text in zip(ids, texts)]
+    # The budget is measured against the one-source view the preflight shrinks to: it must refuse that
+    # one too, or the pass would publish each note alone under a budget that holds it.
+    view = views.editor_view(reader, reader.generation(), 'app', [FEATURE], 60000, sources=blocks[:1])
+    cost = views._cost(next(block for block in view['payload']['pages'] if block['target'] == FEATURE))
+    budget = view['used_tokens'] - cost
+    editor_mode(world, budget=budget)
+    before = commits(world)
+    model = counted(BatchModel(world))
+    report = apply_pending(world.service, model)
+    assert model.calls == 0, 'an empty scope is refused before the model is asked to expand an omitted page'
+    assert sorted(report['parked']) == sorted(ids) and (report['applied'], report['failed']) == ([], [])
+    assert commits(world) == before and world.service.journal.prepared_intents() == []
+    for operation_id in ids:
+        reason = world.outcome(operation_id)['reason']
+        assert ('omitted ' + FEATURE + ': needs ' + str(cost) + ' tokens, 0 of ' + str(budget)
+                + ' left') in reason, reason
+        assert len(reason) <= outcomes.REASON_LIMIT
+
+
+def test_a_batch_answer_to_partial_context_is_refused_with_the_budget_numbers(world):
+    """The batch shape of the settle refusal: the model answered nothing to a context that sent only part
+    of what the batch selected, and the refusal names what the omitted page needed."""
+    from kelmo import outcomes
+    from kelmo.contracts import EvidenceRef
+    from kelmo.creation import apply_pending
+    from kelmo.executor import ModelOutcome
+    from kelmo.wiki import views
+    selected = [FEATURE, 'projects/app/notes.md']
+    texts = notes(2)
+    ids = []
+    for text in texts:
+        # budget_tokens=1: the effective budget is the larger of the stored one and the vault's, which is
+        # written below from the measured view, so the notes are captured before the budget is known.
+        operation = world.service.create(text, project='app', selected=selected, budget_tokens=1)
+        world.service.run(operation['id'])
+        ids.append(operation['id'])
+    reader = world.service.knowledge
+    full = views.editor_view(reader, reader.generation(), 'app', selected, 60000,
+                             sources=[{'operation_id': operation_id, 'text': text,
+                                       'evidence': EvidenceRef.from_dict(
+                                           world.service.journal.evidence_record(operation_id))}
+                                      for operation_id, text in zip(ids, texts)])
+    cost = views._cost(next(block for block in full['payload']['pages']
+                            if block['target'] == 'projects/app/notes.md'))
+    editor_mode(world, budget=full['used_tokens'] - cost)
+
+    class Empty:
+        """The model answer of a batch that saw a partial context: it proposed nothing."""
+
+        def __init__(self):
+            self.jobs = []
+
+        def execute(self, job):
+            self.jobs.append(job)
+            return ModelOutcome('proposal', {'facts': [], 'fact_checks': []})
+
+    model = Empty()
+    before = commits(world)
+    report = apply_pending(world.service, model)
+    assert sorted(report['parked']) == sorted(ids) and (report['applied'], report['failed']) == ([], [])
+    assert commits(world) == before and world.service.journal.prepared_intents() == []
+    for operation_id in ids:
+        reason = world.outcome(operation_id)['reason']
+        assert 'the model saw incomplete context and proposed nothing' in reason, reason
+        assert ('omitted projects/app/notes.md: needs ' + str(cost) + ' tokens, 0 of '
+                + str(full['used_tokens'] - cost) + ' left') in reason, reason
+        assert len(reason) <= outcomes.REASON_LIMIT
+
+
 def test_a_declined_batch_answer_declines_every_member_without_a_commit(world):
     from kelmo.creation import apply_pending
     editor_mode(world)
