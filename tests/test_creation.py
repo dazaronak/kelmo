@@ -498,6 +498,60 @@ def test_a_work_page_that_appears_while_an_attempt_is_open_does_not_meet_the_ide
     assert world.fact('app.export-rework')['text'] == 'Rework the export queue.'
 
 
+def test_a_note_without_a_priority_edits_the_page_a_note_with_one_opened(world):
+    """A priority is an attribute of the page, not part of which page it is."""
+    first = world.service.create('First: rework the export queue.', project='app',
+                                 new_work={'slug': 'export-rework', 'title': 'Rework the export', 'priority': 'H2'},
+                                 idempotency_key='priority-first')
+    second = world.service.create('Second: the queue needs a retry cap.', project='app',
+                                  new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                                  idempotency_key='priority-second')
+    queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export queue.',
+                 status='backlog', expected_revision=None)
+    assert world.service.run(first['id'], executor=Scripted(
+        lambda job: world.propose(facts=[queue])))['state'] == 'applied'
+    cap = dict(fact_key='app.export-rework-cap', target=WORK, text='The queue caps retries at three.',
+               status='backlog', expected_revision=None)
+    result = world.service.run(second['id'], executor=Scripted(lambda job: world.propose(facts=[cap])))
+    assert result['state'] == 'applied', result.get('outcome')
+    assert world.registry()['pages'][WORK]['priority'] == 'H2', 'the page keeps the priority it was opened with'
+
+
+def test_a_request_row_written_under_the_earlier_fingerprint_still_answers_itself(world, monkeypatch):
+    """A row a previous release wrote carries the whole `new_work` in its fingerprint: an upgrade must not
+    turn it into E_IDEMPOTENCY, which would overwrite the outcome of a note that already published."""
+    from kelmo.creation import _attempt
+    from kelmo.editor import _fingerprint
+    from kelmo.publication import StateCoordinator
+    service = world.service
+    operation = service.create('Open the export rework.', project='app',
+                               new_work={'slug': 'export-rework', 'title': 'Rework the export'},
+                               idempotency_key='earlier-fingerprint')
+    queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export queue.',
+                 status='backlog', expected_revision=None)
+    executor = Scripted(lambda job: world.propose(facts=[queue]))
+    called, real = {}, service.editor.edit
+
+    def recording(source, **arguments):
+        called.update(arguments)
+        return real(source, **arguments)
+
+    monkeypatch.setattr(service.editor, 'edit', recording)
+    assert service.run(operation['id'], executor=executor)['state'] == 'applied'
+    key = _attempt(service, operation['id'])[0]
+    origin = service._operation_origin(operation['id'])
+    earlier = _fingerprint({'request': {'source_operation_id': operation['id'], 'project': called['project'],
+                                        'selected': list(called['selected']), 'budget_tokens': called['budget_tokens'],
+                                        'rule_change': called['rule_change'], 'new_work': dict(called['new_work'])},
+                            'origin': origin.to_dict(), 'key': key})
+    with service.journal.conn:
+        service.journal.conn.execute('UPDATE action_requests SET fingerprint=? WHERE request_key=?',
+                                     (earlier, StateCoordinator._request_key('semantic', origin, key)))
+    receipt = real(operation['id'], **called)
+    assert receipt.outcome == 'published'
+    assert len(executor.jobs) == 1, 'the finished row answered without another model call'
+
+
 def test_a_new_work_target_registered_as_another_page_stays_refused(world):
     """Resolution needs the same page: a request whose target names another page is still refused."""
     first = world.service.create('First: rework the export.', project='app',

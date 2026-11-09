@@ -270,18 +270,18 @@ def current_request(registry, request):
 def opened_work_page(registry, project, new_work):
     """The registered page a stored `new_work` already opened, or None when it names another page or none.
 
-    A work page is the same page when its target, parent, title, summary and priority are the ones
-    `new_work_page` would have given it — the same comparison its `existing=` argument makes, page ID
-    aside, because the page is then used as the registry holds it and never re-created under the
-    request's identity. The target must sit in this project's own directory, so a request never resolves
-    onto a page of another project."""
+    A work page is the same page when its target, parent, title and summary are the ones `new_work_page`
+    would have given it. The page ID and the priority are left aside: the page is used as the registry
+    holds it and never re-created under the request's identity, so a note naming no priority or another
+    one still belongs on it. The target must sit in this project's own directory, so a request never
+    resolves onto a page of another project."""
     if not isinstance(new_work, dict):
         return None
     target = new_work.get('target')
     entry = registry['pages'].get(target)
     if entry is None or pages.project_of(target) != project:
         return None
-    if all(new_work.get(name, '') == entry[name] for name in ('parent', 'title', 'summary', 'priority')):
+    if all(new_work.get(name, '') == entry[name] for name in ('parent', 'title', 'summary')):
         return target
     return None
 

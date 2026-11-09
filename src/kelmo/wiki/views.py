@@ -101,8 +101,8 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
     never editable scope.
 
     `fixed_tokens` is what the payload carries before any page and before the receipts: the source, every
-    mandatory rule and the project index. The consult loop reads it to bound the receipts of the next
-    reconcile round, so receipts can never be what pushes the pages out of the budget.
+    mandatory rule and the project index; `used_tokens` less `receipt_tokens` adds the pages sent. The
+    consult loops read them to bound the receipts of the next reconcile round.
 
     `sources` (batched Dreaming apply) replaces the single source
     with a list of `{'operation_id', 'text', 'evidence'}` (optionally `hint`) in capture order: the
@@ -163,10 +163,6 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
     if used + index_cost > budget_tokens:
         raise KelmoError('E_BUDGET', 'The editor budget cannot hold the page index of project ' + project + '.')
     used += index_cost
-    # What the payload carries before any page: the source, every mandatory rule and the project index,
-    # the receipts excluded. `budget - fixed_tokens` is the room the receipts may still take, and the
-    # consult loop measures each reconcile round against it, so neither budget refusal above can be the
-    # receipts' doing and the pages keep what is left.
     fixed += index_cost
     required = {rule['target'] for rule in rules}
     sent, snapshots, omitted, unmet = [], [], [], []

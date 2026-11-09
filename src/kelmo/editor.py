@@ -849,14 +849,14 @@ def _receipt_round(conn, facts, asked, reconciliations, candidates, ceiling):
             fresh, projected)
 
 
-def _receipt_ceiling(budget, view):
+def _receipt_ceiling(budget, held):
     """How far this request's receipts and the candidates they name may still grow.
 
-    A quarter of the budget, tightened to what the payload has left once the source, the mandatory rules
-    and the project index are counted. The second term is what makes "receipts never produce `E_BUDGET`"
-    hold: a round measured against this ceiling leaves `editor_view`'s fixed part and its receipts inside
-    the budget, so the pages keep the rest and no budget refusal is the round's doing."""
-    return min(budget // RECEIPT_CEILING_PARTS, budget - view['fixed_tokens'])
+    A quarter of the budget, tightened to the room `held` tokens leave. A single source holds its fixed
+    part and the pages already sent: `editor_view` charges the receipts before any page, so a round
+    allowed only into that room can never push a sent page out. A batch holds only its fixed part,
+    because a batch that loses the room for its pages drops its newest source instead."""
+    return min(budget // RECEIPT_CEILING_PARTS, budget - held)
 
 
 def _receipt_ceiling_refusal(ceiling, projected, budget):
@@ -866,7 +866,8 @@ def _receipt_ceiling_refusal(ceiling, projected, budget):
     receipts can never grow past the pages they would crowd out of the budget."""
     return ('the reconciliation receipts of this request may cost at most ' + str(ceiling) + ' estimated tokens '
             'of its ' + str(budget) + '; the searches you asked for would bring them to ' + str(projected)
-            + '. No search was run: propose with the receipts you already have, or answer unresolved.')
+            + '. No search was run: ask for fewer facts at once, propose with the receipts you already have, '
+            'or answer unresolved.')
 
 
 def _result(request, disposition, code=None):
@@ -1094,6 +1095,10 @@ class Editor:
             identity['selected'] = [target for target in identity['selected'] if target != new_work['target']]
         fingerprint = _fingerprint({'request': identity, 'origin': origin.to_dict(), 'key': idempotency_key})
         row = self.journal.action_request(request_key)
+        if row is not None and work is not None and row['fingerprint'] == _fingerprint(
+                {'request': request, 'origin': origin.to_dict(), 'key': idempotency_key}):
+            # A row an earlier release wrote names the whole `new_work`; it still answers its own request.
+            fingerprint = row['fingerprint']
         receipt = StateCoordinator._replay(row, fingerprint)
         if receipt is not None:
             return receipt
@@ -1530,7 +1535,7 @@ class Editor:
                 # The shrink left a batch whose budget sends no page it may edit: the model would only be
                 # asked to expand a page the budget already omitted. Refuse it with the numbers instead.
                 raise KelmoError('E_BUDGET', _budget_refusal(view['omitted_budget'], budget, view['used_tokens']))
-            ceiling = _receipt_ceiling(budget, view)
+            ceiling = _receipt_ceiling(budget, view['fixed_tokens'])
             view['payload']['budget']['receipt_ceiling'] = ceiling
             view['payload']['expansions_left'] = MAX_EXPANSIONS - expanded
             if work:
@@ -2075,7 +2080,7 @@ class Editor:
                 # named by the numbers the view measured.
                 raise KelmoError('E_BUDGET', _budget_refusal(view['omitted_budget'], request['budget_tokens'],
                                                              view['used_tokens']))
-            ceiling = _receipt_ceiling(request['budget_tokens'], view)
+            ceiling = _receipt_ceiling(request['budget_tokens'], view['used_tokens'] - view['receipt_tokens'])
             view['payload']['budget']['receipt_ceiling'] = ceiling
             view['payload']['expansions_left'] = MAX_EXPANSIONS - expanded
             if work:

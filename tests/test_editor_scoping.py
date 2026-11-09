@@ -991,11 +991,33 @@ def test_a_reconcile_round_past_the_receipt_ceiling_runs_no_search_and_sends_the
     refusal = second.payload['refusal']
     assert refusal['code'] == 'E_PROPOSAL' and set(refusal) == {'code', 'reason'}
     assert 'may cost at most ' + str(budget // 4) + ' estimated tokens of its ' + str(budget) in refusal['reason']
-    assert 'No search was run: propose with the receipts you already have' in refusal['reason']
+    assert 'No search was run: ask for fewer facts at once, propose with the receipts you already have' \
+        in refusal['reason']
     assert len(refusal['reason']) <= outcomes.REASON_LIMIT
     assert second.payload['reconciliations'] == [] and 'candidates' not in second.payload
     assert second.payload['budget']['receipt_tokens'] == first.payload['budget']['receipt_tokens']
     assert [block['target'] for block in second.payload['pages']] == [NOTES], 'the pages stayed sent'
+
+
+def test_a_reconcile_round_never_pushes_a_sent_page_out_of_the_budget(world):
+    """The ceiling leaves room for the pages already sent, not only for the source, the rules and the index."""
+    from kelmo.executor import ModelOutcome
+    measure, _ = world.archive('Notes now cover the export pipeline in a new reading one.', key='measure')
+    sizing = Scripted(proposal())
+    world.edit(measure, sizing, key='measure', selected=(NOTES,), budget=60000)
+    budget = sizing.jobs[0].payload['budget']['used_tokens'] + 40
+
+    source, _ = world.archive('Notes now cover the export pipeline in a new reading two.', key='tight')
+    asked = [{'text': 'Zebra quartz lantern harbour violet ladder orbit marble.', 'target': NOTES}]
+    executor = Scripted(ModelOutcome('reconcile', {'facts': asked}), proposal())
+    receipt = world.edit(source, executor, key='tight', selected=(NOTES,), budget=budget)
+
+    assert receipt.outcome == 'unchanged', 'the ceiling refuses the round, the budget does not refuse the note'
+    first, second = executor.jobs
+    measured = first.payload['budget']
+    assert measured['receipt_ceiling'] == budget - (measured['used_tokens'] - measured['receipt_tokens'])
+    assert search_rows(world) == 0, 'the round that would have pushed the page out never ran'
+    assert [block['target'] for block in second.payload['pages']] == [NOTES], 'the page stayed sent'
 
 
 def test_a_fact_check_still_verifies_against_the_search_id_of_its_own_receipt(world):
