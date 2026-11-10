@@ -149,6 +149,42 @@ def test_token_window_counts_prefix_and_special_tokens_without_truncation_or_pad
     assert window.identity == "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_windows_over_one_tokenizer_share_one_parsed_copy(tmp_path):
+    pytest.importorskip("tokenizers")
+    path = synthetic_tokenizer(tmp_path / "tokenizer.json")
+    # A real tokenizer.json costs ~300 MB per parsed copy; a chunk, a query and a document window share one.
+    chunk = TokenWindow.from_file(path, budget=8, prefix="passage: ")
+    query = TokenWindow.from_bytes(path.read_bytes(), budget=16, prefix="query: ")
+    document = TokenWindow.from_file(path, budget=32)
+    assert chunk._tokenizer is query._tokenizer is document._tokenizer
+    assert chunk._lock is query._lock is document._lock
+    assert (chunk.count("one two"), query.count("one two"), document.count("one two")) == (6, 6, 4)
+    assert (chunk.budget, query.budget, document.budget) == (8, 16, 32)
+
+
+def test_other_special_tokens_or_other_bytes_get_their_own_tokenizer(tmp_path):
+    pytest.importorskip("tokenizers")
+    path = synthetic_tokenizer(tmp_path / "tokenizer.json")
+    raw = TokenWindow.from_file(path, budget=8)
+    added = TokenWindow.from_file(path, budget=8, special_tokens=["[SEP]"])
+    other = TokenWindow.from_bytes(path.read_bytes().replace(b"[PAD]", b"[PAX]"), budget=8)
+    assert len({id(raw._tokenizer), id(added._tokenizer), id(other._tokenizer)}) == 3
+    # The addition stays on its own copy: the raw window still splits a literal [SEP].
+    assert (added.count("a [SEP] b"), raw.count("a [SEP] b")) == (5, 7)
+
+
+def test_a_shared_tokenizer_is_released_with_its_last_window(tmp_path):
+    pytest.importorskip("tokenizers")
+    from kelmo.store.memory import embed as embed_mod
+    path = synthetic_tokenizer(tmp_path / "tokenizer.json")
+    first = TokenWindow.from_file(path, budget=8)
+    key = (first.identity, first.preparation)
+    assert key in embed_mod._SHARED_TOKENIZERS
+    del first
+    gc.collect()
+    assert key not in embed_mod._SHARED_TOKENIZERS
+
+
 def test_token_window_refuses_a_missing_tokenizer(tmp_path):
     with pytest.raises(ArchiveEmbeddingError) as refused:
         TokenWindow.from_file(tmp_path / "absent.json", budget=8)

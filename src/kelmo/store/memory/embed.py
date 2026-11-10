@@ -10,6 +10,7 @@ import json
 import re
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -222,23 +223,56 @@ def preparation_digest(tokens) -> str:
 NO_ADDITIONS = preparation_digest([])
 
 
+class _SharedTokenizer:
+    """One parsed tokenizer and the lock every encode on it takes. A parsed tokenizer.json of a real model
+    costs hundreds of megabytes, so windows over the same bytes and additions hold one copy per process."""
+    __slots__ = ("tokenizer", "lock", "__weakref__")
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.lock = threading.Lock()
+
+
+# (identity, preparation) -> the parsed copy; an entry lives as long as some window holds it.
+_SHARED_TOKENIZERS = weakref.WeakValueDictionary()
+_SHARED_TOKENIZERS_LOCK = threading.Lock()
+
+
+def _parse_tokenizer(data: bytes, additions):
+    try:
+        from tokenizers import AddedToken, Tokenizer
+    except ImportError as error:
+        raise ArchiveEmbeddingError("could not import 'tokenizers'", reason="tokenizer_missing") from error
+    try:
+        tokenizer = Tokenizer.from_str(data.decode("utf-8"))
+        for token in additions:
+            tokenizer.add_special_tokens([AddedToken(**token) if isinstance(token, dict) else token])
+    except Exception as error:
+        raise ArchiveEmbeddingError("unreadable tokenizer.json", reason="tokenizer_unusable") from error
+    return tokenizer
+
+
 class TokenWindow:
     """Counts the tokens a model sees for one stored text: prefix, text and special tokens, never truncated.
 
     A tokenizer.json may ship with truncation or padding enabled; both are switched off and checked,
     and an encoding that still reports overflow is refused, so a count is never capped at the window.
     `identity` names the raw tokenizer.json bytes and `preparation` the special tokens added on top of it;
-    together they name the tokenizer a count was made with."""
+    together they name the tokenizer a count was made with. Windows built from the same bytes and additions
+    share one parsed tokenizer and its lock."""
 
     def __init__(self, tokenizer, *, budget: int, prefix: str = "", identity: str, preparation: str = NO_ADDITIONS):
         if type(budget) is not int or budget < 1:
             raise ValueError("Token budget must be a positive integer")
-        tokenizer.no_truncation()
-        tokenizer.no_padding()
-        if tokenizer.truncation is not None or tokenizer.padding is not None:
-            raise ArchiveEmbeddingError("The tokenizer still truncates or pads", reason="tokenizer_unusable")
-        self._tokenizer = tokenizer
-        self._lock = threading.Lock()
+        shared = tokenizer if isinstance(tokenizer, _SharedTokenizer) else _SharedTokenizer(tokenizer)
+        with shared.lock:
+            shared.tokenizer.no_truncation()
+            shared.tokenizer.no_padding()
+            if shared.tokenizer.truncation is not None or shared.tokenizer.padding is not None:
+                raise ArchiveEmbeddingError("The tokenizer still truncates or pads", reason="tokenizer_unusable")
+        self._shared = shared
+        self._tokenizer = shared.tokenizer
+        self._lock = shared.lock
         self.budget = budget
         self.prefix = prefix
         self.identity = identity
@@ -264,18 +298,15 @@ class TokenWindow:
         except ValueError as error:
             raise ArchiveEmbeddingError(f"malformed special-token additions: {error}",
                                     reason="input_policy_unproven") from error
-        try:
-            from tokenizers import AddedToken, Tokenizer
-        except ImportError as error:
-            raise ArchiveEmbeddingError("could not import 'tokenizers'", reason="tokenizer_missing") from error
-        try:
-            tokenizer = Tokenizer.from_str(data.decode("utf-8"))
-            for token in additions:
-                tokenizer.add_special_tokens([AddedToken(**token) if isinstance(token, dict) else token])
-        except Exception as error:
-            raise ArchiveEmbeddingError("unreadable tokenizer.json", reason="tokenizer_unusable") from error
-        return cls(tokenizer, budget=budget, prefix=prefix, identity="sha256:" + hashlib.sha256(data).hexdigest(),
-                   preparation=preparation_digest(additions))
+        identity = "sha256:" + hashlib.sha256(data).hexdigest()
+        preparation = preparation_digest(additions)
+        # Held across the parse, so two windows asked for at once still parse the file once.
+        with _SHARED_TOKENIZERS_LOCK:
+            shared = _SHARED_TOKENIZERS.get((identity, preparation))
+            if shared is None:
+                shared = _SharedTokenizer(_parse_tokenizer(data, additions))
+                _SHARED_TOKENIZERS[(identity, preparation)] = shared
+        return cls(shared, budget=budget, prefix=prefix, identity=identity, preparation=preparation)
 
     def count(self, text: str) -> int:
         with self._lock:
