@@ -117,7 +117,8 @@
     "origin": {
       "kinds": [
         "call",
-        "event"
+        "event",
+        "hello"
       ],
       "required_on": []
     },

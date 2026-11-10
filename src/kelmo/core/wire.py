@@ -38,7 +38,9 @@ _FIELDS = {
     'op': ({'call', 'event'}, {'call', 'event'}),
     'lane': ({'call'}, set()),
     'deadline_ms': ({'call'}, {'call'}),
-    'origin': ({'call', 'event'}, set()),
+    # On a hello, the identity a local connection speaks for (kelmod attach fixes it from its own
+    # arguments); a call from a connection never carries one, the gateway attaches it.
+    'origin': ({'call', 'event', 'hello'}, set()),
     'key': ({'call'}, set()),
     'ok': ({'reply'}, {'reply'}),
     'error': ({'reply'}, set()),

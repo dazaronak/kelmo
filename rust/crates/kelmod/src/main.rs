@@ -1,6 +1,19 @@
 //! The Kelmo daemon binary.
+//!
+//! ```text
+//! kelmod --version
+//! kelmod serve --spec FILE [--ephemeral]
+//! kelmod status (--root DIR | --runtime-dir DIR)
+//! kelmod call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]
+//! ```
+//! `status` and `call` print one JSON object: the reply body on success, `{"error": ...}` on a refusal.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
+
+use kelmo_runtime::{client, daemon, ipc, spec::Spec};
+use serde_json::{Value, json};
 
 /// The package version in the form Python packaging uses, so `kelmod --version` and
 /// `kelmo --version` print the same string.
@@ -24,17 +37,145 @@ fn pep440(version: &str) -> String {
     format!("{release}{label}{number}")
 }
 
-const USAGE: &str = "usage: kelmod --version";
+const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | status (--root DIR | --runtime-dir DIR) \
+| call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]";
+
+/// Options that take no value.
+const FLAGS: &[&str] = &["ephemeral"];
+
+struct Options {
+    positional: Vec<String>,
+    named: std::collections::HashMap<String, String>,
+}
+
+fn parse(args: &[String]) -> Result<Options, String> {
+    let mut positional = Vec::new();
+    let mut named = std::collections::HashMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(name) = arg.strip_prefix("--") {
+            if FLAGS.contains(&name) {
+                named.insert(name.to_owned(), String::new());
+                index += 1;
+                continue;
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("--{name} needs a value"))?;
+            named.insert(name.to_owned(), value.clone());
+            index += 2;
+        } else {
+            positional.push(arg.clone());
+            index += 1;
+        }
+    }
+    Ok(Options { positional, named })
+}
+
+fn socket(options: &Options) -> Result<PathBuf, String> {
+    let runtime = match (options.named.get("runtime-dir"), options.named.get("root")) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(root)) => ipc::runtime_dir(&PathBuf::from(root)).map_err(|e| e.to_string())?,
+        (None, None) => return Err("name --root or --runtime-dir".into()),
+    };
+    Ok(ipc::socket_path(&runtime))
+}
+
+fn print_reply(result: Result<(Value, Value), String>) -> ExitCode {
+    match result {
+        Ok((header, body)) if header["ok"] == Value::Bool(true) => {
+            println!("{body}");
+            ExitCode::SUCCESS
+        }
+        Ok((header, _)) => {
+            println!("{}", json!({"error": header["error"]}));
+            ExitCode::from(1)
+        }
+        Err(message) => {
+            let (code, text) = message
+                .split_once(": ")
+                .unwrap_or(("E_TRANSPORT", &message));
+            println!(
+                "{}",
+                json!({"error": {"code": code, "message": text, "retryable": true}})
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+fn run(args: &[String]) -> Result<ExitCode, String> {
+    let options = parse(args)?;
+    match options.positional.first().map(String::as_str) {
+        Some("serve") => {
+            let path = options.named.get("spec").ok_or("serve needs --spec FILE")?;
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            let value: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+            let spec = Spec::from_json(&value)?;
+            let ephemeral = options.named.contains_key("ephemeral");
+            let code = runtime().block_on(daemon::serve(spec, ephemeral));
+            Ok(ExitCode::from(code as u8))
+        }
+        Some("status") => {
+            let socket = socket(&options)?;
+            let request = client::Request {
+                op: "daemon.status",
+                body: json!({}),
+                lane: None,
+                deadline: Duration::from_secs(5),
+                key: None,
+            };
+            Ok(print_reply(
+                runtime().block_on(client::call(&socket, request)),
+            ))
+        }
+        Some("call") => {
+            let op = options.positional.get(1).ok_or("call needs OP")?;
+            let socket = socket(&options)?;
+            let body = match options.named.get("body") {
+                Some(text) => serde_json::from_str(text).map_err(|e| format!("--body: {e}"))?,
+                None => json!({}),
+            };
+            let deadline = options
+                .named
+                .get("deadline-ms")
+                .map(|v| v.parse::<u64>().map_err(|e| format!("--deadline-ms: {e}")))
+                .transpose()?
+                .unwrap_or(30_000);
+            let request = client::Request {
+                op,
+                body,
+                lane: options.named.get("lane").map(String::as_str),
+                deadline: Duration::from_millis(deadline),
+                key: options.named.get("key").map(String::as_str),
+            };
+            Ok(print_reply(
+                runtime().block_on(client::call(&socket, request)),
+            ))
+        }
+        _ => Err(USAGE.into()),
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.as_slice() {
-        [flag] if flag == "--version" || flag == "-V" => {
-            println!("kelmod {}", package_version());
-            ExitCode::SUCCESS
-        }
-        _ => {
-            eprintln!("{USAGE}");
+    if matches!(args.as_slice(), [flag] if flag == "--version" || flag == "-V") {
+        println!("kelmod {}", package_version());
+        return ExitCode::SUCCESS;
+    }
+    match run(&args) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("{message}");
             ExitCode::from(2)
         }
     }

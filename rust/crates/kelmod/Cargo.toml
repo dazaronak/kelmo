@@ -17,6 +17,8 @@ kelmo-wire = { path = "../kelmo-wire" }
 kelmo-runtime = { path = "../kelmo-runtime" }
 kelmo-embed = { path = "../kelmo-embed" }
 kelmo-archive = { path = "../kelmo-archive" }
+serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

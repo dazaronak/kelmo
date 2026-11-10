@@ -23,7 +23,7 @@ Both header and body are canonical JSON: sorted keys, compact separators, non-AS
 | `op` | call, event | call, event |
 | `lane` | call | - |
 | `deadline_ms` | call | call |
-| `origin` | call, event | - |
+| `origin` | call, event, hello | - |
 | `key` | call | - |
 | `ok` | reply | reply |
 | `error` | reply | - |

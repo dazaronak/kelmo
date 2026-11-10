@@ -14,7 +14,7 @@ const FIELDS: [(&str, &[&str], &[&str]); 13] = [
     ("op", &["call", "event"], &["call", "event"]),
     ("lane", &["call"], &[]),
     ("deadline_ms", &["call"], &["call"]),
-    ("origin", &["call", "event"], &[]),
+    ("origin", &["call", "event", "hello"], &[]),
     ("key", &["call"], &[]),
     ("ok", &["reply"], &["reply"]),
     ("error", &["reply"], &[]),
