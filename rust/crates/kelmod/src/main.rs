@@ -3,6 +3,7 @@
 //! ```text
 //! kelmod --version
 //! kelmod serve --spec FILE [--ephemeral]
+//! kelmod embed --tokenizer FILE [--additions JSON] [--preparation DIGEST]
 //! kelmod status (--root DIR | --runtime-dir DIR)
 //! kelmod call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]
 //! ```
@@ -13,6 +14,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use kelmo_runtime::{client, daemon, ipc, spec::Spec};
+
+mod embed;
 use serde_json::{Value, json};
 
 /// The package version in the form Python packaging uses, so `kelmod --version` and
@@ -37,7 +40,7 @@ fn pep440(version: &str) -> String {
     format!("{release}{label}{number}")
 }
 
-const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | status (--root DIR | --runtime-dir DIR) \
+const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | embed --tokenizer FILE [--additions JSON] [--preparation DIGEST] | status (--root DIR | --runtime-dir DIR) \
 | call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]";
 
 /// Options that take no value.
@@ -123,6 +126,25 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let spec = Spec::from_json(&value)?;
             let ephemeral = options.named.contains_key("ephemeral");
             let code = runtime().block_on(daemon::serve(spec, ephemeral));
+            Ok(ExitCode::from(code as u8))
+        }
+        Some("embed") => {
+            let tokenizer = options
+                .named
+                .get("tokenizer")
+                .ok_or("embed needs --tokenizer FILE")?;
+            let additions =
+                embed::additions(options.named.get("additions").map_or("[]", String::as_str))?;
+            let preparation = options
+                .named
+                .get("preparation")
+                .cloned()
+                .unwrap_or_default();
+            let code = embed::serve(embed::Options {
+                tokenizer: PathBuf::from(tokenizer),
+                additions,
+                preparation,
+            });
             Ok(ExitCode::from(code as u8))
         }
         Some("status") => {

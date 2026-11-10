@@ -300,6 +300,10 @@ class TokenWindow:
                                     reason="input_policy_unproven") from error
         identity = "sha256:" + hashlib.sha256(data).hexdigest()
         preparation = preparation_digest(additions)
+        remote = _REMOTE_COUNTER
+        if remote is not None and remote.serves(identity, preparation):
+            # In the archive core: the embedding core holds this exact tokenizer; nothing is parsed here.
+            return RemoteWindow(remote, budget=budget, prefix=prefix, identity=identity, preparation=preparation)
         # Held across the parse, so two windows asked for at once still parse the file once.
         with _SHARED_TOKENIZERS_LOCK:
             shared = _SHARED_TOKENIZERS.get((identity, preparation))
@@ -314,6 +318,64 @@ class TokenWindow:
         if encoding.overflowing:
             raise ArchiveEmbeddingError("The tokenizer truncated a count", reason="tokenizer_unusable")
         return len(encoding.ids)
+
+    def fits(self, text: str) -> bool:
+        return self.count(text) <= self.budget
+
+
+# The counter of the embedding core, installed by the archive core when one serves this vault's tokenizer.
+_REMOTE_COUNTER = None
+
+
+def install_remote_counter(counter):
+    """Makes TokenWindow.from_bytes return a RemoteWindow for the tokenizer `counter` serves (None removes it).
+    `counter` has `serves(identity, preparation) -> bool` and `count(texts, prefix) -> [int]`."""
+    global _REMOTE_COUNTER
+    _REMOTE_COUNTER = counter
+
+
+class RemoteWindow:
+    """A TokenWindow whose counts come from the embedding core (`embed.count`), with the same identity,
+    preparation, budget and prefix, so chunk profiles and their ids are those of a local window. Counts of
+    texts already asked for are remembered: the splitter asks `fits` for the same candidates more than once."""
+
+    MEMO = 4096
+
+    def __init__(self, counter, *, budget: int, prefix: str, identity: str, preparation: str):
+        if type(budget) is not int or budget < 1:
+            raise ValueError("Token budget must be a positive integer")
+        self._counter = counter
+        self.budget = budget
+        self.prefix = prefix
+        self.identity = identity
+        self.preparation = preparation
+        self._memo = {}
+        self._memo_lock = threading.Lock()
+
+    def counts(self, texts):
+        """Counts of several texts in one call to the embedding core."""
+        with self._memo_lock:
+            result = {text: self._memo[text] for text in texts if text in self._memo}
+        missing = [text for text in dict.fromkeys(texts) if text not in result]
+        if missing:
+            try:
+                found = self._counter.count(missing, self.prefix)
+            except ArchiveEmbeddingError:
+                raise
+            except Exception as error:  # the channel or the core failed: vectors wait, text stays durable
+                raise ArchiveEmbeddingError(f"The embedding core did not count: {error}",
+                                            reason="embedding_unavailable") from error
+            if len(found) != len(missing) or any(type(value) is not int or value < 0 for value in found):
+                raise ArchiveEmbeddingError("The embedding core returned malformed counts", reason="protocol_error")
+            result.update(zip(missing, found))
+            with self._memo_lock:
+                if len(self._memo) + len(missing) > self.MEMO:
+                    self._memo.clear()
+                self._memo.update(zip(missing, found))
+        return [result[text] for text in texts]
+
+    def count(self, text: str) -> int:
+        return self.counts([text])[0]
 
     def fits(self, text: str) -> bool:
         return self.count(text) <= self.budget

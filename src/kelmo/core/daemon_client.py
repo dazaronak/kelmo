@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -30,6 +31,16 @@ def runtime_dir(root):
 
 def socket_path(root):
     return runtime_dir(root) / 'd.sock'
+
+
+def _trusted(path):
+    """True when the socket's directory is a real directory of this user with no access for others: under a
+    shared /tmp another user could otherwise stand up a socket that answers in the daemon's place."""
+    try:
+        info = os.lstat(Path(path).parent)
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o077
 
 
 def kelmod_executable(preferred=None):
@@ -57,6 +68,8 @@ def _frames(sock, reader):
 def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
     """One call to the daemon of `root`; returns the reply body or raises KelmoError with its verdict."""
     target = str(path or socket_path(root))
+    if not _trusted(target):
+        raise KelmoError('E_TRANSPORT', f'The daemon directory of {target} is not private to this user.')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(seconds + 5)
         try:
@@ -84,6 +97,8 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
 
 
 def _answers(path):
+    if not _trusted(path):
+        return False
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         try:
             sock.connect(str(path))

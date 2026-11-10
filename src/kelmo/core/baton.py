@@ -15,12 +15,13 @@ class BatonError(AssertionError):
 
 
 class Baton:
-    def __init__(self, in_transaction=lambda: False):
+    def __init__(self, in_transaction=lambda: False, rollback=lambda: None):
         self._condition = threading.Condition()
         self._holder = None
         self._depth = 0
         self._interactive_waiting = 0
         self._in_transaction = in_transaction
+        self._rollback = rollback
 
     def held(self):
         """True when the calling thread holds the baton."""
@@ -49,11 +50,14 @@ class Baton:
             self._depth -= 1
             if self._depth:
                 return
+            # Checked while still held: an open transaction is rolled back here, never handed to the next holder.
             open_transaction = self._in_transaction()
+            if open_transaction:
+                self._rollback()
             self._holder = None
             self._condition.notify_all()
         if open_transaction:
-            raise BatonError('A journal transaction was open when the baton was released.')
+            raise BatonError('A journal transaction was open when the baton was released; it was rolled back.')
 
     @contextmanager
     def hold(self, *, interactive=True):

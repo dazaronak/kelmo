@@ -74,7 +74,20 @@ def serve(start, *, confined, descriptor=3):
             handlers[op.name] = (handler(op.name[len('archive.'):]), op.lanes[0])
     link = CoreLink.from_descriptor(descriptor, handlers=handlers, lanes={'write': 1, 'read': READERS})
     try:
-        link.serve()
+        if start.get('embed_core'):
+            # Counts go to the embedding core, so this process parses no tokenizer. The counter is in place before
+            # hello: kelmod sends no archive call until then, so no window is built with a local tokenizer first.
+            import threading
+            from kelmo.store.memory.embed import install_remote_counter
+            from .embed_client import EmbedCounter
+            link.hold_hello = True
+            serving = threading.Thread(target=link.serve, name='corelink', daemon=True)
+            serving.start()
+            install_remote_counter(EmbedCounter.connect(link))
+            link.say_hello()
+            serving.join()
+        else:
+            link.serve()
     finally:
         for item in opened:
             try:
@@ -103,9 +116,13 @@ class CoreChannel:
         try:
             result = self.link.call(op, frame['args'], context, lane=self.lanes.get(op)).result(self.SECONDS + 5)
         except KelmoError as error:
-            return {'error': {'code': error.code, 'message': str(error)}}
+            refusal = {'code': error.code, 'message': str(error)}
+            if isinstance(getattr(error, 'retryable', None), bool):
+                refusal['retryable'] = error.retryable
+            return {'error': refusal}
         except TimeoutError:
-            return {'error': {'code': 'E_DEADLINE', 'message': 'The archive core did not answer in time.'}}
+            return {'error': {'code': 'E_DEADLINE', 'message': 'The archive core did not answer in time.',
+                              'retryable': False}}
         return {'result': result}
 
     def close(self):
@@ -130,11 +147,12 @@ def _bindings(root, profile_path):
     return config, profile.bindings, profile.fenced
 
 
-def _startup(config, bindings, fenced, scratch, wire):
+def _startup(config, bindings, fenced, scratch, wire, embed_core=False):
     from ..server import ARCHIVE_PROTOCOL, coordinator_canaries
     return {'protocol': ARCHIVE_PROTOCOL, 'enrollment': bindings.describe(),
             'archive': str(config.archive.resolve()), 'cache': str(config.cache), 'scratch': str(scratch),
-            'canaries': coordinator_canaries(config), 'fenced': fenced, 'embedding': wire, 'idle_seconds': None}
+            'canaries': coordinator_canaries(config), 'fenced': fenced, 'embedding': wire, 'idle_seconds': None,
+            'embed_core': embed_core}
 
 
 def main(argv=None):
@@ -145,13 +163,14 @@ def main(argv=None):
     parser.add_argument('--server-profile', type=Path)
     parser.add_argument('--in-process', action='store_true', help='No confinement (tests and unsupported hosts '
                                                                   'that a profile explicitly allows)')
+    parser.add_argument('--embed-core', action='store_true', help='Token counts come from the embedding core')
     args = parser.parse_args(argv)
     config, bindings, fenced = _bindings(args.vault, args.server_profile)
     from ..server import embedding_launch
     scratch = Path(tempfile.mkdtemp(prefix='kelmo-archive-')).resolve()
     try:
         wire, model_roots, model_files, fds, channel_env = embedding_launch(config.embedding, poison=False)
-        start = _startup(config, bindings, fenced, scratch, wire)
+        start = _startup(config, bindings, fenced, scratch, wire, embed_core=args.embed_core)
         if args.in_process:
             return serve(start, confined=False)
         return _confined(config, start, scratch, model_roots, model_files, fds, channel_env)

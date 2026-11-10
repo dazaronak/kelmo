@@ -82,10 +82,11 @@ class CoreLink:
             self._outgoing[call_id] = future
         try:
             self.send(header, body)
-        except OSError as error:
+        except (OSError, ValueError, TypeError, KelmoError) as error:
             with self._state:
                 self._outgoing.pop(call_id, None)
-            future.set_exception(KelmoError('E_TRANSPORT', f'The channel to kelmod failed: {error}'))
+            future.set_exception(error if isinstance(error, KelmoError)
+                                 else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------
@@ -121,13 +122,14 @@ class CoreLink:
 
     def _finish(self):
         self._stopping.set()
-        for pool in self.pools.values():
-            pool.shutdown(wait=True, cancel_futures=False)
+        # Outgoing calls first: no reply can arrive any more, and a handler waiting on one would hold the pool.
         with self._state:
             pending, self._outgoing = list(self._outgoing.values()), {}
         for future in pending:
             if not future.done():
                 future.set_exception(KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
+        for pool in self.pools.values():
+            pool.shutdown(wait=True, cancel_futures=False)
         try:
             self.sock.close()
         except OSError:

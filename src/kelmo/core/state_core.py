@@ -15,8 +15,10 @@ import asyncio
 import contextvars
 import inspect
 import json
+import os
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -44,18 +46,20 @@ _FACADE = contextvars.ContextVar('kelmo_state_facade', default=None)
 
 
 class Storage:
-    """The writer Service on its thread, and the reader Services on theirs."""
+    """The writer Service, used by whichever thread holds the baton, and the reader Services on reader threads.
+
+    There is no writer thread: a write runs on its caller's thread (a lane or handler thread of the core, a job
+    thread) while it holds the baton, so a model call inside one write lets the baton go and the next write runs
+    meanwhile. The writer's connection is opened with check_same_thread=False; the baton is what makes that safe."""
 
     def __init__(self, make_writer, make_reader, readers=DEFAULT_READERS):
         self.writer = make_writer()
-        self.baton = Baton(in_transaction=self._in_transaction)
+        self.baton = Baton(in_transaction=self._in_transaction, rollback=lambda: self.writer.journal._conn.rollback())
         self.writer.journal.guard = self.baton.check
         self._make_reader = make_reader
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
-        self._writer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='state-writer')
-        self._writer_thread = self._writer_pool.submit(threading.get_ident).result()
         self._reader_pool = ThreadPoolExecutor(max_workers=readers, thread_name_prefix='state-reader')
 
     def _in_transaction(self):
@@ -74,17 +78,14 @@ class Storage:
         return service
 
     def write(self, function):
-        """Runs `function(writer)` on the writer thread under the baton, with the caller's context."""
-        def task():
-            with self.baton.hold():
-                return function(self.writer)
-        if threading.get_ident() == self._writer_thread:
-            return task()
-        return self._writer_pool.submit(contextvars.copy_context().run, task).result()
+        """Runs `function(writer)` on this thread holding the baton."""
+        with self.baton.hold():
+            return function(self.writer)
 
     def read(self, function):
-        """Runs `function(reader)` on a reader thread, with the caller's context."""
-        if threading.get_ident() == self._writer_thread:
+        """Runs `function(reader)` on a reader thread, with the caller's context; a baton holder reads its own
+        writes on the writer."""
+        if self.baton.held():
             return function(self.writer)
         return self._reader_pool.submit(contextvars.copy_context().run, lambda: function(self._reader())).result()
 
@@ -99,7 +100,6 @@ class Storage:
         # A reader's connection belongs to its thread, which has ended; closing from here only drops Python refs.
         del readers
         self.write(lambda writer: writer.close())
-        self._writer_pool.shutdown(wait=True)
 
 
 class Routed:
@@ -241,8 +241,8 @@ class StateCore:
         install(self.storage.baton)
         self.jobs = Jobs(self, worker_config=worker_config)
         from .. import daemon as executors
-        groups = self.root / '.state' / 'executors'
-        groups.mkdir(mode=0o700, exist_ok=True)
+        groups = self.root / '.state' / 'executors' / 'state'
+        groups.mkdir(mode=0o700, parents=True, exist_ok=True)
         executors.executor_groups = groups
         if schedule:
             self.jobs.start()
@@ -413,6 +413,28 @@ class StateCore:
         install(None)
 
 
+WRITER_LOCK_SECONDS = 30.0
+
+
+def _writer_lock(root):
+    """Holds `.state/state-core.lock` for the life of the process. kelmod's instance lock ends with kelmod; a
+    state core of a crashed daemon may still be finishing a write, and a new daemon's state core waits here
+    until it has gone instead of writing beside it."""
+    import fcntl
+    path = Path(root).expanduser().resolve() / '.state' / 'state-core.lock'
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    limit = time.monotonic() + WRITER_LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            if time.monotonic() >= limit:
+                os.close(descriptor)
+                raise SystemExit(f'kelmo state core: another state core still holds {path}')
+            time.sleep(0.1)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='kelmo-state-core')
     parser.add_argument('--vault', required=True, type=Path)
@@ -422,6 +444,7 @@ def main(argv=None):
     parser.add_argument('--schedule', action='store_true', help='Run the worker and Dreaming on their schedule')
     parser.add_argument('--archive-core', action='store_true', help='The archive is the supervised archive core')
     args = parser.parse_args(argv)
+    writer_lock = _writer_lock(args.vault)  # noqa: F841 - held until the process ends
     from .corelink import CoreLink
     # The channel exists before the core: the archive proxy calls through it while the core starts.
     link = CoreLink.from_descriptor(handlers={}, lanes={'handler': HANDLER_LANE, 'read': args.readers, 'write': 8,

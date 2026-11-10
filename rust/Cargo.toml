@@ -20,6 +20,8 @@ publish = false
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 libc = "0.2"
+# Pinned to the version of the Python `tokenizers` package in pyproject.toml, so counts are identical.
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "process", "signal", "macros"] }
 
 [workspace.lints.rust]

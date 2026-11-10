@@ -85,3 +85,114 @@ pub fn uid() -> u32 {
 pub fn own_resident_bytes() -> Option<u64> {
     resident_bytes(std::process::id())
 }
+
+/// The channel kelmod handed a core on descriptor 3, as a stream. Called once, at the core's start.
+pub fn inherited_channel(fd: RawFd) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: `fd` is descriptor 3, which kelmod opened for this process and nothing else in it owns; it is
+    // taken over exactly once, here. fstat confirms it is open before ownership is claimed.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) })
+}
+
+/// The direct children of a process.
+#[cfg(target_os = "linux")]
+fn children(pid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|child| {
+            std::fs::read_to_string(format!("/proc/{child}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    // The command name in parentheses may hold spaces: the fields after its closing ')'.
+                    let rest = &stat[stat.rfind(')')? + 1..];
+                    rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+                })
+                == Some(pid)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn children(pid: u32) -> Vec<u32> {
+    let mut buffer = vec![0 as libc::pid_t; 256];
+    let bytes = (buffer.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: proc_listchildpids writes at most `bytes` bytes of pids into `buffer` and returns how many it wrote.
+    let count =
+        unsafe { libc::proc_listchildpids(pid as libc::pid_t, buffer.as_mut_ptr().cast(), bytes) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    buffer
+        .into_iter()
+        .take(count as usize)
+        .filter(|child| *child > 0)
+        .map(|child| child as u32)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn children(_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Resident memory of a process and every process below it: a core's launcher and the confined worker it
+/// starts (bubblewrap puts that worker in a session of its own, so its process group is not the core's).
+pub fn tree_resident_bytes(pid: u32) -> Option<u64> {
+    let mut total = resident_bytes(pid)?;
+    let mut pending = children(pid);
+    let mut seen = 0;
+    while let Some(child) = pending.pop() {
+        seen += 1;
+        if seen > 4096 {
+            break;
+        }
+        total += resident_bytes(child).unwrap_or(0);
+        pending.extend(children(child));
+    }
+    Some(total)
+}
+
+/// When a process started, as the opaque string `kelmo.daemon.process_start` derives the same way, or None
+/// when it is gone. Linux: field 22 of `/proc/<pid>/stat`; macOS: `pbi_start_tvsec.pbi_start_tvusec`.
+#[cfg(target_os = "linux")]
+pub fn process_start(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19).map(str::to_owned)
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_start(pid: u32) -> Option<String> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns how many it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    Some(format!(
+        "{}.{:06}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start(_pid: u32) -> Option<String> {
+    None
+}

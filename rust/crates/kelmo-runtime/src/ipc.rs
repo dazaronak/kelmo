@@ -20,8 +20,8 @@ pub fn root_id(root: &Path) -> std::io::Result<String> {
 /// about 104 bytes, so the socket never lives under the vault.
 pub fn runtime_dir(root: &Path) -> std::io::Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|_| cfg!(target_os = "linux"))
-        .or_else(|| std::env::var_os("TMPDIR"))
+        .filter(|value| cfg!(target_os = "linux") && !value.is_empty())
+        .or_else(|| std::env::var_os("TMPDIR").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     Ok(base.join("kelmo").join(root_id(root)?))

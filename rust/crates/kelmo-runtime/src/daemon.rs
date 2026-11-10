@@ -100,7 +100,8 @@ pub async fn serve(spec: Spec, ephemeral: bool) -> i32 {
     };
     let (events, receiver) = unbounded_channel();
     let (fatal_tx, mut fatal_rx) = unbounded_channel::<i32>();
-    let supervisors = start_all(&spec, &events, &fatal_tx);
+    let drain = spec.drain_timeout;
+    let (supervisors, supervisor_tasks) = start_all(&spec, &events, &fatal_tx);
     let router = Router::new(spec, supervisors);
     let (ready_tx, mut ready_rx) = unbounded_channel();
     let router_task = tokio::spawn(router.run(receiver, ready_tx));
@@ -192,6 +193,13 @@ pub async fn serve(spec: Spec, ephemeral: bool) -> i32 {
     notify("STOPPING=1");
     let _ = events.send(Event::Shutdown);
     let _ = tokio::time::timeout(Duration::from_secs(35), router_task).await;
+    // Every core gets its drain before the runtime is dropped: dropping it kills the children at once.
+    let drained = async {
+        for task in supervisor_tasks {
+            let _ = task.await;
+        }
+    };
+    let _ = tokio::time::timeout(drain + Duration::from_secs(5), drained).await;
     let _ = std::fs::remove_file(ipc::socket_path(&runtime));
     code
 }

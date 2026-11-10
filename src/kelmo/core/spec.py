@@ -3,6 +3,7 @@
 `kelmo core-spec --vault V` prints it as JSON for `kelmod serve --spec`. A core starts with a stripped
 environment, so every value it needs is named here (core/environment.py lists the `core-spec` variables).
 """
+import json
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ STATE_LANES = {
 STATE_BUDGET_MB = (1536, 3072)
 ARCHIVE_LANES = {'write': (1, 512, 'fifo'), 'read': (4, 512, 'fifo')}
 ARCHIVE_BUDGET_MB = (768, 1536)
+EMBED_LANES = {'count': (8, 1024, 'fifo'), 'query': (2, 256, 'fifo'), 'passage': (2, 256, 'fifo')}
+EMBED_BUDGET_MB = (450, 900)
 PASSED_ENVIRONMENT = ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
                       'HOME', 'PATH', 'LANG', 'TMPDIR')
 
@@ -45,6 +48,24 @@ def installed_core_command(launcher):
     return [sys.executable, '-I', '-S', '-X', 'utf8=1', str(prefix / 'share/kelmo/entry.py'), 'core-run', '--']
 
 
+def embed_inputs(settings):
+    """(tokenizer.json path, special-token additions, preparation digest) of the vault's embedding settings,
+    exactly the input the archive's TokenWindow is built from; None without embedding settings. Read from
+    the pinned and declared files only: no model is loaded and no tokenizer parsed."""
+    if settings is None:
+        return None
+    from ..embeddings import declared_policy, provider_from_settings
+    if settings['provider'] == 'broker':
+        policy, additions = declared_policy(settings)
+        return str(Path(settings['tokenizer']).expanduser().resolve()), additions, policy.preparation
+    provider = provider_from_settings(settings)
+    provider._read_policy('unused')  # fills provider._special from the pinned policy files
+    from kelmo.store.memory.embed import preparation_digest
+    tokenizer = (Path(settings['model_dir']).expanduser() / 'tokenizer.json').resolve()
+    provider._pinned('tokenizer.json')  # refuses bytes that are not the pinned ones
+    return str(tokenizer), provider._special, preparation_digest(provider._special)
+
+
 def _command(core_command, executable, name):
     if core_command is not None:
         return [*core_command, name]
@@ -52,7 +73,8 @@ def _command(core_command, executable, name):
 
 
 def build(root, *, server_profile=None, runtime_dir=None, executable=None, readers=4, source_root=None,
-          core_command=None, schedule=False, worker_config=None, archive_core=False, archive_in_process=False):
+          core_command=None, schedule=False, worker_config=None, archive_core=False, archive_in_process=False,
+          embed_core=False, kelmod=None):
     """The spec of the daemon that owns `root`. `core_command` is the argv prefix that runs a core by name
     (default: this interpreter with `-m kelmo.core.<name>_core`); `source_root` puts a source tree on the cores'
     PYTHONPATH (tests and a development checkout). `archive_core` starts the archive as its own supervised core
@@ -77,6 +99,18 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
             archive_argv += ['--server-profile', str(Path(server_profile).expanduser().resolve())]
         if archive_in_process:
             archive_argv.append('--in-process')
+        inputs = None
+        if embed_core:
+            from ..config import Config
+            inputs = embed_inputs(Config.load(root).embedding)
+        if inputs is not None:
+            archive_argv.append('--embed-core')
+            tokenizer, additions, preparation = inputs
+            cores.append({'name': 'embed', 'env': {}, 'lanes': _lanes(EMBED_LANES),
+                          'argv': [str(kelmod or _kelmod()), 'embed', '--tokenizer', tokenizer,
+                                   '--additions', json.dumps(additions), '--preparation', preparation],
+                          'budget': {'soft_mb': EMBED_BUDGET_MB[0], 'hard_mb': EMBED_BUDGET_MB[1]}})
+            served += [(op, EMBED_LANES) for op in operations.table() if op.name.startswith('embed.')]
         cores.append({'name': 'archive', 'argv': archive_argv, 'env': _environment(source_root),
                       'lanes': _lanes(ARCHIVE_LANES),
                       'budget': {'soft_mb': ARCHIVE_BUDGET_MB[0], 'hard_mb': ARCHIVE_BUDGET_MB[1]}})
@@ -88,3 +122,9 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
         spec['runtime_dir'] = str(runtime_dir)
     return spec
 
+
+
+def _kelmod():
+    """The kelmod binary beside this interpreter (the wheel installs both in one scripts directory)."""
+    from .daemon_client import kelmod_executable
+    return kelmod_executable()

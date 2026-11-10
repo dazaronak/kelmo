@@ -1,6 +1,7 @@
-"""Running a job in the state core: an interactive write passes a job's model call, one job per kind at
-a time, the claims of a job end with it, stop waits for a running job, and an executor's process group
-is recorded while its call runs."""
+"""Running a job in the state core: an interactive write passes a job's model call, one job per kind
+at a time, the claims of a job end with it, stop waits for a running job, an executor's process group
+is recorded while its call runs, and a worker pass completes on an empty vault."""
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +12,15 @@ from jobs_support import claim_rows, slow_executor
 from test_action_state import world_factory as world_factory  # noqa: F401
 
 from kelmo.core.jobs import JobBusy
-from kelmo.daemon import execute
+from kelmo.daemon import execute, process_start
+
+
+def record_of(path):
+    """The JSON object in an executor record, or None while it is missing or being written."""
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
 
 
 def test_interactive_write_finishes_during_a_job_model_call(world_factory, core_factory, tmp_path):
@@ -114,8 +123,8 @@ def test_stop_waits_for_a_running_job(world_factory, core_factory, monkeypatch):
 def test_executor_process_group_is_recorded_while_its_call_runs(world_factory, core_factory,
                                                                 tmp_path):
     root = world_factory().root
-    core_factory(root)  # the core points the executor group directory at its vault
-    groups = root / '.state' / 'executors'
+    core_factory(root)  # the state core records its executor groups under its own directory
+    groups = root / '.state' / 'executors' / 'state'
     marker = tmp_path / 'executor.pid'
     argv = slow_executor(tmp_path, seconds=2)
     pool = ThreadPoolExecutor(max_workers=1)
@@ -123,11 +132,25 @@ def test_executor_process_group_is_recorded_while_its_call_runs(world_factory, c
         pending = pool.submit(execute, argv, {}, timeout=30)
         pid = wait_for(lambda: marker.exists() and marker.read_text(), timeout=20,
                        what='the executor to start')
-        # The executor leads its own process group, so the group's record is named by its pid.
-        wait_for(lambda: [entry.name for entry in groups.iterdir()] == [pid], timeout=5,
-                 what='the process group record')
+        # The record is named by the group id and holds the start time of the group's leader.
+        record = wait_for(lambda: record_of(groups / pid), timeout=5,
+                          what='the process group record')
+        assert [entry.name for entry in groups.iterdir()] == [pid]
+        assert record == {'pgid': int(pid), 'start': process_start(int(pid))}
+        assert isinstance(record['start'], str) and record['start']
         assert not pending.done()
         assert pending.result(timeout=30) == {'done': True}
     finally:
         pool.shutdown(wait=True)
     assert list(groups.iterdir()) == []
+
+
+def test_worker_pass_on_an_empty_vault_completes_and_is_recorded(world_factory, core_factory):
+    core = core_factory(world_factory().root)
+    assert core.storage.read(lambda reader: reader.queued()) == []
+    result = core.jobs.run('worker')
+    assert result['operations'] == 0
+    assert result['resolutions'] == 0
+    assert core.jobs.history[-1]['kind'] == 'worker'
+    assert core.jobs.history[-1]['state'] == 'finished'
+    assert core.jobs.history[-1]['result'] == result

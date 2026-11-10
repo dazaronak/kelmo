@@ -192,12 +192,35 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
 executor_groups = None
 
 
+def process_start(pid):
+    """When process `pid` started, as an opaque string kelmod derives the same way (`sys::process_start`), or
+    None when it is gone. A start time survives exec, so it is right even before the child has exec'd."""
+    if sys.platform.startswith('linux'):
+        try:
+            stat = Path(f'/proc/{pid}/stat').read_text(encoding='ascii')
+        except OSError:
+            return None
+        return stat.rsplit(')', 1)[1].split()[19]  # field 22, starttime in clock ticks since boot
+    if sys.platform == 'darwin':
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+        info = ctypes.create_string_buffer(136)  # struct proc_bsdinfo
+        if libc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(3), ctypes.c_uint64(0), info, 136) != 136:
+            return None  # PROC_PIDTBSDINFO
+        seconds, micros = int.from_bytes(info.raw[120:128], 'little'), int.from_bytes(info.raw[128:136], 'little')
+        return f'{seconds}.{micros:06d}'
+    return None
+
+
 def _record_group(pgid):
+    """`<pgid>` holding the group leader's start time: kelmod kills a recorded group when its leader is gone
+    or is still the same process, never when the id now belongs to a process started since."""
     if executor_groups is None:
         return None
     path = Path(executor_groups) / str(pgid)
     try:
-        path.write_text(str(pgid), encoding='ascii')
+        path.write_text(json.dumps({'pgid': pgid, 'start': process_start(pgid)}), encoding='utf-8')
     except OSError:
         return None
     return path
@@ -353,7 +376,8 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
                                     'attempts': attempts, 'exhausted': True})
     processed = 0
     with step():
-        runnable = runnable_operations(service, argv)
+        # A list, not the generator: its body reads the journal and must run inside the step.
+        runnable = list(runnable_operations(service, argv))
     for operation_id in runnable:
         if processed >= 20 or stopping():
             break
@@ -398,6 +422,9 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
                 execute(argv, request['payload'], timeout=timeout))
             queue.submit(request['id'], request['token'], reply)
         except Exception as error:  # noqa: BLE001 - One failed request must not stop the worker.
+            from .core.baton import BatonError
+            if isinstance(error, BatonError):
+                raise
             code = (error.code if isinstance(error, KelmoError) else 'E_IO' if isinstance(error, OSError)
                     else 'E_BUSY' if isinstance(error, sqlite3.Error) and sqlite_busy(error) else 'E_PROCESSING')
             if code == 'E_BUSY':

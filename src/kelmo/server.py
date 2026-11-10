@@ -1051,7 +1051,10 @@ class ArchiveProcess:
             raise KelmoError('E_ARCHIVE_PROCESS', 'The archive process returned an invalid reply.')
         if 'error' in reply:
             error = reply['error']
-            raise KelmoError(str(error.get('code', 'E_ARCHIVE_PROCESS')), str(error.get('message', '')))
+            refusal = KelmoError(str(error.get('code', 'E_ARCHIVE_PROCESS')), str(error.get('message', '')))
+            if isinstance(error.get('retryable'), bool):
+                refusal.retryable = error['retryable']
+            raise refusal
         return reply['result']
 
     def _origin(self, origin):

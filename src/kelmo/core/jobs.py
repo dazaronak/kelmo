@@ -5,7 +5,7 @@ Each job runs on a thread of the state core, over the writer Service, holding th
 (a job step yields to interactive writes) and never across a model call (`daemon.execute` lets it go). At most
 one job of a kind runs at a time. Claims a job takes are tracked by token and released when its thread ends for
 any reason, so a dead job never holds an operation until its lease runs out. Executor children run in their own
-process group, recorded under `<state>/executors/` so kelmod can kill what is left after a crash of the core.
+process group, recorded under `<state>/executors/state/` so kelmod can kill what is left after a crash of the core.
 
 Kinds:
   worker     one pass of the queue: operations, one resolution request, session jobs (daemon.tick)
@@ -81,14 +81,15 @@ class Jobs:
             outcome.update(state='failed', error_code=getattr(error, 'code', type(error).__name__))
             raise
         finally:
-            if claims:
-                self._release(claims)
-            with self._active_lock:
-                self._active.pop(kind, None)
-            outcome['seconds'] = round(time.monotonic() - began, 3)
-            with self._active_lock:
-                self.history = (self.history + [outcome])[-20:]
-            lock.release()
+            try:
+                if claims:
+                    self._release(claims)
+            finally:
+                with self._active_lock:
+                    self._active.pop(kind, None)
+                    outcome['seconds'] = round(time.monotonic() - began, 3)
+                    self.history = (self.history + [outcome])[-20:]
+                lock.release()
 
     def _release(self, tokens):
         """Drops every claim this job still holds, whatever ended it."""
@@ -117,6 +118,8 @@ class Jobs:
 
     def _dream(self, options):
         from ..dreaming_cli import run_dream
+        if options.get('scheduled') and options.get('action') == 'run':
+            self._record_dream_day()  # taken by the run that holds the dream lock, never by a refused one
         with self.step():
             return run_dream(self.storage.writer, options.get('action', 'run'),
                              contexts=getattr(self.core.profile, 'contexts', None))
@@ -176,8 +179,8 @@ class Jobs:
         if self.worker_config is not None:
             self._background('worker', {})
         action = self._dream_due()
-        if action is not None and self._background('dream', {'action': action}) and action == 'run':
-            self._record_dream_day()
+        if action is not None:
+            self._background('dream', {'action': action, 'scheduled': True})
 
     def _background(self, kind, options):
         """Starts a job thread unless one of its kind runs; True when started."""

@@ -5,3 +5,9 @@ linker = "/usr/bin/cc"
 
 [target.x86_64-apple-darwin]
 linker = "/usr/bin/cc"
+
+# The same for C code built by dependencies (the tokenizer's regex library): build scripts call the `cc` crate,
+# which runs `cc` from PATH unless CC names a compiler. An environment that sets CC keeps its own.
+[env]
+CC = { value = "/usr/bin/cc", force = false }
+CXX = { value = "/usr/bin/c++", force = false }

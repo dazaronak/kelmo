@@ -119,19 +119,32 @@ pub struct Supervised {
 }
 
 /// Kills the executor process groups a core left recorded (it crashed or was killed mid-call) and removes
-/// their records, so no model call outlives the core that started it.
+/// their records, so no model call outlives the core that started it. A group whose id now leads a process
+/// started after the record (another start time) is left alone.
 pub fn kill_leftovers(directory: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
-        if let Some(pgid) = entry
+        let pgid = entry
             .file_name()
             .to_str()
             .and_then(|name| name.parse::<u32>().ok())
-            .filter(|pgid| *pgid > 1)
-        {
-            sys::kill_group(pgid);
+            .filter(|pgid| *pgid > 1);
+        let recorded = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .map(|value| value["start"].as_str().map(str::to_owned));
+        // A leader that is gone leaves its group's id unusable for a new group while members remain, so
+        // the kill reaches only the executor's survivors; a live leader must be the recorded process.
+        if let (Some(pgid), Some(start)) = (pgid, recorded) {
+            let same = match sys::process_start(pgid) {
+                None => true,
+                Some(running) => start.as_deref() == Some(running.as_str()),
+            };
+            if same {
+                sys::kill_group(pgid);
+            }
         }
         let _ = std::fs::remove_file(entry.path());
     }
@@ -179,7 +192,7 @@ pub async fn supervise(
         });
         let writer_task = tokio::spawn(write_frames(writer, queue));
         let forward = events.clone();
-        let reader_task = tokio::spawn(read_frames(reader, move |header, body| {
+        let mut reader_task = tokio::spawn(read_frames(reader, move |header, body| {
             forward
                 .send(Event::CoreFrame {
                     core: index,
@@ -196,8 +209,13 @@ pub async fn supervise(
             let deadline = stop_deadline;
             tokio::select! {
                 _ = child.wait() => break,
+                _ = &mut reader_task, if !reader_task.is_finished() => {
+                    eprintln!("kelmod: the channel of core {} stopped; restarting it", core.name);
+                    sys::kill_group(pid);
+                    let _ = child.kill().await;
+                }
                 _ = sampler.tick() => {
-                    let _ = events.send(Event::Memory { core: index, bytes: sys::resident_bytes(pid) });
+                    let _ = events.send(Event::Memory { core: index, bytes: sys::tree_resident_bytes(pid) });
                 }
                 command = commands.recv() => match command {
                     Some(Command::Kill) => {
@@ -235,16 +253,23 @@ pub async fn supervise(
     }
 }
 
-/// Builds the supervisor tasks for every core of the spec.
+/// Builds the supervisor tasks for every core of the spec: their command senders, and the tasks themselves,
+/// which the daemon waits for on a stop so every core drains before the process ends.
 pub fn start_all(
     spec: &Spec,
     events: &UnboundedSender<Event>,
     fatal: &UnboundedSender<i32>,
-) -> Vec<UnboundedSender<Command>> {
+) -> (
+    Vec<UnboundedSender<Command>>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
     let mut senders = Vec::new();
+    let mut tasks = Vec::new();
     for (index, core) in spec.cores.iter().cloned().enumerate() {
         let (tx, rx) = unbounded_channel();
         senders.push(tx);
+        // A core's own directory: restarting one core never kills another core's executors.
+        let executors = spec.state_dir.join("executors").join(&core.name);
         let supervised = Supervised {
             index,
             core,
@@ -252,9 +277,14 @@ pub fn start_all(
             restart_window: spec.restart_window,
             drain: spec.drain_timeout,
             sample: spec.sample,
-            executors: spec.state_dir.join("executors"),
+            executors,
         };
-        tokio::spawn(supervise(supervised, events.clone(), rx, fatal.clone()));
+        tasks.push(tokio::spawn(supervise(
+            supervised,
+            events.clone(),
+            rx,
+            fatal.clone(),
+        )));
     }
-    senders
+    (senders, tasks)
 }

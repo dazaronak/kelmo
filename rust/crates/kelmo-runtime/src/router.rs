@@ -711,6 +711,8 @@ impl Router {
             } else if let Some(call) = self.finish(id)
                 && !call.abandoned
             {
+                // Retryable: the caller resends under its own request key, which the ledger settles at most
+                // once (section 4.6); kelmod itself never sends it again.
                 self.refuse(
                     call.source,
                     &call.caller_id,

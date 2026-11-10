@@ -141,7 +141,7 @@ def through_daemon(args, argv, launcher):
         if result.get('state') == 'unconfigured':
             raise KelmoError('E_CONFIG', 'Configure Dreaming before running it.')
         return result
-    body = {'argv': list(argv)}
+    body = {'argv': list(argv) if args.vault else [*argv, '--vault', str(Path(root).expanduser().resolve())]}
     if getattr(args, 'file', None):
         body['sources'] = {args.file: list(read_source(args.file))}
     if args.command in STDIN_COMMANDS and not (args.command == 'resolution'
