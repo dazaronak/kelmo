@@ -29,6 +29,12 @@ ARCHIVE_PROTOCOL = 'kelmo-archive/1'
 PROFILE_SCHEMA = 'kelmo-server/1'
 MAX_FRAME = 32 * 1048576
 ARCHIVE_TIMEOUT_SECONDS = 300
+# A confined archive process with no frame for this long exits, freeing its archive connection and
+# tokenizer; the coordinator starts a new one for the next operation.
+ARCHIVE_IDLE_SECONDS = 300
+# Exit status of an archive process that left idle. It read nothing after its last reply, so a frame the
+# parent wrote as it left is unread and is sent again to the next process.
+ARCHIVE_IDLE_EXIT = 75
 CLIENT_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{1,128}')
 IDEMPOTENCY_KEY = re.compile(r'[\x21-\x7e]{1,200}')
@@ -307,6 +313,54 @@ class PipeReader:
 
 
 # --- Restricted archive process: worker side ---
+
+_IDLE = object()
+
+
+class _ParentFrames:
+    """The parent's frames on the worker side. With an idle limit and a real descriptor, reads go to the
+    descriptor directly, so waiting on it never misses bytes hidden in a stream buffer; otherwise the
+    stream is read as given and never idles out."""
+
+    def __init__(self, stream, idle_seconds):
+        self.stream = stream
+        self.idle_seconds = idle_seconds
+        self.buffer = b''
+        self.descriptor = None
+        if idle_seconds is not None:
+            try:
+                self.descriptor = stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                self.descriptor = None
+
+    def next(self):
+        """The next frame, None at end of stream, or _IDLE when nothing at all arrived within the idle
+        limit. A partly received frame is always waited for."""
+        if self.descriptor is None:
+            return read_frame(self.stream)
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.descriptor, selectors.EVENT_READ)
+            while b'\n' not in self.buffer:
+                if len(self.buffer) > MAX_FRAME:
+                    raise KelmoError('E_PROTOCOL', 'Frame exceeds the bounded frame size.')
+                if not self.buffer and not selector.select(self.idle_seconds):
+                    return _IDLE
+                chunk = os.read(self.descriptor, 1048576)
+                if not chunk:
+                    if self.buffer:
+                        raise KelmoError('E_PROTOCOL', 'The parent closed the channel inside a frame.')
+                    return None
+                self.buffer += chunk
+        line, _, self.buffer = self.buffer.partition(b'\n')
+        return decode_frame(line + b'\n')
+
+
+def _idle_limit(value):
+    if value is None:
+        return None
+    if type(value) not in (int, float) or not value > 0:
+        raise KelmoError('E_PROTOCOL', 'Archive process idle limit is invalid.')
+    return value
 
 def _decode_origin(bindings, value):
     """Re-issue a principal from the parent's enrollment; a decoded record is only a lookup key."""
@@ -806,8 +860,12 @@ def archive_worker_main(stdin, stdout, *, confined):
         if start is None:
             return 1
         if set(start) != {'protocol', 'enrollment', 'archive', 'cache', 'scratch', 'canaries', 'fenced',
-                          'embedding'} or start['protocol'] != ARCHIVE_PROTOCOL or type(start['fenced']) is not bool:
+                          'embedding', 'idle_seconds'} or start['protocol'] != ARCHIVE_PROTOCOL \
+                or type(start['fenced']) is not bool:
             raise KelmoError('E_PROTOCOL', 'Archive process startup frame is invalid.')
+        # The parent writes nothing after the startup frame until it has read the ready reply, so the
+        # stream's buffer is empty here and later frames can be read from its descriptor.
+        frames = _ParentFrames(stdin, _idle_limit(start['idle_seconds']))
         if confined:
             readable = [path for path in start['canaries'] if _readable(path)]
             if readable:
@@ -832,10 +890,12 @@ def archive_worker_main(stdin, stdout, *, confined):
     try:
         while True:
             try:
-                frame = read_frame(stdin)
+                frame = frames.next()
             except KelmoError as error:
                 write_frame(stdout, {'error': {'code': error.code, 'message': str(error)}})
                 return 1
+            if frame is _IDLE:
+                return ARCHIVE_IDLE_EXIT
             if frame is None:
                 return 0
             write_frame(stdout, worker.handle(frame))
@@ -872,6 +932,8 @@ class _Pipe:
         # True once the process failed with a frame in flight: its effect, and anything it was writing to
         # a shared channel, is unknown.
         self.uncertain = False
+        # True when the frame in flight met an idle exit: the process read nothing, the frame is unread.
+        self.unread = False
 
     def idle_exit(self):
         """Whether the process exited while no call was in flight; checked before the next frame is
@@ -908,8 +970,12 @@ class _Pipe:
             return self.reader.frame(ARCHIVE_TIMEOUT_SECONDS)
         except (KelmoError, OSError) as error:
             self.failed = 'The restricted archive process stopped responding; no unconfined fallback is used.'
-            self.uncertain = True
             self.close()
+            if self.process.returncode == ARCHIVE_IDLE_EXIT:
+                self.failed = 'The restricted archive process left idle before reading the frame.'
+                self.unread = True
+            else:
+                self.uncertain = True
             raise KelmoError('E_ARCHIVE_PROCESS', self.failed) from error
 
     def close(self):
@@ -938,8 +1004,9 @@ class ArchiveProcess:
     """ArchiveCoordinatorAPI over the restricted archive process; never opens archive SQLite here.
 
     A process that exited while idle is found before the next frame is written and started again, under
-    the same confinement, so that operation runs on the new process. A process that died with a frame in
-    flight fails that operation with E_ARCHIVE_PROCESS and it is never resent here, because its effect may
+    the same confinement, so that operation runs on the new process. A process leaves idle on its own after
+    ARCHIVE_IDLE_SECONDS; a frame written as it left is unread (ARCHIVE_IDLE_EXIT) and goes once to the new
+    process. A process that died otherwise with a frame in flight fails that operation with E_ARCHIVE_PROCESS and it is never resent here, because its effect may
     already have happened; the caller's ledger decides whether it is retried. The process started after
     such a death gets no broker channel, which may hold half a request (embedding_launch)."""
     snapshot_graph = True
@@ -963,7 +1030,14 @@ class ArchiveProcess:
         return self._transport
 
     def _call(self, method, **args):
-        reply = self._live().call({'method': method, 'args': args})
+        frame = {'method': method, 'args': args}
+        transport = self._live()
+        try:
+            reply = transport.call(frame)
+        except KelmoError:
+            if not getattr(transport, 'unread', False):
+                raise
+            reply = self._live().call(frame)  # the old process never read it, so it runs once
         if not isinstance(reply, dict) or set(reply) not in ({'result'}, {'error'}):
             raise KelmoError('E_ARCHIVE_PROCESS', 'The archive process returned an invalid reply.')
         if 'error' in reply:
@@ -1206,7 +1280,7 @@ def _spawn_archive(config, bindings, *, platform, fenced, settings, poison=False
     pipe.start({'protocol': ARCHIVE_PROTOCOL, 'enrollment': bindings.describe(),
                 'archive': str(config.archive.resolve()), 'cache': str(config.cache),
                 'scratch': str(scratch), 'canaries': coordinator_canaries(config),
-                'fenced': fenced, 'embedding': wire})
+                'fenced': fenced, 'embedding': wire, 'idle_seconds': ARCHIVE_IDLE_SECONDS})
     return pipe
 
 

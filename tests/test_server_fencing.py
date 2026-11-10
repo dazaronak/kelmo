@@ -11,6 +11,8 @@ import json
 import os
 import sqlite3
 import sys
+import threading
+import time
 
 import pytest
 
@@ -333,11 +335,68 @@ def test_worker_refuses_to_serve_when_it_can_read_coordinator_data(shared):
     config = Config.load(shared.world.root)
     startup = {'protocol': ARCHIVE_PROTOCOL, 'enrollment': shared.hub.profile.bindings.describe(),
                'archive': str(config.archive), 'cache': str(config.cache), 'scratch': str(shared.tmp_path),
-               'canaries': coordinator_canaries(config), 'fenced': False, 'embedding': None}
+               'canaries': coordinator_canaries(config), 'fenced': False, 'embedding': None,
+               'idle_seconds': None}
     stdout = io.BytesIO()
     assert archive_worker_main(io.BytesIO(encode_frame(startup)), stdout, confined=True) == 1
     reply = json.loads(stdout.getvalue())
     assert reply['ready'] is False and reply['error']['code'] == 'E_ISOLATION'
+
+
+def _worker_startup(shared, idle_seconds):
+    from kelmo.config import Config
+    from kelmo.server import ARCHIVE_PROTOCOL
+    config = Config.load(shared.world.root)
+    return {'protocol': ARCHIVE_PROTOCOL, 'enrollment': shared.hub.profile.bindings.describe(),
+            'archive': str(config.archive), 'cache': str(config.cache), 'scratch': str(shared.tmp_path),
+            'canaries': [], 'fenced': False, 'embedding': None, 'idle_seconds': idle_seconds}
+
+
+def test_an_idle_worker_exits_on_its_own_without_reading(shared):
+    """An idle session's worker frees its archive connection and tokenizer; the parent restarts it on demand."""
+    from kelmo.server import ARCHIVE_IDLE_EXIT, archive_worker_main, encode_frame
+    read_end, write_end = os.pipe()
+    os.write(write_end, encode_frame(_worker_startup(shared, 0.2)))
+    stdout = io.BytesIO()
+    started = time.monotonic()
+    try:
+        with os.fdopen(read_end, 'rb') as stdin:
+            assert archive_worker_main(stdin, stdout, confined=False) == ARCHIVE_IDLE_EXIT
+    finally:
+        os.close(write_end)
+    assert 0.2 <= time.monotonic() - started < 5
+    assert [json.loads(line) for line in stdout.getvalue().splitlines()] == [{'ready': True, 'confined': False}]
+
+
+def test_an_idle_limit_keeps_serving_frames_that_arrive_in_time(shared):
+    from kelmo.server import ARCHIVE_IDLE_EXIT, archive_worker_main, encode_frame
+    read_end, write_end = os.pipe()
+    os.write(write_end, encode_frame(_worker_startup(shared, 0.5)))
+    stdout = io.BytesIO()
+
+    def parent():
+        for _ in range(3):
+            time.sleep(0.2)
+            os.write(write_end, encode_frame({'method': 'counts', 'args': {}}))
+    sender = threading.Thread(target=parent)
+    sender.start()
+    try:
+        with os.fdopen(read_end, 'rb') as stdin:
+            assert archive_worker_main(stdin, stdout, confined=False) == ARCHIVE_IDLE_EXIT
+    finally:
+        sender.join()
+        os.close(write_end)
+    replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert len(replies) == 4 and all('result' in reply for reply in replies[1:])
+
+
+@pytest.mark.parametrize('idle_seconds', [0, -1, True, '60', [60]])
+def test_a_startup_frame_with_a_bad_idle_limit_is_refused(shared, idle_seconds):
+    from kelmo.server import archive_worker_main, encode_frame
+    stdout = io.BytesIO()
+    startup = _worker_startup(shared, idle_seconds)
+    assert archive_worker_main(io.BytesIO(encode_frame(startup)), stdout, confined=False) == 1
+    assert json.loads(stdout.getvalue())['error']['code'] == 'E_PROTOCOL'
 
 
 def test_archive_frames_reissue_origins_and_reject_unknown_ones(shared):
@@ -574,6 +633,26 @@ def test_an_idle_archive_exit_is_restarted_before_the_next_frame(shared, tmp_pat
     finally:
         archive.close()
     assert _received(log) == ['first', 'second']
+
+
+def test_a_frame_that_meets_an_idle_exit_runs_once_on_a_new_process(shared, tmp_path):
+    """The worker left idle as the frame was written: its exit code proves it read nothing, so the frame is
+    sent again to a new process, which keeps the broker channel."""
+    import subprocess
+    from kelmo.server import ARCHIVE_IDLE_EXIT, ArchiveProcess, _Pipe
+    log = tmp_path / 'frames.log'
+    echo, started = _echo_archive(tmp_path, log)
+    leaving = subprocess.Popen([sys.executable, '-c', f'import sys, time; time.sleep(0.3); sys.exit({ARCHIVE_IDLE_EXIT})'],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    (tmp_path / 'scratch-idle').mkdir()
+    archive = ArchiveProcess(_Pipe(leaving, tmp_path / 'scratch-idle'), shared.hub.profile.bindings,
+                             {'mode': 'confined'}, restart=echo)
+    try:
+        assert archive._call('first') == 'first'
+        assert [item['uncertain'] for item in started] == [False]
+    finally:
+        archive.close()
+    assert _received(log) == ['first']
 
 
 def test_a_death_during_a_call_is_never_replayed_and_restarts_uncertain(shared, tmp_path):

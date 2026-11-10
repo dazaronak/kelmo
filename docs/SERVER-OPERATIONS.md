@@ -21,7 +21,9 @@ kelmo --vault /srv/memory server status --profile /srv/config/server.json --json
 Initialization uses the archive's existing writer identity. It never guesses a
 new writer name for an imported archive. New profiles start fenced and use the
 confined archive process. Install its OS prerequisites before starting the shared
-service. Client enrollment does not grant requester-attestation authority unless
+service. Each client channel and job starts its own archive process; one that gets
+no request for five minutes exits on its own, and the next request starts a new
+one, so an idle session holds no archive connection or tokenizer. Client enrollment does not grant requester-attestation authority unless
 `--requester` is supplied explicitly.
 
 Enroll repository bindings before assigning them to a client:
