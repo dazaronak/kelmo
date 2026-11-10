@@ -1,0 +1,22 @@
+[package]
+name = "kelmod"
+description = "The Kelmo daemon: supervisor, gateway and router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kelmod"
+path = "src/main.rs"
+
+[dependencies]
+kelmo-wire = { path = "../kelmo-wire" }
+kelmo-runtime = { path = "../kelmo-runtime" }
+kelmo-embed = { path = "../kelmo-embed" }
+kelmo-archive = { path = "../kelmo-archive" }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "kelmo-runtime"
+description = "Mailboxes, lanes, router, supervisor and local IPC of the Kelmo daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

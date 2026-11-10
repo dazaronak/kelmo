@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/kelmo-wire",
+  "crates/kelmo-runtime",
+  "crates/kelmo-embed",
+  "crates/kelmo-archive",
+  "crates/kelmod",
+]
+
+[workspace.package]
+version = "0.2.0-dev.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/dazaronak/kelmo"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

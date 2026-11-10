@@ -1,0 +1,7 @@
+# macOS links through the system compiler driver by absolute path: a `cc` earlier on PATH need not be a
+# C compiler, and cargo would link with whatever it finds there.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/cc"

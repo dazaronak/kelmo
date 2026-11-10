@@ -92,7 +92,7 @@
     {
       "name": "syntax (bash -n, and under bash 3.2 too)",
       "kind": "syntax",
-      "files": ["*.sh", "tests", "packaging"],
+      "files": ["*.sh", "tests", "packaging", "tools"],
       "shebang": true
     },
     {
@@ -106,7 +106,7 @@
     {
       "name": "lint (shellcheck -s bash -S warning over the same shell files)",
       "kind": "shellcheck",
-      "files": ["*.sh", "tests", "packaging"],
+      "files": ["*.sh", "tests", "packaging", "tools"],
       "shebang": true,
       "needs": ["shellcheck"],
       "leaves": "every shellcheck finding, warning or worse, on the installed launcher, the acceptance harness and this gate itself"

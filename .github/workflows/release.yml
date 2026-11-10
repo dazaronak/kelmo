@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag vX.Y.Z whose version matches pyproject.toml. The full CI runs first; the exact wheel and sdist it
-# built and tested are then published to PyPI through Trusted Publishing (no API token is stored anywhere).
+# Push a tag vX.Y.Z whose version matches pyproject.toml. The full CI runs first; the exact four platform wheels
+# and the sdist it built and tested are then published to PyPI through Trusted Publishing (no API token is stored
+# anywhere).
 
 on:
   push:
@@ -32,15 +33,18 @@ jobs:
       - name: Download the tested distributions
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          name: kelmo-dist
+          pattern: kelmo-*
           path: dist/
+          merge-multiple: true
       - name: Check that the tag names the built version
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -- dist/kelmo-*.whl
+          test "$#" -eq 4
+          set -- dist/kelmo-*.tar.gz
           test "$#" -eq 1
-          version=$(basename "$1" | cut -d- -f2)
+          version=$(basename "$1" .tar.gz | cut -d- -f2)
           if [ "v$version" != "$TAG" ]; then
             echo "Tag $TAG does not match the built version $version (pyproject.toml)." >&2
             exit 1

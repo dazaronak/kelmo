@@ -18,6 +18,19 @@ env:
   UV_MANAGED_PYTHON: "1"
 
 jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Format, clippy and tests
+        run: tools/check_rust.sh
+
   source:
     name: Source (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -58,6 +71,8 @@ jobs:
         run: uv lock --check
       - name: Lint
         run: uv run --locked --python ${{ matrix.python }} ruff check .
+      - name: Build kelmod
+        run: tools/build_kelmod.sh
       - name: Test default source profile
         env:
           PYTHONPATH: ${{ github.workspace }}/src
@@ -70,11 +85,17 @@ jobs:
           --ignore=tests/test_installed_cli.py
 
   artifacts:
-    name: Build and inspect artifacts
-    needs: source
-    runs-on: ubuntu-24.04
-    outputs:
-      artifact-id: ${{ steps.distributions.outputs.artifact-id }}
+    name: Build and inspect artifacts (${{ matrix.target }})
+    needs: [rust, source]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, manylinux: "2014", sdist: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2014", sdist: false }
+          - { os: macos-26, target: aarch64-apple-darwin, manylinux: "", sdist: false }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, manylinux: "", sdist: false }
     steps:
       - name: Prepare synthetic environment
         run: |
@@ -102,22 +123,41 @@ jobs:
           cache-dependency-glob: uv.lock
       - name: Sync locked dependencies
         run: uv sync --locked --dev --python 3.12
-      - name: Build wheel and source distribution
-        run: uv build --no-sources
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist
+      - name: Build source distribution
+        if: matrix.sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          command: sdist
+          args: --out dist
       - name: Inspect distribution contents
         run: |
           wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-          source=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
           test -n "$wheel"
-          test -n "$source"
+          source=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
           KELMO_TEST_WHEEL="$wheel" KELMO_TEST_SDIST="$source" \
             uv run --locked pytest tests/test_distribution.py
-      - name: Upload distributions
-        id: distributions
+      - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: kelmo-dist
-          path: dist/
+          name: kelmo-wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload source distribution
+        if: matrix.sdist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kelmo-sdist
+          path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -127,13 +167,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      actions: read
     strategy:
       fail-fast: false
       matrix:
         # Pushes and pull requests: one Linux job. Release tags, the weekly run and a manual run: both
         # operating systems on the lowest and highest supported Python.
-        include: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && '[{"os":"ubuntu-24.04","python":"3.12"},{"os":"ubuntu-24.04","python":"3.13"},{"os":"macos-26","python":"3.12"},{"os":"macos-26","python":"3.13"}]' || '[{"os":"ubuntu-24.04","python":"3.13"}]') }}
+        include: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) && '[{"os":"ubuntu-24.04","python":"3.12","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-24.04","python":"3.13","target":"x86_64-unknown-linux-gnu"},{"os":"macos-26","python":"3.12","target":"aarch64-apple-darwin"},{"os":"macos-26","python":"3.13","target":"aarch64-apple-darwin"}]' || '[{"os":"ubuntu-24.04","python":"3.13","target":"x86_64-unknown-linux-gnu"}]') }}
     steps:
       - name: Prepare synthetic environment
         run: |
@@ -161,13 +200,17 @@ jobs:
           cache-dependency-glob: uv.lock
       - name: Sync locked test dependencies
         run: uv sync --locked --dev --no-install-project --python ${{ matrix.python }}
-      - name: Download immutable distributions
+      - name: Download the wheel of this platform
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          artifact-ids: ${{ needs.artifacts.outputs.artifact-id }}
+          name: kelmo-wheel-${{ matrix.target }}
           path: ${{ runner.temp }}/dist
-          merge-multiple: true
-          github-token: ${{ github.token }}
+          digest-mismatch: error
+      - name: Download the source distribution
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: kelmo-sdist
+          path: ${{ runner.temp }}/dist
           digest-mismatch: error
       - name: Install fresh runtime
         run: |

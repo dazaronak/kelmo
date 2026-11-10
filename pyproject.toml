@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling==1.29.0"]
-build-backend = "hatchling.build"
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
 
 [project]
 name = "kelmo"
-version = "0.1.1"
+version = "0.2.0.dev0"
 description = "Long-term memory for coding agents: a searchable archive, a self-maintained wiki and a startup context"
 readme = "README.md"
 license = "Apache-2.0"
@@ -44,30 +44,23 @@ Issues = "https://github.com/dazaronak/kelmo/issues"
 [dependency-groups]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.6,<1"]
 
-[tool.hatch.build]
-exclude = [
-  "/.git",
-  "/_docs",
+# One wheel per platform: the Python package from src/kelmo plus the kelmod binary. The launcher and
+# the runtime files the launcher reads install from packaging/wheel-data, whose entries link to their
+# single source in packaging/ and src/kelmo.
+[tool.maturin]
+bindings = "bin"
+manifest-path = "rust/crates/kelmod/Cargo.toml"
+python-source = "src"
+module-name = "kelmo"
+data = "packaging/wheel-data"
+locked = true
+strip = true
+include = [
+  { path = "rust-toolchain.toml", format = "sdist" },
+  { path = "packaging/**/*", format = "sdist" },
+  { path = ".cargo/config.toml", format = "sdist" },
 ]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/kelmo"]
-
-[tool.hatch.build.targets.wheel.shared-scripts]
-"packaging/kelmo" = "kelmo"
-
-[tool.hatch.build.targets.wheel.shared-data]
-"packaging/gate.py" = "share/kelmo/gate.py"
-"src/kelmo/bootstrap.py" = "share/kelmo/bootstrap.py"
-"src/kelmo/runtime.py" = "share/kelmo/runtime.py"
-"src/kelmo/linux_runtime.py" = "share/kelmo/linux_runtime.py"
-"src/kelmo/entry.py" = "share/kelmo/entry.py"
-"src/kelmo/interface.py" = "share/kelmo/interface.py"
-"src/kelmo/model_store.py" = "share/kelmo/model_store.py"
-"src/kelmo/config.py" = "share/kelmo/config.py"
-"src/kelmo/hot.py" = "share/kelmo/hot.py"
-"src/kelmo/session_settings.py" = "share/kelmo/session_settings.py"
-"src/kelmo/errors.py" = "share/kelmo/errors.py"
+exclude = ["**/__pycache__/**", "**/*.pyc", "_docs/**", "rust/target/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -83,11 +76,7 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.uv]
 build-constraint-dependencies = [
-  "hatchling==1.29.0",
-  "packaging==26.0",
-  "pathspec==1.0.4",
-  "pluggy==1.6.0",
-  "trove-classifiers==2026.1.14.14",
+  "maturin==1.15.0",
 ]
 constraint-dependencies = [
   "aiofile==3.9.0",

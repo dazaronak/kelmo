@@ -8,5 +8,6 @@ build/
 dist/
 .coverage
 local-data/
+/rust/target/
 .env*
 !.env.example

@@ -1,0 +1,12 @@
+[package]
+name = "kelmo-wire"
+description = "Frame codec, header types, error codes and canonical JSON of the kelmo/2 protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
