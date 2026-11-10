@@ -1,5 +1,6 @@
 """One orchestration layer over the archive and wiki libraries."""
 import base64
+import contextvars
 import fcntl
 import json
 import os
@@ -9,7 +10,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +26,11 @@ from .contracts import (CONTRACT_VERSION, INTAKE_BEHAVIOR_VERSION, ISO_DAY,
                         EvidenceRef, Origin, SearchFilters, SourcePacket, iso_day)
 from .wiki import engine
 from . import fact_checks, outcomes
+
+# The trusted origin of the request this thread or task is serving. The state core binds it for one call
+# (`Service.requested_by`), so one Service serves every client and holds no client of its own.
+_REQUEST_ORIGIN = contextvars.ContextVar('kelmo_request_origin', default=None)
+
 
 def chunk_index_for(config):
     """The configured [embedding] index of a vault, or None; builds its provider without inference.
@@ -181,11 +187,36 @@ class Service:
                 shutil.rmtree(stage)
         return dict(initialized=True, existing=False, **Config.load(root).as_dict())
 
+    @property
+    def origin(self):
+        """The trusted origin of the request being served: the one the state core bound for this call, or,
+        outside a bound call, the origin this Service was opened with (a CLI or a test)."""
+        bound = _REQUEST_ORIGIN.get()
+        return bound if bound is not None else self._default_origin
+
+    @contextmanager
+    def requested_by(self, origin):
+        """Serves the calls inside the block for `origin`, a principal these bindings issued."""
+        try:
+            self.bindings.validate(origin)
+        except ValueError as error:
+            raise KelmoError('E_ORIGIN', str(error)) from error
+        token = _REQUEST_ORIGIN.set(origin)
+        try:
+            yield self
+        finally:
+            _REQUEST_ORIGIN.reset(token)
+
     def __init__(self, root, *, archive_api=None, bindings=None, origin=None,
-                 resolve_context_binding=None, background=False, context_bindings=None):
+                 resolve_context_binding=None, background=False, context_bindings=None, read_only=False,
+                 shared_journal=False):
         """`background`: shared background work (a worker or daemon under a server profile). It has no
         capture origin of its own, so a capture or forget without an explicit issued origin is refused;
-        queued operations keep the origins recorded when they were captured."""
+        queued operations keep the origins recorded when they were captured.
+
+        `read_only`: a reader of the state core. Its journal connection is read-only and runs no schema
+        work; a write through it fails. `shared_journal`: the writer of the state core, whose one journal
+        connection the baton hands between threads."""
         self.config = Config.load(root)
         self.root = self.config.root
         for relative in ('.state/journal.sqlite3', 'archive/archive.db', 'knowledge/wiki', '.cache/embeddings'):
@@ -211,19 +242,22 @@ class Service:
             raise KelmoError('E_ORIGIN', 'Background work has no capture origin and needs the trusted archive.')
         try:
             if background:
-                self.origin = None
+                self._default_origin = None
             else:
-                self.origin = origin if origin is not None else self.bindings.origin('local')
-                self.bindings.validate(self.origin)
+                self._default_origin = origin if origin is not None else self.bindings.origin('local')
+                self.bindings.validate(self._default_origin)
         except ValueError as error:
             raise KelmoError('E_ORIGIN', str(error)) from error
         if resolve_context_binding is not None and not callable(resolve_context_binding):
             raise KelmoError('E_BINDING', 'A trusted context resolver must be callable.')
         self._resolve_context_binding = resolve_context_binding
-        self.journal = Journal(self.config.state / 'journal.sqlite3')
+        self.read_only = read_only
+        self.journal = Journal(self.config.state / 'journal.sqlite3', read_only=read_only,
+                               check_same_thread=not shared_journal)
         try:
-            fact_checks.schema(self.journal.conn)
-            outcomes.schema(self.journal.conn)
+            if not read_only:
+                fact_checks.schema(self.journal.conn)
+                outcomes.schema(self.journal.conn)
             if archive_api is None:
                 from .archive_adapter import LocalArchiveAdapter
                 self.archive_api = LocalArchiveAdapter(self.config.archive, self.config.cache, self.bindings,

@@ -5,6 +5,7 @@ enrolled client; the coordinator re-issues every Origin from controller bindings
 the archive process re-issues the same Origins from the enrollment its parent sends.
 """
 import base64
+import contextvars
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1021,6 +1023,9 @@ class ArchiveProcess:
         self.fenced = fenced
         self._restart = restart
         self.legacy_receipt_verifier = None
+        # One frame in flight on the pipe: the state core's writer and readers share this process.
+        import threading
+        self._channel = threading.RLock()
 
     def _live(self):
         transport = self._transport
@@ -1034,13 +1039,14 @@ class ArchiveProcess:
 
     def _call(self, method, **args):
         frame = {'method': method, 'args': args}
-        transport = self._live()
-        try:
-            reply = transport.call(frame)
-        except KelmoError:
-            if not getattr(transport, 'unread', False):
-                raise
-            reply = self._live().call(frame)  # the old process never read it, so it runs once
+        with self._channel:
+            transport = self._live()
+            try:
+                reply = transport.call(frame)
+            except KelmoError:
+                if not getattr(transport, 'unread', False):
+                    raise
+                reply = self._live().call(frame)  # the old process never read it, so it runs once
         if not isinstance(reply, dict) or set(reply) not in ({'result'}, {'error'}):
             raise KelmoError('E_ARCHIVE_PROCESS', 'The archive process returned an invalid reply.')
         if 'error' in reply:
@@ -1505,11 +1511,67 @@ def _enrollment_digest(profile):
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-class ClientSession:
-    """One enrolled client channel over the same Service the local CLI uses."""
+# The Service a ClientSession uses for the call this thread serves: the state core runs a read on one of its
+# reader Services and a write on its writer, both shared by every client.
+_SESSION_SERVICE = contextvars.ContextVar('kelmo_session_service', default=None)
 
-    def __init__(self, root, profile, client_id, *, archive=None, profile_path=None):
+
+class KeysInFlight:
+    """The request keys a process is executing now; a second attempt of a running key is refused at once
+    (E_BUSY, retryable), as the lock file refuses it across processes."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._keys = set()
+
+    @contextmanager
+    def hold(self, key):
+        with self._lock:
+            if key in self._keys:
+                raise KelmoError('E_BUSY', 'Another attempt of this request is still running; it stays queued.')
+            self._keys.add(key)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._keys.discard(key)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._keys)
+
+
+class ClientSession:
+    """One enrolled client channel over the same Service the local CLI uses.
+
+    With `service`, the session borrows a Service it does not own (the state core's writer) and holds only
+    this client's own state: its origin, the enrollment revision and digest it has seen."""
+
+    @property
+    def service(self):
+        selected = _SESSION_SERVICE.get()
+        return selected if selected is not None else self._service
+
+    @service.setter
+    def service(self, value):
+        self._service = value
+
+    @contextmanager
+    def using(self, service):
+        """Runs the calls inside the block on `service` (a reader or the writer), for this client's origin."""
+        token = _SESSION_SERVICE.set(service)
+        try:
+            with service.requested_by(self.origin):
+                yield self
+        finally:
+            _SESSION_SERVICE.reset(token)
+
+    keys_in_flight = None
+
+    def __init__(self, root, profile, client_id, *, archive=None, profile_path=None, service=None,
+                 keys_in_flight=None):
         from .service import Service
+        self.keys_in_flight = keys_in_flight
         if not isinstance(profile, ServerProfile):
             raise KelmoError('E_CONFIG', 'A shared session requires a trusted server profile.')
         if not isinstance(client_id, str) or not CLIENT_ID.fullmatch(client_id):
@@ -1527,6 +1589,11 @@ class ClientSession:
         config = Config.load(root)
         if config.vault_id != profile.bindings.authority_id:
             raise KelmoError('E_ORIGIN', 'The server profile belongs to another vault authority.')
+        self._owns_service = service is None
+        if service is not None:
+            self.archive = service.archive_api
+            self.service = service
+            return
         self.archive = archive if archive is not None else open_archive(config, profile.bindings,
                                                                         profile.archive_process,
                                                                         fenced=profile.fenced)
@@ -1541,7 +1608,8 @@ class ClientSession:
         self.archive.legacy_receipt_verifier = self.service._legacy_receipt_allowed
 
     def close(self):
-        self.service.close()
+        if self._owns_service:
+            self.service.close()
 
     def __enter__(self):
         return self
@@ -1647,7 +1715,12 @@ class ClientSession:
     def _request_lock(self, request_key):
         """The exclusive lock of one ledger row, refused at once (E_BUSY, retryable) while another live
         attempt holds it. The file is removed after the row is settled: a later opener of the old or a new
-        file then finds the finished row and replays it."""
+        file then finds the finished row and replays it. In the state core, where one process executes
+        every write, the lock is the core's in-process table of keys in flight and no file is made."""
+        if self.keys_in_flight is not None:
+            with self.keys_in_flight.hold(request_key):
+                yield lambda: None
+            return
         import fcntl
         directory = self.service.config.internal('.state/client-requests')
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1885,10 +1958,12 @@ class ClientSession:
         return session_capture(self.service, self.client_id, provider=provider, native_id=native_id,
                                event=event, content=content, sha256=sha256, size=size,
                                file_identity=file_identity, client_generation=client_generation,
-                               offset=0, base_sha256=EMPTY_SHA256, final=True)
+                               offset=0, base_sha256=EMPTY_SHA256, final=True,
+                               single_writer=self.keys_in_flight is not None)
 
     def write_session_append(self, key, **piece):
-        return session_capture(self.service, self.client_id, **piece)
+        return session_capture(self.service, self.client_id, single_writer=self.keys_in_flight is not None,
+                               **piece)
 
 
 def _spool_states(descriptor, offset, length):
@@ -1942,8 +2017,19 @@ def _extend_spool(descriptor, offset, base_sha256, piece, sha256):
         raise KelmoError('E_CAPTURE_RETRY', 'The server spool differs from the received transcript; retry.')
 
 
+@contextmanager
+def _spool_lock(config, directory, name, single_writer):
+    if single_writer:
+        yield
+        return
+    import fcntl
+    with config.internal('.state/client-sessions/' + directory.name + '/' + name + '.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def session_capture(service, client_id, *, provider, native_id, event, content, sha256, size,
-                    file_identity, client_generation, offset, base_sha256, final):
+                    file_identity, client_generation, offset, base_sha256, final, single_writer=False):
     """Extend a server-private spool by one piece of a client transcript; the final piece of a lifecycle
     event runs the existing session intake on the whole spool.
 
@@ -1976,7 +2062,6 @@ def session_capture(service, client_id, *, provider, native_id, event, content, 
         raise KelmoError('E_SOURCE', 'Transcript bytes differ from their declared size.')
     if settings['mode'] == 'off' or settings['paused']:
         return {'captured': False, 'appended': False, 'reason': 'session memory is off or paused on the server'}
-    import fcntl
     directory = config.internal('.state/client-sessions/' + engine.digest(json.dumps([client_id, provider, native_id])))
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     name = engine.digest(file_identity)
@@ -1985,8 +2070,8 @@ def session_capture(service, client_id, *, provider, native_id, event, content, 
     # in place, never replaced: the intake names a transcript generation by the file's inode, so a new
     # inode per capture would start a new generation every time. The lock keeps any reader off a partial
     # file, and each written piece is read back from disk before the intake reads the spool.
-    with config.internal('.state/client-sessions/' + directory.name + '/' + name + '.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    # In the state core every write runs on its one writer thread, which already gives that exclusion.
+    with _spool_lock(config, directory, name, single_writer):
         descriptor = os.open(spool, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             _extend_spool(descriptor, offset, base_sha256, piece, sha256)

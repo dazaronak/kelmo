@@ -823,6 +823,34 @@
   {
     "access": "write",
     "arguments": {
+      "argv": {
+        "required": true,
+        "types": [
+          "array"
+        ]
+      },
+      "sources": {
+        "required": false,
+        "types": [
+          "object"
+        ]
+      },
+      "stdin": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "handler"
+    ],
+    "name": "state.cli",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
       "request": {
         "required": true,
         "types": [
@@ -1210,7 +1238,7 @@
     "replay": "keyed"
   },
   {
-    "access": "read",
+    "access": "write",
     "arguments": {
       "target": {
         "required": true,
@@ -1226,10 +1254,10 @@
       }
     },
     "lanes": [
-      "read"
+      "write"
     ],
     "name": "state.reconcile",
-    "replay": "read"
+    "replay": "never"
   },
   {
     "access": "write",

@@ -80,6 +80,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `embed.describe` | count | read | read | - |
 | `embed.embed` | query, passage | read | read | `purpose`, `texts` |
 | `state.capture` | write | write | keyed | `content`, `filename`, `promote`?, `role`?, `supersedes`? |
+| `state.cli` | handler | write | never | `argv`, `sources`?, `stdin`? |
 | `state.client_request` | handler, read, write | write | keyed | `request` |
 | `state.compat` | handler | write | keyed | `arguments`, `tool` |
 | `state.context` | read | read | read | `binding_status`?, `branch`?, `repositories`?, `repository`?, `work`?, `work_project`? |
@@ -98,7 +99,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `state.page` | read | read | read | `target` |
 | `state.pages` | read | read | read | `projects`? |
 | `state.process` | write | write | keyed | `capture_key` |
-| `state.reconcile` | read | read | read | `target`, `text` |
+| `state.reconcile` | write | write | never | `target`, `text` |
 | `state.register` | write | write | keyed | `kind`?, `summary`?, `targets` |
 | `state.register_preview` | read | read | read | `kind`?, `summary`?, `targets` |
 | `state.retry` | write | write | keyed | `operation_id` |

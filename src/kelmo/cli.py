@@ -1,4 +1,5 @@
 """The public CLI for humans, coding agents and local automation."""
+import contextvars
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 
 from . import __version__, timings
@@ -46,6 +47,14 @@ def _readonly_hook_journal(config):
 
 
 def read_source(name):
+    lent = _BORROWED_INPUT.get()
+    if lent is not None:
+        # Inside the state core: the CLI read and checked the file on its side and sent the content.
+        try:
+            content, filename = lent['sources'][name]
+        except (KeyError, TypeError, ValueError) as error:
+            raise KelmoError('E_INPUT', 'The selected source was not sent with the command.') from error
+        return content, filename
     if name == '-':
         return sys.stdin.read(1048577), 'stdin.md'
     path = Path(name).expanduser()
@@ -58,6 +67,14 @@ def read_source(name):
     if path.stat().st_size > 1048576:
         raise KelmoError('E_INPUT', 'Source exceeds the one MiB intake limit.')
     return path.read_text(encoding="utf-8"), path.name
+
+
+def read_input(limit):
+    """Standard input of the command, at most `limit` characters; inside the state core, what the CLI sent."""
+    lent = _BORROWED_INPUT.get()
+    if lent is not None:
+        return (lent.get('stdin') or '')[:limit]
+    return sys.stdin.read(limit)
 
 
 def shared_opener(root, profile_path):
@@ -80,6 +97,59 @@ def shared_opener(root, profile_path):
             return True  # an unreadable profile writes nothing
     open_service.fenced = fenced
     return open_service
+
+
+# Commands the installed CLI sends to the vault's daemon instead of opening the journal itself. A source
+# file or standard input is read and checked by the CLI and sent as content. Hooks (phase 8), the worker
+# and the operator verbs move with their phases.
+DAEMON_COMMANDS = frozenset({'status', 'trace', 'logs', 'show', 'forget', 'list', 'search', 'graph', 'pages',
+                             'page', 'queue', 'add', 'promote', 'create', 'reconcile', 'register', 'tool',
+                             'context', 'resolution'})
+STDIN_COMMANDS = frozenset({'tool', 'resolution'})
+# What a state core lends to a command it runs for the CLI (`state.cli`): its Service, and the command's
+# sources and standard input as the CLI sent them.
+_BORROWED_SERVICE = contextvars.ContextVar('kelmo_cli_service', default=None)
+_BORROWED_INPUT = contextvars.ContextVar('kelmo_cli_input', default=None)
+
+
+def through_daemon(args, argv, launcher):
+    """Runs a DAEMON_COMMANDS call in the vault's daemon, starting an ephemeral one when none runs."""
+    from .core import daemon_client
+    root = selected_root(args)
+    body = {'argv': list(argv)}
+    if getattr(args, 'file', None):
+        body['sources'] = {args.file: list(read_source(args.file))}
+    if args.command in STDIN_COMMANDS and not (args.command == 'resolution'
+                                               and args.action in ('list', 'claim', 'reopen')):
+        body['stdin'] = sys.stdin.read(EXECUTOR_INPUT_LIMIT + 1)
+    path = daemon_client.ensure(root, kelmod=Path(launcher).parent / 'kelmod', launcher=launcher)
+    return daemon_client.call(root, 'state.cli', body, path=path,
+                              seconds=WAIT_CALL_SECONDS if getattr(args, 'wait', False) else 60.0)
+
+
+# A `--wait` call follows the operation through its model calls.
+WAIT_CALL_SECONDS = 900.0
+
+
+def run_borrowed(service, argv, sources=None, stdin=None):
+    """`state.cli` in the state core: parse and dispatch one CLI call over the core's own Service."""
+    parser, commands = build_parser(__version__)
+    try:
+        with redirect_stdout(io.StringIO()):
+            args = parser.parse_args(argv)
+    except SystemExit as error:
+        raise UsageError('Invalid command arguments.') from error
+    if args.command not in DAEMON_COMMANDS or getattr(args, 'server_profile', None) is not None:
+        raise KelmoError('E_INPUT', f'`{args.command}` is not run by the daemon.', 2)
+    args._kelmo_acknowledge = lambda _: None
+    args.launcher = 'kelmo'
+    token = _BORROWED_SERVICE.set(service)
+    lent = _BORROWED_INPUT.set({'sources': sources or {}, 'stdin': stdin})
+    try:
+        return dispatch(args, commands)
+    finally:
+        _BORROWED_INPUT.reset(lent)
+        _BORROWED_SERVICE.reset(token)
 
 
 def dispatch(args, commands):
@@ -119,6 +189,10 @@ def dispatch(args, commands):
     if args.command == 'uninstall':
         from .install.removal import uninstall
         return uninstall(args)
+    if args.command == 'core-spec':
+        from .core.spec import build
+        return build(selected_root(args), server_profile=getattr(args, 'server_profile', None),
+                     runtime_dir=args.runtime_dir, readers=args.readers)
     if args.command == 'version':
         return {'version': __version__}
     if args.command == 'help':
@@ -171,8 +245,10 @@ def dispatch(args, commands):
         from .knowledge_sync import synchronize
         return synchronize(root, args.remote, args.branch, apply=args.apply, push=args.push)
     if args.command == 'snapshot':
+        from .core.instance import offline
         from .migration_cli import snapshot_command
-        return snapshot_command(root, args)
+        with offline(root, 'a snapshot'):
+            return snapshot_command(root, args)
     if args.command == 'server':
         from . import server_admin as admin
         if args.action == 'init':
@@ -187,8 +263,10 @@ def dispatch(args, commands):
                                            args.remote, project=args.project, apply=args.apply)
         if args.action == 'fence':
             return admin.set_fence(root, args.profile, args.fenced, apply=args.apply)
-        return admin.rotate(root, args.profile, args.writer_id, args.expect_epoch,
-                            args.receipt, apply=args.apply)
+        from .core.instance import offline
+        with offline(root, 'rotating the writer'):
+            return admin.rotate(root, args.profile, args.writer_id, args.expect_epoch,
+                                args.receipt, apply=args.apply)
     if args.command == 'models' and args.action == 'list':
         from .model_selection import catalog
         return catalog(args.query)
@@ -336,7 +414,15 @@ def dispatch(args, commands):
         return initialize(root, label, wiki_root=args.wiki, project=args.project,
                           git_name=args.git_name, git_email=args.git_email)
     open_service = shared_opener(root, getattr(args, 'server_profile', None))
-    with (Service(root) if open_service is None else open_service(None)) as service:
+    borrowed = _BORROWED_SERVICE.get()
+    if borrowed is not None:
+        # Inside the state core: never a second journal connection beside the core's own.
+        if open_service is not None or Path(borrowed.root).resolve() != Path(root).resolve():
+            raise KelmoError('E_INPUT', 'The daemon runs commands for its own vault only.', 2)
+        opened = nullcontext(borrowed)
+    else:
+        opened = Service(root) if open_service is None else open_service(None)
+    with opened as service:
         if args.command == 'graph':
             if args.graph_action == 'stats':
                 return service.graph_stats()
@@ -355,7 +441,7 @@ def dispatch(args, commands):
             return administer(args, service)
         if args.command == 'hook':
             from .integration import hook
-            raw = sys.stdin.read(1048577)
+            raw = read_input(1048577)
             if len(raw.encode()) > 1048576:
                 raise KelmoError('E_INPUT', 'Hook input exceeds size limit.')
             return hook(service, args.action, json.loads(raw or '{}'))
@@ -368,7 +454,7 @@ def dispatch(args, commands):
                 return {'job': resolver.claim()}
             if args.action == 'reopen':
                 return {'job': resolver.reopen(args.job_id)}
-            raw = sys.stdin.read(1048577)
+            raw = read_input(1048577)
             if len(raw.encode()) > 1048576:
                 raise KelmoError('E_INPUT', 'Proposal exceeds size limit.')
             return {'operation': resolver.submit(args.job_id, args.token, json.loads(raw))}
@@ -378,7 +464,7 @@ def dispatch(args, commands):
             return service.register(args.targets, kind=args.kind, summary=args.summary, apply=args.apply)
         if args.command == 'tool':
             from .mcp import compat
-            raw = sys.stdin.read(EXECUTOR_INPUT_LIMIT + 1)
+            raw = read_input(EXECUTOR_INPUT_LIMIT + 1)
             if len(raw.encode()) > EXECUTOR_INPUT_LIMIT:
                 raise KelmoError('E_INPUT', 'Tool input exceeds size limit.')
             return {'result': compat(service, args.tool, json.loads(raw or '{}'))}
@@ -482,6 +568,18 @@ def administer(args, target):
             shutil.rmtree(directory, ignore_errors=True)
             raise
         return {'stream': str(directory / 'archive.db')}
+    if verb in OFFLINE_ADMIN_VERBS:
+        from .core.instance import offline
+        with offline(config.root, f'`admin {verb}`'):
+            return _admin_call(admin, verb, args)
+    return _admin_call(admin, verb, args)
+
+
+# Operator verbs that write the archive or the journal: they need the vault without a running daemon.
+OFFLINE_ADMIN_VERBS = frozenset({'entity-index', 'reembed', 'backfill', 'purge-authorize', 'purge'})
+
+
+def _admin_call(admin, verb, args):
     calls = {
         'count': admin.count, 'stats': admin.stats, 'graph': admin.graph,
         'entity-index': admin.entity_index,
@@ -601,6 +699,11 @@ def call(argv, *, executable='kelmo'):
                 from .mcp import serve
                 serve(selected_root(args))
             return 0
+        if args.command == 'core-run':
+            # A core started by kelmod through the installed runtime; descriptor 3 is its channel.
+            from .core.state_core import main as core_main
+            timings.disarm()
+            return core_main(args.core_args[1:] if args.core_args[:1] == ['--'] else args.core_args)
         if args.command == 'serve-client':
             # stdout carries protocol frames only; refusals are frames, never an envelope.
             from .server import protocol_streams, serve_client
@@ -608,7 +711,14 @@ def call(argv, *, executable='kelmo'):
             stdin, stdout = protocol_streams()
             return serve_client(selected_root(args), args.profile, args.client_id, stdin, stdout)
         with redirect_stdout(sys.stderr), timings.stage('operation'):
-            result = dispatch(args, commands)
+            # The installed launcher names its own path and has kelmod beside it; an in-process call (tests,
+            # embedding) stays local.
+            if (executable != 'kelmo' and args.command in DAEMON_COMMANDS
+                    and getattr(args, 'server_profile', None) is None
+                    and (Path(executable).parent / 'kelmod').is_file()):
+                result = through_daemon(args, argv, executable)
+            else:
+                result = dispatch(args, commands)
         if args.command == 'admin':
             return _finish_admin(args.admin_action, result, machine)
         if args.command in ('hook', 'executor'):

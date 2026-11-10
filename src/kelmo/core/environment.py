@@ -26,6 +26,8 @@ VARIABLES = {
     'GIT_AUTHOR_EMAIL': ('core-spec', 3, 'Git identity of wiki publications, passed to the state core'),
     'SSH_ORIGINAL_COMMAND': ('cli', None, 'read by the ssh gate; `kelmod attach` reads it in phase 7'),
     'VAULT_ROOT': ('cli', None, 'default vault of the standalone wiki policy script'),
+    'XDG_RUNTIME_DIR': ('cli', None, 'base of the daemon socket directory on Linux, as kelmod derives it'),
+    'TMPDIR': ('cli', None, 'base of the daemon socket directory elsewhere, as kelmod derives it'),
 }
 
 # Reads whose variable name is computed. Each resolves to listed names.
@@ -34,4 +36,5 @@ DYNAMIC_READS = {
     'server.py': 'the configured embedding fds_env, forwarded to the archive process',
     'store/config.py': 'the configured embedding fds_env',
     'service.py': 'GIT_AUTHOR_NAME and GIT_AUTHOR_EMAIL while initializing a vault',
+    'core/spec.py': 'the variables of PASSED_ENVIRONMENT, handed to the state core',
 }

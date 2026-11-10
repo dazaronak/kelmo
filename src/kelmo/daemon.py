@@ -72,7 +72,15 @@ def execute(argv, payload, *, timeout=120, raw_output=False, termination_grace=0
 
     A non-zero exit is E_EXECUTOR, except that with json_on_failure a JSON object on stdout that says
     `is_error: true` is returned, so the caller can read why the provider failed (a usage limit, a lost login).
+    In the state core the baton is let go for the call: no journal transaction may be open across it.
     """
+    from .core.baton import model_call
+    with model_call():
+        return _execute(argv, payload, timeout=timeout, raw_output=raw_output,
+                        termination_grace=termination_grace, json_on_failure=json_on_failure)
+
+
+def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_failure):
     validate_argv(argv)
     validate_timeout(timeout)
     if (isinstance(termination_grace, bool) or not isinstance(termination_grace, (int, float))

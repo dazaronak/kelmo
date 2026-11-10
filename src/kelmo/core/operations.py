@@ -37,11 +37,18 @@ def _client_arguments(spec):
             for name, (types, required) in sorted(spec.items())}
 
 
+# Client reads that write to the journal all the same, found by running every read on a read-only journal:
+# reconcile issues a receipt. They run on the writer; the client protocol still calls them reads (no key).
+JOURNAL_WRITING_READS = frozenset({'reconcile'})
+
+
 def _state_operations():
     from ..server import OPERATIONS
     table = []
     for name, (mutating, spec) in sorted(OPERATIONS.items()):
-        if mutating is None:  # compat: a tool call whose effect depends on the tool
+        if name in JOURNAL_WRITING_READS:
+            table.append(Operation('state.' + name, ('write',), WRITE, REPLAY_NEVER, _client_arguments(spec)))
+        elif mutating is None:  # compat: a tool call whose effect depends on the tool
             table.append(Operation('state.' + name, ('handler',), WRITE, REPLAY_KEYED, _client_arguments(spec)))
         elif mutating:
             table.append(Operation('state.' + name, ('write',), WRITE, REPLAY_KEYED, _client_arguments(spec)))
@@ -58,6 +65,12 @@ def _state_operations():
         Operation('state.hook', ('handler',), WRITE, REPLAY_NEVER,
                   {'action': {'types': ['string'], 'required': True}, 'payload': any_object,
                    'context': any_object}),
+        # One installed-CLI call for a command the daemon runs (cli.DAEMON_COMMANDS), with its source
+        # files and standard input as content.
+        Operation('state.cli', ('handler',), WRITE, REPLAY_NEVER,
+                  {'argv': {'types': ['array'], 'required': True},
+                   'sources': {'types': ['object'], 'required': False},
+                   'stdin': {'types': ['string'], 'required': False}}),
         Operation('state.job_run', ('admin',), WRITE, REPLAY_NEVER,
                   {'job': {'types': ['string'], 'required': True},
                    'options': {'types': ['object'], 'required': False}}),
