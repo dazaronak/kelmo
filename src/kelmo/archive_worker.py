@@ -9,11 +9,13 @@ import sys
 
 
 def main(argv):
-    roots, confined = [], False
+    roots, confined, core = [], False, False
     arguments = iter(argv)
     for argument in arguments:
         if argument == '--confined':
             confined = True
+        elif argument == '--core':
+            core = True
         elif argument == '--import-root':
             roots.append(next(arguments, ''))
         else:
@@ -26,8 +28,12 @@ def main(argv):
         sys.stdout.flush()
         return 2
     sys.path[:0] = roots
-    from kelmo.server import archive_worker_main, protocol_streams
+    from kelmo.server import archive_worker_main, protocol_streams, read_frame
     stdin, stdout = protocol_streams()
+    if core:
+        # Under kelmod: the startup frame arrives on stdin, calls on descriptor 3 (kelmo/2).
+        from kelmo.core.archive_core import serve
+        return serve(read_frame(stdin), confined=confined)
     return archive_worker_main(stdin, stdout, confined=confined)
 
 

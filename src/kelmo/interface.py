@@ -508,6 +508,8 @@ def build_parser(version):
     server_profile(core_spec)
     core_spec.add_argument('--runtime-dir', type=Path, help='Socket directory (default under TMPDIR)')
     core_spec.add_argument('--readers', type=int, default=4, help='Reader threads of the state core')
+    core_spec.add_argument('--worker-config', type=Path, help='Executor configuration of the worker job')
+    core_spec.add_argument('--no-schedule', action='store_true', help='Run jobs only on request')
     command('help', 'Discover the installed command contract, including JSON output.')
     command('version', 'Show the installed package version.')
     completion = command('completion', 'Generate shell completion for public commands.')

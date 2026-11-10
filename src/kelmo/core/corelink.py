@@ -51,9 +51,15 @@ class CoreLink:
             self.sock.sendall(data)
 
     def _reply(self, call_id, body=None, error=None):
-        header, body = wire.reply(call_id, body, error=error)
         try:
-            self.send(header, body)
+            data = wire.encode(*wire.reply(call_id, body, error=error))
+        except (TypeError, ValueError, KelmoError) as failure:
+            # A result that cannot be encoded still answers, or the caller would wait for its deadline.
+            data = wire.encode(*wire.reply(call_id, None, error={
+                'code': 'E_PROCESSING', 'retryable': False, 'message': f'The reply could not be encoded: {failure}'}))
+        try:
+            with self._write_lock:
+                self.sock.sendall(data)
         except OSError:
             pass
 
@@ -84,9 +90,21 @@ class CoreLink:
 
     # --- serving ---------------------------------------------------------------------------------------
 
-    def serve(self):
+    # True while the core is still starting: serve() reads replies to the core's own calls but does not say
+    # hello, so kelmod sends it no calls until say_hello().
+    hold_hello = False
+
+    def say_hello(self):
         self.send({'v': wire.VERSION, 'kind': 'hello', 'id': uuid.uuid4().hex, 'body_type': 'json',
                    'protocols': ['kelmo/2'], 'operations': self.operations})
+
+    def serve(self):
+        import faulthandler
+        import signal
+        # `kill -USR1 <core pid>` writes every thread's stack to the core's stderr (kelmod's log).
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        if not self.hold_hello:
+            self.say_hello()
         reader = wire.FrameReader()
         try:
             while not self._stopping.is_set():

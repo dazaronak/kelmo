@@ -133,22 +133,32 @@ def dispatch(root, args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            if dream._state("paused", True):
-                return {"state": "paused"}
-            reset = dream._state("next_attempt", 0)
-            if reset > time.time():
-                return {"state": "deferred", "reset_at": reset}
-            config = validate_config(read_spec(settings["executor_config"]))
-            executor = CommandExecutor(config["argv"], config["timeout_seconds"])
-            service.archive_api.assert_writer()
-            # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
-            # is the owner's "run the editor now".
-            from .creation import apply_pending
-            applied = apply_pending(service, executor)
-            if args.action == "apply":
-                return {"state": "finished", "apply": applied}
-            result = dream.run(executor, origin=service.origin, contexts=contexts,
-                               **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
-            service.archive_api.assert_writer()
-            dream._set_state("next_attempt", result.get("reset_at", 0) if result["state"] == "deferred" else 0)
-            return dict(result, apply=applied)
+            return run_dream(service, args.action, contexts=contexts)
+
+
+def run_dream(service, action, *, contexts=None):
+    """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
+    The caller makes sure no other Dreaming run is in progress."""
+    dream = service.dreaming
+    settings = dream._state("settings")
+    if not settings:
+        return {"state": "unconfigured"}
+    if dream._state("paused", True):
+        return {"state": "paused"}
+    reset = dream._state("next_attempt", 0)
+    if reset > time.time():
+        return {"state": "deferred", "reset_at": reset}
+    config = validate_config(read_spec(settings["executor_config"]))
+    executor = CommandExecutor(config["argv"], config["timeout_seconds"])
+    service.archive_api.assert_writer()
+    # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
+    # is the owner's "run the editor now".
+    from .creation import apply_pending
+    applied = apply_pending(service, executor)
+    if action == "apply":
+        return {"state": "finished", "apply": applied}
+    result = dream.run(executor, origin=service.origin, contexts=contexts,
+                       **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
+    service.archive_api.assert_writer()
+    dream._set_state("next_attempt", result.get("reset_at", 0) if result["state"] == "deferred" else 0)
+    return dict(result, apply=applied)

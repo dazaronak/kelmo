@@ -1,5 +1,6 @@
 """Deterministic queue polling with bounded external command execution."""
 import json
+from contextlib import nullcontext
 import math
 import os
 from pathlib import Path
@@ -95,6 +96,7 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
                                        env=dict(os.environ,KELMO_INTERNAL_JOB='1'))
         except OSError:
             raise KelmoError('E_EXECUTOR', 'Executor could not be started.') from None
+        record = _record_group(process.pid)
         output = bytearray()
         errors = bytearray()
         selector = selectors.DefaultSelector()
@@ -178,6 +180,27 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
                     process.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
                     pass
+            if record is not None:
+                try:
+                    record.unlink()
+                except OSError:
+                    pass
+
+
+# In the state core: the directory where each executor's process group is recorded while it runs, so that
+# kelmod kills what a crashed core left behind before it starts the core again.
+executor_groups = None
+
+
+def _record_group(pgid):
+    if executor_groups is None:
+        return None
+    path = Path(executor_groups) / str(pgid)
+    try:
+        path.write_text(str(pgid), encoding='ascii')
+    except OSError:
+        return None
+    return path
 
 
 def fact_keys(service, operation):
@@ -299,23 +322,27 @@ def runnable_operations(service, argv):
         yield operation_id
 
 
-def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, should_stop=None):
+def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, should_stop=None, step=None):
     """One pass over operations, one resolution request and the session jobs.
 
     `should_stop` is read before every operation and before every editor model call: once it is true
     the pass ends there, and an operation in flight releases its claim and lease and resumes later.
-    Operations another attempt holds are listed under `skipped`.
+    Operations another attempt holds are listed under `skipped`. `step` (the state core's job step) is
+    entered around each unit of work that uses the journal; a model call inside one lets the baton go.
     """
-    from .resolution import Resolution
     if type(max_attempts) is not int or not 1 <= max_attempts <= 10 or not 0 < timeout <= 600:
         raise KelmoError('E_INPUT', 'Invalid retry or timeout configuration.')
     validate_argv(argv, optional=True)
     stopping = should_stop or (lambda: False)
+    step = step or nullcontext
     failed_attempts, skipped = [], []
-    _retries(service.journal.conn)
-    for operation in service.queue():
+    with step():
+        _retries(service.journal.conn)
+        queued = service.queue()
+    for operation in queued:
         try:
-            state, attempts = charge_retry(service, operation, max_attempts)
+            with step():
+                state, attempts = charge_retry(service, operation, max_attempts)
         except sqlite3.Error as error:
             if not sqlite_busy(error):
                 raise
@@ -325,15 +352,18 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
             failed_attempts.append({'operation_id': operation['id'], 'error_code': 'E_ATTEMPTS',
                                     'attempts': attempts, 'exhausted': True})
     processed = 0
-    for operation_id in runnable_operations(service, argv):
+    with step():
+        runnable = runnable_operations(service, argv)
+    for operation_id in runnable:
         if processed >= 20 or stopping():
             break
         try:
-            if service.journal.get(operation_id)['intent'] == 'create':
-                from .creation import CommandExecutor
-                service.run(operation_id, executor=CommandExecutor(argv, timeout, stopping) if argv else None)
-            else:
-                service.run(operation_id)
+            with step():
+                if service.journal.get(operation_id)['intent'] == 'create':
+                    from .creation import CommandExecutor
+                    service.run(operation_id, executor=CommandExecutor(argv, timeout, stopping) if argv else None)
+                else:
+                    service.run(operation_id)
             processed += 1
         except KelmoError as error:
             if error.code not in ('E_BUSY', 'E_CLAIM'):
@@ -351,6 +381,14 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
             if items:
                 result[name] = items
         return result
+    with step():
+        return _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping,
+                                     processed, skipped, failed_attempts)
+
+
+def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping, processed, skipped,
+                          failed_attempts):
+    from .resolution import Resolution
     queue = Resolution(service)
     request = queue.claim(lease_seconds=int(timeout) + 60) if argv else None
     quota_waits = []

@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -113,6 +114,27 @@ pub struct Supervised {
     pub restart_window: Duration,
     pub drain: Duration,
     pub sample: Duration,
+    /// Where a core records the process groups of its executor children while they run.
+    pub executors: PathBuf,
+}
+
+/// Kills the executor process groups a core left recorded (it crashed or was killed mid-call) and removes
+/// their records, so no model call outlives the core that started it.
+pub fn kill_leftovers(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Some(pgid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pgid| *pgid > 1)
+        {
+            sys::kill_group(pgid);
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 pub async fn supervise(
@@ -128,6 +150,7 @@ pub async fn supervise(
         restart_window,
         drain,
         sample,
+        executors,
     } = supervised;
     let mut budget = Budget::new(restart_max, restart_window);
     let mut first = true;
@@ -137,6 +160,7 @@ pub async fn supervise(
             return;
         }
         first = false;
+        kill_leftovers(&executors);
         let (mut child, stream) = match spawn(&core) {
             Ok(spawned) => spawned,
             Err(_) => {
@@ -202,6 +226,7 @@ pub async fn supervise(
         reader_task.abort();
         writer_task.abort();
         sys::kill_group(pid);
+        kill_leftovers(&executors);
         let _ = events.send(Event::CoreExited { core: index });
         if stopping {
             return;
@@ -227,6 +252,7 @@ pub fn start_all(
             restart_window: spec.restart_window,
             drain: spec.drain_timeout,
             sample: spec.sample,
+            executors: spec.state_dir.join("executors"),
         };
         tokio::spawn(supervise(supervised, events.clone(), rx, fatal.clone()));
     }

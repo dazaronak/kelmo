@@ -1,4 +1,5 @@
 """Durable operations and metadata-only stage history."""
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -6,6 +7,7 @@ import socket
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from .errors import KelmoError, sqlite_busy
@@ -40,6 +42,20 @@ def _boot_id():
         return BOOT_ID.read_text(encoding='ascii').strip() or None
     except OSError:
         return None
+
+
+_TRACKED_CLAIMS = contextvars.ContextVar('kelmo_tracked_claims', default=None)
+
+
+@contextmanager
+def tracked_claims(tokens):
+    """Records in `tokens` the token of every claim taken inside the block (a job releases them all when it
+    ends, whatever ends it)."""
+    reset = _TRACKED_CLAIMS.set(tokens)
+    try:
+        yield tokens
+    finally:
+        _TRACKED_CLAIMS.reset(reset)
 
 
 def claim_owner():
@@ -206,6 +222,9 @@ class Journal:
                     self.event(operation_id, 'claim_recovered', owner_host=current['owner_host'],
                                owner_pid=current['owner_pid'])
             token = uuid.uuid4().hex
+            tracked = _TRACKED_CLAIMS.get()
+            if tracked is not None:
+                tracked.add(token)
             host, pid, boot = claim_owner()
             self.conn.execute('''INSERT INTO claims(operation_id,token,expires_at,local_worker,owner_host,owner_pid,
                 owner_boot) VALUES (?,?,?,?,?,?,?)

@@ -104,7 +104,7 @@ def shared_opener(root, profile_path):
 # and the operator verbs move with their phases.
 DAEMON_COMMANDS = frozenset({'status', 'trace', 'logs', 'show', 'forget', 'list', 'search', 'graph', 'pages',
                              'page', 'queue', 'add', 'promote', 'create', 'reconcile', 'register', 'tool',
-                             'context', 'resolution'})
+                             'context', 'resolution', 'worker', 'dream'})
 STDIN_COMMANDS = frozenset({'tool', 'resolution'})
 # What a state core lends to a command it runs for the CLI (`state.cli`): its Service, and the command's
 # sources and standard input as the CLI sent them.
@@ -112,10 +112,35 @@ _BORROWED_SERVICE = contextvars.ContextVar('kelmo_cli_service', default=None)
 _BORROWED_INPUT = contextvars.ContextVar('kelmo_cli_input', default=None)
 
 
+def routed(args):
+    """True when the installed CLI sends this call to the daemon: `worker daemon` is the long-lived loop the
+    daemon itself replaces, and Dreaming other than run and apply edits its settings locally."""
+    if args.command not in DAEMON_COMMANDS or getattr(args, 'server_profile', None) is not None:
+        return False
+    if args.command == 'worker':
+        return args.action == 'run'
+    if args.command == 'dream':
+        return args.action in ('run', 'apply')
+    return True
+
+
 def through_daemon(args, argv, launcher):
-    """Runs a DAEMON_COMMANDS call in the vault's daemon, starting an ephemeral one when none runs."""
+    """Runs a DAEMON_COMMANDS call in the vault's daemon, starting an ephemeral one when none runs. Dreaming
+    runs as the daemon's dream job, so it never overlaps a scheduled run."""
     from .core import daemon_client
     root = selected_root(args)
+    if args.command == 'dream':
+        path = daemon_client.ensure(root, kelmod=Path(launcher).parent / 'kelmod', launcher=launcher)
+        try:
+            result = daemon_client.call(root, 'state.job_run', {'job': 'dream', 'options': {'action': args.action}},
+                                        path=path, seconds=WAIT_CALL_SECONDS)
+        except KelmoError as error:
+            if error.code == 'E_BUSY':
+                return {'state': 'busy'}  # what the local run answers while another holds dreaming.lock
+            raise
+        if result.get('state') == 'unconfigured':
+            raise KelmoError('E_CONFIG', 'Configure Dreaming before running it.')
+        return result
     body = {'argv': list(argv)}
     if getattr(args, 'file', None):
         body['sources'] = {args.file: list(read_source(args.file))}
@@ -139,8 +164,8 @@ def run_borrowed(service, argv, sources=None, stdin=None):
             args = parser.parse_args(argv)
     except SystemExit as error:
         raise UsageError('Invalid command arguments.') from error
-    if args.command not in DAEMON_COMMANDS or getattr(args, 'server_profile', None) is not None:
-        raise KelmoError('E_INPUT', f'`{args.command}` is not run by the daemon.', 2)
+    if not routed(args) or args.command == 'dream':
+        raise KelmoError('E_INPUT', f'`{args.command}` is not run by the daemon this way.', 2)
     args._kelmo_acknowledge = lambda _: None
     args.launcher = 'kelmo'
     token = _BORROWED_SERVICE.set(service)
@@ -192,7 +217,8 @@ def dispatch(args, commands):
     if args.command == 'core-spec':
         from .core.spec import build
         return build(selected_root(args), server_profile=getattr(args, 'server_profile', None),
-                     runtime_dir=args.runtime_dir, readers=args.readers)
+                     runtime_dir=args.runtime_dir, readers=args.readers, schedule=not args.no_schedule,
+                     worker_config=args.worker_config)
     if args.command == 'version':
         return {'version': __version__}
     if args.command == 'help':
@@ -701,9 +727,15 @@ def call(argv, *, executable='kelmo'):
             return 0
         if args.command == 'core-run':
             # A core started by kelmod through the installed runtime; descriptor 3 is its channel.
-            from .core.state_core import main as core_main
             timings.disarm()
-            return core_main(args.core_args[1:] if args.core_args[:1] == ['--'] else args.core_args)
+            rest = args.core_args[1:] if args.core_args[:1] == ['--'] else args.core_args
+            if rest[:1] == ['archive']:
+                from .core.archive_core import main as core_main
+            elif rest[:1] == ['state']:
+                from .core.state_core import main as core_main
+            else:
+                raise UsageError('core-run names the core to run: state or archive.')
+            return core_main(rest[1:])
         if args.command == 'serve-client':
             # stdout carries protocol frames only; refusals are frames, never an envelope.
             from .server import protocol_streams, serve_client
@@ -713,9 +745,7 @@ def call(argv, *, executable='kelmo'):
         with redirect_stdout(sys.stderr), timings.stage('operation'):
             # The installed launcher names its own path and has kelmod beside it; an in-process call (tests,
             # embedding) stays local.
-            if (executable != 'kelmo' and args.command in DAEMON_COMMANDS
-                    and getattr(args, 'server_profile', None) is None
-                    and (Path(executable).parent / 'kelmod').is_file()):
+            if executable != 'kelmo' and routed(args) and (Path(executable).parent / 'kelmod').is_file():
                 result = through_daemon(args, argv, executable)
             else:
                 result = dispatch(args, commands)

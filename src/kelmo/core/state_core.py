@@ -179,7 +179,8 @@ def _session_service(core, origin, root):
 
 
 class StateCore:
-    def __init__(self, root, *, profile_path=None, profile=None, readers=DEFAULT_READERS):
+    def __init__(self, root, *, profile_path=None, profile=None, readers=DEFAULT_READERS, worker_config=None,
+                 schedule=False, archive_link=None):
         """`profile_path` names the server profile, reread on every call; `profile` is an already loaded one
         (tests), read once."""
         from ..config import Config
@@ -193,18 +194,37 @@ class StateCore:
         self.keys_in_flight = KeysInFlight()
         self._sessions = {}
         self._sessions_lock = threading.Lock()
-        if self.profile is None:
+        if self.profile is None and archive_link is None:
             def make_writer():
                 return Service(self.root, shared_journal=True)
 
             def make_reader():
                 return Service(self.root, read_only=True)
+        elif self.profile is None:
+            # A local vault whose archive is the supervised archive core.
+            from .archive_core import proxy
+            config = Config.load(self.root)
+            bindings = config.local_bindings()
+            self.archive = proxy(archive_link, bindings)
+
+            def make_writer():
+                service = Service(self.root, archive_api=self.archive, bindings=bindings, shared_journal=True)
+                self.archive.legacy_receipt_verifier = service._legacy_receipt_allowed
+                return service
+
+            def make_reader():
+                return Service(self.root, archive_api=self.archive, bindings=bindings, read_only=True)
         else:
             profile = self.profile
             config = Config.load(self.root)
             if config.vault_id != profile.bindings.authority_id:
                 raise KelmoError('E_ORIGIN', 'The server profile belongs to another vault authority.')
-            self.archive = open_archive(config, profile.bindings, profile.archive_process, fenced=profile.fenced)
+            if archive_link is not None:
+                from .archive_core import proxy
+                self.archive = proxy(archive_link, profile.bindings, fenced=profile.fenced)
+            else:
+                self.archive = open_archive(config, profile.bindings, profile.archive_process,
+                                            fenced=profile.fenced)
 
             def make_writer():
                 service = Service(self.root, archive_api=self.archive, bindings=profile.bindings, background=True,
@@ -217,7 +237,15 @@ class StateCore:
                                context_bindings=profile.contexts, read_only=True)
         self.storage = Storage(make_writer, make_reader, readers)
         from .baton import install
+        from .jobs import Jobs
         install(self.storage.baton)
+        self.jobs = Jobs(self, worker_config=worker_config)
+        from .. import daemon as executors
+        groups = self.root / '.state' / 'executors'
+        groups.mkdir(mode=0o700, exist_ok=True)
+        executors.executor_groups = groups
+        if schedule:
+            self.jobs.start()
         self._tools = None
 
     # --- origins and sessions --------------------------------------------------------------------------
@@ -346,11 +374,21 @@ class StateCore:
                                   stdin)
         return json.loads(json.dumps(result, default=str))
 
+    def handle_job_run(self, context, body):
+        """Runs one job now (`kelmo worker run`, `kelmo dream apply`); E_BUSY while one of its kind runs."""
+        if self._enrolled(context.origin) is not None:
+            raise KelmoError('E_FORBIDDEN', 'Jobs are started by local callers only.')
+        if not isinstance(body, dict) or not isinstance(body.get('job'), str):
+            raise KelmoError('E_PROTOCOL', 'state.job_run carries {job, options}.')
+        result = self.jobs.run(body['job'], body.get('options') or {})
+        return json.loads(json.dumps(result, default=str))
+
     def handlers(self):
         from ..server import OPERATIONS
         table = {'state.client_request': (self.handle_client_request, 'handler'),
                  'state.tool': (self.handle_tool, 'handler'),
-                 'state.cli': (self.handle_cli, 'handler')}
+                 'state.cli': (self.handle_cli, 'handler'),
+                 'state.job_run': (self.handle_job_run, 'admin')}
         from .operations import JOURNAL_WRITING_READS
         for op, (mutating, _spec) in OPERATIONS.items():
             mutating = True if op in JOURNAL_WRITING_READS else mutating
@@ -360,7 +398,7 @@ class StateCore:
 
     def status(self):
         return dict(self.storage.counts(), keys_in_flight=len(self.keys_in_flight),
-                    sessions=len(self._sessions), profile=self.profile is not None)
+                    sessions=len(self._sessions), profile=self.profile is not None, jobs=self.jobs.status())
 
     def trim(self):
         import gc
@@ -368,6 +406,7 @@ class StateCore:
 
     def close(self):
         from .baton import install
+        self.jobs.stop()
         with self._sessions_lock:
             self._sessions.clear()
         self.storage.close()
@@ -379,14 +418,29 @@ def main(argv=None):
     parser.add_argument('--vault', required=True, type=Path)
     parser.add_argument('--server-profile', type=Path)
     parser.add_argument('--readers', type=int, default=DEFAULT_READERS)
+    parser.add_argument('--worker-config', type=Path, help='Executor configuration of the worker job')
+    parser.add_argument('--schedule', action='store_true', help='Run the worker and Dreaming on their schedule')
+    parser.add_argument('--archive-core', action='store_true', help='The archive is the supervised archive core')
     args = parser.parse_args(argv)
     from .corelink import CoreLink
-    core = StateCore(args.vault, profile_path=args.server_profile, readers=args.readers)
-    link = CoreLink.from_descriptor(handlers=core.handlers(),
-                                    lanes={'handler': HANDLER_LANE, 'read': args.readers, 'write': 8},
-                                    trim=core.trim, status=core.status)
+    # The channel exists before the core: the archive proxy calls through it while the core starts.
+    link = CoreLink.from_descriptor(handlers={}, lanes={'handler': HANDLER_LANE, 'read': args.readers, 'write': 8,
+                                                        'admin': 4})
+    serving = threading.Thread(target=link.serve, name='corelink', daemon=True) if args.archive_core else None
+    if serving is not None:
+        link.hold_hello = True
+        serving.start()
+    core = StateCore(args.vault, profile_path=args.server_profile, readers=args.readers,
+                     worker_config=args.worker_config, schedule=args.schedule,
+                     archive_link=link if args.archive_core else None)
+    link.handlers, link.trim, link.status = core.handlers(), core.trim, core.status
+    link.operations = sorted(link.handlers)
     try:
-        link.serve()
+        if serving is None:
+            link.serve()
+        else:
+            link.say_hello()
+            serving.join()
     finally:
         core.close()
     return 0
