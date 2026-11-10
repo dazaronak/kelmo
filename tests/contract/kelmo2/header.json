@@ -1,0 +1,174 @@
+{
+  "body_types": [
+    "json"
+  ],
+  "daemon_codes": {
+    "final": [
+      "E_CANCELLED",
+      "E_FORBIDDEN"
+    ],
+    "retryable": [
+      "E_CORE_RESTARTED",
+      "E_DEADLINE",
+      "E_OVERLOADED"
+    ]
+  },
+  "fields": {
+    "body_type": {
+      "kinds": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ],
+      "required_on": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ]
+    },
+    "deadline_ms": {
+      "kinds": [
+        "call"
+      ],
+      "required_on": [
+        "call"
+      ]
+    },
+    "error": {
+      "kinds": [
+        "reply"
+      ],
+      "required_on": []
+    },
+    "id": {
+      "kinds": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ],
+      "required_on": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ]
+    },
+    "key": {
+      "kinds": [
+        "call"
+      ],
+      "required_on": []
+    },
+    "kind": {
+      "kinds": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ],
+      "required_on": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ]
+    },
+    "lane": {
+      "kinds": [
+        "call"
+      ],
+      "required_on": []
+    },
+    "ok": {
+      "kinds": [
+        "reply"
+      ],
+      "required_on": [
+        "reply"
+      ]
+    },
+    "op": {
+      "kinds": [
+        "call",
+        "event"
+      ],
+      "required_on": [
+        "call",
+        "event"
+      ]
+    },
+    "operations": {
+      "kinds": [
+        "hello"
+      ],
+      "required_on": [
+        "hello"
+      ]
+    },
+    "origin": {
+      "kinds": [
+        "call",
+        "event"
+      ],
+      "required_on": []
+    },
+    "protocols": {
+      "kinds": [
+        "hello"
+      ],
+      "required_on": [
+        "hello"
+      ]
+    },
+    "v": {
+      "kinds": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ],
+      "required_on": [
+        "call",
+        "cancel",
+        "event",
+        "hello",
+        "reply"
+      ]
+    }
+  },
+  "kinds": [
+    "call",
+    "cancel",
+    "event",
+    "hello",
+    "reply"
+  ],
+  "limit_codes": {
+    "malformed": "E_PROTOCOL",
+    "over_bound": "E_LIMIT"
+  },
+  "max_frame": 33554432,
+  "max_header": 65535,
+  "origin_fields": [
+    "client_id",
+    "machine_tag",
+    "session"
+  ],
+  "patterns": {
+    "error.code": "E_[A-Z0-9_]{1,40}",
+    "id": "[0-9a-f]{32}",
+    "lane": "[a-z][a-z0-9_]{0,31}",
+    "op": "[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*"
+  },
+  "version": 2
+}

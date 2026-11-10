@@ -1,0 +1,1596 @@
+[
+  {
+    "access": "write",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "admin.drain",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "admin.ping",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "admin.refresh",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "admin.status",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "admin.stop",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "admin.trim",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.assert_writer",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "operation_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "ref": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.bind_legacy_receipt",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "idempotency_key": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "source": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.capture",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "operation_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.capture_receipt",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.counts",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "locator": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "neighbors": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.expand",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.full_record",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "version": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.get",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "generation": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "operation": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "params": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.graph",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "snapshot": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.graph_publish",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.hidden_at",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "idempotency_key": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "reason": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.hide",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "cursor": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "limit": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.history",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.index_generation",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "filters": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "limit": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "offset": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "order": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "order_by": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.list_filtered",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "limit": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "offset": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.list_records",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "paths": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.probe",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.public_record",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "operation_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "ref": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.receipt_record",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.refuse_hidden_target",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "filters": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "limit": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "mode": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      },
+      "queries": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.search",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "filters": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "limit": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "mode": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      },
+      "query": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.search_records",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.stats",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "superseded_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.supersede",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "archive_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "content": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "expected_version": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "receipt": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.update",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "receipt": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.update_receipt",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "operation_id": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "origin": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      },
+      "ref": {
+        "required": true,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.verify_receipt",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "action": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "context": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      },
+      "payload": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "handler"
+    ],
+    "name": "edge.hook",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "arguments": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      },
+      "tool": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "handler",
+      "read",
+      "write"
+    ],
+    "name": "edge.tool",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "prefix": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "texts": {
+        "required": true,
+        "types": [
+          "array"
+        ]
+      }
+    },
+    "lanes": [
+      "count"
+    ],
+    "name": "embed.count",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "count"
+    ],
+    "name": "embed.describe",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "purpose": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "texts": {
+        "required": true,
+        "types": [
+          "array"
+        ]
+      }
+    },
+    "lanes": [
+      "query",
+      "passage"
+    ],
+    "name": "embed.embed",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "content": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "filename": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "promote": {
+        "required": false,
+        "types": [
+          "boolean"
+        ]
+      },
+      "role": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "supersedes": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.capture",
+    "replay": "keyed"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "request": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "handler",
+      "read",
+      "write"
+    ],
+    "name": "state.client_request",
+    "replay": "keyed"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "arguments": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      },
+      "tool": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "handler"
+    ],
+    "name": "state.compat",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "binding_status": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      },
+      "branch": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      },
+      "repositories": {
+        "required": false,
+        "types": [
+          "array"
+        ]
+      },
+      "repository": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      },
+      "work": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      },
+      "work_project": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.context",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "budget_tokens": {
+        "required": false,
+        "types": [
+          "integer"
+        ]
+      },
+      "content": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "filename": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "new_work": {
+        "required": false,
+        "types": [
+          "object"
+        ]
+      },
+      "pending": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "project": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "rule_change": {
+        "required": false,
+        "types": [
+          "boolean"
+        ]
+      },
+      "selected": {
+        "required": false,
+        "types": [
+          "array"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.create",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "state.doctor",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "budget_tokens": {
+        "required": true,
+        "types": [
+          "integer"
+        ]
+      },
+      "project": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "selected": {
+        "required": false,
+        "types": [
+          "array"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.editor_context",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "memory_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "reason": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.forget",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "params": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.graph_query",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "entity_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.graph_read",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "state.graph_rebuild",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "state.graph_stats",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "state.hello",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "action": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "context": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      },
+      "payload": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "handler"
+    ],
+    "name": "state.hook",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "job": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "options": {
+        "required": false,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "admin"
+    ],
+    "name": "state.job_run",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "limit": {
+        "required": false,
+        "types": [
+          "integer"
+        ]
+      },
+      "offset": {
+        "required": false,
+        "types": [
+          "integer"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.list",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "target": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.page",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "projects": {
+        "required": false,
+        "types": [
+          "array",
+          "null"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.pages",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "capture_key": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.process",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "target": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "text": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.reconcile",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "kind": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "summary": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "targets": {
+        "required": true,
+        "types": [
+          "array"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.register",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "kind": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "summary": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      },
+      "targets": {
+        "required": true,
+        "types": [
+          "array"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.register_preview",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "operation_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.retry",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "limit": {
+        "required": false,
+        "types": [
+          "integer"
+        ]
+      },
+      "project": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      },
+      "query": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "since": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      },
+      "tags": {
+        "required": false,
+        "types": [
+          "array",
+          "null"
+        ]
+      },
+      "until": {
+        "required": false,
+        "types": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.search",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "base_sha256": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "client_generation": {
+        "required": true,
+        "types": [
+          "integer"
+        ]
+      },
+      "content": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "event": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "file_identity": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "final": {
+        "required": true,
+        "types": [
+          "boolean"
+        ]
+      },
+      "native_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "offset": {
+        "required": true,
+        "types": [
+          "integer"
+        ]
+      },
+      "provider": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "sha256": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "size": {
+        "required": true,
+        "types": [
+          "integer"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.session_append",
+    "replay": "keyed"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "client_generation": {
+        "required": true,
+        "types": [
+          "integer"
+        ]
+      },
+      "content": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "event": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "file_identity": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "native_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "provider": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "sha256": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      },
+      "size": {
+        "required": true,
+        "types": [
+          "integer"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.session_capture",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "state.sessions_inspect",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "memory_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.show",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "update": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "state.state_apply",
+    "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "state.status",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "arguments": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      },
+      "tool": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "handler",
+      "read",
+      "write"
+    ],
+    "name": "state.tool",
+    "replay": "never"
+  },
+  {
+    "access": "read",
+    "arguments": {
+      "operation_id": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "read"
+    ],
+    "name": "state.trace",
+    "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "request": {
+        "required": true,
+        "types": [
+          "object"
+        ]
+      }
+    },
+    "lanes": [
+      "call"
+    ],
+    "name": "uplink.call",
+    "replay": "never"
+  }
+]

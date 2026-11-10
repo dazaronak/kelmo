@@ -1,0 +1,262 @@
+[
+  {
+    "body": {
+      "limit": 5,
+      "query": "basalt"
+    },
+    "canonical": true,
+    "file": "call.bin",
+    "header": {
+      "body_type": "json",
+      "deadline_ms": 5000,
+      "id": "0123456789abcdef0123456789abcdef",
+      "kind": "call",
+      "lane": "read",
+      "op": "state.search",
+      "v": 2
+    },
+    "name": "call"
+  },
+  {
+    "body": {
+      "content": "Ledger, кедр и łąka \"quoted\" \\ back\nslash   😀",
+      "filename": "n.md"
+    },
+    "canonical": true,
+    "file": "call_origin_key.bin",
+    "header": {
+      "body_type": "json",
+      "deadline_ms": 5000,
+      "id": "0123456789abcdef0123456789abcdef",
+      "key": "client/a/request-1",
+      "kind": "call",
+      "lane": "write",
+      "op": "state.capture",
+      "origin": {
+        "client_id": "mac-work",
+        "machine_tag": "mac-work",
+        "session": null
+      },
+      "v": 2
+    },
+    "name": "call_origin_key"
+  },
+  {
+    "body": {
+      "count": -3,
+      "items": [
+        {
+          "big": 1e+16,
+          "score": 0.125,
+          "tiny": 1e-05,
+          "whole": 2.0
+        }
+      ]
+    },
+    "canonical": true,
+    "file": "reply_ok.bin",
+    "header": {
+      "body_type": "json",
+      "id": "0123456789abcdef0123456789abcdef",
+      "kind": "reply",
+      "ok": true,
+      "v": 2
+    },
+    "name": "reply_ok"
+  },
+  {
+    "body": null,
+    "canonical": true,
+    "file": "reply_error.bin",
+    "header": {
+      "body_type": "json",
+      "error": {
+        "code": "E_OVERLOADED",
+        "message": "Lane read is full.",
+        "retry_after_ms": 250,
+        "retryable": true
+      },
+      "id": "0123456789abcdef0123456789abcdef",
+      "kind": "reply",
+      "ok": false,
+      "v": 2
+    },
+    "name": "reply_error"
+  },
+  {
+    "body": null,
+    "canonical": true,
+    "file": "cancel.bin",
+    "header": {
+      "body_type": "json",
+      "id": "0123456789abcdef0123456789abcdef",
+      "kind": "cancel",
+      "v": 2
+    },
+    "name": "cancel"
+  },
+  {
+    "body": {
+      "cores": []
+    },
+    "canonical": true,
+    "file": "event.bin",
+    "header": {
+      "body_type": "json",
+      "id": "fedcba9876543210fedcba9876543210",
+      "kind": "event",
+      "op": "admin.status",
+      "v": 2
+    },
+    "name": "event"
+  },
+  {
+    "body": {},
+    "canonical": true,
+    "file": "hello.bin",
+    "header": {
+      "body_type": "json",
+      "id": "fedcba9876543210fedcba9876543210",
+      "kind": "hello",
+      "operations": [
+        "state.search",
+        "state.capture"
+      ],
+      "protocols": [
+        "kelmo/2"
+      ],
+      "v": 2
+    },
+    "name": "hello"
+  },
+  {
+    "body": "",
+    "canonical": true,
+    "file": "empty_body_string.bin",
+    "header": {
+      "body_type": "json",
+      "deadline_ms": 5000,
+      "id": "0123456789abcdef0123456789abcdef",
+      "kind": "call",
+      "lane": "read",
+      "op": "state.search",
+      "v": 2
+    },
+    "name": "empty_body_string"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "truncated.bin",
+    "name": "truncated"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "trailing_bytes.bin",
+    "name": "trailing_bytes"
+  },
+  {
+    "code": "E_LIMIT",
+    "file": "over_limit_prefix.bin",
+    "name": "over_limit_prefix"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "header_length_outside.bin",
+    "name": "header_length_outside"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "header_length_zero.bin",
+    "name": "header_length_zero"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "header_invalid_utf8.bin",
+    "name": "header_invalid_utf8"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "body_invalid_utf8.bin",
+    "name": "body_invalid_utf8"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "body_not_json.bin",
+    "name": "body_not_json"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "body_nan.bin",
+    "name": "body_nan"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "body_float_overflow.bin",
+    "name": "body_float_overflow"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "body_integer_overflow.bin",
+    "name": "body_integer_overflow"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "body_lone_surrogate.bin",
+    "name": "body_lone_surrogate"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "header_not_object.bin",
+    "name": "header_not_object"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "unknown_field.bin",
+    "name": "unknown_field"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "field_of_other_kind.bin",
+    "name": "field_of_other_kind"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "missing_deadline.bin",
+    "name": "missing_deadline"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "wrong_version.bin",
+    "name": "wrong_version"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "bad_id.bin",
+    "name": "bad_id"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "bad_op.bin",
+    "name": "bad_op"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "negative_deadline.bin",
+    "name": "negative_deadline"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "origin_without_client.bin",
+    "name": "origin_without_client"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "reply_ok_with_error.bin",
+    "name": "reply_ok_with_error"
+  },
+  {
+    "code": "E_PROTOCOL",
+    "file": "unknown_kind.bin",
+    "name": "unknown_kind"
+  }
+]

@@ -16,6 +16,10 @@ license = "Apache-2.0"
 repository = "https://github.com/dazaronak/kelmo"
 publish = false
 
+[workspace.dependencies]
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

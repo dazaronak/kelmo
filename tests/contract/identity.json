@@ -1,0 +1,33 @@
+[
+  {
+    "canonical": "{\"artifact_identity\":\"bge-m3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"byte_order\":\"little\",\"contract_version\":\"adoption/1\",\"dimension\":1024,\"document_transform\":\"passage: q\\\"uote\\\\back\\u0001ctl\\ttab sep😀 кедр\",\"dtype\":\"float32\",\"normalization\":\"l2\",\"pooling\":\"cls\",\"projection\":\"none\",\"query_transform\":\"q\\\"uote\\\\back\\u0001ctl\\ttab sep😀 кедр\",\"tokenizer_identity\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}",
+    "id": "sha256:75455a5e27f02872feb0f5e5416fbb7ccb0a159006bd6a4adf2ff73684e85413",
+    "name": "space",
+    "record": {
+      "artifact_identity": "bge-m3@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "byte_order": "little",
+      "contract_version": "adoption/1",
+      "dimension": 1024,
+      "document_transform": "passage: q\"uote\\back\u0001ctl\ttab sep😀 кедр",
+      "dtype": "float32",
+      "normalization": "l2",
+      "pooling": "cls",
+      "projection": "none",
+      "query_transform": "q\"uote\\back\u0001ctl\ttab sep😀 кедр",
+      "tokenizer_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  {
+    "canonical": "{\"overlap\":64,\"segmentation\":\"q\\\"uote\\\\back\\u0001ctl\\ttab sep😀 кедр\",\"text_preparation\":\"nfc\",\"token_budget\":512,\"tokenizer_identity\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"version\":\"kelmo-chunk/1\"}",
+    "id": "sha256:94bd3ccee6ae8a7366df1a04ec5f8a2c545a75c3a2844c6f245e059268ea7881",
+    "name": "profile",
+    "record": {
+      "overlap": 64,
+      "segmentation": "q\"uote\\back\u0001ctl\ttab sep😀 кедр",
+      "text_preparation": "nfc",
+      "token_budget": 512,
+      "tokenizer_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "version": "kelmo-chunk/1"
+    }
+  }
+]

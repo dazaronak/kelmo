@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the kelmod binary into rust/target/<profile>/kelmod.
+# Builds kelmod into rust/target/<profile>/kelmod and the test helpers into rust/target/<profile>/examples.
 # Usage: tools/build_kelmod.sh [--release] [cargo arguments...]
 #
 # On macOS build scripts get the system C compiler by absolute path, because a `cc` on PATH is not
@@ -10,4 +10,4 @@ if [ "$(uname -s)" = Darwin ]; then
     export CC=/usr/bin/cc CXX=/usr/bin/c++
 fi
 cd "$root"
-exec cargo build --locked --manifest-path rust/Cargo.toml --bin kelmod "$@"
+exec cargo build --locked --manifest-path rust/Cargo.toml --workspace --bins --examples "$@"
