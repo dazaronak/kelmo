@@ -3,7 +3,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/kelmo-install-dark.png">
-    <img alt="Install in five steps: pipx install kelmo, then kelmo setup picks the model and login, creates the vault (archive and wiki in Git), registers MCP and hooks for Claude Code and Codex, downloads the MiniLM embedding model once, and starts the worker with launchd or systemd after a model check. --dry-run lists every change first." src="assets/kelmo-install-light.png" width="900">
+    <img alt="Install in five steps: pipx install kelmo, then kelmo setup picks the model and login, creates the vault (archive and wiki in Git), registers MCP and hooks for Claude Code and Codex, downloads the MiniLM embedding model once, and starts the kelmod daemon with launchd or systemd after a model check. --dry-run lists every change first." src="assets/kelmo-install-light.png" width="900">
   </picture>
 </p>
 
@@ -270,4 +270,5 @@ Temporary-profile coverage also includes restoring all eight client files from
 one upgrade's backups, retaining intervening user edits, and reinstalling again.
 This exercises file recovery, not a running-service rollback. Client integrations
 can be removed with preview and exact ownership checks; see [REMOVAL.md](REMOVAL.md).
-The removal command retains the runtime, background worker and durable data.
+The removal command retains the runtime, the background service (`kelmod`, or the
+worker on a server) and durable data.

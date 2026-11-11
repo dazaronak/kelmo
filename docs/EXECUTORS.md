@@ -114,7 +114,9 @@ Select the adapter in the existing executor JSON configuration:
 }
 ```
 
-Run `kelmo worker daemon --vault /path/to/vault --executor-config /path/to/executor.json`.
+A local `kelmod` daemon runs its queue pass with the executor configuration setup
+recorded for it. On a server, or to run the pass in the foreground, run
+`kelmo worker daemon --vault /path/to/vault --executor-config /path/to/executor.json`.
 For local `kelmo create --wait`, the vault's selected session executor or
 `.state/executor.json` supplies the same configuration. Provider commands are
 owner configuration; remote note contents cannot select them.

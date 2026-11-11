@@ -127,8 +127,9 @@ with its age, warning when it is older than 36 hours.
 A writer pause means: fence the server profile (`kelmo server fence --on
 --apply`; a channel opened before the fence reads the profile again on every
 write, so clients keep their writes queued, and a running worker waits between
-passes while the fence holds), stop the worker and vault sync,
-back up, then unfence and start them again on every exit path. The embedding
+passes while the fence holds), stop the worker, the vault's `kelmod`
+(`kelmo daemon stop`) and vault sync, back up, then unfence and start them
+again on every exit path. The embedding
 model, caches, locks and the executor binding are not copied; they are
 installed again on a restored host.
 

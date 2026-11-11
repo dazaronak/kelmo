@@ -127,9 +127,12 @@ bytes and completed jobs do not establish that every meaningful fact was extract
 
 ## Measuring a call, and serving a vault for a whole session
 
-Every command is a fresh process unless you say otherwise. `--timings`, in front of the
-command name or after it, writes exactly one JSON line to stderr after the answer, so a
-caller that reads stdout sees the same bytes it always did:
+With the installed launcher, a command is a small client of the vault's `kelmod` daemon
+(see [architecture](ARCHITECTURE.md)): the vault is opened and the model loaded there, not
+in the command. A source checkout, or a launcher without `kelmod` beside it, runs every
+command as a fresh process. `--timings`, in front of the command name or after it, writes
+exactly one JSON line to stderr after the answer, so a caller that reads stdout sees the
+same bytes it always did. A fresh process reports:
 
 ```sh
 kelmo --timings search "gate runner" --vault /path/to/vault --limit 5 --json
@@ -143,11 +146,14 @@ the moment the answer was written; a launcher's shell and the interpreter's star
 before it, so time the whole process and subtract `process_ms` to see them. `operation_ms`
 is the service work, and `engine_import_ms` and `model_load_ms` are parts of it. A stage that
 did not happen is absent, and `model_load_ms` is named only by the call that paid for the
-load.
+load. A call through the daemon names neither of those two stages, and its `operation_ms`
+includes the round trip to the daemon.
 
-`kelmo mcp --vault /path/to/vault` is the way to pay that load once: it serves the same
-tools over stdio, opens the vault once per worker thread, loads the pinned model before the
-first request and says so once on stderr.
+Without the daemon, `kelmo mcp --vault /path/to/vault` is the way to pay that load once: it
+serves the same tools over stdio, opens the vault once per worker thread, loads the pinned
+model before the first request and says so once on stderr. Setup registers it for a source
+checkout and on a server; with the installed launcher it registers the daemon's HTTP
+endpoint instead.
 
 ```sh
 kelmo mcp --vault /path/to/vault
@@ -196,8 +202,8 @@ A vault that configures no `[budget]` table measures no instruction chain, and s
 `doctor` reports `hot_chains_configured: 0` beside `hot_chains_checked: 0` rather than a
 pass. A configured chain whose `global` file is absent is named in `hot_chains_uncovered`
 and repeated as a warning instead of being skipped silently. An `@` import whose page the
-vault does not hold is named the same way — `hot_imports_unresolved` carries
-`<chain> -> <path>` and `doctor` repeats it as a warning — and the chain is still measured,
+vault does not hold is named the same way (`hot_imports_unresolved` carries
+`<chain> -> <path>` and `doctor` repeats it as a warning), and the chain is still measured,
 with the import line counted as written: a page a fresh vault has not been given is not a
 budget violation. An import cycle or a file that cannot be read is a violation, named as
 `anchor resolution failed: <chain> (<error>)`. Each chain `doctor` measured is reported in

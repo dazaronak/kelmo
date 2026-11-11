@@ -16,11 +16,13 @@ marked MCP region. Changed or unmarked entries stop removal before writes. User
 text outside the instruction region, unrelated settings and hook siblings remain.
 Codex's shared hooks feature stays enabled because other hooks may use it.
 
-This disconnects clients. It retains the runtime, worker service, vault, wiki and
-backups. A running worker can continue processing queued work. The response reports
-`background_retained=true` and `data_retained=true`, not a complete package uninstall.
-Restart affected clients after applying: a client that is still open keeps the
-`kelmo mcp` server processes it started until it exits.
+This disconnects clients. It retains the runtime, the background service, vault, wiki
+and backups. A running `kelmod` daemon (or, on a server, the worker) keeps processing
+queued work. The response reports `background_retained=true` and `data_retained=true`,
+not a complete package uninstall, and its `next_step` names `kelmo daemon uninstall
+--apply`, which stops and removes the daemon service. Restart affected clients after
+applying: a client that is still open keeps its connection to the daemon, or the
+`kelmo mcp` process it started, until it exits.
 
 Preview writes nothing. Apply preflights all files, uses the client installer lock,
 compares observed bytes and verifies backups before atomic per-file replacement.

@@ -28,7 +28,8 @@ Before installation, an administrator checks:
 - `visudo -cf /absolute/private/executor-install/kelmo-executor.sudoers`
   accepts the rule. The empty quoted argument list is deliberate.
 
-Stop the worker before replacing its executor. Back up existing wrapper and
+Stop the memory service before replacing its executor: the worker, and `kelmod`
+if one runs for the vault (`kelmo daemon stop`). Back up existing wrapper and
 sudoers bytes and modes, verify those backups, then install the wrapper at
 `/usr/local/libexec/kelmo-executor` with root ownership/mode 0755 and the
 rule at `/etc/sudoers.d/kelmo-executor` with root ownership/mode 0440.
@@ -42,6 +43,6 @@ argument to the wrapper is refused, then check one scoped real source and its
 publication receipt. A missing login or denied sudo rule is an executor failure,
 not permission to broaden the grant.
 
-For rollback, stop the worker, restore the saved files with their modes,
+For rollback, stop the memory service, restore the saved files with their modes,
 validate sudoers again and restart the previously selected configuration.
 This restores the execution route; it never rolls back accepted memory writes.

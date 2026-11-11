@@ -22,7 +22,7 @@ Do not choose these for them.
 
 1. **Project name**, for example the repository's name.
 2. **Client:** `claude`, `codex` or `both`.
-3. **Editor model and provider.** The background worker calls this model for every note, on the
+3. **Editor model and provider.** The background daemon calls this model for every note, on the
    user's subscription or API key. On the author's vault Claude Haiku cost a median of $0.13 per
    note on an API key. Ask which model they want. There is no fallback.
 4. **Session capture.** `off` is the default. `auto` or `archive-only` saves session transcripts
@@ -55,7 +55,7 @@ instead of the client's built-in memory. If the user wants to keep both, use
 
 Run the same command without `--dry-run`. It creates the vault, downloads the pinned embedding
 model once (87 MB), registers MCP and hooks, makes one real model call to check the editor, and
-starts a user-level background worker. Changed files get verified backups.
+starts `kelmod`, the user-level background daemon. Changed files get verified backups.
 
 ## 6. Verify
 
@@ -82,7 +82,8 @@ To undo the client integration:
 kelmo uninstall --home "$HOME" --executable "$(command -v kelmo)" --vault VAULT --client CLIENT --json
 ```
 
-Add `--apply` after showing the preview. This disconnects the clients and keeps the worker and
-the data; see [docs/REMOVAL.md](docs/REMOVAL.md).
+Add `--apply` after showing the preview. This disconnects the clients and keeps the `kelmod`
+daemon and the data; `kelmo daemon uninstall --apply` then removes the daemon service. See
+[docs/REMOVAL.md](docs/REMOVAL.md).
 
 More options, a shared server and custom models are in [docs/SETUP.md](docs/SETUP.md).

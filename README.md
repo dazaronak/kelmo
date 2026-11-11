@@ -46,7 +46,7 @@ Prefer to hand it over? Tell your agent:
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dazaronak/kelmo/main/docs/assets/kelmo-install-dark.png">
-    <img alt="Install in five steps: pipx install kelmo, then kelmo setup picks the model and login, creates the vault (archive and wiki in Git), registers MCP and hooks for Claude Code and Codex, downloads the MiniLM embedding model once, and starts the worker with launchd or systemd after a model check. --dry-run lists every change first." src="https://raw.githubusercontent.com/dazaronak/kelmo/main/docs/assets/kelmo-install-light.png" width="900">
+    <img alt="Install in five steps: pipx install kelmo, then kelmo setup picks the model and login, creates the vault (archive and wiki in Git), registers MCP and hooks for Claude Code and Codex, downloads the MiniLM embedding model once, and starts the kelmod daemon with launchd or systemd after a model check. --dry-run lists every change first." src="https://raw.githubusercontent.com/dazaronak/kelmo/main/docs/assets/kelmo-install-light.png" width="900">
   </picture>
 </p>
 
@@ -180,10 +180,10 @@ which is why the editor's output was audited (see [Known issues](#known-issues))
 - **Models:** [embeddings](https://github.com/dazaronak/kelmo/blob/main/docs/MODELS.md), [embedding broker](https://github.com/dazaronak/kelmo/blob/main/docs/EMBEDDING-BROKER.md),
   [executors](https://github.com/dazaronak/kelmo/blob/main/docs/EXECUTORS.md), [executor accounts](https://github.com/dazaronak/kelmo/blob/main/docs/EXECUTOR-ACCOUNT.md)
 - **Operations:** [daemon](https://github.com/dazaronak/kelmo/blob/main/docs/DAEMON.md), [diagnostics](https://github.com/dazaronak/kelmo/blob/main/docs/DIAGNOSTICS.md),
-  [shared server](https://github.com/dazaronak/kelmo/blob/main/docs/SERVER-OPERATIONS.md), [SSH gate](https://github.com/dazaronak/kelmo/blob/main/docs/SSH-GATE.md),
+  [shared server](https://github.com/dazaronak/kelmo/blob/main/docs/SERVER-OPERATIONS.md), [shared client](https://github.com/dazaronak/kelmo/blob/main/docs/EDGE.md), [SSH gate](https://github.com/dazaronak/kelmo/blob/main/docs/SSH-GATE.md),
   [knowledge sync](https://github.com/dazaronak/kelmo/blob/main/docs/KNOWLEDGE-SYNC.md),
   [migration](https://github.com/dazaronak/kelmo/blob/main/docs/MIGRATION-CLI.md), [adoption](https://github.com/dazaronak/kelmo/blob/main/docs/ADOPTION-CONTRACT.md)
-- **Internals:** [architecture](https://github.com/dazaronak/kelmo/blob/main/docs/TECHNICAL.md), [wiki file contract](https://github.com/dazaronak/kelmo/blob/main/docs/WIKI-FILE-CONTRACT.md),
+- **Internals:** [architecture](https://github.com/dazaronak/kelmo/blob/main/docs/ARCHITECTURE.md), [technical design](https://github.com/dazaronak/kelmo/blob/main/docs/TECHNICAL.md), [wiki file contract](https://github.com/dazaronak/kelmo/blob/main/docs/WIKI-FILE-CONTRACT.md),
   [runtime isolation](https://github.com/dazaronak/kelmo/blob/main/docs/RUNTIME-SECURITY.md), [tests and CI](https://github.com/dazaronak/kelmo/blob/main/docs/CI.md),
   [target state](https://github.com/dazaronak/kelmo/blob/main/docs/TARGET-STATE.md), [releasing](https://github.com/dazaronak/kelmo/blob/main/docs/RELEASING.md)
 
