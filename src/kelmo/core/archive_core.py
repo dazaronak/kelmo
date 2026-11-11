@@ -103,6 +103,11 @@ class CoreChannel:
     replies are matched by id in CoreLink."""
 
     SECONDS = 300.0
+    # The route to the archive core failed, not the archive: the core died with the frame in flight, kelmod
+    # was stopping or full, or no answer came. As with the pipe to an archive process, the frame's effect is
+    # unknown, so the refusal is E_ARCHIVE_PROCESS and the caller's ledger decides whether it runs again
+    # (daemon.TRANSIENT_FAILURES); the daemon's own code would leave the operation failed for good.
+    ROUTE_FAILURES = frozenset({'E_CORE_RESTARTED', 'E_TRANSPORT', 'E_UNAVAILABLE', 'E_OVERLOADED', 'E_DEADLINE'})
 
     def __init__(self, link):
         from . import operations
@@ -116,13 +121,16 @@ class CoreChannel:
         try:
             result = self.link.call(op, frame['args'], context, lane=self.lanes.get(op)).result(self.SECONDS + 5)
         except KelmoError as error:
+            if error.code in self.ROUTE_FAILURES:
+                return {'error': {'code': 'E_ARCHIVE_PROCESS',
+                                  'message': f'The archive core did not complete {op} ({error.code}): {error}'}}
             refusal = {'code': error.code, 'message': str(error)}
             if isinstance(getattr(error, 'retryable', None), bool):
                 refusal['retryable'] = error.retryable
             return {'error': refusal}
         except TimeoutError:
-            return {'error': {'code': 'E_DEADLINE', 'message': 'The archive core did not answer in time.',
-                              'retryable': False}}
+            return {'error': {'code': 'E_ARCHIVE_PROCESS',
+                              'message': f'The archive core did not answer {op} in time.'}}
         return {'result': result}
 
     def close(self):
