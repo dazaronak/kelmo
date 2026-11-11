@@ -13,6 +13,8 @@ body    UTF-8 JSON value (body_type "json")
 
 Both header and body are canonical JSON: sorted keys, compact separators, non-ASCII kept, no NaN or infinity, integers within 64 bits. A malformed frame is refused with `E_PROTOCOL`, a frame over a bound with `E_LIMIT`.
 
+A reader accepts JSON whitespace after the body. A remote client ends the body of its `hello` with one newline, so a server that only reads lines (0.1.1) refuses the hello at once and the client falls back to `kelmo-client/1`.
+
 ## Header fields
 
 | Field | On kinds | Required on |

@@ -2123,19 +2123,33 @@ def _select_shared_repository(profile, origin, repository, repositories, *, proj
 def shared_context(service, profile, origin, *, repository=None, work=None, work_project=None,
                    client_binding=None, repositories=None):
     """Context for an enrolled repository from the committed generation; never from client paths."""
-    from .hot import _render_generation, adopted
+    from .hot import adopted
     from .config import Config
     config = Config.load(service.root)
-    hot = config.hot
-    if hot is None:
+    if config.hot is None:
         return {'configured': False, 'project': None, 'pages': [], 'context': '', 'bytes': 0,
                 'binding_status': 'unconfigured', 'client_binding': client_binding}
-    if not adopted(config):
-        raise KelmoError('E_CAPABILITY', 'Shared context delivery reads the committed registry; '
-                                        'this vault has none yet (run kelmo init).')
-    from .projects import canonical_project, resolve_bound_work, project_aliases
     reader = service.knowledge
-    generation = reader.generation()
+    # The head is read once for the whole answer and once more after it: a publication in between refuses the
+    # answer instead of mixing two generations into it.
+    with reader.holding_head():
+        if not adopted(config, reader):
+            raise KelmoError('E_CAPABILITY', 'Shared context delivery reads the committed registry; '
+                                            'this vault has none yet (run kelmo init).')
+        generation = reader.generation()
+        result = _shared_context(service, profile, origin, config, reader, generation, repository=repository,
+                                 work=work, work_project=work_project, client_binding=client_binding,
+                                 repositories=repositories)
+    if reader.generation() != generation:
+        raise KelmoError('E_GENERATION', 'Knowledge changed while context was assembled; retry the next prompt.')
+    return result
+
+
+def _shared_context(service, profile, origin, config, reader, generation, *, repository, work, work_project,
+                    client_binding, repositories):
+    from .hot import _render_generation
+    from .projects import canonical_project, resolve_bound_work, project_aliases
+    hot = config.hot
     registry = reader._pinned(generation)['registry']
     effective_projects = {key: canonical_project(registry, value) or value
                           for key, value in profile.projects.items()}
@@ -2185,8 +2199,6 @@ def shared_context(service, profile, origin, *, repository=None, work=None, work
                               'state': operation['state'], 'pending': request['pending']}
                              for operation, request in pending_operations(service, project, include_unarchived=True, registry=registry)
                              if request.get('pending') and request.get('project') in projects]
-    if reader.generation() != generation:
-        raise KelmoError('E_GENERATION', 'Knowledge changed while context was assembled; retry the next prompt.')
     return result
 
 

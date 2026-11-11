@@ -6,7 +6,7 @@
 //! kelmod embed --tokenizer FILE [--additions JSON] [--preparation DIGEST]
 //! kelmod status (--root DIR | --runtime-dir DIR)
 //! kelmod call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]
-//! kelmod attach --client-id ID [--protocol 1|2] (default 1) (--root DIR | --runtime-dir DIR)
+//! kelmod attach --client-id ID [--protocol 1|2|auto] (default 1) (--root DIR | --runtime-dir DIR)
 //! kelmod mcp-stdio (--root DIR | --runtime-dir DIR)
 //! kelmod hook ACTION [--provider P] [--state DIR] (--root DIR | --runtime-dir DIR)
 //! kelmod http-headers --state DIR --port N (--root DIR | --runtime-dir DIR)
@@ -52,7 +52,7 @@ fn pep440(version: &str) -> String {
 
 const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | embed --tokenizer FILE [--additions JSON] [--preparation DIGEST] | status (--root DIR | --runtime-dir DIR) \
 | call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K] \
-| attach --client-id ID [--protocol 1|2] (default 1) (--root DIR | --runtime-dir DIR) | mcp-stdio (--root DIR | --runtime-dir DIR) \
+| attach --client-id ID [--protocol 1|2|auto] (default 1) (--root DIR | --runtime-dir DIR) | mcp-stdio (--root DIR | --runtime-dir DIR) \
 | hook ACTION [--provider P] [--state DIR] (--root DIR | --runtime-dir DIR) \
 | http-headers --state DIR --port N (--root DIR | --runtime-dir DIR)";
 
@@ -243,6 +243,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let protocol = match options.named.get("protocol").map(String::as_str) {
                 None | Some("1") => 1,
                 Some("2") => 2,
+                Some("auto") => 0,
                 Some(other) => return Err(format!("attach: unknown protocol {other}")),
             };
             let socket = socket(&options)?;

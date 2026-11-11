@@ -30,12 +30,15 @@ def hook(service, action, payload, *, acknowledge=None):
         pending_items = []
         try:
             config = Config.load(service.root)
-            # A full service supplies its trusted reader; payload fields never enroll a root.
-            reader = getattr(service, 'knowledge', None) if config.hot is not None and adopted(config) else None
-            if reader is None and config.hot is not None and adopted(config):
+            # A full service supplies its trusted reader; payload fields never enroll a root. The reader keeps
+            # what it learned about a commit, so asking it costs one read of the head instead of a tree walk.
+            trusted = getattr(service, 'knowledge', None)
+            published = config.hot is not None and adopted(config, trusted)
+            reader = trusted if published else None
+            if reader is None and published:
                 from .wiki.pages import KnowledgeReader
                 reader = KnowledgeReader(config)
-            if (config.hot and config.hot.get('views') and adopted(config)
+            if (config.hot and config.hot.get('views') and published
                     and has_hub_generation(config, reader)):
                 from .hot import hub_context
                 from .hub_delivery import prepare, install_set

@@ -80,11 +80,14 @@ def canonical(value):
     return text
 
 
-def encode(header, body=None):
-    """Bytes of one frame. The header is validated before anything is written."""
+def encode(header, body=None, *, line_end=False):
+    """Bytes of one frame. The header is validated before anything is written.
+
+    `line_end` ends the body with a newline, inside the frame: a peer that reads lines (kelmo-client/1) then
+    has one finished, invalid line and refuses it at once, instead of waiting for a line that never ends."""
     validate_header(header)
     head = canonical(header).encode('utf-8')
-    data = canonical(body).encode('utf-8')
+    data = canonical(body).encode('utf-8') + (b'\n' if line_end else b'')
     if len(head) > MAX_HEADER:
         raise KelmoError('E_LIMIT', 'Frame header exceeds 65535 bytes.')
     total = 2 + len(head) + len(data)

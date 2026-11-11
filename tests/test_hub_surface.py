@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from kelmo.errors import KelmoError
@@ -220,7 +222,7 @@ def test_pending_journal_failure_preserves_hot_and_retries(tmp_path, monkeypatch
     from tests.test_hub_delivery import snapshot
     from kelmo import cli, hot, creation
     selected = config(tmp_path, '[hot]\nviews=true\n')
-    monkeypatch.setattr(hot, 'adopted', lambda config: True)
+    monkeypatch.setattr(hot, 'adopted', lambda *args: True)
     monkeypatch.setattr(hot, 'has_hub_generation', lambda *args: True)
     monkeypatch.setattr(hot, 'hub_context', lambda *args, **kwargs: {
         'hub_set': snapshot(1, 0), 'project': 'alpha', 'hub_work': '', 'hub_work_path': None,
@@ -278,7 +280,7 @@ def test_local_hook_omission_pointer_uses_verified_copy(tmp_path, monkeypatch):
     old = selected.wiki.parent/'hot'
     old.mkdir()
     (old/'alpha.md').write_text('UNPUBLISHED_TAMPER')
-    monkeypatch.setattr(hot, 'adopted', lambda config: True)
+    monkeypatch.setattr(hot, 'adopted', lambda *args: True)
     monkeypatch.setattr(hot, 'has_hub_generation', lambda *args: True)
     monkeypatch.setattr(hot, 'hub_context', lambda *args, **kwargs: {
         'hub_set': value, 'project': 'alpha', 'hub_work': '', 'hub_work_path': None,
@@ -315,6 +317,7 @@ def test_legacy_hook_preserves_final_context_or_reports_storage_failure(
         profile = selected
         _deadline = None
         _channel = object()
+        files = threading.RLock()
         @contextmanager
         def deadline(self, seconds):
             self._deadline = time.monotonic() + seconds
@@ -346,7 +349,7 @@ def test_local_fitting_hook_does_not_need_a_view_cache(tmp_path, monkeypatch):
     from tests.test_hub_delivery import snapshot
     from kelmo import hot, integration, hub_delivery
     selected = config(tmp_path, '[hot]\nviews=true\n')
-    monkeypatch.setattr(hot, 'adopted', lambda config: True)
+    monkeypatch.setattr(hot, 'adopted', lambda *args: True)
     monkeypatch.setattr(hot, 'has_hub_generation', lambda *args: True)
     monkeypatch.setattr(hot, 'hub_context', lambda *args, **kwargs: {
         'hub_set': snapshot(1, 0), 'project': 'alpha', 'hub_work': '', 'hub_work_path': None,

@@ -192,7 +192,7 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
 
 
 
-EDGE_LANES = {'handler': (8, 512, 'rr'), 'hook': (4, 256, 'rr')}
+EDGE_LANES = {'handler': (32, 512, 'rr'), 'hook': (4, 256, 'rr')}
 # Soft: the steady edge core. Hard: room for one transcript snapshot of a long session (the outbox holds it in
 # 8 MiB pieces) without a restart loop; the per-piece streaming that would let it shrink is not built yet.
 EDGE_BUDGET_MB = (150, 512)

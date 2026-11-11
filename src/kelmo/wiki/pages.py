@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import base64
 from collections import OrderedDict
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -23,6 +24,7 @@ import posixpath
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import threading
 
 from kelmo.contracts import ContextBinding, ContextBudget, EvidenceRef, Generation, PageBatch, PageSnapshot
 from kelmo.errors import KelmoError
@@ -701,16 +703,52 @@ class KnowledgeReader:
             self.root, self.registry_path, self.manifest_path = committed_paths(config)
             self.wiki_path = None
         self._snapshots = OrderedDict()
+        # Whether a commit carries a supported registry: a commit never changes, so the answer is kept.
+        self._adopted = OrderedDict()
+        self._held = threading.local()
         self._resolve_binding = resolve_binding
         self._scope = digest(json.dumps([str(self.root), self.registry_path, self.wiki_path]))
 
+    @contextmanager
+    def holding_head(self):
+        """One read of the head serves every read inside, on this thread.
+
+        A request that assembles one answer from several reads would otherwise ask Git for the head before each
+        of them. It reads the head once here, works on that commit, and after leaving reads the head again
+        (`generation()`) to learn whether a publication moved it meanwhile."""
+        if getattr(self._held, 'active', False):
+            yield
+            return
+        self._held.active, self._held.commit = True, None  # read by the first `_head()` inside
+        try:
+            yield
+        finally:
+            self._held.active, self._held.commit = False, None
+
     def _head(self):
+        held = getattr(self._held, 'commit', None)
+        if held is not None:
+            return held
+        commit = self._read_head()
+        if getattr(self._held, 'active', False):
+            self._held.commit = commit
+        return commit
+
+    def _read_head(self):
         # Recheck bindings even when every object requested is already cached.
         generation_paths(self.config)
-        actual = Path(os.fsdecode(_read_git(self.root, 'rev-parse', '--show-toplevel')).strip())
-        if actual != self.root:
+        return self._top_and_head()
+
+    def _top_and_head(self):
+        """The commit HEAD names, after checking that Git's top level is still the bound root.
+        One process answers both questions: the repository's top level, then the commit."""
+        answer = os.fsdecode(_read_git(self.root, 'rev-parse', '--show-toplevel', 'HEAD^{commit}')).rstrip('\n')
+        top, _, commit = answer.rpartition('\n')
+        if Path(top.strip()) != self.root:
             raise KelmoError('E_CONFIG', 'Knowledge Git root changed from its bound repository.')
-        return _read_git(self.root, 'rev-parse', '--verify', 'HEAD^{commit}').decode('ascii').strip()
+        if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', commit):
+            raise KelmoError('E_GIT', 'Knowledge Git object inspection failed: rev-parse')
+        return commit
 
     def _blob(self, entries, path):
         entry = entries.get(path)
@@ -780,10 +818,18 @@ class KnowledgeReader:
         root, registry_path, manifest_path = committed_paths(self.config)
         if (root, registry_path, manifest_path) != (self.root, self.registry_path, self.manifest_path):
             raise KelmoError('E_CONFIG', 'Knowledge bindings changed since this reader was created.')
-        head = _read_git(root, 'rev-parse', '--verify', 'HEAD^{commit}').decode('ascii').strip()
+        head = getattr(self._held, 'commit', None)
+        if head is None:
+            # Inside a hold this read is the hold's one read of the head, so the answer and every later read
+            # are about the same commit. Outside it the top level is still checked on every call: a kept
+            # answer for a commit must not vouch for another repository that holds the same commit.
+            head = self._head() if getattr(self._held, 'active', False) else self._top_and_head()
+        if head in self._adopted:
+            self._adopted.move_to_end(head)
+            return self._adopted[head]
         entries = _tree_entries(root, head, (registry_path, manifest_path))
         if self.registry_path not in entries and self.manifest_path not in entries:
-            return False
+            return self._remember_adopted(head, False)
         try:
             registry = json.loads(self._blob(entries, self.registry_path))
             version = registry['version']
@@ -792,7 +838,13 @@ class KnowledgeReader:
         except (KeyError, TypeError, ValueError, UnicodeError) as error:
             raise KelmoError('E_GENERATION', 'The committed registry is unreadable or has an unsupported format; '
                              'this release reads version 3 only.') from error
-        return True
+        return self._remember_adopted(head, True)
+
+    def _remember_adopted(self, commit, answer):
+        self._adopted[commit] = answer
+        while len(self._adopted) > GENERATION_CACHE_LIMIT:
+            self._adopted.popitem(last=False)
+        return answer
 
     def registry(self, generation):
         """The exact registry one reachable generation pins; a copy, never a write handle."""

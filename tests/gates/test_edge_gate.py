@@ -37,7 +37,8 @@ for directory in (TESTS, TESTS / 'daemon', TESTS / 'state_core', REPO / 'tools')
 
 from fastmcp import Client  # noqa: E402
 from fastmcp.client.transports import StreamableHttpTransport  # noqa: E402
-from loadtest import EN, RU, Results, command_of, descendants, error_code, process_table  # noqa: E402
+from loadtest import (EN, RU, Results, command_of, descendants, error_code, initial_stagger,  # noqa: E402
+                      nonnegative_seconds, pacing_delay, process_table)
 from daemon_harness import KELMOD, SRC, Daemon, wait_for  # noqa: E402
 from state_core_support import profile_path  # noqa: E402
 from test_action_state import world_factory as world_factory  # noqa: E402,F401
@@ -47,7 +48,8 @@ from kelmo.client import prepare_profile  # noqa: E402
 from kelmo.config import ClientProfile  # noqa: E402
 from kelmo.core import spec as core_spec  # noqa: E402
 
-SESSIONS = 50
+SESSIONS = int(os.environ.get('KELMO_EDGE_GATE_SESSIONS', '50'))
+THINK_SECONDS = nonnegative_seconds(os.environ.get('KELMO_EDGE_GATE_THINK_SECONDS', '0'))
 ENROLLED = 'mac-a'
 SECONDS = int(os.environ.get('KELMO_EDGE_GATE_SECONDS', '30'))
 # A context hook per session every 30 s, the pace of a prompt hook on a busy session; searches run without pause.
@@ -153,6 +155,8 @@ async def drive(url, token, root, hook_argv, seconds):
     headers = {'Authorization': 'Bearer ' + token}
 
     async def searches(client, rng, end):
+        if THINK_SECONDS:
+            await asyncio.sleep(pacing_delay(initial_stagger(rng, THINK_SECONDS), end - time.monotonic()))
         while time.monotonic() < end:
             arguments = {'query_en': ' '.join(rng.sample(EN, 3)), 'query_ru': ' '.join(rng.sample(RU, 3)),
                          'limit': 5}
@@ -162,10 +166,15 @@ async def drive(url, token, root, hook_argv, seconds):
                 results.add('memory_search', time.monotonic() - begin)
             except Exception as error:  # every refusal is counted by its code
                 results.add('memory_search', time.monotonic() - begin, error_code(error))
+            if THINK_SECONDS:
+                await asyncio.sleep(pacing_delay(THINK_SECONDS, end - time.monotonic()))
 
     async def hooks(session_id, end):
         payload = json.dumps({'session_id': session_id, 'cwd': str(root),
                               'hook_event_name': 'SessionStart'}).encode()
+        if THINK_SECONDS:
+            await asyncio.sleep(pacing_delay(initial_stagger(random.Random(session_id), HOOK_EVERY),
+                                             end - time.monotonic()))
         while time.monotonic() < end:
             begin = time.monotonic()
             process = await asyncio.create_subprocess_exec(
@@ -181,7 +190,7 @@ async def drive(url, token, root, hook_argv, seconds):
                 results.add('hook_start', time.monotonic() - begin, code)
             else:
                 results.add('hook_start', time.monotonic() - begin)
-            await asyncio.sleep(HOOK_EVERY)
+            await asyncio.sleep(pacing_delay(HOOK_EVERY, end - time.monotonic()))
 
     async def session(number):
         started = time.monotonic()
@@ -207,7 +216,7 @@ async def drive(url, token, root, hook_argv, seconds):
     since = time.monotonic()
     clock['end'] = since + seconds
     go.set()
-    await asyncio.gather(*tasks)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=seconds + 120)
     return results, opened, since, clock['end']
 
 
@@ -235,7 +244,7 @@ def authority(shared, tmp_path):
 
 def test_edge_gate_fifty_sessions_on_one_edge(shared, authority, tmp_path):
     root = shared.tmp_path / 'client-edge'
-    prepare_profile(root, shared.world.bindings.authority_id, attach_command(authority.runtime, ENROLLED, 1),
+    prepare_profile(root, shared.world.bindings.authority_id, attach_command(authority.runtime, ENROLLED, 'auto'),
                     timeout_seconds=60)
     profile = ClientProfile.load(root)
     runtime = Path(tempfile.mkdtemp(prefix='ge', dir='/tmp'))
@@ -265,6 +274,9 @@ def test_edge_gate_fifty_sessions_on_one_edge(shared, authority, tmp_path):
         shutil.rmtree(runtime, ignore_errors=True)
 
     report = {'sessions': SESSIONS, 'sessions_opened': len(opened), 'seconds': SECONDS,
+              'load_model': {'kind': 'closed_loop', 'think_seconds': THINK_SECONDS,
+                             'initial_stagger': bool(THINK_SECONDS), 'hook_every_seconds': HOOK_EVERY,
+                             'operations': 'searches plus separate SessionStart hooks'},
               'operations': results.summary(), **sampler.summary(since, until)}
     text = json.dumps(report, indent=2, ensure_ascii=False)
     print(text)

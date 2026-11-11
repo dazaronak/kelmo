@@ -76,8 +76,8 @@ class Attach:
     """A protocol-2 attach process driven frame by frame. Its output is read against a deadline; frames for other
     calls wait in an inbox until their call asks for them."""
 
-    def __init__(self, runtime, client_id):
-        self.process = subprocess.Popen(attach_command(runtime, client_id, 2), stdin=subprocess.PIPE,
+    def __init__(self, runtime, client_id, protocol=2):
+        self.process = subprocess.Popen(attach_command(runtime, client_id, protocol), stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE)
         self.reader = wire.FrameReader()
         self.inbox = []
@@ -111,9 +111,10 @@ class Attach:
                 self.inbox += self.reader.feed(data)
 
 
-def test_protocol_one_client_completes_hello_search_capture_create_and_append(shared, daemon):
+@pytest.mark.parametrize('protocol', [1, 'auto'])
+def test_protocol_one_client_completes_hello_search_capture_create_and_append(shared, daemon, protocol):
     root = shared.tmp_path / 'client-attach'
-    prepare_profile(root, shared.world.bindings.authority_id, attach_command(daemon.runtime, ENROLLED, 1),
+    prepare_profile(root, shared.world.bindings.authority_id, attach_command(daemon.runtime, ENROLLED, protocol),
                     timeout_seconds=60)
     with SharedClient(ClientProfile.load(root)) as client:
         service = ClientService(client)
@@ -179,6 +180,42 @@ def test_protocol_two_pins_the_origin_the_attach_argument_names(daemon):
         header, body = attach.receive(plain)
         assert header['ok'] is True and body['ok'] is True
         assert body['result']['client_id'] == ENROLLED and body['result']['writer'] == 'shared'
+
+
+def test_protocol_two_auto_forwards_concurrent_client_requests_by_id(daemon):
+    with Attach(daemon.runtime, ENROLLED, protocol='auto') as attach:
+        hello = new_id()
+        attach.send({'v': 2, 'kind': 'hello', 'id': hello, 'body_type': 'json', 'protocols': ['kelmo/2'],
+                     'operations': [], 'origin': {'client_id': STRANGER, 'machine_tag': None, 'session': None}})
+        header, _ = attach.receive(hello)
+        assert header['kind'] == 'hello' and header['operations'] == ['state.client_request']
+
+        calls = [new_id(), new_id()]
+        for call_id in calls:
+            attach.send({'v': 2, 'kind': 'call', 'id': call_id, 'op': 'state.client_request',
+                         'body_type': 'json', 'deadline_ms': 20000}, {'request': request('status')})
+        replies = [attach.receive(call_id) for call_id in calls]
+        assert {header['id'] for header, _ in replies} == set(calls)
+        assert all(header['kind'] == 'reply' and header['ok'] is True for header, _ in replies)
+        assert all(body['ok'] is True and body['result']['client_id'] == ENROLLED for _, body in replies)
+
+
+def test_protocol_auto_refuses_an_unrecognized_first_byte(daemon):
+    completed = subprocess.run(attach_command(daemon.runtime, ENROLLED, 'auto'), input=b'x',
+                               capture_output=True, timeout=60)
+    lines = completed.stdout.splitlines(keepends=True)
+    assert completed.returncode == 1
+    assert len(lines) == 1 and lines[0].endswith(b'\n')
+    reply = json.loads(lines[0])
+    assert reply['protocol'] == 'kelmo-client/1' and reply['ok'] is False
+    assert reply['request_id'] is None and reply['error']['code'] == 'E_PROTOCOL'
+
+
+def test_protocol_auto_exits_cleanly_on_empty_input(daemon):
+    completed = subprocess.run(attach_command(daemon.runtime, ENROLLED, 'auto'), input=b'',
+                               capture_output=True, timeout=60)
+    assert completed.returncode == 0
+    assert completed.stdout == b''
 
 
 def test_an_unknown_client_id_gets_a_refusal_not_a_result(daemon):

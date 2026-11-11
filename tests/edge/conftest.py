@@ -44,19 +44,31 @@ class FakeClient:
         self.deadlines = []  # seconds passed to deadline(), in order
         self.flushed = threading.Event()
         self.closed = False
+        self.wait_seconds = 5.0  # what remaining() answers: how long a write waits for the outbox
+        self.files = threading.RLock()
+        self._lock = threading.RLock()  # the edge core replaces it with its owner gate
 
     @contextmanager
     def deadline(self, seconds):
         self.deadlines.append(seconds)
         yield
 
+    def remaining(self):
+        return self.wait_seconds
+
     def flush(self):
         self.flushed.set()
         return {'reached': True, 'stopped': None, 'pending': 0, 'delivered': 0}
 
     def capture_session(self, provider, action, payload, *, deliver=True, restart=True, internal_job=None):
-        self.captured.append((provider, action, dict(payload), deliver, internal_job))
+        with self._lock:  # a capture queues in the outbox, as in SharedClient
+            self.captured.append((provider, action, dict(payload), deliver, internal_job))
         return {'queued': True, 'accepted': False}
+
+    def write(self):
+        """What a tool that queues something does to the outbox."""
+        with self._lock:
+            return {}
 
     def close(self):
         self.closed = True

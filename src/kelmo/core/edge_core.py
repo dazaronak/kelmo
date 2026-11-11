@@ -3,6 +3,10 @@ machine. It is `SharedClient` behind the daemon: tool calls (`edge.tool`) run th
 `ClientService`, hooks (`edge.hook`) run `client.hook` with what `kelmod hook` read in the hook's process, and a
 deliverer thread carries the outbox to the authority, woken by every hook that queued something.
 
+Reads go to the authority several at a time, over one channel that matches replies by id. Whatever touches the
+outbox (a write, a delivery pass, a transcript capture) takes the owner lock inside the client, one caller at a
+time, a hook before a tool.
+
     python -m kelmo.core.edge_core --client ROOT       (descriptor 3 is the channel to kelmod)
 """
 import argparse
@@ -16,10 +20,11 @@ from pathlib import Path
 
 from ..errors import KelmoError
 
-# Every call serializes on the one client: the router queues the rest, round robin between sessions.
-HANDLER_LANE = 8
+# Tool calls in flight in this core; the router queues the rest, round robin between sessions. Reads overlap
+# on the channel to the authority, whose own lanes bound what runs there.
+HANDLER_LANE = 32
 HOOK_LANE = 4
-# How long one delivery pass may hold the client: a hook that needs the client waits at most this long.
+# How long one delivery pass may hold the outbox: a write that needs it waits at most this long.
 DELIVER_SECONDS = 5.0
 # How often the deliverer tries on its own when nothing woke it (a write queued while the authority was down).
 DELIVER_INTERVAL = 30.0
@@ -81,16 +86,40 @@ class OwnerLock:
                 self._condition.notify_all()
 
 
+class _OwnerGate:
+    """What `SharedClient` takes around its outbox in the edge core: the owner lock, waited for within the
+    calling thread's deadline and urgently for a hook. A caller that cannot get it in time is refused as busy."""
+
+    def __init__(self, core):
+        self._core = core
+
+    def __enter__(self):
+        from ..client import Busy
+        core = self._core
+        try:
+            seconds = core.client.remaining()
+        except KelmoError:  # the deadline has passed: one try, no wait
+            seconds = 0.0
+        if not core._owner.acquire(timeout=seconds, urgent=getattr(core._urgent, 'value', False)):
+            raise Busy('The edge core is busy with another write; retry.')
+        return self
+
+    def __exit__(self, *_):
+        self._core._owner.release()
+
+
 class EdgeCore:
     def __init__(self, root, client=None):
         from ..client import SharedClient
         from ..config import ClientProfile
         self.root = Path(root).expanduser().resolve()
-        self.client = client or SharedClient(ClientProfile.load(self.root))
+        self.client = client or SharedClient(ClientProfile.load(self.root), multiplex=True)
         self._tools = None
-        # SharedClient keeps its deadline on the instance and its outbox on one connection: one caller at a
-        # time owns it, handlers and the deliverer alike.
+        # The outbox is one connection and a delivery is one ordered pass: one caller at a time owns it, handlers
+        # and the deliverer alike. Reads do not take it.
         self._owner = OwnerLock()
+        self._urgent = threading.local()
+        self.client._lock = _OwnerGate(self)
         self._depth = threading.local()
         self._acks = {}
         self._acks_lock = threading.Lock()
@@ -104,11 +133,10 @@ class EdgeCore:
 
     @contextmanager
     def owned(self, seconds, urgent=False):
-        """Holds the client for one caller, waiting at most `seconds` for it."""
+        """Holds the outbox for one caller across a whole section, waiting at most `seconds` for it."""
+        from ..client import Busy
         if not self._owner.acquire(timeout=max(0.0, seconds), urgent=urgent):
-            error = KelmoError('E_BUSY', 'The edge core is busy with another call; retry.')
-            error.retryable = True
-            raise error
+            raise Busy('The edge core is busy with another write; retry.')
         self._depth.count = getattr(self._depth, 'count', 0) + 1
         try:
             yield self.client
@@ -118,13 +146,18 @@ class EdgeCore:
 
     @contextmanager
     def serving(self, context, cap=None, urgent=False):
-        """Owns the client for one call: waits for it within the call's deadline, then checks that the call is
-        still wanted and bounds the work by what is left (at most `cap` seconds)."""
-        with self.owned(context.remaining(), urgent):
-            context.check()
-            left = context.remaining() if cap is None else min(cap, context.remaining())
+        """Bounds one call by what is left of its deadline (at most `cap` seconds) and says whether its writes go
+        ahead of waiting tools. The owner lock is taken inside the client, only where the call touches the
+        outbox; its reads overlap with every other call's."""
+        context.check()
+        left = context.remaining() if cap is None else min(cap, context.remaining())
+        previous = getattr(self._urgent, 'value', False)
+        self._urgent.value = urgent
+        try:
             with self.client.deadline(max(0.001, left)):
                 yield self.client
+        finally:
+            self._urgent.value = previous
 
     # Acknowledgements of HOT deliveries, run when `kelmod hook` reports that the session printed the context.
     ACK_SECONDS = 60.0
@@ -145,7 +178,7 @@ class EdgeCore:
             held = self._acks.pop(token, None) if isinstance(token, str) else None
         if held is None:
             return {'acknowledged': False}
-        with self.serving(context):
+        with self.serving(context), self.client.files:
             for acknowledgement in held[1]:
                 try:
                     acknowledgement()
@@ -175,13 +208,13 @@ class EdgeCore:
             self._wake.clear()
             if self._stopping.is_set():
                 return
-            # Each spooled hook takes the client on its own, so a waiting session hook gets its turn in between.
+            # Each spooled hook takes the outbox on its own, so a waiting session hook gets its turn in between.
             try:
                 spool = self.ingest_spool()
             except Exception as error:  # noqa: BLE001 - an unreadable spool must not end delivery for good
                 spool = {'ingested': 0, 'pending': None, 'stopped': type(error).__name__}
             try:
-                with self.owned(DELIVER_SECONDS), self.client.deadline(DELIVER_SECONDS):
+                with self.client.deadline(DELIVER_SECONDS):
                     result = self.client.flush()
             except Exception as error:  # noqa: BLE001 - the next pass retries; the outbox keeps every entry
                 result = {'stopped': type(error).__name__, 'message': str(error)[:200]}
@@ -281,7 +314,7 @@ class EdgeCore:
                 spool.reject(path)
                 continue
             try:
-                with self.owned(SPOOL_HOOK_SECONDS), self.client.deadline(SPOOL_HOOK_SECONDS):
+                with self.client.deadline(SPOOL_HOOK_SECONDS):
                     self._run_hook(body)
             except KelmoError as error:
                 # Only a refusal worth retrying (busy, unreachable) keeps the file; any other would repeat for
@@ -308,7 +341,8 @@ class EdgeCore:
                 or not all(isinstance(pair, list) and len(pair) == 2 and all(isinstance(part, str) for part in pair)
                            for pair in sources.values())):
             raise KelmoError('E_PROTOCOL', 'edge.cli sources are {name: [content, filename]}, stdin a string.')
-        with self.serving(context):
+        # A CLI command may read and rewrite the outbox in several steps (resend, flush): it holds it throughout.
+        with self.owned(context.remaining()), self.serving(context):
             result = run_borrowed_client(self.client, argv, sources, stdin, root=self.root)
         self.wake()
         return result

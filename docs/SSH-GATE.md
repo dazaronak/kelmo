@@ -35,7 +35,11 @@ client id or a shell command must be refused.
 
 On the server, `serve-client` starts the vault's daemon if none runs and then
 becomes `kelmod attach` for the enrolled client, so every SSH connection is
-one small process in front of the one daemon.
+one small process in front of the one daemon. A 0.2.0 client sends several
+requests at once on that connection and matches the replies by id. An older
+client sends one request and waits for its reply. `kelmod attach` tells the
+two apart by the first byte it receives, so both kinds of client work against
+one server.
 
 Do not register this SSH command with the agent. `kelmo setup` on the client
 installs a local `kelmod` service and registers its HTTP endpoint with Claude

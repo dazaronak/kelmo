@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -145,6 +146,7 @@ def test_shared_hook_delivers_real_set_and_acknowledges_after_output(tmp_path):
         profile = SimpleNamespace(state=tmp_path)
         _deadline = None
         _channel = object()
+        files = threading.RLock()
         @contextmanager
         def deadline(self, seconds):
             import time

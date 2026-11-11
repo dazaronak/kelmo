@@ -18,9 +18,17 @@ SSH forced command.
   tries every 30 seconds, so a write queued while the server was unreachable goes out once it answers. One
   delivery pass holds the client for at most 5 seconds.
 
-Every call runs on the one client, so the edge core serializes them: the router keeps up to 8 tool calls and 4
-hooks in flight and queues the rest, round robin between sessions. A hook a session is waiting on goes ahead of
-waiting tool calls, but never twice in a row past one, so a stream of hooks cannot shut the tools out either.
+The edge core keeps one channel to the server open, and the server answers several requests at once on it, so
+reads from different sessions overlap. The router keeps up to 32 tool calls and 4 hooks in flight and queues
+the rest, round robin between sessions.
+
+Only what touches the outbox goes one caller at a time: a write, a delivery pass, a transcript capture. A hook
+a session is waiting on takes the outbox ahead of waiting tool calls, but never twice in a row past one, so a
+stream of hooks cannot shut the tools out either. A write that cannot get the outbox before its deadline is
+refused as busy (`E_BUSY`) and can be retried.
+
+A server older than 0.2.0 answers one request at a time. The edge core then sends its calls one after another,
+as before, and offers the newer protocol again after five minutes.
 
 ## Hooks never block a session
 

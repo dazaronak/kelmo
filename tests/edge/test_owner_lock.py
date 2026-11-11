@@ -1,4 +1,5 @@
-"""The owner lock of the edge core: reentrant, with urgent callers (hooks) served before ordinary ones.
+"""The owner lock of the edge core: reentrant, with urgent callers (hooks) served before ordinary ones, and taken
+only by a call that touches the outbox.
 
 A waiter is known to be queued through a hook on the condition's `wait`, not by sleeping, so each thread starts
 only once the one before it is blocked.
@@ -7,6 +8,7 @@ only once the one before it is blocked.
 import threading
 
 from kelmo.core.edge_core import OwnerLock
+from kelmo.errors import KelmoError
 
 
 class Context:
@@ -147,7 +149,7 @@ def record_acquires(core, monkeypatch):
     return flags
 
 
-def test_handle_hook_takes_the_owner_lock_urgently(edge, monkeypatch):
+def test_a_hook_that_queues_takes_the_owner_lock_urgently(edge, monkeypatch):
     core, client, _ = edge
     flags = record_acquires(core, monkeypatch)
     body = {'action': 'session-stop', 'payload': {}, 'context': {'provider': 'claude'}}
@@ -158,11 +160,46 @@ def test_handle_hook_takes_the_owner_lock_urgently(edge, monkeypatch):
     assert [action for _, action, *_ in client.captured] == ['session-stop']
 
 
-def test_handle_tool_takes_the_owner_lock_ordinarily(edge, monkeypatch):
-    core, _, _ = edge
+def test_a_tool_that_writes_takes_the_owner_lock_ordinarily(edge, monkeypatch):
+    core, client, _ = edge
     flags = record_acquires(core, monkeypatch)
-    monkeypatch.setattr(core, 'tools', lambda: {'stub': lambda: {}})
+    monkeypatch.setattr(core, 'tools', lambda: {'stub': client.write})
 
     assert core.handle_tool(Context(12.5), {'tool': 'stub', 'arguments': {}}) == {}
 
     assert flags == [False]
+
+
+def test_a_tool_that_only_reads_never_takes_the_owner_lock(edge, monkeypatch):
+    core, _, _ = edge
+    flags = record_acquires(core, monkeypatch)
+    monkeypatch.setattr(core, 'tools', lambda: {'stub': lambda: {'read': True}})
+
+    assert core.handle_tool(Context(12.5), {'tool': 'stub', 'arguments': {}}) == {'read': True}
+
+    assert flags == []
+
+
+def test_a_read_answers_while_another_caller_holds_the_outbox(edge, monkeypatch):
+    core, _, _ = edge
+    monkeypatch.setattr(core, 'tools', lambda: {'stub': lambda: {'read': True}})
+    core._owner.acquire()
+    try:
+        read = call_in_thread(core.handle_tool, Context(12.5), {'tool': 'stub', 'arguments': {}})
+        assert read(timeout=5) == {'read': True}
+    finally:
+        core._owner.release()
+
+
+def test_a_write_that_cannot_get_the_outbox_in_time_is_refused_as_busy(edge, monkeypatch):
+    core, client, _ = edge
+    monkeypatch.setattr(core, 'tools', lambda: {'stub': client.write})
+    client.wait_seconds = 0.05
+    core._owner.acquire()
+    try:
+        refused = call_in_thread(core.handle_tool, Context(12.5), {'tool': 'stub', 'arguments': {}})(timeout=5)
+    finally:
+        core._owner.release()
+
+    assert isinstance(refused, KelmoError)
+    assert (refused.code, refused.retryable) == ('E_BUSY', True)

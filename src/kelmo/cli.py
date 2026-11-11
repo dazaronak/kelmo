@@ -135,7 +135,7 @@ def routed(args):
 
 def attach_client(root, profile, client_id, launcher, kelmod):
     """`serve-client` under the installed launcher: start the vault's daemon if none runs, then become
-    `kelmod attach --protocol 1` for this client. A daemon that cannot start is answered as a /1 refusal."""
+    `kelmod attach --protocol auto` for this client. A daemon that cannot start is answered as a /1 refusal."""
     from .core import daemon_client
     from .server import PROTOCOL, write_frame
     def refuse(code, message):
@@ -145,7 +145,7 @@ def attach_client(root, profile, client_id, launcher, kelmod):
     try:
         daemon_client.ensure(root, kelmod=kelmod, launcher=launcher, server_profile=profile)
         runtime = daemon_client.runtime_dir(Path(root).expanduser().resolve())
-        os.execv(kelmod, [str(kelmod), 'attach', '--client-id', client_id, '--protocol', '1',
+        os.execv(kelmod, [str(kelmod), 'attach', '--client-id', client_id, '--protocol', 'auto',
                           '--runtime-dir', str(runtime)])
     except KelmoError as error:
         return refuse(error.code, str(error))

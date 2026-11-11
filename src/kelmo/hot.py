@@ -34,12 +34,16 @@ def _page(wiki, name, limit):
         raise KelmoError('E_HOT', f'HOT page is missing, unreadable or not UTF-8: {name}') from error
 
 
-def adopted(config):
-    """A committed registry cannot be downgraded by unpublished registry changes."""
-    from .wiki.pages import KnowledgeReader
+def adopted(config, reader=None):
+    """A committed registry cannot be downgraded by unpublished registry changes. `reader` is the caller's
+    reader of the same knowledge repository, whose answer for a commit it has already read is reused."""
+    from .wiki.pages import KnowledgeReader, committed_paths
     git_root = Path(getattr(config, 'knowledge_git_root', config.root))
-    if (git_root / '.git').exists() and KnowledgeReader(config).adopted():
-        return True
+    if (git_root / '.git').exists():
+        if reader is None or (reader.root, reader.registry_path, reader.manifest_path) != committed_paths(config):
+            reader = KnowledgeReader(config)
+        if reader.adopted():
+            return True
     registry = config.checked_path(config.registry)
     try:
         raw = registry.read_bytes()

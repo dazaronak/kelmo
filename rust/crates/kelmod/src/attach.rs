@@ -1,4 +1,4 @@
-//! `kelmod attach --client-id ID [--protocol 1|2]`: the ssh forced command of a remote client. It bridges
+//! `kelmod attach --client-id ID [--protocol 1|2|auto]`: the ssh forced command of a remote client. It bridges
 //! its stdin and stdout to the daemon's socket and fixes the origin from its own argument, which the ssh gate
 //! chose; nothing the client sends can name another origin.
 //!
@@ -12,6 +12,9 @@
 //! [`REMOTE_OPERATIONS`] and cancels of its own calls. The client's `hello` is answered here with those
 //! operations and never reaches the router, so the origin stays the one set at connect. When the client
 //! closes its input, the bridge waits for the replies of the calls still open before it closes.
+//!
+//! `--protocol auto` is encoded as `0` and selects `/1` for a first byte of `{`, or `/2` for a
+//! four-byte frame length beginning with `0x00`, `0x01` or `0x02`.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -118,8 +121,37 @@ async fn connect(socket: &Path, client_id: &str) -> Result<Daemon, String> {
 /// Runs the bridge until either side closes; returns the exit status.
 pub async fn run(socket: &Path, client_id: &str, protocol: u8) -> i32 {
     match protocol {
-        2 => v2(socket, client_id).await,
-        _ => v1(socket, client_id).await,
+        2 => v2(socket, client_id, Vec::new()).await,
+        0 => {
+            let mut first = [0u8; 1];
+            let mut stdin = tokio::io::stdin();
+            let count = match stdin.read(&mut first).await {
+                Ok(count) => count,
+                Err(_) => return 0,
+            };
+            if count == 0 {
+                return 0;
+            }
+            match first[0] {
+                b'{' => v1(socket, client_id, first.to_vec()).await,
+                0x00..=0x02 => v2(socket, client_id, first.to_vec()).await,
+                _ => {
+                    let mut stdout = tokio::io::stdout();
+                    write_line(
+                        &mut stdout,
+                        &v1_refusal(
+                            Value::Null,
+                            "E_PROTOCOL",
+                            "The first byte does not identify a supported attach protocol.",
+                            false,
+                        ),
+                    )
+                    .await;
+                    1
+                }
+            }
+        }
+        _ => v1(socket, client_id, Vec::new()).await,
     }
 }
 
@@ -129,7 +161,7 @@ fn reply_refusal(id: &Value, code: &str, message: &str) -> Option<Vec<u8>> {
     kelmo_wire::encode(&header, &Value::Null).ok()
 }
 
-async fn v2(socket: &Path, client_id: &str) -> i32 {
+async fn v2(socket: &Path, client_id: &str, initial: Vec<u8>) -> i32 {
     let daemon = match connect(socket, client_id).await {
         Ok(daemon) => daemon,
         Err(message) => {
@@ -143,6 +175,17 @@ async fn v2(socket: &Path, client_id: &str) -> i32 {
         reader: mut daemon_reader,
         pending: early,
     } = daemon;
+    let mut reader = FrameReader::new();
+    let mut prefetched = VecDeque::new();
+    if !initial.is_empty() {
+        match reader.feed(&initial) {
+            Ok(frames) => prefetched.extend(frames),
+            Err(error) => {
+                eprintln!("{error}");
+                return 1;
+            }
+        }
+    }
     // One writer to stdout, whole frames only: daemon replies and local answers never split each other.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(async move {
@@ -196,23 +239,26 @@ async fn v2(socket: &Path, client_id: &str) -> i32 {
         answered_down.notify_waiters();
     });
     let mut stdin = tokio::io::stdin();
-    let mut reader = FrameReader::new();
     let mut buffer = vec![0u8; 64 * 1024];
     let mut daemon_gone = false;
     let status = 'bridge: loop {
-        let count = tokio::select! {
-            count = stdin.read(&mut buffer) => match count {
-                Ok(0) | Err(_) => break 'bridge 0,
-                Ok(count) => count,
-            },
-            _ = &mut downstream => { daemon_gone = true; break 'bridge 0 }
-        };
-        let frames = match reader.feed(&buffer[..count]) {
-            Ok(frames) => frames,
-            Err(error) => {
-                eprintln!("{error}");
-                break 1;
+        let frames = if prefetched.is_empty() {
+            let count = tokio::select! {
+                count = stdin.read(&mut buffer) => match count {
+                    Ok(0) | Err(_) => break 'bridge 0,
+                    Ok(count) => count,
+                },
+                _ = &mut downstream => { daemon_gone = true; break 'bridge 0 }
+            };
+            match reader.feed(&buffer[..count]) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    eprintln!("{error}");
+                    break 1;
+                }
             }
+        } else {
+            prefetched.drain(..).collect()
         };
         for (header, body) in frames {
             match header["kind"].as_str().unwrap_or("") {
@@ -301,14 +347,16 @@ async fn write_line(stdout: &mut tokio::io::Stdout, value: &Value) -> bool {
 /// Lines from the client, read on their own task so a call in flight still notices the client leaving.
 /// Each item is one raw line (with its newline when it had one); the channel closes at end of input, after
 /// a line without a newline (oversized or cut off) or on a read error.
-fn client_lines() -> mpsc::Receiver<Vec<u8>> {
+fn client_lines(initial: Vec<u8>) -> mpsc::Receiver<Vec<u8>> {
     let (sender, receiver) = mpsc::channel(4);
     tokio::spawn(async move {
         let mut stdin = BufReader::with_capacity(1 << 20, tokio::io::stdin());
+        let mut initial = initial;
         loop {
-            let mut raw = Vec::new();
+            let mut raw = std::mem::take(&mut initial);
             // At most one byte past the bound is read, as `readline(MAX_FRAME + 1)` does.
-            let mut limited = (&mut stdin).take(MAX_FRAME as u64 + 1);
+            let remaining = MAX_FRAME.saturating_add(1).saturating_sub(raw.len()) as u64;
+            let mut limited = (&mut stdin).take(remaining);
             match limited.read_until(b'\n', &mut raw).await {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {}
@@ -409,7 +457,7 @@ async fn v1_request(
     }
 }
 
-async fn v1(socket: &Path, client_id: &str) -> i32 {
+async fn v1(socket: &Path, client_id: &str, initial: Vec<u8>) -> i32 {
     let mut stdout = tokio::io::stdout();
     let mut daemon = match connect(socket, client_id).await {
         Ok(daemon) => daemon,
@@ -425,7 +473,7 @@ async fn v1(socket: &Path, client_id: &str) -> i32 {
             return 1;
         }
     };
-    let mut lines = client_lines();
+    let mut lines = client_lines(initial);
     let mut queued = VecDeque::new();
     let mut client_gone = false;
     let mut counter = 0u64;

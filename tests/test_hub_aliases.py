@@ -1,4 +1,5 @@
 """Renaming a project must preserve its existing branch and server bindings."""
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from tests.test_hot import config
@@ -111,11 +112,12 @@ def test_shared_global_context_only_includes_pending_for_authorized_projects(tmp
                          {'repository_id': 'repo-b', 'root': '/private/tmp/b',
                           'remote': 'https://example.invalid/b', 'project': 'beta'}]})
     registry = {'pages': {}, 'redirects': {}}
-    reader = SimpleNamespace(generation=lambda: 1, _pinned=lambda _: {'registry': registry})
+    reader = SimpleNamespace(generation=lambda: 1, _pinned=lambda _: {'registry': registry},
+                             holding_head=nullcontext)
     service = SimpleNamespace(root=tmp_path, knowledge=reader)
     monkeypatch.setattr(Config, 'load', lambda root: SimpleNamespace(hot={'pages': [], 'projects': {},
                                                                          'views': {'max_bytes': 48000}, 'max_bytes': 48000}))
-    monkeypatch.setattr(hot, 'adopted', lambda config: True)
+    monkeypatch.setattr(hot, 'adopted', lambda *args: True)
     monkeypatch.setattr(hot, 'has_hub_generation', lambda *args: True)
     monkeypatch.setattr(hot, '_render_generation', lambda *args, **kwargs: {'context': 'mandatory'})
     monkeypatch.setattr(hub_delivery, 'published_set', lambda *args: {})
