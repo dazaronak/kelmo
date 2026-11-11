@@ -281,9 +281,8 @@ Manual `sessions run --executor-config` wins over saved configuration. Without i
 Claude uses `.claude.json` MCP plus `.claude/settings.json` hooks. Codex uses `.codex/config.toml` plus `.codex/hooks.json`. Commands bind absolute executable/vault. Backups verified before replace, observed bytes compared at each write, unrelated settings retained, ownership receipts support interrupted updates. This is not a transaction over every profile file or an OS atomic compare-and-swap.
 
 macOS: launchd user agent, bootout/bootstrap. Linux: systemd user unit, daemon-reload/enable/restart. On a local
-vault or a shared client the unit runs one kelmod through `kelmo daemon run` (`org.kelmo.daemon`, `kelmod.service`
-with `Type=notify`, a watchdog and memory bounds) and setup retires the 0.1 worker unit; a server profile keeps the
-worker unit. Actual native lifecycle remains unverified; stateful substitutes cover logic. Runtime upgrades currently modify the owned runtime in place; native active-worker/rollback acceptance is mandatory before launch.
+vault, a server profile or a shared client the unit runs one kelmod through `kelmo daemon run` (`org.kelmo.daemon`,
+`kelmod.service` with `Type=notify`, a watchdog and memory bounds) and setup retires the 0.1 worker unit. Actual native lifecycle remains unverified; stateful substitutes cover logic. Runtime upgrades currently modify the owned runtime in place; native active-worker/rollback acceptance is mandatory before launch.
 
 ### Stopped-copy snapshot and cutover
 
@@ -292,6 +291,7 @@ worker unit. Actual native lifecycle remains unverified; stateful substitutes co
 `snapshot.verify_snapshot(snapshot)` verifies `manifest.json` against its hash and re-checks every copied database and file map against disk. `snapshot.inventory(snapshot, queues=())` assigns exactly one disposition to every operation, request and record. Journal operations with archived evidence become `import`; terminal operations become `carry-unresolved`; in-flight operations become `resume-after-cutover`. Action requests in `open` or `prepared` state become `settle-before-cutover` (blocking cutover). Queued jobs in tree sources become `drain-before-cutover` (blocking cutover). Duplicate item identities raise `E_SNAPSHOT`.
 
 `snapshot.import_snapshot` unpacks a verified snapshot into a schema-2 vault with independent roots (`state_root`, `archive_root`, `knowledge_git_root`). Progress is tracked in `.import/state.json`. The process is resumable step by step:
+
 1. `vault`: copies Git history to `knowledge_git_root` using temporary staging, proving file maps match.
 2. `archive`: places `archive.db` into `archive_root`, proving file SHA-256.
 3. `journal`: places `journal.sqlite3` into `state_root` or initializes a fresh journal.

@@ -166,14 +166,16 @@ probes the executor, writes the selected clients' integrations and starts the us
 service. `--client claude|codex|both` selects profiles. `--allow-native-memory` omits
 the prohibition rule. The native-memory option must be explicit.
 
-On a local vault or a shared client, the user service runs one `kelmod` daemon
+On a local vault, a server profile or a shared client, the user service runs one `kelmod` daemon
 (`org.kelmo.daemon` under launchd, `kelmod.service` under systemd) through
 `kelmo daemon run`, which rebuilds the daemon's spec at every start, so an
 upgraded package brings its own tools and paths without a new setup. Setup
 stops and removes a 0.1 worker service (`org.kelmo.worker`, `kelmo.service`) in
 the same run: two services must never write one journal. With `--no-start` the
-old worker stays, and `kelmo daemon run` refuses to start until it is gone. A
-server profile still installs the worker service. Reinstalling on Linux reloads
+old worker stays, and `kelmo daemon run` refuses to start until it is gone.
+Setup refuses to replace a worker whose service manager cannot confirm a successful
+stop or that the service is absent. A server profile uses the SSH client gateway
+and has no local HTTP endpoint. Reinstalling on Linux reloads
 the unit files and restarts the service so a running process picks up the new
 definition. A failed activation stops setup and retains the prepared
 configuration for recovery.

@@ -108,7 +108,8 @@ def test_uninstall_apply_unloads_the_service_and_removes_its_file(tmp_path, monk
     service.parent.mkdir(parents=True)
     service.write_text('synthetic', encoding='utf-8')
     unloads = []
-    monkeypatch.setattr(daemon_admin.subprocess, 'run', lambda command, **kwargs: unloads.append(command))
+    monkeypatch.setattr(subprocess, 'run', lambda command, **kwargs: unloads.append(command)
+                        or subprocess.CompletedProcess(command, 0))
 
     result = daemon_admin.uninstall(tmp_path / 'vault', home, apply=True, platform='darwin')
 
@@ -130,3 +131,32 @@ def test_memory_limits_sum_the_core_budgets_and_the_linux_unit_carries_them(tmp_
                  'Restart=on-failure', 'RestartPreventExitStatus=78', 'TimeoutStopSec=40', 'OOMPolicy=continue',
                  f'MemoryHigh={high}M', f'MemoryMax={hard}M'):
         assert line in lines
+
+
+@pytest.mark.parametrize('platform', ['darwin', 'linux'])
+def test_the_service_command_is_one_the_command_line_accepts(tmp_path, platform):
+    """The service starts `kelmo daemon run --vault ROOT`: the parser must take the vault after the action."""
+    import plistlib
+    import shlex
+
+    from kelmo.interface import build_parser
+    root = tmp_path / 'vault'
+    _, data = shared.service_definition(tmp_path, tmp_path / 'bin' / 'kelmo', root, platform)
+    if platform == 'darwin':
+        argv = plistlib.loads(data)['ProgramArguments']
+    else:
+        start = next(line for line in data.decode('utf-8').splitlines() if line.startswith('ExecStart='))
+        argv = shlex.split(start[len('ExecStart='):])
+    parser, _ = build_parser('')
+    args = parser.parse_args(argv[1:])
+    assert (args.command, args.action, args.vault) == ('daemon', 'run', root)
+
+
+@pytest.mark.parametrize('action', ['status', 'stop', 'run', 'uninstall'])
+def test_every_daemon_action_takes_the_vault_before_or_after_it(tmp_path, action):
+    from kelmo.interface import build_parser
+    parser, _ = build_parser('')
+    after = parser.parse_args(['daemon', action, '--vault', str(tmp_path), '--json'])
+    before = parser.parse_args(['--vault', str(tmp_path), '--json', 'daemon', action])
+    assert after.vault == before.vault == tmp_path
+    assert after.json is True and before.json is True

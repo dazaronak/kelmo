@@ -101,7 +101,7 @@ def use(root, profile, *, dry_run=False):
     result = replace_table(root, 'embedding', profile, dry_run=dry_run)
     return dict(result, provider=settings['provider'], model=settings.get('model'),
                 model_dir=settings.get('model_dir'), reindex_required=result['changed'],
-                next_step='Restart the daemon (on a server, the worker), then run kelmo admin reembed for this vault.'
+                next_step='Restart the daemon, then run kelmo admin reembed for this vault.'
                           if result['changed'] else 'The selected embedding profile is unchanged.')
 
 

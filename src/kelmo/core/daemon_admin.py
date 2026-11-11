@@ -9,7 +9,6 @@ Client registrations are removed by `kelmo uninstall`.
 import fcntl
 import os
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -63,19 +62,27 @@ def build_spec(root):
     command = installed_core_command(options['launcher'])
     if options['role'] == 'edge':
         return build_edge(root, core_command=command, http_port=options['port'], runtime_dir=options['runtime'])
-    return build(root, core_command=command, schedule=True, worker_config=options.get('worker_config'),
-                 archive_core=True, embed_core=True, kelmod=options['kelmod'], http_port=options['port'],
+    profile = options.get('server_profile')
+    return build(root, core_command=command, server_profile=profile, schedule=True,
+                 worker_config=options.get('worker_config'),
+                 archive_core=True, embed_core=True, kelmod=options['kelmod'],
+                 http_port=None if profile else options['port'],
                  runtime_dir=options['runtime'])
 
 
 def run(root):
     """The service's command: rebuild the spec, then become `kelmod serve --spec`."""
     import json
-    from ..install.setup import worker_service_file
+    from ..install.setup import service_absent, worker_service_file
     leftover = worker_service_file(Path.home())
     if leftover is not None and not _client_root(root):
         raise KelmoError('E_CONFIG', f'The 0.1 worker service ({leftover}) is still installed; run kelmo setup '
                                      'without --no-start, or remove it, before the daemon starts.')
+    if not _client_root(root):
+        worker = f'gui/{os.getuid()}/org.kelmo.worker' if sys.platform == 'darwin' else 'kelmo.service'
+        if not service_absent(worker, sys.platform):
+            raise KelmoError('E_CONFIG', 'The legacy worker may still be loaded; run kelmo setup without '
+                                        '--no-start to unload it before the daemon starts.')
     spec = build_spec(root)
     state = _state(root)
     path = state / 'kelmod.spec.json'
@@ -137,6 +144,7 @@ def stop(root, seconds=STOP_SECONDS):
 def uninstall(root, home, *, apply=False, platform=None):
     """Unloads and removes the kelmod service, stops the daemon, and verifies the lock is free."""
     from ..install.shared import SERVICE_LABEL, SERVICE_UNIT
+    from ..install.setup import unload_service
     platform = platform or sys.platform
     home = Path(home).expanduser().resolve()
     if platform == 'darwin':
@@ -148,9 +156,9 @@ def uninstall(root, home, *, apply=False, platform=None):
     result = {'applied': apply, 'service_file': str(service) if service.exists() else None}
     if not apply:
         return dict(result, running=not lock_free(root))
+    # A loaded service can outlive its file and restart the daemon after rollback.
+    unload_service(unload, platform)
     if service.exists():
-        # A service that is not loaded makes these fail; the file is still removed.
-        subprocess.run(unload, capture_output=True, timeout=60)
         service.unlink()
     result.update(stop(root))
     if not lock_free(root):

@@ -8,10 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::process::Command;
 
-/// The open-file soft limit kelmod was started with, once `raise_open_files` raised it (0 before). Cores get it
-/// back: Python code that uses select(2) fails on a descriptor past 1024, which a core under a raised limit
-/// could be handed.
-static INHERITED_OPEN_FILES: AtomicU64 = AtomicU64::new(0);
+/// The open-file soft limit a core is started with, once `raise_open_files` raised kelmod's own (0 before).
+/// Python code that uses select(2) fails on a descriptor past 1024, which a core under kelmod's raised limit
+/// could be handed; a service manager's own soft limit (launchd 256) is too low for a core with executor
+/// children. So a core gets `SELECT_LIMIT`, or what kelmod was started with when that was higher.
+static CORE_OPEN_FILES: AtomicU64 = AtomicU64::new(0);
+
+/// `FD_SETSIZE`: the first descriptor number select(2) cannot watch.
+const SELECT_LIMIT: u64 = 1024;
 
 /// Highest descriptor number the child sweep looks at; a soft limit of "unlimited" would make the sweep
 /// endless, and a daemon that holds more descriptors than this has a different problem.
@@ -28,9 +32,10 @@ const SWEEP_LIMIT: RawFd = 1 << 16;
 pub fn map_descriptors(command: &mut Command, fds: Vec<(RawFd, RawFd)>) {
     // SAFETY: getdtablesize has no memory effects.
     let limit = unsafe { libc::getdtablesize() }.clamp(4, SWEEP_LIMIT);
-    let inherited = INHERITED_OPEN_FILES.load(Ordering::Relaxed);
-    // SAFETY: the closure runs in the forked child before exec and calls only dup2, fcntl, getrlimit and
-    // setrlimit, which are async-signal-safe; it allocates nothing.
+    let core_open_files = CORE_OPEN_FILES.load(Ordering::Relaxed);
+    // SAFETY: the closure runs in the forked child before exec and allocates nothing. dup2 and fcntl are
+    // async-signal-safe; getrlimit and setrlimit are not on POSIX's list, but on Linux and macOS they are plain
+    // system calls that take no lock and touch only the struct passed to them.
     unsafe {
         command.pre_exec(move || {
             for &(source, target) in &fds {
@@ -54,14 +59,18 @@ pub fn map_descriptors(command: &mut Command, fds: Vec<(RawFd, RawFd)>) {
                     libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
                 }
             }
-            if inherited > 0 {
+            if core_open_files > 0 {
                 let mut open_files = libc::rlimit {
                     rlim_cur: 0,
                     rlim_max: 0,
                 };
-                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut open_files) == 0 {
-                    open_files.rlim_cur = inherited;
-                    libc::setrlimit(libc::RLIMIT_NOFILE, &open_files);
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut open_files) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                open_files.rlim_cur = core_open_files;
+                // A core left under kelmod's limit would fail later, in select(2), with nothing naming why.
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &open_files) != 0 {
+                    return Err(io::Error::last_os_error());
                 }
             }
             Ok(())
@@ -146,7 +155,10 @@ pub fn raise_open_files(cap: u64) -> u64 {
             rlim_max: limit.rlim_max,
         };
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-            INHERITED_OPEN_FILES.store(limit.rlim_cur, Ordering::Relaxed);
+            CORE_OPEN_FILES.store(
+                limit.rlim_cur.max(wanted.min(SELECT_LIMIT)),
+                Ordering::Relaxed,
+            );
             return wanted;
         }
     }

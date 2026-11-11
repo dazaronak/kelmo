@@ -115,7 +115,8 @@ def test_daemon_uninstall_and_kelmo_uninstall_undo_the_upgrade(machine, monkeypa
     install_0_1(machine)
     run_setup(machine, monkeypatch)
     unloads = []
-    monkeypatch.setattr(daemon_admin.subprocess, 'run', lambda command, **kwargs: unloads.append(command))
+    monkeypatch.setattr(installer.subprocess, 'run', lambda command, **kwargs: unloads.append(command)
+                        or SimpleNamespace(returncode=0))
 
     daemon = daemon_admin.uninstall(machine.vault, machine.home, apply=True, platform='darwin')
 

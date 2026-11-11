@@ -127,7 +127,8 @@ def test_linux_unit_quotes_the_daemon_command_and_does_not_restart_on_status_78(
 def test_retiring_the_worker_service_removes_its_file_and_reports_the_path(tmp_path, platform, relative,
                                                                          monkeypatch):
     calls = []
-    monkeypatch.setattr(install_setup.subprocess, 'run', lambda command, **_: calls.append(command))
+    monkeypatch.setattr(install_setup.subprocess, 'run', lambda command, **_: calls.append(command)
+                        or SimpleNamespace(returncode=0))
     path = tmp_path / relative
     path.parent.mkdir(parents=True)
     path.write_text('synthetic')

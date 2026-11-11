@@ -23,7 +23,7 @@ import base64
 import hashlib
 import json
 import os
-import select
+import selectors
 import sys
 import threading
 import time
@@ -395,20 +395,23 @@ class _Channel:
 
     def _write(self, line, deadline):
         view = memoryview(line)
-        while view:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                if len(view) != len(line):
-                    self.closed = True
-                raise TimeoutError
-            readable, writable, _ = select.select([self.answer_fd], [self.request_fd], [], left)
-            if readable:
-                self._drain()
-            if writable:
-                try:
-                    view = view[os.write(self.request_fd, view):]
-                except BlockingIOError:
-                    pass
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.answer_fd, selectors.EVENT_READ)
+            selector.register(self.request_fd, selectors.EVENT_WRITE)
+            while view:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    if len(view) != len(line):
+                        self.closed = True
+                    raise TimeoutError
+                ready = {key.fd for key, _ in selector.select(left)}
+                if self.answer_fd in ready:
+                    self._drain()
+                if self.request_fd in ready:
+                    try:
+                        view = view[os.write(self.request_fd, view):]
+                    except BlockingIOError:
+                        pass
 
     @staticmethod
     def _answer(line):
@@ -436,16 +439,18 @@ class _Channel:
             raise ValueError('answer too long')
 
     def _read_answer(self, deadline):
-        while b'\n' not in self.buffer:
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.answer_fd], [], [], left)[0]:
-                raise TimeoutError
-            data = os.read(self.answer_fd, 1 << 16)
-            if not data:
-                raise EOFError('the launcher closed the channel')
-            self.buffer += data
-            if len(self.buffer) > self.MAX_ANSWER:
-                raise ValueError('answer too long')
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.answer_fd, selectors.EVENT_READ)
+            while b'\n' not in self.buffer:
+                left = deadline - time.monotonic()
+                if left <= 0 or not selector.select(left):
+                    raise TimeoutError
+                data = os.read(self.answer_fd, 1 << 16)
+                if not data:
+                    raise EOFError('the launcher closed the channel')
+                self.buffer += data
+                if len(self.buffer) > self.MAX_ANSWER:
+                    raise ValueError('answer too long')
         line, self.buffer = self.buffer.split(b'\n', 1)
         return self._answer(line)
 

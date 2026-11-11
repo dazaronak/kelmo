@@ -170,17 +170,17 @@ pub async fn supervise(
         executors,
     } = supervised;
     let mut budget = Budget::new(restart_max, restart_window);
-    let mut first = true;
+    let mut charge_restart = false;
     // A closed command channel (every sender gone) stays closed: read it once, not on every turn of the loop.
     // While the daemon runs it keeps a sender of its own, so the channel stays open and a stop arrives as
     // `Command::Stop`, from the router or, when the router is lost, from the daemon itself.
     let mut commands_open = true;
     loop {
-        if !first && !budget.restart(Instant::now()) {
+        if charge_restart && !budget.restart(Instant::now()) {
             let _ = fatal.send(EXIT_RESTART_BUDGET);
             return;
         }
-        first = false;
+        charge_restart = true;
         kill_leftovers(&executors);
         let (mut child, stream) = match spawn(&core) {
             Ok(spawned) => spawned,
@@ -216,11 +216,13 @@ pub async fn supervise(
         let mut sampler = tokio::time::interval(sample);
         sampler.tick().await;
         let mut stopping = false;
+        let mut planned_restart = false;
         let mut stop_deadline: Option<tokio::time::Instant> = None;
         loop {
             let deadline = stop_deadline;
             tokio::select! {
                 status = child.wait() => {
+                    planned_restart &= status.as_ref().is_ok_and(|status| status.success());
                     if let Ok(status) = status
                         && !stopping
                         && !status.success()
@@ -257,6 +259,7 @@ pub async fn supervise(
                     }
                     sys::kill_group(pid);
                     let _ = child.kill().await;
+                    planned_restart = false;
                     break;
                 }
                 _ = sampler.tick() => {
@@ -264,24 +267,30 @@ pub async fn supervise(
                 }
                 command = commands.recv(), if commands_open => match command {
                     Some(Command::Kill) => {
+                        planned_restart = false;
                         sys::kill_group(pid);
                         let _ = child.kill().await;
                     }
-                    // A later stop never moves an earlier deadline.
                     Some(Command::Restart) => {
-                        stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
+                        if !stopping {
+                            planned_restart = true;
+                            stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
+                        }
                     }
-                    Some(Command::Stop) => {
-                        stopping = true;
-                        stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
+                    command => {
+                        if command.is_none() {
+                            commands_open = false;
+                        }
+                        // The first Stop gets a full drain even during a planned restart. Repeated Stops
+                        // keep that deadline so shutdown cannot be postponed indefinitely.
+                        if !stopping {
+                            let deadline = tokio::time::Instant::now() + drain;
+                            stop_deadline = Some(stop_deadline.map_or(deadline, |old| old.max(deadline)));
+                            stopping = true;
+                        }
                         // Closing kelmod's half of the channel is a stop the core sees even when the router that
                         // would send `admin.stop` is stuck: the core reads end of file, drains and exits.
                         writer_task.abort();
-                    }
-                    None => {
-                        commands_open = false;
-                        stopping = true;
-                        stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
                     }
                 },
                 _ = async {
@@ -290,6 +299,7 @@ pub async fn supervise(
                         None => std::future::pending::<()>().await,
                     }
                 } => {
+                    planned_restart = false;
                     sys::kill_group(pid);
                     let _ = child.kill().await;
                     // Spent: the killed core's exit ends the loop, and a past deadline must not spin it.
@@ -297,6 +307,7 @@ pub async fn supervise(
                 }
             }
         }
+        charge_restart = !planned_restart;
         reader_task.abort();
         writer_task.abort();
         sys::kill_group(pid);

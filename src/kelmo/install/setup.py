@@ -527,18 +527,17 @@ def service_file(home, executable, vault, platform, executor_config, server_prof
 
 
 def local_daemon(args, executable, vault, server_profile):
-    """The machine daemon of a local vault under an installed launcher (kelmod beside it): sessions reach the
-    state core over the HTTP endpoint and `kelmod hook`. None for a development checkout or a server (a server
-    profile serves remote clients over ssh, not the endpoint)."""
+    """The installed vault's machine daemon. Server profiles use SSH attach; local vaults also serve HTTP."""
     kelmod = Path(executable).parent / 'kelmod'
-    if server_profile or not kelmod.is_file():
+    if not kelmod.is_file():
         return None
     from .shared import DEFAULT_HTTP_PORT
     from ..core.daemon_client import runtime_dir
-    port = int(getattr(args, 'http_port', None) or DEFAULT_HTTP_PORT)
+    port = None if server_profile else int(getattr(args, 'http_port', None) or DEFAULT_HTTP_PORT)
     # Nothing is written here: the vault must still be empty when `initialize` runs.
     state = Path(vault) / '.state'
-    return {'kelmod': kelmod, 'state': state, 'port': port, 'url': f'http://127.0.0.1:{port}/mcp',
+    return {'kelmod': kelmod, 'state': state, 'port': port,
+            'url': None if server_profile else f'http://127.0.0.1:{port}/mcp',
             'runtime': runtime_dir(Path(vault)), 'spec': state / 'kelmod.spec.json'}
 
 
@@ -549,15 +548,18 @@ def finish_local_daemon(args, home, executable, vault, daemon, executor_config, 
     from ..core.daemon_admin import build_spec, write_options, write_private
     from ..core.spec import http_token_at
     from .shared import activate, memory_limits, service_definition
-    http_token_at(daemon['state'])
+    if not server_profile:
+        http_token_at(daemon['state'])
     write_options(daemon['state'], {'role': 'vault', 'port': daemon['port'], 'runtime': str(daemon['runtime']),
+                                    'server_profile': str(Path(server_profile).expanduser().resolve())
+                                    if server_profile else None,
                                     'worker_config': str(executor_config) if executor_config else None,
                                     'launcher': str(executable), 'kelmod': str(daemon['kelmod'])})
     spec = build_spec(vault)
     write_private(daemon['spec'], (json.dumps(spec, indent=2) + '\n').encode())
     path, data = service_definition(home, executable, vault, sys.platform, memory_limits(spec))
-    write(path, data)
     retired = retire_worker_service(home, sys.platform, stop=not args.no_start)
+    write(path, data)
     active = False
     if not args.no_start:
         activate(path, sys.platform)
@@ -570,6 +572,36 @@ def finish_local_daemon(args, home, executable, vault, daemon, executor_config, 
                 complete=active and executor_ready and (session_ready['session_memory_mode'] == 'off'
                                                         or session_ready['native_hooks_verified']),
                 native_memory_disabled=False, native_memory_prohibited=bool(args.disable_native_memory))
+
+
+def service_absent(name, platform):
+    """True only when the service manager explicitly reports that this service is not loaded."""
+    probe = (['launchctl', 'print', name] if platform == 'darwin' else
+             ['systemctl', '--user', 'show', '--property=LoadState', '--value', name])
+    try:
+        checked = subprocess.run(probe, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise KelmoError('E_SETUP', 'Service state could not be checked; restore access to the service manager '
+                                  'before retrying.') from error
+    if platform == 'darwin':
+        missing = f'Could not find service "{name.rsplit("/", 1)[-1]}" in domain'.encode()
+        return checked.returncode == 113 and missing in checked.stderr
+    return checked.returncode == 0 and checked.stdout.strip() == b'not-found'
+
+
+def unload_service(command, platform, *, timeout=60):
+    """Refuses an uncertain unload; a missing service is acceptable only when the manager confirms absence."""
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=timeout)
+        if result.returncode == 0:
+            return
+        if service_absent(command[-1], platform):
+            return
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise KelmoError('E_SETUP', 'Service unload could not be confirmed; configuration was retained. '
+                                  'Restore access to the service manager and retry.') from error
+    raise KelmoError('E_SETUP', 'Service unload failed; configuration was retained. '
+                              'Stop and unload the service before retrying.')
 
 
 def retire_worker_service(home, platform, *, stop=True):
@@ -585,10 +617,7 @@ def retire_worker_service(home, platform, *, stop=True):
     if not stop:
         return None
     # Unloaded whether or not the file is still there: a loaded job outlives its file.
-    try:
-        subprocess.run(command, capture_output=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    unload_service(command, platform, timeout=STOP_SECONDS + 5)
     if not path.exists():
         return None
     path.unlink()
@@ -693,8 +722,9 @@ def setup(args):
     from .session_setup import prepare as prepare_sessions, finish as finish_sessions
     session_plan=prepare_sessions(args,home,vault)
     daemon = local_daemon(args, executable, vault, server_profile)
+    endpoint = daemon if not server_profile else None
     client_plan = prepare_clients(home, executable, vault, args.client,
-                                  args.disable_native_memory,session_plan['settings']['mode'], edge=daemon,
+                                  args.disable_native_memory,session_plan['settings']['mode'], edge=endpoint,
                                   **profile_options(args))
     initialize(vault, args.label, wiki_root=args.wiki,
                project=getattr(args, 'project', 'default'),
@@ -743,7 +773,7 @@ def setup(args):
         # A provider CLI rewrites its own client configuration on every call (Claude Code updates
         # ~/.claude.json), so the plan read before the probe is stale: read the clients again.
         client_plan = prepare_clients(home, executable, vault, args.client, args.disable_native_memory,
-                                      session_plan['settings']['mode'], edge=daemon, **profile_options(args))
+                                      session_plan['settings']['mode'], edge=endpoint, **profile_options(args))
     session_ready=finish_sessions(args,session_plan,vault,executable,executor_config)
     clients = apply_clients(client_plan)
     if daemon is not None:

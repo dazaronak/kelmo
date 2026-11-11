@@ -20,6 +20,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import random
 import shutil
@@ -480,7 +481,22 @@ async def hook_event(kelmo, vault, session_id, daemon=None):
         raise RuntimeError(error_code(stderr.decode()) if b'E_' in stderr else f'exit {process.returncode}')
 
 
-async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs, daemon=None):
+def initial_stagger(rng, think_seconds):
+    return rng.random() * think_seconds if think_seconds else 0.0
+
+
+def pacing_delay(think_seconds, remaining):
+    return max(0.0, min(think_seconds, remaining))
+
+
+def nonnegative_seconds(value):
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError('seconds must be finite and nonnegative')
+    return seconds
+
+
+async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs, daemon=None, think_seconds=0):
     from fastmcp import Client
     from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
     rng = random.Random(number)
@@ -496,6 +512,8 @@ async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs,
         async with Client(transport) as client:
             results.add('session_start', time.monotonic() - started)
             ready.append(number)
+            if think_seconds:
+                await asyncio.sleep(pacing_delay(initial_stagger(rng, think_seconds), deadline - time.monotonic()))
             while time.monotonic() < deadline:
                 op = rng.choices(('search', 'get', 'store', 'create', 'hook'), (50, 20, 15, 5, 10))[0]
                 begin = time.monotonic()
@@ -523,6 +541,8 @@ async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs,
                     results.add(op, time.monotonic() - begin)
                 except Exception as error:  # every refusal is counted by its code
                     results.add(op, time.monotonic() - begin, error_code(error))
+                if think_seconds:
+                    await asyncio.sleep(pacing_delay(think_seconds, deadline - time.monotonic()))
     except Exception as error:
         results.add('session_start', time.monotonic() - started, error_code(error))
 
@@ -568,7 +588,7 @@ def start_daemon(kelmod, vault, logs, archive_in_process=False):
     return {'kelmod': kelmod, 'runtime': runtime, 'url': url, 'token': token, 'process': process}
 
 
-async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
+async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None, think_seconds=0):
     results, ids, ready = Results(), seed_ids(vault), []
     logs = Path(vault).parent / f'{Path(vault).name}-logs'
     logs.mkdir(exist_ok=True)
@@ -579,7 +599,8 @@ async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
     with Sampler() as sampler:
         deadline = time.monotonic() + warmup + seconds
         try:
-            tasks = [asyncio.create_task(run_session(n, kelmo, vault, deadline, results, ids, ready, logs, daemon))
+            tasks = [asyncio.create_task(run_session(n, kelmo, vault, deadline, results, ids, ready, logs,
+                                                    daemon, think_seconds))
                      for n in range(sessions)]
             await asyncio.sleep(warmup)
             measured_from = time.monotonic()
@@ -601,6 +622,9 @@ async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
                     daemon['process'].kill()
                     daemon['process'].wait()
     report = {'sessions': sessions, 'sessions_ready': len(ready), 'seconds': seconds, 'warmup_seconds': warmup,
+              'load_model': {'kind': 'closed_loop', 'think_seconds': think_seconds,
+                             'initial_stagger': bool(think_seconds),
+                             'operation_mix': {'search': 50, 'get': 20, 'store': 15, 'create': 5, 'hook': 10}},
               'operations': results.summary(), 'processes': sampler.summary(measured_from)}
     if structure is not None:
         if structure.error is not None:
@@ -626,7 +650,7 @@ def run(args):
             logs = copy.parent / f'{copy.name}-logs'
             logs.mkdir(exist_ok=True)
             daemon = start_daemon(args.daemon, copy, logs, args.archive_in_process)
-        report = asyncio.run(drive(kelmo, copy, sessions, args.seconds, args.warmup, daemon))
+        report = asyncio.run(drive(kelmo, copy, sessions, args.seconds, args.warmup, daemon, args.think_seconds))
         report.update(kelmo=kelmo, mode='daemon' if args.daemon else '0.1', vault=str(copy), platform=sys.platform,
                       archive_in_process=bool(args.daemon and args.archive_in_process),
                       started=time.strftime('%Y-%m-%dT%H:%M:%S%z'))
@@ -813,6 +837,8 @@ def main(argv=None):
     r.add_argument('--sessions', default='5,50')
     r.add_argument('--seconds', type=int, default=60)
     r.add_argument('--warmup', type=int, default=15)
+    r.add_argument('--think-seconds', type=nonnegative_seconds, default=0,
+                   help='delay after each request; positive values also stagger the first request per session')
     r.add_argument('--kelmo', help='the installed kelmo launcher (default: kelmo on PATH)')
     r.add_argument('--out')
     r.add_argument('--keep', action='store_true', help='keep the per-run vault copies')

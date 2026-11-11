@@ -11,7 +11,7 @@ from ..wiki.directory import has_content
 from .instructions import normalize_binding, render_instructions
 from .removal import _read
 from .session_setup import prepare as prepare_sessions
-from .setup import model_plan, prepare_clients, profile_options, read_json, service_definition
+from .setup import local_daemon, model_plan, prepare_clients, profile_options, read_json, service_definition
 
 
 def _change(path, prior, desired):
@@ -80,8 +80,10 @@ def preview(args, *, linked=False):
         from ..daemon import validate_config
         validate_config(read_json(custom, required=True))
     sessions = prepare_sessions(args, home, vault, check_provider=False)
+    daemon = local_daemon(args, executable, vault, server_profile)
     plan = prepare_clients(home, executable, vault, args.client,
-                           args.disable_native_memory, sessions['settings']['mode'], **profile_options(args))
+                           args.disable_native_memory, sessions['settings']['mode'],
+                           edge=daemon if not server_profile else None, **profile_options(args))
     changes = []
     binding = shlex.join([str(executable), '--vault', str(vault)])
     for name, item in plan['prepared'].items():
@@ -98,7 +100,11 @@ def preview(args, *, linked=False):
                 changes.append(_change(path, prior, desired))
     state = Config.load(vault).state if (vault / 'kelmo.toml').is_file() else vault / '.state'
     executor_config = state / 'executor.json' if args.provider else custom
-    service, data = service_definition(home, executable, vault, sys.platform, executor_config, server_profile)
+    if daemon is not None:
+        from .shared import service_definition as daemon_service_definition
+        service, data = daemon_service_definition(home, executable, vault, sys.platform)
+    else:
+        service, data = service_definition(home, executable, vault, sys.platform, executor_config, server_profile)
     changes.append(_change(service, _read(service), data))
     providers = set(filter(None, (args.provider, getattr(args, 'extractor_provider', None))))
     warnings = []

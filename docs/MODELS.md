@@ -110,8 +110,7 @@ channel available for this check.
 
 After applying a changed selection, restart the daemon so its cores start with
 the new model (`systemctl --user restart kelmod.service`, or `launchctl
-kickstart -k gui/$UID/org.kelmo.daemon`; on a server, restart the worker
-service), then run `kelmo admin reembed --vault /path/to/vault`. Selection reports
+kickstart -k gui/$UID/org.kelmo.daemon`; a server runs the same service), then run `kelmo admin reembed --vault /path/to/vault`. Selection reports
 `reindex_required`; it does not start a large reindex implicitly or combine
 vectors from different spaces. Local FastEmbed loading uses two explicit CPU
 threads so ONNX Runtime does not infer an affinity layout from a container host.

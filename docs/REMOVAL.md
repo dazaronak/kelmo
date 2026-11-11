@@ -17,7 +17,7 @@ text outside the instruction region, unrelated settings and hook siblings remain
 Codex's shared hooks feature stays enabled because other hooks may use it.
 
 This disconnects clients. It retains the runtime, the background service, vault, wiki
-and backups. A running `kelmod` daemon (or, on a server, the worker) keeps processing
+and backups. A running `kelmod` daemon keeps processing
 queued work. The response reports `background_retained=true` and `data_retained=true`,
 not a complete package uninstall, and its `next_step` names `kelmo daemon uninstall
 --apply`, which stops and removes the daemon service. Restart affected clients after

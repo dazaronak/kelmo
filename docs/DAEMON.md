@@ -9,11 +9,18 @@ one edge core. The user service runs it as `kelmo daemon run`; see
 
 Background work runs as jobs on the state core: one queue pass (`worker`), Dreaming (`dream`), vector
 backfill, re-embedding and the graph rebuild. At most one job of a kind runs at
-a time, and a job step yields to interactive writes. A server profile still
-installs the worker service, and `kelmo worker daemon --vault PATH
+a time, and a job step yields to interactive writes. Server profiles use the same
+persistent daemon and accept remote clients through the SSH gateway.
+`kelmo worker daemon --vault PATH
 --executor-config executor.json` runs the same queue pass in the foreground
 (`--once` for one tick). Without executor configuration, ordinary queued work
 runs and resolution requests remain pending.
+
+The scheduler runs queue passes and Dreaming. Backfill, re-embedding and graph
+rebuild jobs require explicit submission. External backup and Git sync schedules
+remain operator-managed. The supervised archive core does not yet receive the
+external embedding broker's channels; upgrading a broker-backed server requires
+that integration before semantic search and vector backfill can work there.
 
 The trusted executor configuration is JSON with argv (an absolute executable followed by
 arguments), timeout_seconds (default 120), max_attempts (default 3) and poll_seconds
