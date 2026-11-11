@@ -104,12 +104,14 @@ def shared_opener(root, profile_path):
 # and the operator verbs move with their phases.
 DAEMON_COMMANDS = frozenset({'status', 'trace', 'logs', 'show', 'forget', 'list', 'search', 'graph', 'pages',
                              'page', 'queue', 'add', 'promote', 'create', 'reconcile', 'register', 'tool',
-                             'context', 'resolution', 'worker', 'dream'})
+                             'context', 'resolution', 'worker', 'dream', 'client'})
 STDIN_COMMANDS = frozenset({'tool', 'resolution'})
 # What a state core lends to a command it runs for the CLI (`state.cli`): its Service, and the command's
 # sources and standard input as the CLI sent them.
 _BORROWED_SERVICE = contextvars.ContextVar('kelmo_cli_service', default=None)
 _BORROWED_INPUT = contextvars.ContextVar('kelmo_cli_input', default=None)
+# What the edge core lends to a command it runs for the CLI (`edge.cli`): its SharedClient.
+_BORROWED_CLIENT = contextvars.ContextVar('kelmo_cli_client', default=None)
 
 
 def routed(args):
@@ -119,9 +121,37 @@ def routed(args):
         return False
     if args.command == 'worker':
         return args.action == 'run'
+    if args.command in ('client', 'hot', 'action', 'compat'):
+        # On a client root these use the outbox or its caches, which the edge daemon owns; `client init` creates
+        # the root. On a local vault `client`, `action` and `compat` are refused anyway, `hot` reads in place.
+        from .config import ClientProfile
+        if args.command == 'client' and args.action == 'init':
+            return False
+        return ClientProfile.selected(selected_root(args))
     if args.command == 'dream':
         return args.action in ('run', 'apply')
     return True
+
+
+def attach_client(root, profile, client_id, launcher, kelmod):
+    """`serve-client` under the installed launcher: start the vault's daemon if none runs, then become
+    `kelmod attach --protocol 1` for this client. A daemon that cannot start is answered as a /1 refusal."""
+    from .core import daemon_client
+    from .server import PROTOCOL, write_frame
+    def refuse(code, message):
+        write_frame(sys.stdout.buffer, {'protocol': PROTOCOL, 'request_id': None, 'ok': False,
+                                        'error': {'code': code, 'message': message, 'retryable': True}})
+        return 1
+    try:
+        daemon_client.ensure(root, kelmod=kelmod, launcher=launcher, server_profile=profile)
+        runtime = daemon_client.runtime_dir(Path(root).expanduser().resolve())
+        os.execv(kelmod, [str(kelmod), 'attach', '--client-id', client_id, '--protocol', '1',
+                          '--runtime-dir', str(runtime)])
+    except KelmoError as error:
+        return refuse(error.code, str(error))
+    except OSError as error:
+        # The /1 channel is stdout: a traceback there would be read as a frame.
+        return refuse('E_RUNTIME', f'The daemon could not be started: {error.strerror or error}')
 
 
 def through_daemon(args, argv, launcher):
@@ -148,7 +178,9 @@ def through_daemon(args, argv, launcher):
                                                and args.action in ('list', 'claim', 'reopen')):
         body['stdin'] = sys.stdin.read(EXECUTOR_INPUT_LIMIT + 1)
     path = daemon_client.ensure(root, kelmod=Path(launcher).parent / 'kelmod', launcher=launcher)
-    return daemon_client.call(root, 'state.cli', body, path=path,
+    from .config import ClientProfile
+    op = 'edge.cli' if ClientProfile.selected(root) else 'state.cli'
+    return daemon_client.call(root, op, body, path=path,
                               seconds=WAIT_CALL_SECONDS if getattr(args, 'wait', False) else 60.0)
 
 
@@ -175,6 +207,30 @@ def run_borrowed(service, argv, sources=None, stdin=None):
     finally:
         _BORROWED_INPUT.reset(lent)
         _BORROWED_SERVICE.reset(token)
+
+
+def run_borrowed_client(client, argv, sources=None, stdin=None, *, root=None):
+    """`edge.cli` in the edge core: parse and dispatch one CLI call over the core's own SharedClient, for the
+    core's own client root only."""
+    parser, commands = build_parser(__version__)
+    try:
+        with redirect_stdout(io.StringIO()):
+            args = parser.parse_args(argv)
+    except SystemExit as error:
+        raise UsageError('Invalid command arguments.') from error
+    if not routed(args) or args.command == 'dream':
+        raise KelmoError('E_INPUT', f'`{args.command}` is not run by the daemon this way.', 2)
+    if root is not None and Path(selected_root(args)).expanduser().resolve() != Path(root).resolve():
+        raise KelmoError('E_INPUT', 'The edge daemon runs commands for its own client root only.', 2)
+    args._kelmo_acknowledge = lambda _: None
+    args.launcher = 'kelmo'
+    token = _BORROWED_CLIENT.set(client)
+    lent = _BORROWED_INPUT.set({'sources': sources or {}, 'stdin': stdin})
+    try:
+        return dispatch(args, commands)
+    finally:
+        _BORROWED_INPUT.reset(lent)
+        _BORROWED_CLIENT.reset(token)
 
 
 def dispatch(args, commands):
@@ -211,14 +267,27 @@ def dispatch(args, commands):
     if args.command == 'install':
         from .install.instructions import install_instructions
         return install_instructions(args.instructions, disable_native=args.disable_native_memory)
+    if args.command == 'daemon':
+        from .core import daemon_admin
+        target = selected_root(args)
+        if args.action == 'status':
+            return daemon_admin.status(target)
+        if args.action == 'stop':
+            return daemon_admin.stop(target)
+        if args.action == 'run':
+            daemon_admin.run(target)
+        return daemon_admin.uninstall(target, args.home, apply=args.apply)
     if args.command == 'uninstall':
         from .install.removal import uninstall
         return uninstall(args)
     if args.command == 'core-spec':
-        from .core.spec import build
+        from .config import ClientProfile
+        from .core.spec import build, build_edge
+        if ClientProfile.selected(selected_root(args)):
+            return build_edge(selected_root(args), runtime_dir=args.runtime_dir, http_port=args.http_port)
         return build(selected_root(args), server_profile=getattr(args, 'server_profile', None),
                      runtime_dir=args.runtime_dir, readers=args.readers, schedule=not args.no_schedule,
-                     worker_config=args.worker_config)
+                     worker_config=args.worker_config, http_port=args.http_port)
     if args.command == 'version':
         return {'version': __version__}
     if args.command == 'help':
@@ -309,7 +378,7 @@ def dispatch(args, commands):
     from .config import ClientProfile
     if ClientProfile.selected(root):
         from .client import dispatch as client_dispatch
-        return client_dispatch(root, args, read_source)
+        return client_dispatch(root, args, read_source, client=_BORROWED_CLIENT.get())
     if args.command == 'action':
         raise KelmoError('E_CAPABILITY', 'Action CLI updates require an enrolled shared-client profile. '
                         'Local integrations use ActionState with explicit trusted bindings.')
@@ -718,12 +787,8 @@ def call(argv, *, executable='kelmo'):
             return run(json.loads(args.command_json), child, fds_env=args.fds_env)
         if args.command == 'mcp':
             timings.disarm()
-            if args.reconnect:
-                from .mcp_proxy import serve
-                serve(selected_root(args), executable=executable)
-            else:
-                from .mcp import serve
-                serve(selected_root(args))
+            from .mcp import serve
+            serve(selected_root(args))
             return 0
         if args.command == 'core-run':
             # A core started by kelmod through the installed runtime; descriptor 3 is its channel.
@@ -733,13 +798,20 @@ def call(argv, *, executable='kelmo'):
                 from .core.archive_core import main as core_main
             elif rest[:1] == ['state']:
                 from .core.state_core import main as core_main
+            elif rest[:1] == ['edge']:
+                from .core.edge_core import main as core_main
             else:
-                raise UsageError('core-run names the core to run: state or archive.')
+                raise UsageError('core-run names the core to run: state, archive or edge.')
             return core_main(rest[1:])
         if args.command == 'serve-client':
             # stdout carries protocol frames only; refusals are frames, never an envelope.
             from .server import protocol_streams, serve_client
             timings.disarm()
+            kelmod = Path(executable).parent / 'kelmod'
+            if executable != 'kelmo' and kelmod.is_file():
+                # The installed launcher hands the channel to the daemon: an existing ssh gate line keeps
+                # working, and the connection is one small attach process instead of a vault per client.
+                return attach_client(selected_root(args), args.profile, args.client_id, executable, kelmod)
             stdin, stdout = protocol_streams()
             return serve_client(selected_root(args), args.profile, args.client_id, stdin, stdout)
         with redirect_stdout(sys.stderr), timings.stage('operation'):

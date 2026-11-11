@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod gateway;
 pub mod ipc;
 pub mod lane;
 pub mod router;

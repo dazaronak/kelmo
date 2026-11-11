@@ -96,6 +96,13 @@ pub fn resident_bytes(_pid: u32) -> Option<u64> {
     None
 }
 
+/// True when a process with this pid exists (it may belong to another user).
+pub fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists; no memory effects.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// The real uid of this process.
 pub fn uid() -> u32 {
     // SAFETY: getuid cannot fail and has no memory effects.

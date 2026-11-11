@@ -607,8 +607,28 @@ class SharedClient:
         self._factory = channel_factory or (lambda: StdioChannel(profile.command, profile.timeout_seconds))
         self._channel = None
         self._lock = threading.RLock()
-        self._deadline = None
+        # Per thread: the edge core runs calls on several threads, each under its own deadline.
+        self._local = threading.local()
         self.server = None
+
+    def pause(self, seconds):
+        """How a wait sleeps between polls; the edge core replaces it to lend its owner lock out meanwhile."""
+        time.sleep(seconds)
+
+    def _thread_state(self):
+        # Created on first use as well: a subclass that skips __init__ still gets per-thread deadlines.
+        local = self.__dict__.get('_local')
+        if local is None:
+            local = self.__dict__.setdefault('_local', threading.local())
+        return local
+
+    @property
+    def _deadline(self):
+        return getattr(self._thread_state(), 'deadline', None)
+
+    @_deadline.setter
+    def _deadline(self, value):
+        self._thread_state().deadline = value
 
     @contextmanager
     def deadline(self, seconds):
@@ -952,14 +972,17 @@ class SharedClient:
 
     # Transcript capture
 
-    def capture_session(self, provider, action, payload, *, deliver=True, restart=True):
+    def capture_session(self, provider, action, payload, *, deliver=True, restart=True, internal_job=None):
         """Queue the transcript named by a native lifecycle event, in pieces from the last delivered
         position, and deliver the queue unless the caller hands delivery to a detached flusher.
 
         A transcript has no size ceiling here. Returns the server result of the final piece when it was
-        delivered, or the queued state (`queued`, `pieces`, `generation`).
+        delivered, or the queued state (`queued`, `pieces`, `generation`). `internal_job` is the hook
+        process's own guard when the caller is a daemon core, whose environment cannot show it.
         """
-        if os.environ.get('KELMO_INTERNAL_JOB') == '1':
+        if internal_job is None:
+            internal_job = os.environ.get('KELMO_INTERNAL_JOB') == '1'
+        if internal_job:
             # The recursion guard: a transcript of Kelmo's own executor job is never captured. The skip
             # is recorded (outbox `skips`, `client status`), so a guard in the wrong environment shows.
             native = payload.get('session_id') if isinstance(payload, dict) else None
@@ -1041,6 +1064,10 @@ class ClientService:
         self.client = client
         self.root = client.profile.root
 
+    def pause(self, seconds):
+        # The edge core's client lends its owner lock out while it waits; a session client has nothing to lend.
+        getattr(self.client, 'pause', time.sleep)(seconds)
+
     def capture(self, content, filename, role='unknown', intent='archive', idempotency_key=None, supersedes=None):
         """Service.capture's shape: the accepted operation's fields, or the explicit queued result while
         the server has not accepted it (queued true, accepted false, the pending reason)."""
@@ -1110,7 +1137,7 @@ class ClientService:
                 if ((not following['terminal'] or (following['state'] == 'failed'
                                                    and following.get('error_code') == 'E_BUSY'))
                         and following['state'] != 'captured'):
-                    time.sleep(max(0, min(0.25, limit - time.monotonic())))
+                    self.client.pause(max(0, min(0.25, limit - time.monotonic())))
 
     def _capture(self, content, filename, role, intent, idempotency_key, supersedes):
         if intent not in ('archive', 'promote'):
@@ -1242,8 +1269,9 @@ def _stable_read(source):
     raise KelmoError('E_CAPTURE_RETRY', 'Transcript changed while reading; retry capture.')
 
 
-def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=None):
-    """Native lifecycle events against the shared authority."""
+def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=None, internal_job=None):
+    """Native lifecycle events against the shared authority. `flusher` is an argv started detached, or a
+    callable that wakes a long-lived deliverer; either way the hook itself never waits for delivery."""
     if not isinstance(payload, dict):
         raise KelmoError('E_INPUT', 'Hook payload must be a JSON object.')
     if action in ('start', 'prompt'):
@@ -1318,7 +1346,8 @@ def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=No
         # The hook runs under a provider's short hook timeout: it queues the transcript locally and
         # returns; a detached flusher carries the queue to the server, outliving the hook process.
         try:
-            client.capture_session(provider, action, payload, deliver=flusher is None)
+            client.capture_session(provider, action, payload, deliver=flusher is None,
+                                   internal_job=internal_job)
         except KelmoError as error:
             if error.code not in CAPTURE_SKIPS:
                 raise
@@ -1332,7 +1361,9 @@ def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=No
             except sqlite3.Error:
                 pass
             return {}
-        if flusher is not None:
+        if callable(flusher):
+            flusher()
+        elif flusher is not None:
             detach(flusher)
         return {}
     raise KelmoError('E_INPUT', 'Unsupported hook action.')
@@ -1347,11 +1378,13 @@ def detach(argv):
         pass  # the entries stay pending; the next hook or SessionStart flush delivers them
 
 
-def dispatch(root, args, read_source):
-    """CLI commands a shared client serves; everything else runs on the server and is refused here."""
+def dispatch(root, args, read_source, client=None):
+    """CLI commands a shared client serves; everything else runs on the server and is refused here. Inside the
+    edge core `client` is the core's own SharedClient, the one owner of the outbox."""
     import sys
+    from contextlib import nullcontext
     command = args.command
-    with SharedClient(ClientProfile.load(root)) as client:
+    with (nullcontext(client) if client is not None else SharedClient(ClientProfile.load(root))) as client:
         service = ClientService(client)
         if command == 'client':
             if args.action == 'flush':

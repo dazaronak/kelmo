@@ -27,6 +27,24 @@ pub fn runtime_dir(root: &Path) -> std::io::Result<PathBuf> {
     Ok(base.join("kelmo").join(root_id(root)?))
 }
 
+/// Refuses a runtime directory another user could have planted or can write into: it must be a real
+/// directory (not a symlink), owned by this process's uid, with no group or other permission bits.
+pub fn trusted_directory(directory: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|e| format!("{}: {e}; is the daemon running?", directory.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!("{} is not a directory", directory.display()));
+    }
+    if metadata.uid() != crate::sys::uid() {
+        return Err(format!("{} belongs to another user", directory.display()));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(format!("{} is open to other users", directory.display()));
+    }
+    Ok(())
+}
+
 pub fn socket_path(runtime: &Path) -> PathBuf {
     runtime.join("d.sock")
 }
@@ -66,6 +84,7 @@ pub fn bind(runtime: &Path) -> std::io::Result<UnixListener> {
         .mode(0o700)
         .create(runtime)?;
     fs::set_permissions(runtime, fs::Permissions::from_mode(0o700))?;
+    trusted_directory(runtime).map_err(std::io::Error::other)?;
     let socket = socket_path(runtime);
     match fs::remove_file(&socket) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),

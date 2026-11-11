@@ -88,8 +88,12 @@ def inspect(root):
     return result
 
 
-def capture_hook(root,provider,action,payload):
-    if os.environ.get('KELMO_INTERNAL_JOB')=='1':
+def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
+    """`internal_job` is what the hook's own process saw (None: this process's environment); `journal` lends the
+    state core's writer journal."""
+    if internal_job is None:
+        internal_job=os.environ.get('KELMO_INTERNAL_JOB')=='1'
+    if internal_job:
         return {}
     config=Config.load(root)
     if config.sessions['mode']=='off' or config.sessions['paused']:
@@ -102,7 +106,7 @@ def capture_hook(root,provider,action,payload):
     selected=next(real for real in (Path(r).expanduser().resolve() for r in roots) if source.is_relative_to(real))
     from .sessions import Sessions
     from .journal import now
-    sessions=Sessions(config)
+    sessions=Sessions(config,journal=journal)
     event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
     try:
         sessions.capture(provider,payload.get('session_id') or payload.get('thread_id'),source,selected,event,

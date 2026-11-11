@@ -62,7 +62,7 @@ def _state_operations():
         # One MCP tool call: {tool, arguments}. Tools mix reads and keyless writes, so never replayed.
         Operation('state.tool', ('handler', 'read', 'write'), WRITE, REPLAY_NEVER,
                   {'tool': {'types': ['string'], 'required': True}, 'arguments': any_object}),
-        Operation('state.hook', ('handler',), WRITE, REPLAY_NEVER,
+        Operation('state.hook', ('hook',), WRITE, REPLAY_NEVER,
                   {'action': {'types': ['string'], 'required': True}, 'payload': any_object,
                    'context': any_object}),
         # One installed-CLI call for a command the daemon runs (cli.DAEMON_COMMANDS), with its source
@@ -117,7 +117,13 @@ def _fixed_operations():
         Operation('embed.embed', ('query', 'passage'), READ, REPLAY_READ,
                   {'purpose': _string(), 'texts': texts}),
         Operation('edge.tool', ('handler', 'read', 'write'), WRITE, REPLAY_NEVER, tool),
-        Operation('edge.hook', ('handler',), WRITE, REPLAY_NEVER, hook),
+        Operation('edge.hook', ('hook',), WRITE, REPLAY_NEVER, hook),
+        Operation('edge.ack', ('hook',), WRITE, REPLAY_NEVER, {'token': _string()}),
+        Operation('state.ack', ('hook',), WRITE, REPLAY_NEVER, {'token': _string()}),
+        Operation('edge.cli', ('handler',), WRITE, REPLAY_NEVER,
+                  {'argv': {'types': ['array'], 'required': True},
+                   'sources': {'types': ['object'], 'required': False},
+                   'stdin': {'types': ['string'], 'required': False}}),
         Operation('uplink.call', ('call',), WRITE, REPLAY_NEVER,
                   {'request': {'types': ['object'], 'required': True}}),
     ]

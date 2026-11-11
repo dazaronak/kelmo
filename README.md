@@ -179,9 +179,9 @@ which is why the editor's output was audited (see [Known issues](#known-issues))
   [conflicts](https://github.com/dazaronak/kelmo/blob/main/docs/RESOLUTION.md), [work state](https://github.com/dazaronak/kelmo/blob/main/docs/ACTIONS.md), [graph](https://github.com/dazaronak/kelmo/blob/main/docs/GRAPH.md)
 - **Models:** [embeddings](https://github.com/dazaronak/kelmo/blob/main/docs/MODELS.md), [embedding broker](https://github.com/dazaronak/kelmo/blob/main/docs/EMBEDDING-BROKER.md),
   [executors](https://github.com/dazaronak/kelmo/blob/main/docs/EXECUTORS.md), [executor accounts](https://github.com/dazaronak/kelmo/blob/main/docs/EXECUTOR-ACCOUNT.md)
-- **Operations:** [worker](https://github.com/dazaronak/kelmo/blob/main/docs/DAEMON.md), [diagnostics](https://github.com/dazaronak/kelmo/blob/main/docs/DIAGNOSTICS.md),
+- **Operations:** [daemon](https://github.com/dazaronak/kelmo/blob/main/docs/DAEMON.md), [diagnostics](https://github.com/dazaronak/kelmo/blob/main/docs/DIAGNOSTICS.md),
   [shared server](https://github.com/dazaronak/kelmo/blob/main/docs/SERVER-OPERATIONS.md), [SSH gate](https://github.com/dazaronak/kelmo/blob/main/docs/SSH-GATE.md),
-  [knowledge sync](https://github.com/dazaronak/kelmo/blob/main/docs/KNOWLEDGE-SYNC.md), [MCP reconnect](https://github.com/dazaronak/kelmo/blob/main/docs/MCP-RECONNECT.md),
+  [knowledge sync](https://github.com/dazaronak/kelmo/blob/main/docs/KNOWLEDGE-SYNC.md),
   [migration](https://github.com/dazaronak/kelmo/blob/main/docs/MIGRATION-CLI.md), [adoption](https://github.com/dazaronak/kelmo/blob/main/docs/ADOPTION-CONTRACT.md)
 - **Internals:** [architecture](https://github.com/dazaronak/kelmo/blob/main/docs/TECHNICAL.md), [wiki file contract](https://github.com/dazaronak/kelmo/blob/main/docs/WIKI-FILE-CONTRACT.md),
   [runtime isolation](https://github.com/dazaronak/kelmo/blob/main/docs/RUNTIME-SECURITY.md), [tests and CI](https://github.com/dazaronak/kelmo/blob/main/docs/CI.md),

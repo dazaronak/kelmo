@@ -13,9 +13,11 @@ from . import operations
 LOCAL_ORIGIN = {'client_id': 'local', 'machine_tag': None, 'session': None}
 
 # Lane: (in flight to the core, queued in kelmod, order). Round robin per origin, so one busy client cannot
-# starve the others; the state core runs writes one at a time on its writer thread whatever the limit.
+# starve the others; the state core runs writes one at a time under its baton whatever the limit. Hooks
+# have their own lane: a session waits on its SessionStart hook, which must not queue behind busy sessions' tools.
 STATE_LANES = {
     'handler': (32, 512, 'rr'),
+    'hook': (4, 256, 'rr'),
     'read': (4, 512, 'rr'),
     'write': (8, 512, 'rr'),
     'admin': (4, 64, 'fifo'),
@@ -66,6 +68,62 @@ def embed_inputs(settings):
     return str(tokenizer), provider._special, preparation_digest(provider._special)
 
 
+def http_token(root):
+    """The bearer token of the root's HTTP MCP endpoint: 256 random bits in `.state/http-token` (0600),
+    created on first use. Clients registered with the endpoint carry it."""
+    return http_token_at(Path(root) / '.state')
+
+
+def http_token_at(state, value=None):
+    """`<state>/http-token`, written whole by link from a private temporary file, so no reader (kelmod
+    included) ever sees an empty or partial token. A token file shorter than a token is replaced."""
+    import secrets
+    path = Path(state) / 'http-token'
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The token never reaches a git repository the state directory may sit in.
+    ignore = path.parent / '.gitignore'
+    if not ignore.exists():
+        ignore.write_text('*\n', encoding='utf-8')
+    try:
+        if len(path.read_bytes().strip()) >= 64:
+            return path
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    temporary = path.with_name(f'.http-token.{os.getpid()}.{secrets.token_hex(4)}')
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write((value or secrets.token_hex(32)) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)  # fails if another writer won: its token stands
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def tool_definitions():
+    """The MCP tool definitions as `list_tools` answers them; the HTTP endpoint serves these."""
+    import asyncio
+
+    from ..mcp import server
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        tools = asyncio.run(server('/nonexistent').list_tools())
+    else:
+        # Called from inside an event loop: list the tools on a thread of its own.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(1) as pool:
+            tools = pool.submit(asyncio.run, server('/nonexistent').list_tools()).result()
+    return sorted((tool.to_mcp_tool().model_dump(mode='json', exclude_none=True) for tool in tools),
+                  key=lambda tool: tool['name'])
+
+
 def _command(core_command, executable, name):
     if core_command is not None:
         return [*core_command, name]
@@ -74,11 +132,16 @@ def _command(core_command, executable, name):
 
 def build(root, *, server_profile=None, runtime_dir=None, executable=None, readers=4, source_root=None,
           core_command=None, schedule=False, worker_config=None, archive_core=False, archive_in_process=False,
-          embed_core=False, kelmod=None):
+          embed_core=False, kelmod=None, http_port=None):
     """The spec of the daemon that owns `root`. `core_command` is the argv prefix that runs a core by name
     (default: this interpreter with `-m kelmo.core.<name>_core`); `source_root` puts a source tree on the cores'
     PYTHONPATH (tests and a development checkout). `archive_core` starts the archive as its own supervised core
-    (confined unless `archive_in_process`)."""
+    (confined unless `archive_in_process`). `http_port` serves the HTTP MCP endpoint on 127.0.0.1 at that port
+    (0 picks a free one, published in the runtime directory's endpoint.json)."""
+    if http_port is not None and server_profile is not None:
+        # The endpoint speaks for the local origin, which a server profile serves only when it enrolls it.
+        from ..errors import KelmoError
+        raise KelmoError('E_CONFIG', 'A server daemon serves remote clients over ssh, not the HTTP endpoint.')
     root = Path(root).expanduser().resolve()
     argv = [*_command(core_command, executable, 'state'), '--vault', str(root), '--readers', str(readers)]
     if server_profile is not None:
@@ -116,12 +179,45 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
                       'budget': {'soft_mb': ARCHIVE_BUDGET_MB[0], 'hard_mb': ARCHIVE_BUDGET_MB[1]}})
         served += [(op, ARCHIVE_LANES) for op in operations.table() if op.name.startswith('archive.')]
     spec = {'root': str(root), 'origin': LOCAL_ORIGIN, 'cores': cores,
+            'meta': {'role': 'vault', 'server_profile': None if server_profile is None
+                     else str(Path(server_profile).expanduser().resolve())},
             'operations': [{'name': op.name, 'lanes': [lane for lane in op.lanes if lane in table],
                             'replay': op.replay} for op, table in served]}
     if runtime_dir is not None:
         spec['runtime_dir'] = str(runtime_dir)
+    if http_port is not None:
+        spec['http'] = {'port': int(http_port), 'token_file': str(http_token(root)), 'tools': tool_definitions(),
+                        'tool_op': 'state.tool'}
     return spec
 
+
+
+EDGE_LANES = {'handler': (8, 512, 'rr'), 'hook': (4, 256, 'rr')}
+# Soft: the steady edge core. Hard: room for one transcript snapshot of a long session (the outbox holds it in
+# 8 MiB pieces) without a restart loop; the per-piece streaming that would let it shrink is not built yet.
+EDGE_BUDGET_MB = (150, 512)
+
+
+def build_edge(root, *, runtime_dir=None, executable=None, source_root=None, core_command=None, http_port=None):
+    """The spec of the daemon on an edge machine: one edge core that owns the client root's outbox and caches
+    and reaches the authority through the profile's channel. Sessions and hooks call `edge.*`."""
+    from ..config import ClientProfile
+    root = Path(root).expanduser().resolve()
+    profile = ClientProfile.load(root)
+    argv = [*_command(core_command, executable, 'edge'), '--client', str(root)]
+    edge = {'name': 'edge', 'argv': argv, 'env': _environment(source_root), 'lanes': _lanes(EDGE_LANES),
+            'budget': {'soft_mb': EDGE_BUDGET_MB[0], 'hard_mb': EDGE_BUDGET_MB[1]}}
+    served = [op for op in operations.table() if op.name.startswith('edge.')]
+    spec = {'root': str(root), 'state_dir': str(profile.state), 'origin': LOCAL_ORIGIN, 'cores': [edge],
+            'meta': {'role': 'edge', 'server_profile': None},
+            'operations': [{'name': op.name, 'lanes': [lane for lane in op.lanes if lane in EDGE_LANES],
+                            'replay': op.replay} for op in served]}
+    if runtime_dir is not None:
+        spec['runtime_dir'] = str(runtime_dir)
+    if http_port is not None:
+        spec['http'] = {'port': int(http_port), 'token_file': str(http_token_at(profile.state)),
+                        'tools': tool_definitions(), 'tool_op': 'edge.tool'}
+    return spec
 
 
 def _kelmod():

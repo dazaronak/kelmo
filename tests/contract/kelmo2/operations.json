@@ -676,6 +676,50 @@
   {
     "access": "write",
     "arguments": {
+      "token": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "hook"
+    ],
+    "name": "edge.ack",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "argv": {
+        "required": true,
+        "types": [
+          "array"
+        ]
+      },
+      "sources": {
+        "required": false,
+        "types": [
+          "object"
+        ]
+      },
+      "stdin": {
+        "required": false,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "handler"
+    ],
+    "name": "edge.cli",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
       "action": {
         "required": true,
         "types": [
@@ -696,7 +740,7 @@
       }
     },
     "lanes": [
-      "handler"
+      "hook"
     ],
     "name": "edge.hook",
     "replay": "never"
@@ -778,6 +822,22 @@
     ],
     "name": "embed.embed",
     "replay": "read"
+  },
+  {
+    "access": "write",
+    "arguments": {
+      "token": {
+        "required": true,
+        "types": [
+          "string"
+        ]
+      }
+    },
+    "lanes": [
+      "hook"
+    ],
+    "name": "state.ack",
+    "replay": "never"
   },
   {
     "access": "write",
@@ -1139,7 +1199,7 @@
       }
     },
     "lanes": [
-      "handler"
+      "hook"
     ],
     "name": "state.hook",
     "replay": "never"

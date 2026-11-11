@@ -33,7 +33,7 @@ Both header and body are canonical JSON: sorted keys, compact separators, non-AS
 
 ## Daemon error codes
 
-Retryable: `E_CORE_RESTARTED`, `E_DEADLINE`, `E_OVERLOADED`. Final: `E_CANCELLED`, `E_FORBIDDEN`.
+Retryable: `E_CORE_RESTARTED`, `E_DEADLINE`, `E_OVERLOADED`, `E_UNAVAILABLE`. Final: `E_CANCELLED`, `E_FORBIDDEN`.
 
 ## Operations
 
@@ -74,11 +74,14 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `archive.update` | write | write | never | `archive_id`, `expected_version`, `content`, `origin`, `receipt`? |
 | `archive.update_receipt` | read | read | read | `receipt`, `origin` |
 | `archive.verify_receipt` | read | read | read | `ref`, `operation_id`, `origin` |
-| `edge.hook` | handler | write | never | `action`, `payload`, `context` |
+| `edge.ack` | hook | write | never | `token` |
+| `edge.cli` | handler | write | never | `argv`, `sources`?, `stdin`? |
+| `edge.hook` | hook | write | never | `action`, `payload`, `context` |
 | `edge.tool` | handler, read, write | write | never | `tool`, `arguments` |
 | `embed.count` | count | read | read | `texts`, `prefix`? |
 | `embed.describe` | count | read | read | - |
 | `embed.embed` | query, passage | read | read | `purpose`, `texts` |
+| `state.ack` | hook | write | never | `token` |
 | `state.capture` | write | write | keyed | `content`, `filename`, `promote`?, `role`?, `supersedes`? |
 | `state.cli` | handler | write | never | `argv`, `sources`?, `stdin`? |
 | `state.client_request` | handler, read, write | write | keyed | `request` |
@@ -93,7 +96,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `state.graph_rebuild` | read | read | read | - |
 | `state.graph_stats` | read | read | read | - |
 | `state.hello` | read | read | read | - |
-| `state.hook` | handler | write | never | `action`, `payload`, `context` |
+| `state.hook` | hook | write | never | `action`, `payload`, `context` |
 | `state.job_run` | admin | write | never | `job`, `options`? |
 | `state.list` | read | read | read | `limit`?, `offset`? |
 | `state.page` | read | read | read | `target` |

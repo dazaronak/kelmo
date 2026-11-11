@@ -50,10 +50,11 @@ SPOOL_READ_BYTES = 1048576
 # request row, an unsettled write) sets `retryable` on the error it raises, and that wins.
 # E_CLAIM means this attempt lost its claim before settling, so the request is replayed, not refused.
 # The daemon's own refusals: a full lane, a deadline that passed in the queue, a core that restarted under the
-# call, and a cancel that reached a call before it did anything; none of them had an effect.
+# call, a daemon that is stopping, and a cancel that reached a call before it did anything. A restarted core and a
+# stopped daemon set `retryable` on the frame when the call may have taken effect, and that wins.
 RETRYABLE = frozenset({'E_BUSY', 'E_FENCED', 'E_WRITER', 'E_ARCHIVE_PROCESS', 'E_IO', 'E_TRANSPORT',
                        'E_CAPTURE_RETRY', 'E_AUTHORITY', 'E_GIT', 'E_GENERATION', 'E_BUDGET', 'E_CLAIM',
-                       'E_OVERLOADED', 'E_DEADLINE', 'E_CORE_RESTARTED', 'E_CANCELLED'})
+                       'E_OVERLOADED', 'E_DEADLINE', 'E_CORE_RESTARTED', 'E_UNAVAILABLE', 'E_CANCELLED'})
 
 
 def _retryable(error):

@@ -96,9 +96,11 @@ def read_snapshot(config, connection, checksum):
 
 
 class Sessions:
-    def __init__(self, config):
+    def __init__(self, config, journal=None):
+        """`journal` lends an open journal (the state core's writer); it is then left open by `close`."""
         self.config = config
-        self.journal = Journal(config.internal('.state/journal.sqlite3'))
+        self._owns_journal = journal is None
+        self.journal = journal if journal is not None else Journal(config.internal('.state/journal.sqlite3'))
         try:
             with self._lock():
                 self._migrate()
@@ -113,7 +115,8 @@ class Sessions:
             raise
 
     def close(self):
-        self.journal.close()
+        if self._owns_journal:
+            self.journal.close()
 
     @contextmanager
     def _lock(self):

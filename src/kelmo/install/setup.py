@@ -6,6 +6,7 @@ import fcntl
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import stat
 import subprocess
 import sys
@@ -235,9 +236,41 @@ def client_paths(home, client, *, claude_profile=None, codex_profile=None, claud
     return root, path
 
 
-def mcp_entry(executable, vault, *, reconnect=True):
+def mcp_entry(executable, vault, *, reconnect=False):
     return {'command': str(executable), 'args': ['mcp', '--vault', str(vault)]
             + (['--reconnect'] if reconnect else [])}
+
+
+def headers_helper(endpoint):
+    """The command a client runs for the endpoint's `Authorization` header: `kelmod http-headers` reads the
+    token from the state directory and gives it out only to a live daemon on that port, so no client file holds
+    the token."""
+    return shlex.join([str(endpoint['kelmod']), 'http-headers', '--state', str(endpoint['state']),
+                       '--port', str(endpoint['port']), '--runtime-dir', str(endpoint['runtime'])])
+
+
+def http_entry(client, endpoint):
+    """The registration of the machine daemon's HTTP MCP endpoint in each client's own keys: Claude Code
+    `type`/`url`/`headersHelper`, Codex `url`/`http_headers_helper`."""
+    if client == 'claude':
+        return {'type': 'http', 'url': endpoint['url'], 'headersHelper': headers_helper(endpoint)}
+    return {'url': endpoint['url'], 'http_headers_helper': headers_helper(endpoint)}
+
+
+def codex_table(entry):
+    """The `[mcp_servers.kelmo]` table with bare keys, as setup has always written it; a header map
+    (`http_headers`) follows as its own subtable."""
+    lines = ['[mcp_servers.kelmo]']
+    lines += [f'{key} = {json.dumps(value)}' for key, value in entry.items() if not isinstance(value, dict)]
+    for key, value in entry.items():
+        if isinstance(value, dict):
+            lines += [f'[mcp_servers.kelmo.{key}]'] + [f'{json.dumps(k)} = {json.dumps(v)}' for k, v in value.items()]
+    return '\n'.join(lines) + '\n'
+
+
+def is_http_entry(entry):
+    return (isinstance(entry, dict) and isinstance(entry.get('url'), str)
+            and entry['url'].startswith('http://127.0.0.1:') and 'command' not in entry)
 
 
 def render_codex(text, names, entry):
@@ -269,7 +302,9 @@ def render_codex(text, names, entry):
     return text.encode()
 
 
-def prepare_clients(home, executable, vault, client, disable_native, session_mode=None, **profiles):
+def prepare_clients(home, executable, vault, client, disable_native, session_mode=None, edge=None, **profiles):
+    """Plans the client configuration. `edge` ({'kelmod', 'state', 'url', 'token'}) registers the machine
+    daemon's HTTP endpoint and `kelmod hook` instead of a per-session `kelmo mcp` and `kelmo hook`."""
     from .hooks import EVENTS, definitions, variants
     if session_mode not in (None,'off','auto','archive-only'):
         raise KelmoError('E_CONFIG','Invalid session-memory mode.')
@@ -281,7 +316,7 @@ def prepare_clients(home, executable, vault, client, disable_native, session_mod
     for name in clients:
         prior_bindings = []
         root, path = client_paths(home, name, **profiles)
-        entry = mcp_entry(executable, vault)
+        entry = http_entry(name, edge) if edge else mcp_entry(executable, vault)
         if name == 'claude':
             prior, data = client_config(path, 'json')
             servers = data.setdefault('mcpServers', {})
@@ -302,6 +337,8 @@ def prepare_clients(home, executable, vault, client, disable_native, session_mod
                 raise KelmoError('E_CONFIG', 'The owned MCP entry changed outside kelmo.')
             if current_owned is None and live is not None and live != entry:
                 raise KelmoError('E_CONFIG', 'An unmanaged kelmo MCP entry already exists.')
+            if edge is None and is_http_entry(live):
+                raise KelmoError('E_CONFIG', 'The kelmo MCP entry points at a machine daemon; remove it first.')
             servers['kelmo'] = entry
             config_data = (json.dumps(data, indent=2) + '\n').encode()
             ownership.pop('claude_mcp_entry', None)
@@ -328,8 +365,7 @@ def prepare_clients(home, executable, vault, client, disable_native, session_mod
             if not isinstance(parsed.get('mcp_servers', {}), dict):
                 raise KelmoError('E_CONFIG', 'Codex mcp_servers must be a table.')
             begin, end = '# kelmo:begin', '# kelmo:end'
-            block = (begin + '\n[mcp_servers.kelmo]\ncommand = ' + json.dumps(str(executable))
-                     + '\nargs = ' + json.dumps(entry['args']) + '\n' + end)
+            block = begin + '\n' + codex_table(entry) + end
             if begin in text or end in text:
                 if text.count(begin) != 1 or text.count(end) != 1 or text.index(begin) > text.index(end):
                     raise KelmoError('E_CONFIG', 'Ambiguous Codex integration markers.')
@@ -361,10 +397,10 @@ def prepare_clients(home, executable, vault, client, disable_native, session_mod
         hook_prior, settings = client_config(hook_path, 'json')
         hooks = settings.setdefault('hooks', {})
         validate_hook_shapes(hooks)
-        desired = definitions(executable,vault,name,session_mode)
+        desired = definitions(executable,vault,name,session_mode,edge)
         for event in EVENTS:
             groups = hooks.get(event, [])
-            allowed = variants(executable,vault,name,event)
+            allowed = variants(executable,vault,name,event,edge)
             for binding in prior_bindings:
                 args = binding.get('args',[])
                 if (isinstance(binding.get('command'),str) and isinstance(args,list)
@@ -490,6 +526,83 @@ def service_file(home, executable, vault, platform, executor_config, server_prof
     return path
 
 
+def local_daemon(args, executable, vault, server_profile):
+    """The machine daemon of a local vault under an installed launcher (kelmod beside it): sessions reach the
+    state core over the HTTP endpoint and `kelmod hook`. None for a development checkout or a server (a server
+    profile serves remote clients over ssh, not the endpoint)."""
+    kelmod = Path(executable).parent / 'kelmod'
+    if server_profile or not kelmod.is_file():
+        return None
+    from .shared import DEFAULT_HTTP_PORT
+    from ..core.daemon_client import runtime_dir
+    port = int(getattr(args, 'http_port', None) or DEFAULT_HTTP_PORT)
+    # Nothing is written here: the vault must still be empty when `initialize` runs.
+    state = Path(vault) / '.state'
+    return {'kelmod': kelmod, 'state': state, 'port': port, 'url': f'http://127.0.0.1:{port}/mcp',
+            'runtime': runtime_dir(Path(vault)), 'spec': state / 'kelmod.spec.json'}
+
+
+def finish_local_daemon(args, home, executable, vault, daemon, executor_config, server_profile, checked, clients,
+                        session_ready, project_result, executor_ready, model_action):
+    """Writes the vault's daemon spec and its one user service, stops the 0.1 worker service (two writers on one
+    journal otherwise), and starts the daemon."""
+    from ..core.daemon_admin import build_spec, write_options, write_private
+    from ..core.spec import http_token_at
+    from .shared import activate, memory_limits, service_definition
+    http_token_at(daemon['state'])
+    write_options(daemon['state'], {'role': 'vault', 'port': daemon['port'], 'runtime': str(daemon['runtime']),
+                                    'worker_config': str(executor_config) if executor_config else None,
+                                    'launcher': str(executable), 'kelmod': str(daemon['kelmod'])})
+    spec = build_spec(vault)
+    write_private(daemon['spec'], (json.dumps(spec, indent=2) + '\n').encode())
+    path, data = service_definition(home, executable, vault, sys.platform, memory_limits(spec))
+    write(path, data)
+    retired = retire_worker_service(home, sys.platform, stop=not args.no_start)
+    active = False
+    if not args.no_start:
+        activate(path, sys.platform)
+        active = True
+    embedding_ready = checked.get('checks', {}).get('embedding_model', False)
+    return dict(clients, **session_ready, project_hub=project_result, memory_ready=True,
+                embedding_ready=embedding_ready, search_degraded=not embedding_ready, executor_ready=executor_ready,
+                background_started=active, service_file=str(path), retired_service=retired,
+                mcp_url=daemon['url'],
+                complete=active and executor_ready and (session_ready['session_memory_mode'] == 'off'
+                                                        or session_ready['native_hooks_verified']),
+                native_memory_disabled=False, native_memory_prohibited=bool(args.disable_native_memory))
+
+
+def retire_worker_service(home, platform, *, stop=True):
+    """Unloads and removes the 0.1 `kelmo worker daemon` service; returns its path when one was there."""
+    if platform == 'darwin':
+        path = Path(home) / 'Library/LaunchAgents/org.kelmo.worker.plist'
+        command = ['launchctl', 'bootout', f'gui/{os.getuid()}/org.kelmo.worker']
+    else:
+        path = Path(home) / '.config/systemd/user/kelmo.service'
+        command = ['systemctl', '--user', 'disable', '--now', 'kelmo.service']
+    # Without `stop` (setup --no-start) nothing is unloaded and the file stays: `kelmo daemon run` refuses to
+    # start while it is there, so the worker and the daemon never write one journal together.
+    if not stop:
+        return None
+    # Unloaded whether or not the file is still there: a loaded job outlives its file.
+    try:
+        subprocess.run(command, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if not path.exists():
+        return None
+    path.unlink()
+    return str(path)
+
+
+def worker_service_file(home, platform=None):
+    """The 0.1 worker unit file, when one is installed."""
+    platform = platform or sys.platform
+    path = (Path(home) / 'Library/LaunchAgents/org.kelmo.worker.plist' if platform == 'darwin'
+            else Path(home) / '.config/systemd/user/kelmo.service')
+    return path if path.exists() else None
+
+
 def model_plan(args, vault):
     from ..config import Config
     source = getattr(args, 'model_source', None)
@@ -579,8 +692,10 @@ def setup(args):
             raise KelmoError('E_FENCED', 'The server is fenced; prepare with --no-start before cutover.')
     from .session_setup import prepare as prepare_sessions, finish as finish_sessions
     session_plan=prepare_sessions(args,home,vault)
+    daemon = local_daemon(args, executable, vault, server_profile)
     client_plan = prepare_clients(home, executable, vault, args.client,
-                                  args.disable_native_memory,session_plan['settings']['mode'], **profile_options(args))
+                                  args.disable_native_memory,session_plan['settings']['mode'], edge=daemon,
+                                  **profile_options(args))
     initialize(vault, args.label, wiki_root=args.wiki,
                project=getattr(args, 'project', 'default'),
                git_name=getattr(args, 'git_name', None), git_email=getattr(args, 'git_email', None))
@@ -628,9 +743,12 @@ def setup(args):
         # A provider CLI rewrites its own client configuration on every call (Claude Code updates
         # ~/.claude.json), so the plan read before the probe is stale: read the clients again.
         client_plan = prepare_clients(home, executable, vault, args.client, args.disable_native_memory,
-                                      session_plan['settings']['mode'], **profile_options(args))
+                                      session_plan['settings']['mode'], edge=daemon, **profile_options(args))
     session_ready=finish_sessions(args,session_plan,vault,executable,executor_config)
     clients = apply_clients(client_plan)
+    if daemon is not None:
+        return finish_local_daemon(args, home, executable, vault, daemon, executor_config, server_profile,
+                                   checked, clients, session_ready, project_result, executor_ready, model_action)
     path = service_file(home, executable, vault, sys.platform, executor_config, server_profile)
     active = False
     if not args.no_start:

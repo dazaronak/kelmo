@@ -191,7 +191,7 @@ def test_claude_owned_mcp_entry_can_move_to_new_runtime_and_vault(tmp_path):
 
     entry = json.loads((home / '.claude.json').read_text())['mcpServers']['kelmo']
     assert entry == {'command': str(tmp_path / 'new-kelmo'),
-                     'args': ['mcp', '--vault', str(tmp_path / 'new-vault'), '--reconnect']}
+                     'args': ['mcp', '--vault', str(tmp_path / 'new-vault')]}
 
 
 def test_claude_owned_mcp_entry_refuses_foreign_edit_after_install(tmp_path):

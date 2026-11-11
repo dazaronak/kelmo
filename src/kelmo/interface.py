@@ -152,8 +152,8 @@ def build_parser(version):
                                 help='Seconds between passes; a ceilinged pass, not a continuously running agent')
             action.add_argument('--apply', action='store_true')
     mcp = command('mcp', 'Serve memory tools over stdio.')
-    mcp.add_argument('--reconnect', action='store_true',
-                     help='Keep local stdio alive and restart a failed MCP backend without replaying tools')
+    # Accepted so registrations written by 0.1 keep starting until setup rewrites them; it does nothing.
+    mcp.add_argument('--reconnect', action='store_true', help=argparse.SUPPRESS)
     broker = command('broker', 'Run one command with an owner-selected stdio embedding broker.')
     broker.add_argument('--command-json', required=True, help='Embedding broker executable and arguments as JSON')
     broker.add_argument('--fds-env', default='KELMO_EMBED_FDS')
@@ -325,6 +325,8 @@ def build_parser(version):
     setup.add_argument('--effort', choices=['low', 'medium', 'high', 'xhigh', 'max'])
     server_profile(setup)
     setup.add_argument('--client', choices=['claude', 'codex', 'both', 'none'], default='both')
+    setup.add_argument('--http-port', type=int, default=None,
+                       help='Port of the machine daemon\'s HTTP MCP endpoint on a shared client (default 47821).')
     policy = setup.add_mutually_exclusive_group(required=True)
     policy.add_argument('--disable-native-memory', action='store_true')
     policy.add_argument('--allow-native-memory', action='store_true')
@@ -347,6 +349,16 @@ def build_parser(version):
     uninstall.add_argument('--executable', type=Path, required=True)
     uninstall.add_argument('--client', choices=['claude', 'codex', 'both'], default='both')
     uninstall.add_argument('--apply', action='store_true', help='Apply removal; otherwise preview only')
+    daemon_command = command('daemon', 'Show, stop or uninstall the machine daemon of the selected root.')
+    daemon_actions = daemon_command.add_subparsers(dest='action', required=True)
+    daemon_actions.add_parser('status', help='Cores, lanes and memory of the running daemon')
+    daemon_actions.add_parser('stop', help='Stop the running daemon after its calls in flight finish')
+    daemon_actions.add_parser('run', help='Rebuild the daemon spec from the setup options and run kelmod (the '
+                                          'service command)')
+    daemon_uninstall = daemon_actions.add_parser(
+        'uninstall', help='Unload and remove the kelmod service, stop the daemon, and check its lock is free')
+    daemon_uninstall.add_argument('--home', type=Path, default=Path.home())
+    daemon_uninstall.add_argument('--apply', action='store_true', help='Apply; otherwise preview only')
     executor = command('executor', 'Run a native or custom provider adapter with JSON stdin/stdout.')
     executor.add_argument('--provider', choices=['claude', 'codex', 'custom'], required=True)
     executor.add_argument('--model', help='Explicit native model; optional for a custom router')
@@ -510,6 +522,8 @@ def build_parser(version):
     core_spec.add_argument('--readers', type=int, default=4, help='Reader threads of the state core')
     core_spec.add_argument('--worker-config', type=Path, help='Executor configuration of the worker job')
     core_spec.add_argument('--no-schedule', action='store_true', help='Run jobs only on request')
+    core_spec.add_argument('--http-port', type=int,
+                           help='Serve HTTP MCP on 127.0.0.1 at this port (0 picks one; see endpoint.json)')
     command('help', 'Discover the installed command contract, including JSON output.')
     command('version', 'Show the installed package version.')
     completion = command('completion', 'Generate shell completion for public commands.')

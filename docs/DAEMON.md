@@ -1,10 +1,21 @@
-# Worker daemon
+# Daemon and background work
 
-Run `kelmo worker daemon --vault PATH --executor-config executor.json` in the
-foreground, or add `--once` for a scheduled tick. Without executor configuration,
-ordinary queued work runs and resolution requests remain pending.
+One `kelmod` process per machine serves MCP sessions over a local HTTP
+endpoint, hooks, the CLI and, on a vault, the background work. It starts
+and supervises its cores as child processes: on a vault the state core (journal,
+outbox and jobs), the archive core and the embedding core; on a shared client
+one edge core. The user service runs it as `kelmo daemon run`; see
+[setup](SETUP.md) for the service and `kelmo daemon status|stop|uninstall`.
 
-The trusted configuration is JSON with argv (an absolute executable followed by
+Background work runs as jobs on the state core: one queue pass (`worker`), Dreaming (`dream`), vector
+backfill, re-embedding and the graph rebuild. At most one job of a kind runs at
+a time, and a job step yields to interactive writes. A server profile still
+installs the worker service, and `kelmo worker daemon --vault PATH
+--executor-config executor.json` runs the same queue pass in the foreground
+(`--once` for one tick). Without executor configuration, ordinary queued work
+runs and resolution requests remain pending.
+
+The trusted executor configuration is JSON with argv (an absolute executable followed by
 arguments), timeout_seconds (default 120), max_attempts (default 3) and poll_seconds
 (default 2). The executable reads one resolution payload as JSON on stdin and
 returns one proposal JSON object on stdout. Use a provider-specific wrapper for

@@ -10,7 +10,8 @@
     "retryable": [
       "E_CORE_RESTARTED",
       "E_DEADLINE",
-      "E_OVERLOADED"
+      "E_OVERLOADED",
+      "E_UNAVAILABLE"
     ]
   },
   "fields": {

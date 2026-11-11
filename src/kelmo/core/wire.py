@@ -27,7 +27,7 @@ ERROR_CODE = re.compile(r'E_[A-Z0-9_]{1,40}')
 ORIGIN_FIELDS = frozenset({'client_id', 'machine_tag', 'session'})
 
 # Codes the daemon adds; each is retryable by the caller's own rule.
-DAEMON_RETRYABLE = frozenset({'E_OVERLOADED', 'E_DEADLINE', 'E_CORE_RESTARTED'})
+DAEMON_RETRYABLE = frozenset({'E_OVERLOADED', 'E_DEADLINE', 'E_CORE_RESTARTED', 'E_UNAVAILABLE'})
 DAEMON_CODES = DAEMON_RETRYABLE | {'E_CANCELLED', 'E_FORBIDDEN'}
 
 # Header fields: name -> (kinds the field may appear on, kinds that require it).

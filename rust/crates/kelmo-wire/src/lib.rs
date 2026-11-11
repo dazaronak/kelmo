@@ -60,10 +60,11 @@ impl std::fmt::Display for WireError {
 
 impl std::error::Error for WireError {}
 
-/// Error codes the daemon itself answers with. The first three are retryable by the caller's own rule.
+/// Error codes the daemon itself answers with. The first four are retryable by the caller's own rule.
 pub const E_OVERLOADED: &str = "E_OVERLOADED";
 pub const E_DEADLINE: &str = "E_DEADLINE";
 pub const E_CORE_RESTARTED: &str = "E_CORE_RESTARTED";
+pub const E_UNAVAILABLE: &str = "E_UNAVAILABLE";
 pub const E_CANCELLED: &str = "E_CANCELLED";
 pub const E_FORBIDDEN: &str = "E_FORBIDDEN";
 

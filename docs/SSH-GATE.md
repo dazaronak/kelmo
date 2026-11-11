@@ -33,9 +33,14 @@ Configure the shared authority with `kelmo client init`, then perform a
 must report the expected authority and client. An attempt to pass a different
 client id or a shell command must be refused.
 
-Locally, register `kelmo mcp --reconnect`, not this SSH command, with the agent.
-The gate speaks the internal shared-client protocol; the local process speaks
-MCP and retains its stdio connection when the channel reconnects.
+On the server, `serve-client` starts the vault's daemon if none runs and then
+becomes `kelmod attach` for the enrolled client, so every SSH connection is
+one small process in front of the one daemon.
+
+Do not register this SSH command with the agent. `kelmo setup` on the client
+installs a local `kelmod` service and registers its HTTP endpoint with Claude
+Code and Codex; that daemon holds the channel and reconnects it, and agent
+sessions keep their connection while it does.
 
 This module does not create keys, edit SSH configuration, start a tunnel, grant
 privileges or activate a server.

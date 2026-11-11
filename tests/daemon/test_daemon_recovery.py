@@ -34,7 +34,8 @@ def test_a_keyed_call_without_a_key_is_refused_as_restarted(start):
     client = daemon.client()
     error = error_of(client.reply(client.call("state.crash_keyed", {}))[0])
     assert error["code"] == "E_CORE_RESTARTED"
-    assert error["retryable"] is True
+    # Without a key a resend could apply the write twice.
+    assert error["retryable"] is False
     wait_for(lambda: daemon.settled(restarts=1), what="the core restarted")
     assert deliveries(daemon) == 1
 

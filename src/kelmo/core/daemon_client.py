@@ -107,19 +107,47 @@ def _answers(path):
     return True
 
 
-def ensure(root, *, kelmod=None, launcher=None):
+def _check_profile(root, path, server_profile):
+    """Refuses a running daemon that serves another server profile than the caller needs: its answers
+    would read as an enrollment problem instead of naming the mismatch."""
+    if server_profile is None:
+        return
+    wanted = str(Path(server_profile).expanduser().resolve())
+    meta = call(root, 'daemon.status', {}, seconds=5.0, path=path).get('meta') or {}
+    if meta.get('server_profile') != wanted:
+        running = meta.get('server_profile') or 'no server profile'
+        raise KelmoError('E_RUNTIME', f'The daemon of {root} runs with {running}, not {wanted}; '
+                                      'stop it (kelmo daemon stop) and connect again.')
+
+
+def ensure(root, *, kelmod=None, launcher=None, server_profile=None):
     """The socket of the daemon that owns `root`, starting an ephemeral one when none answers. `launcher`
-    is the installed `kelmo` script, whose runtime then starts the cores."""
-    from .spec import build, installed_core_command
+    is the installed `kelmo` script, whose runtime then starts the cores; `server_profile` lets the started
+    daemon serve the profile's enrolled clients. A client root (a shared client) gets the edge daemon."""
+    from ..config import ClientProfile
+    from .spec import build, build_edge, installed_core_command
     root = Path(root).expanduser().resolve()
     path = socket_path(root)
     if _answers(path):
+        _check_profile(root, path, server_profile)
         return path
-    state = root / '.state'
+    command = installed_core_command(launcher) if launcher is not None else None
+    service_spec = (ClientProfile.load(root).state if ClientProfile.selected(root) else root / '.state') / 'kelmod.spec.json'
+    if service_spec.exists():
+        # The kelmod service owns this root; a temporary daemon without its endpoint would take its lock.
+        raise KelmoError('E_RUNTIME', f'The kelmod service of {root} is not running; start it '
+                                      '(launchctl kickstart gui/$UID/org.kelmo.daemon, or systemctl --user start '
+                                      'kelmod.service) and retry.')
+    if ClientProfile.selected(root):
+        state = ClientProfile.load(root).state
+        spec = build_edge(root, core_command=command)
+    else:
+        state = root / '.state'
+        spec = build(root, core_command=command, server_profile=server_profile)
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
     spec_path = state / 'daemon.spec.json'
     temporary = spec_path.with_name(spec_path.name + '.' + uuid.uuid4().hex)
-    command = installed_core_command(launcher) if launcher is not None else None
-    temporary.write_text(json.dumps(build(root, core_command=command)), encoding='utf-8')
+    temporary.write_text(json.dumps(spec), encoding='utf-8')
     os.replace(temporary, spec_path)
     log_path = state / 'kelmod.log'
     start = log_path.stat().st_size if log_path.exists() else 0
@@ -130,6 +158,7 @@ def ensure(root, *, kelmod=None, launcher=None):
     limit = time.monotonic() + START_SECONDS
     while time.monotonic() < limit:
         if _answers(path):
+            _check_profile(root, path, server_profile)
             return path
         code = process.poll()
         # 75: another daemon took the root first; its socket answers in a moment.

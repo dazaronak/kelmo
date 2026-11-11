@@ -6,6 +6,10 @@
 //! kelmod embed --tokenizer FILE [--additions JSON] [--preparation DIGEST]
 //! kelmod status (--root DIR | --runtime-dir DIR)
 //! kelmod call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]
+//! kelmod attach --client-id ID [--protocol 1|2] (default 1) (--root DIR | --runtime-dir DIR)
+//! kelmod mcp-stdio (--root DIR | --runtime-dir DIR)
+//! kelmod hook ACTION [--provider P] [--state DIR] (--root DIR | --runtime-dir DIR)
+//! kelmod http-headers --state DIR --port N (--root DIR | --runtime-dir DIR)
 //! ```
 //! `status` and `call` print one JSON object: the reply body on success, `{"error": ...}` on a refusal.
 
@@ -15,8 +19,14 @@ use std::time::Duration;
 
 use kelmo_runtime::{client, daemon, ipc, spec::Spec};
 
+mod attach;
 mod embed;
+mod hook;
+mod http;
 use serde_json::{Value, json};
+
+/// Exit code for a spec the daemon cannot serve (sysexits EX_CONFIG).
+const EXIT_CONFIG: i32 = daemon::EXIT_CONFIG;
 
 /// The package version in the form Python packaging uses, so `kelmod --version` and
 /// `kelmo --version` print the same string.
@@ -41,7 +51,10 @@ fn pep440(version: &str) -> String {
 }
 
 const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | embed --tokenizer FILE [--additions JSON] [--preparation DIGEST] | status (--root DIR | --runtime-dir DIR) \
-| call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]";
+| call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K] \
+| attach --client-id ID [--protocol 1|2] (default 1) (--root DIR | --runtime-dir DIR) | mcp-stdio (--root DIR | --runtime-dir DIR) \
+| hook ACTION [--provider P] [--state DIR] (--root DIR | --runtime-dir DIR) \
+| http-headers --state DIR --port N (--root DIR | --runtime-dir DIR)";
 
 /// Options that take no value.
 const FLAGS: &[&str] = &["ephemeral"];
@@ -76,13 +89,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
     Ok(Options { positional, named })
 }
 
+fn runtime_dir(options: &Options) -> Result<PathBuf, String> {
+    match (options.named.get("runtime-dir"), options.named.get("root")) {
+        (Some(dir), _) => Ok(PathBuf::from(dir)),
+        (None, Some(root)) => ipc::runtime_dir(&PathBuf::from(root)).map_err(|e| e.to_string()),
+        (None, None) => Err("name --root or --runtime-dir".into()),
+    }
+}
+
 fn socket(options: &Options) -> Result<PathBuf, String> {
-    let runtime = match (options.named.get("runtime-dir"), options.named.get("root")) {
-        (Some(dir), _) => PathBuf::from(dir),
-        (None, Some(root)) => ipc::runtime_dir(&PathBuf::from(root)).map_err(|e| e.to_string())?,
-        (None, None) => return Err("name --root or --runtime-dir".into()),
-    };
-    Ok(ipc::socket_path(&runtime))
+    Ok(ipc::socket_path(&runtime_dir(options)?))
 }
 
 fn print_reply(result: Result<(Value, Value), String>) -> ExitCode {
@@ -108,6 +124,15 @@ fn print_reply(result: Result<(Value, Value), String>) -> ExitCode {
     }
 }
 
+/// Runs a bridge (attach, mcp-stdio, hook) to its end. Its runtime is shut down without joining the blocking
+/// threads, so a stdin read still parked there cannot keep the process alive after the bridge is done.
+fn bridge<F: std::future::Future<Output = i32>>(future: F) -> ExitCode {
+    let runtime = runtime();
+    let code = runtime.block_on(future);
+    runtime.shutdown_background();
+    ExitCode::from(code as u8)
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -125,7 +150,26 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let value: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
             let spec = Spec::from_json(&value)?;
             let ephemeral = options.named.contains_key("ephemeral");
-            let code = runtime().block_on(daemon::serve(spec, ephemeral));
+            let code = runtime().block_on(async move {
+                let Some(http) = spec.http.clone() else {
+                    return daemon::serve(spec, ephemeral).await;
+                };
+                let settings = match http::Settings::from_spec(&http) {
+                    Ok(settings) => settings,
+                    Err(message) => {
+                        eprintln!("E_CONFIG: {message}");
+                        return EXIT_CONFIG;
+                    }
+                };
+                let prepare: daemon::Prepare = Box::new(move || {
+                    let listener = http::bind(&settings)
+                        .map_err(|error| format!("the HTTP port {}: {error}", settings.port))?;
+                    let front: daemon::FrontEnd =
+                        Box::new(move |gateway| http::start(settings, listener, gateway));
+                    Ok(front)
+                });
+                daemon::serve_with(spec, ephemeral, Some(prepare)).await
+            });
             Ok(ExitCode::from(code as u8))
         }
         Some("embed") => {
@@ -183,6 +227,69 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             Ok(print_reply(
                 runtime().block_on(client::call(&socket, request)),
             ))
+        }
+        Some("attach") => {
+            let client_id = options
+                .named
+                .get("client-id")
+                .ok_or("attach needs --client-id ID")?;
+            if client_id.is_empty() || client_id.len() > 128 {
+                return Err("attach: --client-id must be 1 to 128 characters".into());
+            }
+            let protocol = match options.named.get("protocol").map(String::as_str) {
+                None | Some("1") => 1,
+                Some("2") => 2,
+                Some(other) => return Err(format!("attach: unknown protocol {other}")),
+            };
+            let socket = socket(&options)?;
+            Ok(bridge(attach::run(&socket, client_id, protocol)))
+        }
+        Some("hook") => {
+            // A hook never fails a session: every error, a bad path included, is reported with status 0.
+            let Some(action) = options.positional.get(1).cloned() else {
+                eprintln!("E_INPUT: hook needs ACTION");
+                return Ok(ExitCode::SUCCESS);
+            };
+            let socket = match socket(&options) {
+                Ok(socket) => Some(socket),
+                Err(message) => {
+                    eprintln!("E_RUNTIME: {message}");
+                    None
+                }
+            };
+            let options = hook::Options {
+                action,
+                provider: options.named.get("provider").cloned(),
+                socket,
+                state: options.named.get("state").map(PathBuf::from),
+            };
+            Ok(bridge(hook::run(options)))
+        }
+        Some("http-headers") => {
+            let state = options
+                .named
+                .get("state")
+                .ok_or("http-headers needs --state DIR")?;
+            let port: u16 = options
+                .named
+                .get("port")
+                .ok_or("http-headers needs --port N")?
+                .parse()
+                .map_err(|e| format!("--port: {e}"))?;
+            match http::headers(&PathBuf::from(state), &runtime_dir(&options)?, port) {
+                Ok(headers) => {
+                    println!("{headers}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(message) => {
+                    eprintln!("{message}");
+                    Ok(ExitCode::from(1))
+                }
+            }
+        }
+        Some("mcp-stdio") => {
+            let runtime_dir = runtime_dir(&options)?;
+            Ok(bridge(http::stdio(&runtime_dir)))
         }
         _ => Err(USAGE.into()),
     }

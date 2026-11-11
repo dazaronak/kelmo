@@ -68,6 +68,11 @@ pub struct Spec {
     pub restart_max: usize,
     pub restart_window: Duration,
     pub drain_timeout: Duration,
+    /// The HTTP MCP endpoint's settings, read by `kelmod`; absent when the daemon serves no endpoint.
+    pub http: Option<Value>,
+    /// What the spec was built for (role, server profile), echoed by `daemon.status` so a caller can tell
+    /// whether the running daemon is the one it needs.
+    pub meta: Value,
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> Result<&'a Value, String> {
@@ -154,7 +159,9 @@ impl Spec {
             sample: millis(value, "sample_ms", 10_000)?,
             restart_max: number(value, "restart_max", 5)? as usize,
             restart_window: millis(value, "restart_window_ms", 60_000)?,
-            drain_timeout: millis(value, "drain_timeout_ms", 30_000)?,
+            drain_timeout: millis(value, "drain_timeout_ms", 20_000)?,
+            http: value.get("http").filter(|http| !http.is_null()).cloned(),
+            meta: value.get("meta").cloned().unwrap_or(Value::Null),
         })
     }
 }

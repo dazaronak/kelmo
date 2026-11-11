@@ -4,9 +4,16 @@ Implementation reference for contributors: the flows, invariants and refusal cod
 
 ## Runtime in one screen
 
-Python 3.12/3.13; macOS and Linux. Default single-user local writer. FastMCP stdio, SQLite journal, SQLite/FTS5/sqlite-vec archive, local pinned MiniLM embeddings (or an explicitly configured `[embedding]` chunk index, below), Git-backed Markdown/registry. Native Claude/Codex subprocesses are optional executors. No cloud account is required for local storage/search; configured model executors have their own authentication/network requirements.
+Python 3.12/3.13; macOS and Linux. Default single-user local writer. One `kelmod` daemon (Rust) per machine serves
+MCP over Streamable HTTP on 127.0.0.1 with a bearer token, hooks and the CLI, and supervises the cores it routes
+calls to over the `kelmo/2` framing ([PROTOCOLS.md](PROTOCOLS.md)). SQLite journal, SQLite/FTS5/sqlite-vec archive, local pinned MiniLM embeddings (or an explicitly configured `[embedding]` chunk index, below), Git-backed Markdown/registry. Native Claude/Codex subprocesses are optional executors. No cloud account is required for local storage/search; configured model executors have their own authentication/network requirements.
 
 ```text
+Claude Code / Codex --HTTP MCP--> kelmod --kelmo/2--> state core -> Service (journal, jobs, archive proxy)
+kelmod hook, kelmo CLI --d.sock-->   |                 archive core -> archive/archive.db
+ssh -> serve-client -> kelmod attach |                 embed core (Rust: token counts, embeddings)
+                                     `-- on a shared client: edge core -> SharedClient -> uplink -> authority
+
 packaging/kelmo -> entry.py -> cli.py -> Service
                                   |        |-- Journal (.state/journal.sqlite3)
                                   |        |-- ArchiveAPI -> LocalArchiveAdapter -> archive (archive/archive.db)
@@ -14,7 +21,7 @@ packaging/kelmo -> entry.py -> cli.py -> Service
                                   |-- mcp.server -> same Service, memory and graph tools
                                   |-- hook start -> Config + hot.render (no model required)
                                   `-- session hooks -> immutable snapshots + session jobs
-worker daemon -> operations -> resolution executor -> session_worker.tick
+state core jobs (or worker daemon) -> operations -> resolution executor -> session_worker.tick
 session_worker -> extract chunks -> save note -> Service archive receipt
                -> reconcile candidates -> checked optional wiki application
 graph queries/reads -> selected wiki snapshot -> refresh derived graph if changed
@@ -273,7 +280,10 @@ Manual `sessions run --executor-config` wins over saved configuration. Without i
 
 Claude uses `.claude.json` MCP plus `.claude/settings.json` hooks. Codex uses `.codex/config.toml` plus `.codex/hooks.json`. Commands bind absolute executable/vault. Backups verified before replace, observed bytes compared at each write, unrelated settings retained, ownership receipts support interrupted updates. This is not a transaction over every profile file or an OS atomic compare-and-swap.
 
-macOS: launchd user agent, bootout/bootstrap. Linux: systemd user unit, daemon-reload/enable/restart. Actual native lifecycle remains unverified; stateful substitutes cover logic. Runtime upgrades currently modify the owned runtime in place; native active-worker/rollback acceptance is mandatory before launch.
+macOS: launchd user agent, bootout/bootstrap. Linux: systemd user unit, daemon-reload/enable/restart. On a local
+vault or a shared client the unit runs one kelmod through `kelmo daemon run` (`org.kelmo.daemon`, `kelmod.service`
+with `Type=notify`, a watchdog and memory bounds) and setup retires the 0.1 worker unit; a server profile keeps the
+worker unit. Actual native lifecycle remains unverified; stateful substitutes cover logic. Runtime upgrades currently modify the owned runtime in place; native active-worker/rollback acceptance is mandatory before launch.
 
 ### Stopped-copy snapshot and cutover
 

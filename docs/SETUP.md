@@ -166,10 +166,22 @@ probes the executor, writes the selected clients' integrations and starts the us
 service. `--client claude|codex|both` selects profiles. `--allow-native-memory` omits
 the prohibition rule. The native-memory option must be explicit.
 
-Reinstalling on Linux reloads the unit files, enables the worker and restarts it
-so an existing process uses the new service definition. Restart also starts an
-inactive worker. `--no-start` leaves the running service alone. A failed activation
-stops setup and retains the prepared configuration for recovery.
+On a local vault or a shared client, the user service runs one `kelmod` daemon
+(`org.kelmo.daemon` under launchd, `kelmod.service` under systemd) through
+`kelmo daemon run`, which rebuilds the daemon's spec at every start, so an
+upgraded package brings its own tools and paths without a new setup. Setup
+stops and removes a 0.1 worker service (`org.kelmo.worker`, `kelmo.service`) in
+the same run: two services must never write one journal. With `--no-start` the
+old worker stays, and `kelmo daemon run` refuses to start until it is gone. A
+server profile still installs the worker service. Reinstalling on Linux reloads
+the unit files and restarts the service so a running process picks up the new
+definition. A failed activation stops setup and retains the prepared
+configuration for recovery.
+
+`kelmo daemon status` reports the daemon and its cores, `kelmo daemon stop`
+stops it (calls already accepted finish first; new ones are refused as
+retryable), and `kelmo daemon uninstall --apply` removes the service, which is
+the first step back to a 0.1 install.
 
 Installed agent guidance uses the absolute runtime executable and selected vault,
 so it works when the private runtime is absent from PATH and the data is outside
@@ -191,11 +203,16 @@ selected profile. Session capture uses that profile's transcript directory.
 Repeat setup for another profile; unselected profiles are untouched. Uninstall
 accepts the same path options.
 
-New MCP registrations use `mcp --reconnect`. Setup recognizes a matching
-registration made by `client migrate-mcp` and records ownership when installing
-hooks and instructions. It still refuses an unrelated registration using the
-same name. Removal recognizes both the previous plain MCP command and the
-reconnecting command.
+Setup registers the daemon's HTTP endpoint, `http://127.0.0.1:47821/mcp` unless
+`--http-port` names another port. Claude Code gets an `http` entry with a
+`headersHelper`, Codex gets `url` and `http_headers_helper`. The helper,
+`kelmod http-headers`, prints the bearer header only while this user's daemon
+serves that port, so no client file holds the token. Hooks call `kelmod hook`,
+which spools a capture when no daemon runs and never fails the session.
+Setup recognizes a matching registration made by `client migrate-mcp` and
+records ownership when installing hooks and instructions. It still refuses an
+unrelated registration using the same name. Removal recognizes the 0.1 stdio
+registrations (the plain command and `mcp --reconnect`) and the HTTP ones.
 The result lists backup paths. A partial failure identifies the completed client
 steps so rerunning setup can resume without replacing unrelated configuration.
 Both client profiles retain current and previous owned MCP entries in
@@ -218,8 +235,9 @@ complete-note archive, optional wiki promotion and recovery behavior. Enabled
 session hooks replace the legacy last-assistant-message collector. Manual collector
 evidence still requires explicit promotion through the CLI or MCP tools.
 
-macOS uses a launchd user agent; Linux uses a systemd user service. The latter
-requires a working user manager. Logout persistence on Linux depends on the host's
+macOS uses a launchd user agent; Linux uses a systemd user service
+(`Type=notify` with a watchdog and memory bounds). The latter requires a working
+user manager. Logout persistence on Linux depends on the host's
 user-service policy. `--no-start` prepares files without starting a service and
 reports complete=false. Omitting an executor leaves memory usable and resolutions
 pending; executor_ready and complete remain false.

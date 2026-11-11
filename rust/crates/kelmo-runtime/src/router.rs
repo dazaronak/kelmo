@@ -79,10 +79,15 @@ struct Call {
     body: Value,
     deadline: Instant,
     replay: Replay,
-    via_gateway: bool,
+    /// The call came from a client connection (a session, attach, the HTTP gateway), not from a core.
+    from_client: bool,
+    /// The caller cancelled it while it ran: its reply is still forwarded, but it is never sent again.
+    cancelled: bool,
     replayed: bool,
     dispatched: bool,
     abandoned: bool,
+    /// Answered E_DEADLINE after deadline plus grace while the core still holds it.
+    overdue: bool,
     admitted: Instant,
 }
 
@@ -122,7 +127,11 @@ fn allowed(caller: Option<&str>, op: &str) -> bool {
 
 const GRACE: Duration = Duration::from_secs(2);
 const RETRY_AFTER_MS: u64 = 100;
+const STOPPING_RETRY_AFTER_MS: u64 = 1000;
 const LATENCY_WINDOW: usize = 1000;
+/// The longest a shutdown waits for admitted calls before it stops the cores. With the daemon's own waits and the
+/// cores' stop (`drain_timeout`, 20 s by default) it stays inside the service managers' 40 s stop timeout.
+pub const ROUTER_DRAIN: Duration = Duration::from_secs(10);
 
 pub struct Router {
     spec: Spec,
@@ -138,6 +147,22 @@ pub struct Router {
     started: Instant,
     pub fatal: Option<i32>,
     shutting_down: bool,
+    /// Set by a shutdown: admitted calls may finish until then, new client calls are refused as retryable.
+    drain_until: Option<Instant>,
+    stopped: bool,
+}
+
+/// Whom a lane shares its slots between, round robin: a client, or one session of it when the origin names
+/// one (each MCP session of the HTTP endpoint).
+fn fairness_key(origin: &Value) -> String {
+    let client = origin
+        .get("client_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match origin.get("session").and_then(Value::as_str) {
+        Some(session) => format!("{client}\u{1f}{session}"),
+        None => client.to_owned(),
+    }
 }
 
 fn hex(id: u64) -> String {
@@ -156,8 +181,16 @@ fn error(code: &str, message: impl Into<String>, retryable: bool) -> Value {
     map.insert("code".into(), code.into());
     map.insert("message".into(), message.into().into());
     map.insert("retryable".into(), retryable.into());
-    if code == "E_OVERLOADED" {
-        map.insert("retry_after_ms".into(), RETRY_AFTER_MS.into());
+    match code {
+        _ if !retryable => {}
+        "E_OVERLOADED" => {
+            map.insert("retry_after_ms".into(), RETRY_AFTER_MS.into());
+        }
+        // A stopping daemon: the next one (service restart, upgrade) needs seconds, not a lane slot.
+        "E_UNAVAILABLE" => {
+            map.insert("retry_after_ms".into(), STOPPING_RETRY_AFTER_MS.into());
+        }
+        _ => {}
     }
     Value::Object(map)
 }
@@ -218,6 +251,8 @@ impl Router {
             started: now,
             fatal: None,
             shutting_down: false,
+            drain_until: None,
+            stopped: false,
         }
     }
 
@@ -232,13 +267,15 @@ impl Router {
     ) -> Self {
         let mut announced = false;
         while let Some(event) = events.recv().await {
-            let stop = matches!(event, Event::Shutdown);
             self.handle(event);
             if !announced && self.all_ready() {
                 announced = true;
                 let _ = ready.send(());
             }
-            if stop || self.fatal.is_some() {
+            if self.shutting_down {
+                self.stop_when_drained();
+            }
+            if self.stopped || self.fatal.is_some() {
                 break;
             }
         }
@@ -323,6 +360,18 @@ impl Router {
                     );
                     return;
                 }
+                if self.shutting_down {
+                    let out = client.out.clone();
+                    let id = header["id"].as_str().unwrap_or("").to_owned();
+                    self.refuse_to(
+                        &out,
+                        &id,
+                        "E_UNAVAILABLE",
+                        "The daemon is stopping; retry once it is back.",
+                        true,
+                    );
+                    return;
+                }
                 let origin = client.origin.clone().unwrap_or(Value::Null);
                 self.admit(Source::Client(conn), header, body, origin);
             }
@@ -343,6 +392,14 @@ impl Router {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
+            // Nobody is left to read the reply, and nobody may see the call run again after a restart.
+            if let Some(call) = self.calls.get_mut(&id)
+                && call.dispatched
+            {
+                call.abandoned = true;
+                let (source, caller_id) = (call.source, call.caller_id.clone());
+                self.by_caller.remove(&(source, caller_id));
+            }
             self.drop_or_cancel(id);
         }
     }
@@ -397,6 +454,17 @@ impl Router {
             return;
         }
         if op == "daemon.status" {
+            // Pids, memory and queue depths of every core are for the machine's own callers only.
+            if origin.get("client_id") != self.spec.origin.get("client_id") {
+                self.refuse(
+                    source,
+                    &caller_id,
+                    "E_FORBIDDEN",
+                    "Daemon status is served to local callers only.",
+                    false,
+                );
+                return;
+            }
             let status = self.status();
             if let Some(out) = self.out_of(source) {
                 send(&out, &kelmo_wire::header::reply(&caller_id, None), &status);
@@ -461,11 +529,7 @@ impl Router {
             return;
         }
         let id = self.id();
-        let origin_key = origin
-            .get("client_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let origin_key = fairness_key(&origin);
         let entry = Entry {
             id,
             origin: origin_key,
@@ -499,10 +563,12 @@ impl Router {
                 body,
                 deadline: now + Duration::from_millis(deadline_ms),
                 replay: spec.replay,
-                via_gateway: matches!(source, Source::Client(_)),
+                from_client: matches!(source, Source::Client(_)),
+                cancelled: false,
                 replayed: false,
                 dispatched: false,
                 abandoned: false,
+                overdue: false,
                 admitted: now,
             },
         );
@@ -551,10 +617,11 @@ impl Router {
 
     /// A queued call is removed and answered E_CANCELLED; one in flight gets a cancel sent to its core.
     fn drop_or_cancel(&mut self, id: u64) {
-        let Some(call) = self.calls.get(&id) else {
+        let Some(call) = self.calls.get_mut(&id) else {
             return;
         };
         if call.dispatched {
+            call.cancelled = true;
             if let Some(out) = self.cores[call.core].out.clone() {
                 send(
                     &out,
@@ -659,7 +726,8 @@ impl Router {
         self.pump(core);
     }
 
-    /// A core's process ended. Calls in flight that came through the gateway are sent again once when
+    /// A core's process ended. Calls in flight that came from a client, still have a waiting caller and were
+    /// not cancelled are sent again once when
     /// their replay class allows it; every other call in flight is answered E_CORE_RESTARTED. Queued calls
     /// stay queued for the restarted core.
     fn core_exited(&mut self, core: usize) {
@@ -683,26 +751,16 @@ impl Router {
         }
         for id in in_flight {
             let call = self.calls.get_mut(&id).expect("listed above");
-            let again = call.via_gateway
-                && !call.replayed
-                && !call.abandoned
-                && matches!(call.replay, Replay::Read)
-                || call.via_gateway
-                    && !call.replayed
-                    && !call.abandoned
-                    && matches!(call.replay, Replay::Keyed)
-                    && call.key.is_some();
+            let eligible = call.from_client && !call.replayed && !call.abandoned && !call.cancelled;
+            let again = eligible
+                && (matches!(call.replay, Replay::Read)
+                    || matches!(call.replay, Replay::Keyed) && call.key.is_some());
             if again {
                 call.replayed = true;
                 call.dispatched = false;
                 let entry = Entry {
                     id,
-                    origin: call
-                        .origin
-                        .get("client_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
+                    origin: fairness_key(&call.origin),
                 };
                 let lane = call.lane.clone();
                 if let Some(lane) = self.cores[core].lanes.get_mut(&lane) {
@@ -711,14 +769,17 @@ impl Router {
             } else if let Some(call) = self.finish(id)
                 && !call.abandoned
             {
-                // Retryable: the caller resends under its own request key, which the ledger settles at most
-                // once (section 4.6); kelmod itself never sends it again.
+                // Retryable only for a read or a keyed call: the caller resends under its own request key,
+                // which the ledger settles at most once (section 4.6). A keyless write may have taken effect,
+                // so a resend could apply it twice. kelmod itself never sends it again.
+                let retryable =
+                    matches!(call.replay, Replay::Read) || call.key.is_some() && !call.cancelled;
                 self.refuse(
                     call.source,
                     &call.caller_id,
                     "E_CORE_RESTARTED",
                     "The core restarted during the call; its effect is unknown.",
-                    true,
+                    retryable,
                 );
             }
         }
@@ -781,6 +842,32 @@ impl Router {
         let _ = self.cores[core].supervisor.send(Command::Restart);
     }
 
+    /// A core whose every slot in some lane is held by overdue calls (answered E_DEADLINE to their callers,
+    /// never answered by the core) serves nothing on that lane any more; it is restarted, which frees the
+    /// slots. A call left by a closed client is not counted: it is still within its deadline.
+    fn restart_stuck_lanes(&mut self) {
+        for core in 0..self.cores.len() {
+            let state = &self.cores[core];
+            if !state.ready || state.restarting {
+                continue;
+            }
+            let stuck = state.lanes.iter().any(|(name, lane)| {
+                let abandoned = self
+                    .calls
+                    .values()
+                    .filter(|call| {
+                        call.core == core && call.dispatched && call.overdue && &call.lane == name
+                    })
+                    .count();
+                lane.limit > 0 && abandoned >= lane.limit
+            });
+            if stuck {
+                self.cores[core].restarting = true;
+                let _ = self.cores[core].supervisor.send(Command::Kill);
+            }
+        }
+    }
+
     fn tick(&mut self) {
         let now = Instant::now();
         // Deadlines: a queued call past its deadline never reaches the core; a call in flight past it by
@@ -818,6 +905,7 @@ impl Router {
         for id in overdue {
             let call = self.calls.get_mut(&id).expect("listed above");
             call.abandoned = true;
+            call.overdue = true;
             let (source, caller_id, core) = (call.source, call.caller_id.clone(), call.core);
             self.by_caller.remove(&(source, caller_id.clone()));
             let retryable = matches!(call.replay, Replay::Read);
@@ -836,6 +924,7 @@ impl Router {
                 );
             }
         }
+        self.restart_stuck_lanes();
         // Heartbeats bypass the mailboxes; a core that misses too many is killed and restarted.
         if now.duration_since(self.last_heartbeat) >= self.spec.heartbeat {
             self.last_heartbeat = now;
@@ -866,8 +955,45 @@ impl Router {
         }
     }
 
+    /// Starts the drain: new client calls are refused from now on, and the cores stop once every admitted call
+    /// (and every call a core makes on its behalf) has its reply, or when the drain time is up.
     fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
         self.shutting_down = true;
+        self.drain_until = Some(Instant::now() + ROUTER_DRAIN.min(self.spec.drain_timeout));
+    }
+
+    fn stop_when_drained(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let expired = self.drain_until.is_none_or(|until| Instant::now() >= until);
+        if !self.calls.is_empty() && !expired {
+            return;
+        }
+        // The drain is over: every caller still waiting gets an answer instead of a closed connection. A queued
+        // call never ran; one a core still holds may have taken effect, so only a read or a keyed call may be
+        // sent again.
+        let ids: Vec<u64> = self.calls.keys().copied().collect();
+        for id in ids {
+            if let Some(call) = self.finish(id)
+                && !call.abandoned
+            {
+                let retryable = !call.dispatched
+                    || matches!(call.replay, Replay::Read)
+                    || call.key.is_some() && !call.cancelled;
+                self.refuse(
+                    call.source,
+                    &call.caller_id,
+                    "E_UNAVAILABLE",
+                    "The daemon stopped before the call finished.",
+                    retryable,
+                );
+            }
+        }
+        self.stopped = true;
         for core in &self.cores {
             if let Some(out) = &core.out {
                 send(
@@ -916,6 +1042,7 @@ impl Router {
             .collect();
         json!({"pid": std::process::id(), "uptime_ms": self.started.elapsed().as_millis() as u64,
                "memory_bytes": crate::sys::own_resident_bytes(), "connections": self.clients.len(),
-               "calls": self.calls.len(), "cores": cores, "p95_ms": p95})
+               "calls": self.calls.len(), "cores": cores, "p95_ms": p95,
+               "meta": self.spec.meta})
     }
 }

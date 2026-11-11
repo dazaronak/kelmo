@@ -11,7 +11,6 @@ In a vault with a server profile every call that names an enrolled client runs t
 enrollment read per request). A vault without one has a single origin, `local`, and today's local rules.
 """
 import argparse
-import asyncio
 import contextvars
 import inspect
 import json
@@ -41,6 +40,7 @@ SHARED_ATTRIBUTES = frozenset({'root', 'config', 'bindings', 'context_bindings'}
 
 DEFAULT_READERS = 4
 HANDLER_LANE = 32
+HOOK_LANE = 4
 
 _FACADE = contextvars.ContextVar('kelmo_state_facade', default=None)
 
@@ -187,6 +187,8 @@ class StateCore:
         from ..server import KeysInFlight, ServerProfile, open_archive
         from ..service import Service
         self.root = Path(root).expanduser().resolve()
+        self._acks = {}
+        self._acks_lock = threading.Lock()
         self.profile_path = Path(profile_path) if profile_path is not None else None
         if profile is None and self.profile_path is not None:
             profile = ServerProfile.load(self.profile_path)
@@ -324,8 +326,7 @@ class StateCore:
     def tools(self):
         if self._tools is None:
             from .. import mcp
-            server = mcp.server(self.root, service=_FACADE.get)
-            self._tools = {tool.name: tool.fn for tool in asyncio.run(server.list_tools())}
+            self._tools = mcp.server(self.root, service=_FACADE.get, registry={})
         return self._tools
 
     def facade(self, origin):
@@ -374,6 +375,100 @@ class StateCore:
                                   stdin)
         return json.loads(json.dumps(result, default=str))
 
+    def handle_hook(self, context, body):
+        """One native lifecycle event of a session on this machine (`kelmod hook`), served on the core's own
+        Services: context hooks on a reader, capture on the writer under the baton."""
+        if self._enrolled(context.origin) is not None:
+            raise KelmoError('E_FORBIDDEN', 'Hooks are served to local callers only.')
+        return self.serve_hook(body)
+
+    def serve_hook(self, body):
+        from ..integration import hook
+        from ..session_control import capture_hook
+        if not isinstance(body, dict) or not isinstance(body.get('action'), str):
+            raise KelmoError('E_PROTOCOL', 'state.hook carries {action, payload, context}.')
+        action = body['action']
+        payload = body.get('payload') if body.get('payload') is not None else {}
+        frame = body.get('context') or {}
+        if not isinstance(payload, dict) or not isinstance(frame, dict):
+            raise KelmoError('E_INPUT', 'Hook payload and context must be JSON objects.')
+        provider = frame.get('provider') if isinstance(frame.get('provider'), str) else None
+        if isinstance(frame.get('cwd'), str) and not payload.get('cwd'):
+            payload['cwd'] = frame['cwd']
+        if action.startswith('session-'):
+            with self.storage.baton.hold():
+                result = capture_hook(self.root, provider, action, payload,
+                                      internal_job=frame.get('internal_job') is True,
+                                      journal=self.storage.writer.journal)
+        elif action in ('start', 'prompt'):
+            if provider:
+                payload['kelmo_provider'] = provider
+            acknowledgements = []
+            result = self.storage.read(lambda reader: hook(reader, action, payload,
+                                                           acknowledge=acknowledgements.append))
+            if acknowledgements:
+                # Recorded once `kelmod hook` has printed the context (state.ack): a lost reply delivers again.
+                result = dict(result, _kelmo_ack=self._hold_acks(acknowledgements))
+        else:
+            result = self.storage.write(lambda writer: hook(writer, action, payload))
+        return json.loads(json.dumps(result, default=str))
+
+    ACK_SECONDS = 60.0
+
+    def _hold_acks(self, acknowledgements):
+        import uuid
+        now = time.monotonic()
+        with self._acks_lock:
+            for token in [t for t, (at, _) in self._acks.items() if now - at > self.ACK_SECONDS]:
+                del self._acks[token]
+            token = uuid.uuid4().hex
+            self._acks[token] = (now, acknowledgements)
+        return token
+
+    def handle_ack(self, context, body):
+        if self._enrolled(context.origin) is not None:
+            raise KelmoError('E_FORBIDDEN', 'Hooks are served to local callers only.')
+        token = body.get('token') if isinstance(body, dict) else None
+        with self._acks_lock:
+            held = self._acks.pop(token, None) if isinstance(token, str) else None
+        for acknowledgement in (held[1] if held else ()):
+            try:
+                acknowledgement()
+            except OSError:
+                pass
+        return {'acknowledged': held is not None}
+
+    def ingest_spool(self):
+        """Runs every capture `kelmod hook` spooled while no daemon answered (`.state/hook-spool/`), oldest
+        first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`;
+        a hook that fails otherwise stays for the next start."""
+        from . import spool
+        names = spool.entries(self.root / '.state' / 'hook-spool')
+        ingested = 0
+        for path in names:
+            try:
+                body = json.loads(path.read_text(encoding='utf-8'))
+                if (not isinstance(body, dict) or not isinstance(body.get('action'), str)
+                        or body['action'] in ('start', 'prompt')):
+                    raise ValueError('not a capture frame')
+            except (OSError, ValueError, UnicodeDecodeError):
+                spool.reject(path)
+                continue
+            try:
+                self.serve_hook(body)
+            except KelmoError as error:
+                if not getattr(error, 'retryable', False) and error.code not in ('E_BUSY',):
+                    spool.reject(path)
+                    continue
+                return {'ingested': ingested, 'stopped': error.code}
+            except Exception as error:  # noqa: BLE001 - kept in the spool for the next start; the core serves on
+                print(f'kelmo state core: a spooled hook failed ({type(error).__name__}); kept for the next start',
+                      file=sys.stderr)
+                return {'ingested': ingested, 'stopped': type(error).__name__}
+            path.unlink(missing_ok=True)
+            ingested += 1
+        return {'ingested': ingested}
+
     def handle_job_run(self, context, body):
         """Runs one job now (`kelmo worker run`, `kelmo dream apply`); E_BUSY while one of its kind runs."""
         if self._enrolled(context.origin) is not None:
@@ -388,6 +483,8 @@ class StateCore:
         table = {'state.client_request': (self.handle_client_request, 'handler'),
                  'state.tool': (self.handle_tool, 'handler'),
                  'state.cli': (self.handle_cli, 'handler'),
+                 'state.hook': (self.handle_hook, 'hook'),
+                 'state.ack': (self.handle_ack, 'hook'),
                  'state.job_run': (self.handle_job_run, 'admin')}
         from .operations import JOURNAL_WRITING_READS
         for op, (mutating, _spec) in OPERATIONS.items():
@@ -447,8 +544,8 @@ def main(argv=None):
     writer_lock = _writer_lock(args.vault)  # noqa: F841 - held until the process ends
     from .corelink import CoreLink
     # The channel exists before the core: the archive proxy calls through it while the core starts.
-    link = CoreLink.from_descriptor(handlers={}, lanes={'handler': HANDLER_LANE, 'read': args.readers, 'write': 8,
-                                                        'admin': 4})
+    link = CoreLink.from_descriptor(handlers={}, lanes={'handler': HANDLER_LANE, 'hook': HOOK_LANE,
+                                                        'read': args.readers, 'write': 8, 'admin': 4})
     serving = threading.Thread(target=link.serve, name='corelink', daemon=True) if args.archive_core else None
     if serving is not None:
         link.hold_hello = True
@@ -458,6 +555,8 @@ def main(argv=None):
                      archive_link=link if args.archive_core else None)
     link.handlers, link.trim, link.status = core.handlers(), core.trim, core.status
     link.operations = sorted(link.handlers)
+    # Captures spooled while no daemon ran are applied beside serving, not before it.
+    threading.Thread(target=core.ingest_spool, name='hook-spool', daemon=True).start()
     try:
         if serving is None:
             link.serve()

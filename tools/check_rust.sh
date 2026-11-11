@@ -11,3 +11,8 @@ manifest=rust/Cargo.toml
 cargo fmt --manifest-path "$manifest" --all --check
 cargo clippy --locked --manifest-path "$manifest" --workspace --all-targets -- -D warnings
 cargo test --locked --manifest-path "$manifest" --workspace
+# The MCP SDK is used as a server only; an HTTP client in the tree means a client feature was switched on.
+if cargo tree --locked --offline --manifest-path "$manifest" -i reqwest >/dev/null 2>&1; then
+    echo "reqwest is in the dependency tree; keep rmcp's client features off" >&2
+    exit 1
+fi

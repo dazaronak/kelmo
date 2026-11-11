@@ -10,7 +10,8 @@ import stat
 import tomllib
 
 from .instructions import BASE, LEGACY_BASE, BEGIN, END, PROHIBITION, normalize_binding
-from .setup import client_config, client_paths, mcp_entry, profile_options, validate_hook_shapes, write
+from .setup import (client_config, client_paths, is_http_entry, mcp_entry, profile_options, validate_hook_shapes,
+                    write)
 from .hooks import EVENTS, variants
 from ..errors import KelmoError
 
@@ -58,6 +59,14 @@ def prepare(args):
             files.append({'path': path, 'before': before, 'after': after})
 
     entries = [mcp_entry(executable, vault, reconnect=value) for value in (True, False)]
+    edge = None
+    from ..config import ClientProfile
+    from ..core.daemon_client import runtime_dir
+    if (Path(executable).parent / 'kelmod').is_file():
+        # Installed with the machine daemon: its HTTP registration and `kelmod hook` hooks.
+        state = (ClientProfile.load(Path(vault)).state if ClientProfile.selected(Path(vault))
+                 else Path(vault) / '.state')
+        edge = {'kelmod': Path(executable).parent / 'kelmod', 'state': state, 'runtime': runtime_dir(Path(vault))}
     for client in clients:
         root, path = client_paths(home, client, **profile_options(args))
         roots.append(root)
@@ -71,7 +80,7 @@ def prepare(args):
             observe(receipt)
             _, owner = client_config(receipt, 'json')
             if 'kelmo' in servers:
-                if (servers['kelmo'] not in entries
+                if ((servers['kelmo'] not in entries and not (edge and is_http_entry(servers['kelmo'])))
                         or owner.get('current_owned_entry', owner.get('claude_mcp_entry')) != servers['kelmo']):
                     raise KelmoError('E_CONFIG', 'Claude MCP ownership differs; removal stopped.')
                 del servers['kelmo']
@@ -85,7 +94,7 @@ def prepare(args):
                     raise KelmoError('E_CONFIG', 'Invalid MCP entries; removal stopped.')
                 region = _region(text, '# kelmo:begin', '# kelmo:end')
                 if region is not None:
-                    if servers.get('kelmo') not in entries:
+                    if servers.get('kelmo') not in entries and not (edge and is_http_entry(servers.get('kelmo'))):
                         raise KelmoError('E_CONFIG', 'Codex MCP binding changed; removal stopped.')
                     start, end = region
                     after = text[:start] + text[end:]
@@ -111,7 +120,7 @@ def prepare(args):
         validate_hook_shapes(hooks)
         changed = False
         for event in EVENTS:
-            expected = variants(executable,vault,client,event)
+            expected = variants(executable,vault,client,event,edge)
             groups = []
             for group in hooks.get(event, []):
                 remaining = []
@@ -182,4 +191,6 @@ def uninstall(args):
     return {'applied': args.apply, 'clients': plan['clients'],
             'files': [str(item['path']) for item in plan['files']], 'backups': backups,
             'background_retained': True, 'data_retained': True,
+            'next_step': 'The kelmod service, if installed, keeps running: kelmo daemon uninstall --apply stops '
+                         'and removes it.',
             'client_restart_required': bool(args.apply and plan['files'])}

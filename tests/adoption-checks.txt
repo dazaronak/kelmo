@@ -17,7 +17,6 @@ tests/test_server_setup.py
 tests/test_server_admin.py
 tests/test_server_fencing.py::test_requester_authority_is_not_granted_by_transport
 tests/test_mcp.py::test_mcp_search_works_with_telemetry_and_exposes_no_log_or_admin_tool
-tests/test_mcp_proxy.py
 tests/test_initialization.py
 tests/test_migration_cli.py
 tests/test_snapshot_fidelity.py::test_forward_recover_carries_extra_settings_and_captured_source_bytes

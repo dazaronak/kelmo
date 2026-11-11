@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command as Process;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::router::{Command, Event};
@@ -49,7 +50,9 @@ impl Budget {
 }
 
 /// Reads frames from a channel and forwards each as an event; ends at end of file or on a refused frame.
-pub async fn read_frames<R, F>(mut reader: R, mut forward: F)
+/// Returns why the channel ended when that was not a plain end of stream: a read error or a frame that does
+/// not decode, which the caller reports, since a core's channel then restarts.
+pub async fn read_frames<R, F>(mut reader: R, mut forward: F) -> Option<String>
 where
     R: AsyncReadExt + Unpin,
     F: FnMut(serde_json::Value, serde_json::Value) -> bool,
@@ -58,18 +61,19 @@ where
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return None,
+            Err(error) => return Some(format!("read failed: {error}")),
             Ok(read) => read,
         };
         match decoder.feed(&buffer[..read]) {
             Ok(frames) => {
                 for (header, body) in frames {
                     if !forward(header, body) {
-                        return;
+                        return None;
                     }
                 }
             }
-            Err(_) => return,
+            Err(error) => return Some(format!("invalid frame: {error}")),
         }
     }
 }
@@ -167,6 +171,8 @@ pub async fn supervise(
     } = supervised;
     let mut budget = Budget::new(restart_max, restart_window);
     let mut first = true;
+    // Once the router is gone its command channel stays closed: read it once, not on every turn of the loop.
+    let mut commands_open = true;
     loop {
         if !first && !budget.restart(Instant::now()) {
             let _ = fatal.send(EXIT_RESTART_BUDGET);
@@ -208,26 +214,60 @@ pub async fn supervise(
         loop {
             let deadline = stop_deadline;
             tokio::select! {
-                _ = child.wait() => break,
-                _ = &mut reader_task, if !reader_task.is_finished() => {
-                    eprintln!("kelmod: the channel of core {} stopped; restarting it", core.name);
+                status = child.wait() => {
+                    if let Ok(status) = status
+                        && !stopping
+                        && !status.success()
+                    {
+                        eprintln!("kelmod: core {} exited ({status}); restarting it", core.name);
+                    }
+                    // A reply the core wrote just before it ended is still in the channel: read it out first.
+                    if !reader_task.is_finished() {
+                        let _ = tokio::time::timeout(Duration::from_millis(200), &mut reader_task).await;
+                    }
+                    break;
+                }
+                ended = &mut reader_task, if !reader_task.is_finished() => {
+                    let reason = ended.ok().flatten();
+                    // A core that is ending closes its channel first: a moment for it to exit names its status.
+                    let exited = if reason.is_none() && !stopping {
+                        tokio::time::timeout(Duration::from_secs(1), child.wait()).await.ok().and_then(Result::ok)
+                    } else {
+                        None
+                    };
+                    match (reason, exited) {
+                        (Some(reason), _) => eprintln!(
+                            "kelmod: the channel of core {} stopped ({reason}); restarting it", core.name),
+                        (None, Some(status)) => eprintln!(
+                            "kelmod: core {} exited ({status}); restarting it", core.name),
+                        (None, None) if !stopping => eprintln!(
+                            "kelmod: the channel of core {} stopped; restarting it", core.name),
+                        (None, None) => {}
+                    }
                     sys::kill_group(pid);
                     let _ = child.kill().await;
+                    break;
                 }
                 _ = sampler.tick() => {
                     let _ = events.send(Event::Memory { core: index, bytes: sys::tree_resident_bytes(pid) });
                 }
-                command = commands.recv() => match command {
+                command = commands.recv(), if commands_open => match command {
                     Some(Command::Kill) => {
                         sys::kill_group(pid);
                         let _ = child.kill().await;
                     }
+                    // A later stop never moves an earlier deadline.
                     Some(Command::Restart) => {
-                        stop_deadline = Some(tokio::time::Instant::now() + drain);
+                        stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
                     }
-                    Some(Command::Stop) | None => {
+                    Some(Command::Stop) => {
                         stopping = true;
-                        stop_deadline = Some(tokio::time::Instant::now() + drain);
+                        stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
+                    }
+                    None => {
+                        commands_open = false;
+                        stopping = true;
+                        stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
                     }
                 },
                 _ = async {
@@ -246,6 +286,17 @@ pub async fn supervise(
         sys::kill_group(pid);
         kill_leftovers(&executors);
         let _ = events.send(Event::CoreExited { core: index });
+        // A stop that came while the core was ending must not let a new one start.
+        loop {
+            match commands.try_recv() {
+                Ok(Command::Stop) | Err(TryRecvError::Disconnected) => {
+                    stopping = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => break,
+            }
+        }
         if stopping {
             return;
         }

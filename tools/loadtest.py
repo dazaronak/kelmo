@@ -4,6 +4,9 @@
     uv run --locked python tools/loadtest.py run --vault /tmp/load/vault --sessions 5,50 --seconds 60 \
         --out measurements/before.json
 
+With `--daemon KELMOD` the same mix runs against the 0.2 shape instead: one `kelmod serve` for the vault (state,
+archive and embed cores, HTTP endpoint), each session an MCP client of that endpoint, each hook `kelmod hook`.
+
 `build` makes a vault with a synthetic word-level tokenizer and a synthetic embedding broker (this script's
 `broker` command), then archives `--records` mixed Russian and English records through the same store path the
 `memory_store` tool uses. `run` starts each session the way a 0.1 client does on a single machine, one
@@ -153,25 +156,95 @@ def build(args):
 
 # --- process sampling ----------------------------------------------------------------------------------------
 
-def descendants(root):
-    """(pid, rss bytes, command) of every live process below `root`, from one `ps` snapshot."""
-    output = subprocess.run(['ps', '-A', '-o', 'pid=,ppid=,rss=,command='], capture_output=True, text=True,
-                            check=True).stdout
-    children, info = {}, {}
-    for line in output.splitlines():
-        fields = line.split(None, 3)
-        if len(fields) < 4:
+def process_table(commands=True):
+    """{pid: (ppid, rss bytes, command)} for every process this user may inspect; with `commands` false the
+    command is left empty (on macOS reading every process's argv each second is the costly part).
+
+    Read from the kernel rather than `ps`: `ps` is setuid on macOS, and a sandboxed run may not execute setuid
+    programs.
+    """
+    if sys.platform == 'darwin':
+        return _darwin_table(commands)
+    table = {}
+    page = os.sysconf('SC_PAGE_SIZE')
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
             continue
-        pid, ppid, rss = int(fields[0]), int(fields[1]), int(fields[2]) * 1024
+        try:
+            stat = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+            rss_pages = int((entry / 'statm').read_text().split()[1])
+            argv = (entry / 'cmdline').read_bytes().split(b'\0')
+        except OSError:
+            continue
+        ppid = int(stat[stat.rindex(')') + 2:].split()[1])
+        table[int(entry.name)] = (ppid, rss_pages * page, b' '.join(a for a in argv if a).decode(errors='replace'))
+    return table
+
+
+def _darwin_table(commands=True):
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    count = libproc.proc_listallpids(None, 0)
+    pids = (ctypes.c_int * (count * 2))()
+    count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+    bsd = ctypes.create_string_buffer(136)      # struct proc_bsdinfo; pbi_ppid at offset 16
+    task = ctypes.create_string_buffer(96)      # struct proc_taskinfo; pti_resident_size at offset 8
+    table = {}
+    for pid in pids[:count]:
+        if pid <= 0:
+            continue
+        if libproc.proc_pidinfo(pid, 3, 0, bsd, 136) != 136 or libproc.proc_pidinfo(pid, 4, 0, task, 96) != 96:
+            continue
+        ppid = int.from_bytes(bsd.raw[16:20], 'little')
+        rss = int.from_bytes(task.raw[8:16], 'little')
+        table[pid] = (ppid, rss, _darwin_command(libc, ctypes, pid) if commands else '')
+    return table
+
+
+def _darwin_command(libc, ctypes, pid):
+    """argv of `pid` joined by spaces, from sysctl KERN_PROCARGS2 (argc, exec path, padding, argv...)."""
+    mib = (ctypes.c_int * 3)(1, 49, pid)
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or not size.value:
+        return ''
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        return ''
+    raw = buffer.raw[:size.value]
+    argc = int.from_bytes(raw[:4], 'little')
+    rest = raw[4:]
+    rest = rest[rest.index(b'\0'):].lstrip(b'\0')
+    argv = rest.split(b'\0')[:argc]
+    return b' '.join(argv).decode(errors='replace')
+
+
+def descendants(root):
+    """(pid, rss bytes, command) of every live process below `root`, from one process-table snapshot."""
+    table = process_table(commands=False)
+    children = {}
+    for pid, (ppid, _rss, _command) in table.items():
         children.setdefault(ppid, []).append(pid)
-        info[pid] = (rss, fields[3])
     found, stack = [], list(children.get(root, ()))
     while stack:
         pid = stack.pop()
-        if pid in info and not info[pid][1].startswith('ps -A'):
-            found.append((pid, *info[pid]))
+        found.append((pid, table[pid][1], command_of(pid)))
         stack.extend(children.get(pid, ()))
     return found
+
+
+def command_of(pid):
+    """The argv of one process joined by spaces, or '' once it is gone."""
+    if sys.platform == 'darwin':
+        import ctypes
+        import ctypes.util
+        return _darwin_command(ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True), ctypes, pid)
+    try:
+        argv = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')
+    except OSError:
+        return ''
+    return b' '.join(a for a in argv if a).decode(errors='replace')
 
 
 def role(command):
@@ -181,6 +254,12 @@ def role(command):
         return 'kelmo broker'
     if 'loadtest.py' in command:
         return 'synthetic broker'
+    if 'kelmo.core.' in command or 'core-run' in words:
+        for core in ('state', 'archive', 'edge'):
+            if f'{core}_core' in command or f'core-run -- {core}' in command:
+                return f'{core} core'
+    if words and Path(words[0]).name == 'kelmod':
+        return 'kelmod ' + (words[1] if len(words) > 1 else '')
     for verb in ('broker', 'mcp', 'hook', 'archive-worker', 'serve-client', 'client', 'worker'):
         if verb in words:
             return 'kelmo ' + verb
@@ -192,7 +271,14 @@ def role(command):
 class Sampler:
     def __init__(self, interval=1.0):
         self.interval, self.samples, self.stopped = interval, [], threading.Event()
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.error = None
+        self.thread = threading.Thread(target=self._guarded, daemon=True)
+
+    def _guarded(self):
+        try:
+            self._loop()
+        except Exception as error:  # a run without samples measures nothing: the caller raises it
+            self.error = error
 
     def _loop(self):
         while not self.stopped.wait(self.interval):
@@ -213,6 +299,8 @@ class Sampler:
     def __exit__(self, *_):
         self.stopped.set()
         self.thread.join()
+        if self.error is not None:
+            raise RuntimeError(f'process sampling failed: {self.error!r}') from self.error
 
     def summary(self, since):
         window = [s for s in self.samples if s['t'] >= since] or self.samples
@@ -270,26 +358,31 @@ def session_command(kelmo, vault):
                    str(vault), 'mcp']
 
 
-async def hook_event(kelmo, vault, session_id):
+async def hook_event(kelmo, vault, session_id, daemon=None):
     payload = json.dumps({'session_id': session_id, 'cwd': str(vault), 'hook_event_name': 'SessionStart'})
+    argv = ([daemon['kelmod'], 'hook', 'start', '--provider', 'claude', '--runtime-dir', daemon['runtime'],
+             '--state', str(Path(vault) / '.state')] if daemon
+            else [kelmo, '--vault', str(vault), 'hook', 'start', '--provider', 'claude'])
     process = await asyncio.create_subprocess_exec(
-        kelmo, '--vault', str(vault), 'hook', 'start', '--provider', 'claude',
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, stderr = await process.communicate(payload.encode())  # stderr: refusal codes only
     if process.returncode:
         raise RuntimeError(error_code(stderr.decode()) if b'E_' in stderr else f'exit {process.returncode}')
 
 
-async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs):
+async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs, daemon=None):
     from fastmcp import Client
-    from fastmcp.client.transports import StdioTransport
-    command, argv = session_command(kelmo, vault)
+    from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
     rng = random.Random(number)
     session_id = f'loadtest-{number:04d}'
     started = time.monotonic()
     try:
-        transport = StdioTransport(command, argv, env=dict(os.environ), keep_alive=False,
-                                   log_file=logs / f'session-{number:04d}.log')
+        if daemon:
+            transport = StreamableHttpTransport(daemon['url'], headers={'Authorization': 'Bearer ' + daemon['token']})
+        else:
+            command, argv = session_command(kelmo, vault)
+            transport = StdioTransport(command, argv, env=dict(os.environ), keep_alive=False,
+                                       log_file=logs / f'session-{number:04d}.log')
         async with Client(transport) as client:
             results.add('session_start', time.monotonic() - started)
             ready.append(number)
@@ -316,7 +409,7 @@ async def run_session(number, kelmo, vault, deadline, results, ids, ready, logs)
                                        f'tags: [loadtest, synthetic, harness]\n---\n\n{text(rng, number)}\n',
                             'project': PROJECT, 'idempotency_key': f'{session_id}-{begin}'})
                     else:
-                        await hook_event(kelmo, vault, session_id)
+                        await hook_event(kelmo, vault, session_id, daemon)
                     results.add(op, time.monotonic() - begin)
                 except Exception as error:  # every refusal is counted by its code
                     results.add(op, time.monotonic() - begin, error_code(error))
@@ -339,17 +432,53 @@ def seed_ids(vault, count=200):
     return []
 
 
-async def drive(kelmo, vault, sessions, seconds, warmup):
+def start_daemon(kelmod, vault, logs, archive_in_process=False):
+    """`kelmod serve` for the vault with its cores and the HTTP endpoint; returns how sessions reach it.
+    `archive_in_process` runs the archive core without its confined worker: inside a sandbox that forbids a
+    nested one (the test sandbox on macOS) the confined worker cannot start."""
+    import tempfile
+    sys.path.insert(0, str(SCRIPT.parent.parent / 'src'))
+    from kelmo.core.spec import build
+    runtime = tempfile.mkdtemp(prefix='kl', dir='/tmp')
+    spec = build(vault, runtime_dir=runtime, source_root=SCRIPT.parent.parent / 'src', archive_core=True,
+                 archive_in_process=archive_in_process, embed_core=True, kelmod=kelmod, http_port=0)
+    spec_path = Path(logs) / 'daemon.spec.json'
+    spec_path.write_text(json.dumps(spec))
+    log = (Path(logs) / 'kelmod.log').open('wb')
+    process = subprocess.Popen([kelmod, 'serve', '--spec', str(spec_path)], stdout=log, stderr=log)
+    endpoint = Path(runtime) / 'endpoint.json'
+    limit = time.monotonic() + 60
+    while not endpoint.exists():
+        if process.poll() is not None or time.monotonic() > limit:
+            process.kill()
+            raise SystemExit(f'kelmod did not start; see {logs}/kelmod.log')
+        time.sleep(0.1)
+    url = json.loads(endpoint.read_text())['url']
+    token = (Path(vault) / '.state' / 'http-token').read_text().strip()
+    return {'kelmod': kelmod, 'runtime': runtime, 'url': url, 'token': token, 'process': process}
+
+
+async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
     results, ids, ready = Results(), seed_ids(vault), []
     logs = Path(vault).parent / f'{Path(vault).name}-logs'
     logs.mkdir(exist_ok=True)
-    deadline = time.monotonic() + warmup + seconds
     with Sampler() as sampler:
-        tasks = [asyncio.create_task(run_session(n, kelmo, vault, deadline, results, ids, ready, logs))
-                 for n in range(sessions)]
-        await asyncio.sleep(warmup)
-        measured_from = time.monotonic()
-        await asyncio.gather(*tasks)
+        deadline = time.monotonic() + warmup + seconds
+        try:
+            tasks = [asyncio.create_task(run_session(n, kelmo, vault, deadline, results, ids, ready, logs, daemon))
+                     for n in range(sessions)]
+            await asyncio.sleep(warmup)
+            measured_from = time.monotonic()
+            # A session stuck on a dead daemon must not hold the run forever.
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=seconds + 120)
+        finally:
+            if daemon:
+                daemon['process'].terminate()
+                try:
+                    daemon['process'].wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    daemon['process'].kill()
+                    daemon['process'].wait()
     return {'sessions': sessions, 'sessions_ready': len(ready), 'seconds': seconds, 'warmup_seconds': warmup,
             'operations': results.summary(), 'processes': sampler.summary(measured_from)}
 
@@ -357,15 +486,21 @@ async def drive(kelmo, vault, sessions, seconds, warmup):
 def run(args):
     vault = Path(args.vault).absolute()
     kelmo = args.kelmo or shutil.which('kelmo')
-    if not kelmo:
+    if not kelmo and not args.daemon:
         raise SystemExit('Name the installed kelmo launcher with --kelmo.')
     reports = []
     for sessions in (int(n) for n in args.sessions.split(',')):
         copy = vault.parent / f'{vault.name}-run-{sessions}'
         shutil.rmtree(copy, ignore_errors=True)
         shutil.copytree(vault, copy, symlinks=True)
-        report = asyncio.run(drive(kelmo, copy, sessions, args.seconds, args.warmup))
-        report.update(kelmo=kelmo, vault=str(copy), platform=sys.platform,
+        daemon = None
+        if args.daemon:
+            logs = copy.parent / f'{copy.name}-logs'
+            logs.mkdir(exist_ok=True)
+            daemon = start_daemon(args.daemon, copy, logs, args.archive_in_process)
+        report = asyncio.run(drive(kelmo, copy, sessions, args.seconds, args.warmup, daemon))
+        report.update(kelmo=kelmo, mode='daemon' if args.daemon else '0.1', vault=str(copy), platform=sys.platform,
+                      archive_in_process=bool(args.daemon and args.archive_in_process),
                       started=time.strftime('%Y-%m-%dT%H:%M:%S%z'))
         print(json.dumps({k: report[k] for k in ('sessions', 'sessions_ready')} |
                          {'rss_total_mb_median': report['processes'].get('rss_total_mb_median'),
@@ -396,6 +531,9 @@ def main(argv=None):
     r.add_argument('--kelmo', help='the installed kelmo launcher (default: kelmo on PATH)')
     r.add_argument('--out')
     r.add_argument('--keep', action='store_true', help='keep the per-run vault copies')
+    r.add_argument('--daemon', metavar='KELMOD', help='measure the 0.2 shape: one kelmod serve for the vault')
+    r.add_argument('--archive-in-process', action='store_true',
+                   help='with --daemon: no confined archive worker (needed inside a sandbox that forbids nesting)')
     k = commands.add_parser('broker', help='the synthetic embedding broker (stdio), used by sessions')
     k.add_argument('--tokenizer', required=True)
     args = parser.parse_args(argv)
