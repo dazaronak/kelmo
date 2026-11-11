@@ -24,7 +24,7 @@ READERS = 4
 READER_CACHE_KIB = 16000
 
 
-def _worker_factory(start, *, confined):
+def _worker_factory(start, *, confined, provider_factory=None):
     from ..archive_adapter import LocalArchiveAdapter
     from ..server import ArchiveWorker, OriginBindings, chunk_index
     bindings = OriginBindings.from_description(start['enrollment'])
@@ -38,7 +38,7 @@ def _worker_factory(start, *, confined):
             current = ArchiveWorker(None, bindings, start['scratch'], confined=confined, fenced=start['fenced'])
             current.adapter = LocalArchiveAdapter(start['archive'], start['cache'], bindings,
                                                   legacy_receipt_verifier=current.legacy_verified,
-                                                  chunk_index=chunk_index(start['embedding']))
+                                                  chunk_index=chunk_index(start['embedding'], provider_factory))
             local.worker = current
             with lock:
                 opened.append(current)
@@ -56,8 +56,9 @@ def serve(start, *, confined, descriptor=3):
         if readable:
             raise KelmoError('E_ISOLATION', 'The archive core can read coordinator data; native confinement is '
                                             'absent, so it refuses to serve.')
-    worker, opened = _worker_factory(start, confined=confined)
-    worker()  # the archive opens (and its schema is checked) before the core says hello
+    provider_factory = None
+    worker = None
+    opened = []
 
     def handler(name):
         def handle(_context, body):
@@ -72,21 +73,45 @@ def serve(start, *, confined, descriptor=3):
     for op in operations.table():
         if op.name.startswith('archive.'):
             handlers[op.name] = (handler(op.name[len('archive.'):]), op.lanes[0])
-    link = CoreLink.from_descriptor(descriptor, handlers=handlers, lanes={'write': 1, 'read': READERS})
+    link = CoreLink.from_descriptor(descriptor, confined=confined, handlers=handlers,
+                                    lanes={'write': 1, 'read': READERS})
     try:
         if start.get('embed_core'):
             # Counts go to the embedding core, so this process parses no tokenizer. The counter is in place before
             # hello: kelmod sends no archive call until then, so no window is built with a local tokenizer first.
             import threading
             from kelmo.store.memory.embed import install_remote_counter
-            from .embed_client import EmbedCounter
+            from .embed_client import EmbedChannel, EmbedCounter
             link.hold_hello = True
             serving = threading.Thread(target=link.serve, name='corelink', daemon=True)
             serving.start()
-            install_remote_counter(EmbedCounter.connect(link))
+            settings = start.get('embedding') or {}
+            broker_command = settings.get('provider') == 'broker' and bool(settings.get('command'))
+            counter = EmbedCounter.connect(link, pending_vectors=broker_command)
+            install_remote_counter(counter)
+            if broker_command:
+                from ..contracts import EmbeddingSpace
+                from ..embeddings import BrokeredProvider
+                from ..store.errors import ArchiveEmbeddingError
+
+                def provider_factory(settings):
+                    # An embedding core that did not answer at start is asked again by every call: the channel
+                    # reports it as unavailable until it serves.
+                    if counter is not None and not counter.provider:
+                        raise ArchiveEmbeddingError('The embedding core provider is unavailable',
+                                                    reason='embedding_unavailable')
+                    return BrokeredProvider(None, None, EmbeddingSpace.from_dict(settings['space']),
+                                            tokenizer=settings['tokenizer'], channel=EmbedChannel(link))
+                if counter is not None and not counter.provider:
+                    print('kelmo archive core: embedding core has no provider; vectors pending',
+                          file=sys.stderr, flush=True)
+            worker, opened = _worker_factory(start, confined=confined, provider_factory=provider_factory)
+            worker()  # check the archive schema before hello
             link.say_hello()
             serving.join()
         else:
+            worker, opened = _worker_factory(start, confined=confined)
+            worker()
             link.serve()
     finally:
         for item in opened:

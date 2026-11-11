@@ -179,6 +179,11 @@ pub fn inherited_channel(fd: RawFd) -> io::Result<std::os::unix::net::UnixStream
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // A program the core starts (the embedding provider) must not inherit the channel to kelmod.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) })
 }
 

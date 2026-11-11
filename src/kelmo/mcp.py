@@ -100,6 +100,12 @@ def warm_model(service):
         if settings is not None:
             index = getattr(service.archive_api, 'chunk_index', None)
             if index is None:
+                health = getattr(service.archive_api, 'embedding_health', None)
+                if callable(health):
+                    answer = health()
+                    return {'loaded': answer.get('ok') is True,
+                            'model_load_ms': round((time.monotonic() - began) * 1000, 1),
+                            'reason': answer.get('reason'), **selected}
                 return {'loaded': False, 'model_load_ms': None, 'reason': 'warmup_unsupported', **selected}
             provider = index.provider
             if provider is None:

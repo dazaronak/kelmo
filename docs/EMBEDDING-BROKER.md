@@ -5,7 +5,12 @@ tokenizer. Its `fds_env` names the channel variable. Provision those files and
 select the profile with `kelmo models use --profile /absolute/embedding.json`.
 Selection itself does not connect to a broker.
 
-Wrap one Kelmo command with the broker's absolute stdio executable:
+For a daemon, set `command` in `[embedding]` to a non-empty array whose first
+element is the absolute path of the broker executable. The embed core starts it
+on the first request and restarts it after a channel failure. Its stdout is
+reserved for protocol replies and its stderr carries diagnostics.
+
+For a command run without the daemon, wrap it with the broker's absolute stdio executable:
 
 ```sh
 /absolute/runtime/bin/kelmo broker --command-json '["/absolute/custom-embedding-broker","--profile","/absolute/broker-config.json"]' -- /absolute/runtime/bin/kelmo --vault /srv/memory worker daemon --executor-config /srv/config/executor.json
@@ -35,6 +40,8 @@ If the broker dies, provider calls report unavailability; it is not silently
 replaced with another model. Restart the wrapped service after repairing the
 broker.
 
-Wrap `kelmo doctor` for a bounded live health check before starting a worker.
+For an offline worker, wrap `kelmo doctor` for a bounded live health check.
+When a daemon serves the vault, `kelmo doctor` asks it for the configured
+provider's health, because only the daemon reaches that provider.
 Remote endpoints, credentials and any connection window belong to the selected
 broker's deployment. No remote broker is installed or activated by this package.

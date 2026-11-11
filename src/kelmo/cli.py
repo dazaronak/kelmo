@@ -114,6 +114,32 @@ _BORROWED_INPUT = contextvars.ContextVar('kelmo_cli_input', default=None)
 _BORROWED_CLIENT = contextvars.ContextVar('kelmo_cli_client', default=None)
 
 
+class DaemonEmbedding:
+    """The embedding provider's health as the vault's running daemon reports it. A provider started by
+    `[embedding] command` lives behind the daemon's embedding core, so `kelmo doctor`, which checks the vault in
+    its own process, cannot reach it and asks the daemon for that one answer."""
+
+    def __init__(self, root):
+        self.root = root
+
+    def embedding_health(self):
+        from .core import daemon_client
+        return daemon_client.call(self.root, 'state.embedding_health', {}, seconds=30.0)
+
+
+def daemon_embedding(root):
+    """A DaemonEmbedding when a daemon owns this vault now, else None. Nothing is started for the question."""
+    from .config import ClientProfile
+    from .core.daemon_admin import lock_free
+    resolved = Path(root).expanduser().resolve()
+    try:
+        if ClientProfile.selected(resolved) or lock_free(resolved):
+            return None
+    except (KelmoError, OSError):
+        return None
+    return DaemonEmbedding(resolved)
+
+
 def routed(args):
     """True when the installed CLI sends this call to the daemon: `worker daemon` is the long-lived loop the
     daemon itself replaces, and Dreaming other than run and apply edits its settings locally."""
@@ -188,8 +214,25 @@ def through_daemon(args, argv, launcher):
 WAIT_CALL_SECONDS = 900.0
 
 
-def run_borrowed(service, argv, sources=None, stdin=None):
-    """`state.cli` in the state core: parse and dispatch one CLI call over the core's own Service."""
+# What `state.cli` still runs on a fenced server: commands that change nothing a cutover or a copy depends on.
+# Everything else waits for the fence to be lifted, as a client's write and a job do.
+FENCED_COMMANDS = frozenset({'status', 'trace', 'logs', 'show', 'list', 'search', 'pages', 'page', 'context'})
+FENCED_ACTIONS = {'queue': ('action', frozenset({'list'})), 'resolution': ('action', frozenset({'list'})),
+                  'graph': ('graph_action', frozenset({'stats', 'read', 'query'}))}
+
+
+def served_while_fenced(args):
+    if args.command in FENCED_COMMANDS:
+        return True
+    field, allowed = FENCED_ACTIONS.get(args.command, (None, frozenset()))
+    return field is not None and getattr(args, field, None) in allowed
+
+
+def run_borrowed(service, argv, sources=None, stdin=None, *, fenced=False, lease=None):
+    """`state.cli` in the state core: parse and dispatch one CLI call over the core's own Service. `fenced`:
+    the server profile is fenced, so only commands that change nothing are run. `lease(reads_only)`, when
+    given, is a context manager that yields the Service for this call: a command that changes nothing then
+    need not wait for the writer, which a Dreaming pass can hold for minutes."""
     parser, commands = build_parser(__version__)
     try:
         with redirect_stdout(io.StringIO()):
@@ -198,8 +241,17 @@ def run_borrowed(service, argv, sources=None, stdin=None):
         raise UsageError('Invalid command arguments.') from error
     if not routed(args) or args.command == 'dream':
         raise KelmoError('E_INPUT', f'`{args.command}` is not run by the daemon this way.', 2)
+    if fenced and not served_while_fenced(args):
+        raise KelmoError('E_FENCED', 'This server profile is fenced; the command waits until the fence is lifted.')
     args._kelmo_acknowledge = lambda _: None
     args.launcher = 'kelmo'
+    if lease is None:
+        return _dispatch_borrowed(service, args, commands, sources, stdin)
+    with lease(served_while_fenced(args)) as leased:
+        return _dispatch_borrowed(leased, args, commands, sources, stdin)
+
+
+def _dispatch_borrowed(service, args, commands, sources, stdin):
     token = _BORROWED_SERVICE.set(service)
     lent = _BORROWED_INPUT.set({'sources': sources or {}, 'stdin': stdin})
     try:
@@ -487,7 +539,7 @@ def dispatch(args, commands):
             raise KelmoError('E_MODEL_IMPORT', 'Model files are missing or unreadable; provide complete verified files with --from.') from None
     if args.command == 'doctor':
         from .doctor import diagnose
-        return diagnose(root)
+        return diagnose(root, archive=daemon_embedding(root))
     if args.command == 'admin':
         from .archive_admin import READ_VERBS
         if args.admin_action in READ_VERBS:

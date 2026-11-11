@@ -50,10 +50,12 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `admin.stop` | admin | write | never | - |
 | `admin.trim` | admin | write | never | - |
 | `archive.assert_writer` | read | read | read | - |
+| `archive.backfill_vectors` | write | write | never | `batch`?, `limit`?, `after`? |
 | `archive.bind_legacy_receipt` | write | write | never | `ref`, `operation_id`, `origin` |
 | `archive.capture` | write | write | keyed | `source`, `origin`, `idempotency_key` |
 | `archive.capture_receipt` | read | read | read | `operation_id`, `origin` |
 | `archive.counts` | read | read | read | - |
+| `archive.embedding_health` | read | read | read | - |
 | `archive.expand` | read | read | read | `locator`, `neighbors` |
 | `archive.full_record` | read | read | read | `archive_id` |
 | `archive.get` | read | read | read | `archive_id`, `version`? |
@@ -82,7 +84,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `edge.tool` | handler, read, write | write | never | `tool`, `arguments` |
 | `embed.count` | count | read | read | `texts`, `prefix`? |
 | `embed.describe` | count | read | read | - |
-| `embed.embed` | query, passage | read | read | `purpose`, `texts` |
+| `embed.embed` | query, passage | read | read | `purpose`, `texts`, `timeout`? |
 | `state.ack` | hook | write | never | `token` |
 | `state.capture` | write | write | keyed | `content`, `filename`, `promote`?, `role`?, `supersedes`? |
 | `state.cli` | handler | write | never | `argv`, `sources`?, `stdin`? |
@@ -92,6 +94,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `state.create` | write | write | keyed | `budget_tokens`?, `content`, `filename`, `new_work`?, `pending`?, `project`, `rule_change`?, `selected`? |
 | `state.doctor` | read | read | read | - |
 | `state.editor_context` | read | read | read | `budget_tokens`, `project`, `selected`? |
+| `state.embedding_health` | admin | read | read | - |
 | `state.forget` | write | write | keyed | `memory_id`, `reason`? |
 | `state.graph_query` | read | read | read | `params` |
 | `state.graph_read` | read | read | read | `entity_id` |
@@ -108,6 +111,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | `state.register` | write | write | keyed | `kind`?, `summary`?, `targets` |
 | `state.register_preview` | read | read | read | `kind`?, `summary`?, `targets` |
 | `state.retry` | write | write | keyed | `operation_id` |
+| `state.scheduler_status` | admin | read | read | - |
 | `state.search` | read | read | read | `limit`?, `project`?, `query`, `since`?, `tags`?, `until`? |
 | `state.session_append` | write | write | keyed | `base_sha256`, `client_generation`, `content`, `event`, `file_identity`, `final`, `native_id`, `offset`, `provider`, `sha256`, `size` |
 | `state.session_capture` | write | write | keyed | `client_generation`, `content`, `event`, `file_identity`, `native_id`, `provider`, `sha256`, `size` |

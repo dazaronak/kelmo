@@ -16,22 +16,24 @@ SECONDS = 60.0
 
 
 class EmbedCounter:
-    def __init__(self, link, identity, preparation):
+    def __init__(self, link, identity, preparation, provider=False):
         self.link = link
         self.identity = identity
         self.preparation = preparation
+        self.provider = provider
 
     @classmethod
-    def connect(cls, link, seconds=30.0):
+    def connect(cls, link, seconds=30.0, *, pending_vectors=False):
         """The counter of the embedding core behind `link`, or None (with the reason on stderr) when it does not
         answer: the archive then counts with its own tokenizer, as before."""
         try:
             described = link.call('embed.describe', {}, Context.local(os.urandom(16).hex(), seconds)).result(
                 seconds + 5)
         except (KelmoError, TimeoutError) as error:
-            print(f'kelmo archive core: no embedding core ({error}); counting locally', file=sys.stderr, flush=True)
+            fallback = 'counting locally, vectors pending' if pending_vectors else 'counting locally'
+            print(f'kelmo archive core: no embedding core ({error}); {fallback}', file=sys.stderr, flush=True)
             return None
-        return cls(link, described['tokenizer_identity'], described['preparation'])
+        return cls(link, described['tokenizer_identity'], described['preparation'], described.get('provider') is True)
 
     def serves(self, identity, preparation):
         return (identity, preparation) == (self.identity, self.preparation)
@@ -56,3 +58,31 @@ class EmbedCounter:
                 raise KelmoError('E_EMBEDDING', 'The embedding core changed its tokenizer.')
             counts += body['counts']
         return counts
+
+
+class EmbedChannel:
+    """A broker channel routed through the embedding core."""
+
+    def __init__(self, link):
+        self.link = link
+
+    def call(self, kind, texts, timeout):
+        from ..store.errors import ArchiveEmbeddingError
+
+        deadline = timeout + 5.0
+        context = Context.local(os.urandom(16).hex(), deadline)
+        try:
+            return self.link.call('embed.embed', {'purpose': kind, 'texts': texts, 'timeout': timeout}, context,
+                                  lane='passage' if kind == 'passage' else 'query').result(deadline)
+        except TimeoutError as error:
+            raise ArchiveEmbeddingError('The embedding core did not answer in time', reason='timeout') from error
+        except KelmoError as error:
+            if error.code == 'E_EMBEDDING':
+                reason = str(error).partition(':')[0]
+                if reason not in ('timeout', 'embedding_unavailable', 'protocol_error'):
+                    reason = 'protocol_error'
+            elif error.code == 'E_DEADLINE':
+                reason = 'timeout'
+            else:
+                reason = 'embedding_unavailable'
+            raise ArchiveEmbeddingError(str(error), reason=reason) from error

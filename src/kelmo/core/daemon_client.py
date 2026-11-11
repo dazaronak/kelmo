@@ -132,17 +132,17 @@ def ensure(root, *, kelmod=None, launcher=None, server_profile=None):
         _check_profile(root, path, server_profile)
         return path
     command = installed_core_command(launcher) if launcher is not None else None
-    service_spec = (ClientProfile.load(root).state if ClientProfile.selected(root) else root / '.state') / 'kelmod.spec.json'
+    from .instance import state_dir
+    state = state_dir(root)
+    service_spec = state / 'kelmod.spec.json'
     if service_spec.exists():
         # The kelmod service owns this root; a temporary daemon without its endpoint would take its lock.
         raise KelmoError('E_RUNTIME', f'The kelmod service of {root} is not running; start it '
                                       '(launchctl kickstart gui/$UID/org.kelmo.daemon, or systemctl --user start '
                                       'kelmod.service) and retry.')
     if ClientProfile.selected(root):
-        state = ClientProfile.load(root).state
         spec = build_edge(root, core_command=command)
     else:
-        state = root / '.state'
         spec = build(root, core_command=command, server_profile=server_profile)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     spec_path = state / 'daemon.spec.json'

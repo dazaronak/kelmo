@@ -21,6 +21,53 @@ from .context import Context
 CHANNEL_FD = 3
 
 
+class DescriptorChannel:
+    """The channel as a plain descriptor, for a core inside the Linux sandbox: its seccomp policy refuses every
+    socket syscall (`getsockopt` already, which `socket.socket(fileno=...)` makes), while read, write and poll on
+    an inherited descriptor stay allowed. Offers the socket methods CoreLink uses; `shutdown` wakes the reader
+    through a pipe instead of `shutdown(2)`."""
+
+    def __init__(self, fd):
+        self.fd = fd
+        os.set_blocking(fd, True)  # sendall's write loop expects a write to wait, not to fail with EAGAIN
+        self._wake_read, self._wake_write = os.pipe()
+        self._closed = False
+
+    def recv(self, size):
+        import select
+        poller = select.poll()  # poll, not select: no FD_SETSIZE limit on descriptor numbers
+        poller.register(self.fd, select.POLLIN)
+        poller.register(self._wake_read, select.POLLIN)
+        while True:
+            ready = dict(poller.poll())
+            if self._wake_read in ready:
+                return b''
+            if self.fd in ready:
+                return os.read(self.fd, size)  # POLLHUP or POLLERR: read returns b'' or raises OSError
+
+    def sendall(self, data):
+        view = memoryview(data)
+        while view:
+            view = view[os.write(self.fd, view):]
+
+    def shutdown(self, _how):
+        try:
+            os.write(self._wake_write, b'x')
+        except OSError:
+            pass
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        fds, self.fd = (self.fd, self._wake_read, self._wake_write), -1  # a late write fails with EBADF
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 class CoreLink:
     def __init__(self, sock, handlers, lanes, *, trim=None, status=None):
         """`handlers`: op -> (function(context, body) -> body, lane). `lanes`: lane -> thread count.
@@ -40,8 +87,9 @@ class CoreLink:
         self.operations = sorted(handlers)
 
     @classmethod
-    def from_descriptor(cls, fd=CHANNEL_FD, **options):
-        return cls(socket.socket(fileno=fd), **options)
+    def from_descriptor(cls, fd=CHANNEL_FD, *, confined=False, **options):
+        """`confined`: the core runs inside the sandbox, where socket syscalls are refused (DescriptorChannel)."""
+        return cls(DescriptorChannel(fd) if confined else socket.socket(fileno=fd), **options)
 
     # --- writing ---------------------------------------------------------------------------------------
 

@@ -76,7 +76,7 @@ def _embedding(data, root):
     # report, because only the bytes it actually embeds can be counted.
     allowed = {'local': common | {'model', 'model_dir', 'files', 'pooling', 'projection', 'normalization',
                                   'dimension', 'query_prefix', 'document_prefix'},
-               'broker': common | {'fds_env', 'space', 'tokenizer', 'input'}}.get(data.get('provider'))
+               'broker': common | {'fds_env', 'space', 'tokenizer', 'input', 'command'}}.get(data.get('provider'))
     if allowed is None:
         raise ValueError('provider must be "local" or "broker"')
     unknown = set(data) - allowed
@@ -148,6 +148,13 @@ def _embedding(data, root):
         contracts = sibling('contracts')
         settings['query_prefix'] = settings['document_prefix'] = None
         settings['fds_env'] = text('fds_env')
+        if 'command' in data:
+            command = data['command']
+            if (not isinstance(command, list) or not command
+                    or any(not isinstance(arg, str) or not arg.strip() for arg in command)
+                    or not Path(command[0]).is_absolute()):
+                raise ValueError('command must be a non-empty list of non-empty strings with an absolute argv[0]')
+            settings['command'] = list(command)
         space = data['space']
         if not isinstance(space, dict) or set(space) != set(_SPACE_FIELDS):
             raise ValueError('space must name every EmbeddingSpace field')

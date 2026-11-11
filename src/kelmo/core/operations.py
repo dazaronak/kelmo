@@ -74,6 +74,9 @@ def _state_operations():
         Operation('state.job_run', ('admin',), WRITE, REPLAY_NEVER,
                   {'job': {'types': ['string'], 'required': True},
                    'options': {'types': ['object'], 'required': False}}),
+        Operation('state.scheduler_status', ('admin',), READ, REPLAY_READ, {}),
+        # The embedding provider's health as the daemon's archive sees it, for `kelmo doctor` on this machine.
+        Operation('state.embedding_health', ('admin',), READ, REPLAY_READ, {}),
     ]
     return table
 
@@ -81,7 +84,8 @@ def _state_operations():
 # Archive writes and their replay class. A write without a key is never sent again: its effect may have
 # happened (the rule ArchiveProcess keeps today).
 _ARCHIVE_WRITES = {'capture': REPLAY_KEYED, 'hide': REPLAY_KEYED, 'update': REPLAY_NEVER,
-                   'supersede': REPLAY_NEVER, 'graph_publish': REPLAY_NEVER, 'bind_legacy_receipt': REPLAY_NEVER}
+                   'supersede': REPLAY_NEVER, 'graph_publish': REPLAY_NEVER, 'bind_legacy_receipt': REPLAY_NEVER,
+                   'backfill_vectors': REPLAY_NEVER}
 
 
 def _archive_operations():
@@ -115,7 +119,7 @@ def _fixed_operations():
         Operation('embed.count', ('count',), READ, REPLAY_READ,
                   {'texts': texts, 'prefix': _string(required=False)}),
         Operation('embed.embed', ('query', 'passage'), READ, REPLAY_READ,
-                  {'purpose': _string(), 'texts': texts}),
+                  {'purpose': _string(), 'texts': texts, 'timeout': {'types': ['number'], 'required': False}}),
         Operation('edge.tool', ('handler', 'read', 'write'), WRITE, REPLAY_NEVER, tool),
         Operation('edge.hook', ('hook',), WRITE, REPLAY_NEVER, hook),
         Operation('edge.ack', ('hook',), WRITE, REPLAY_NEVER, {'token': _string()}),

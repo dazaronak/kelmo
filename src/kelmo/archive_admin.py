@@ -344,7 +344,13 @@ class ArchiveAdmin:
                     if index.provider.health().get('ok') is not True:
                         raise RuntimeError('provider reports unhealthy')
                     index.provider.input_policy()
-        elif probe_embedding and index_error is None:
+        elif (probe_embedding and index_error is None and self.service is not None
+              and callable(getattr(self.service.archive_api, 'embedding_health', None))):
+            def embedding_probe():
+                result = self.service.archive_api.embedding_health()
+                if not result.get('ok'):
+                    raise RuntimeError(result.get('reason', 'embedding_unavailable'))
+        elif probe_embedding and index_error is None and self.config.embedding is None:
             def embedding_probe():
                 from kelmo.store.memory.embed import embed
                 embed('Synthetic model health check', cache_dir=str(self.config.cache))
@@ -466,19 +472,25 @@ class ArchiveAdmin:
             raise KelmoError('E_INPUT', 'Batch must be between 1 and 10000.', 2)
         return self._archive().rebuild_chunks(force=bool(force), batch=batch)
 
-    def backfill(self, *, batch=None):
+    def backfill(self, *, batch=None, limit=None, after=None):
         """Embed missing vectors of the configured profile (backfill); one run at a time."""
         from .errors import KelmoError
         self._require('backfill')
         if batch is not None and (type(batch) is not int or not 1 <= batch <= 10000):
             raise KelmoError('E_INPUT', 'Batch must be between 1 and 10000.', 2)
-        archive = self._archive()
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 10000):
+            raise KelmoError('E_INPUT', 'Limit must be between 1 and 10000.', 2)
+        if self.service is None:
+            raise KelmoError('E_STATE', 'Backfill needs the vault opened with its writer.')
+        archive = self.service.archive_api
         with self.config.internal('.state/backfill.lock').open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {'skipped': 'another backfill is running'}
-            return archive.backfill_vectors(batch=batch)
+            if limit is None and after is None:
+                return archive.backfill_vectors(batch=batch)
+            return archive.backfill_vectors(batch=batch, limit=limit, after=after)
 
     def search_log(self, limit=500):
         """The last `limit` (at most 500) logged searches, oldest first. A configured [telemetry]

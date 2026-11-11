@@ -155,6 +155,57 @@ def test_build_spec_preserves_server_profile_scheduling_worker_config_and_superv
     assert 'http' not in built
 
 
+def test_build_spec_runs_the_archive_core_in_process_when_the_profile_says_so(
+        machine, tmp_path, monkeypatch, capsys):
+    settings = json.loads(machine.profile.read_text(encoding='utf-8'))
+    settings['archive_process'] = 'in-process'
+    machine.profile.write_text(json.dumps(settings), encoding='utf-8')
+    daemon_admin.write_options(machine.vault / '.state', {
+        'role': 'vault', 'port': None, 'runtime': str(tmp_path / 'runtime'), 'worker_config': None,
+        'launcher': str(machine.executable), 'kelmod': str(machine.kelmod), 'server_profile': str(machine.profile)})
+    monkeypatch.setattr(core_spec, 'installed_core_command', lambda launcher: [str(launcher), 'core-run'])
+
+    archive = next(core for core in daemon_admin.build_spec(machine.vault)['cores'] if core['name'] == 'archive')
+
+    assert '--in-process' in archive['argv']
+    assert capsys.readouterr().err == ''  # setup and status build the spec too; only a start speaks
+
+    class Started(Exception):
+        pass
+
+    def execv(path, argv):
+        raise Started
+
+    monkeypatch.setattr(installer, 'worker_service_file', lambda home, platform=None: None)
+    monkeypatch.setattr(installer, 'service_absent', lambda name, platform: True)
+    monkeypatch.setattr(daemon_admin.os, 'execv', execv)
+    with pytest.raises(Started):
+        daemon_admin.run(machine.vault)
+    assert 'without confinement' in capsys.readouterr().err  # in the service log at every start
+
+
+def test_cli_doctor_asks_a_running_daemon_for_the_embedding_provider(machine, monkeypatch):
+    from kelmo import cli
+    from kelmo.core import daemon_client
+
+    monkeypatch.setattr(daemon_admin, 'lock_free', lambda root: True)
+    assert cli.daemon_embedding(machine.vault) is None  # no daemon: doctor checks in its own process
+
+    monkeypatch.setattr(daemon_admin, 'lock_free', lambda root: False)
+    asked = []
+    answers = [{'ok': True, 'reason': None}, {'ok': False, 'reason': 'embedding_unavailable'}]
+
+    def call(root, operation, body, **options):
+        asked.append((operation, body))
+        return answers.pop(0)
+
+    monkeypatch.setattr(daemon_client, 'call', call)
+    handle = cli.daemon_embedding(machine.vault)
+    assert handle.embedding_health() == {'ok': True, 'reason': None}
+    assert handle.embedding_health() == {'ok': False, 'reason': 'embedding_unavailable'}
+    assert asked == [('state.embedding_health', {})] * 2
+
+
 def test_server_setup_installs_kelmod_service_and_retires_worker_after_successful_stop(
         machine, monkeypatch, tmp_path):
     configure_broker_embedding(machine.vault)

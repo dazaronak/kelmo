@@ -541,12 +541,13 @@ class BrokeredProvider:
 
     MAX_TEXTS = 64
 
-    def __init__(self, request_fd, answer_fd, space, *, tokenizer, query_timeout=5.0, document_timeout=60.0):
+    def __init__(self, request_fd, answer_fd, space, *, tokenizer, query_timeout=5.0, document_timeout=60.0,
+                 channel=None):
         if not isinstance(space, EmbeddingSpace):
             raise TypeError('A brokered provider needs its declared EmbeddingSpace')
         self._space = space
         self._tokenizer = Path(tokenizer)
-        self._channel = shared_channel(request_fd, answer_fd)
+        self._channel = shared_channel(request_fd, answer_fd) if channel is None else channel
         self._additions = None
         self._policy = None
         self._windows = None

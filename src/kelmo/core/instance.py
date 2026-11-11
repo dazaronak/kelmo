@@ -1,4 +1,4 @@
-"""`<vault>/.state/daemon.lock`: the one lock that says who owns a vault.
+"""`<state>/daemon.lock`: the one lock that says who owns a vault.
 
 `kelmod serve` holds it for its whole life. An offline tool that must have the vault to itself (snapshot,
 import, rotate-writer, the archive operator verbs that write) takes the same lock for its run and refuses
@@ -12,8 +12,24 @@ from pathlib import Path
 from ..errors import KelmoError
 
 
+def state_dir(root):
+    """Where the daemon of `root` keeps its own files (the lock, its spec and options, job state, spools): the
+    vault's state directory, which a vault with bound storage keeps outside the vault directory, or a shared
+    client's state directory. A root that is not initialized yet has `<root>/.state`, where `init` puts it."""
+    from ..config import ClientProfile, Config
+    root = Path(root).expanduser().resolve()
+    if ClientProfile.selected(root):
+        return ClientProfile.load(root).state
+    try:
+        return Config.load(root).state
+    except KelmoError as error:
+        if error.code != 'E_NOT_INITIALIZED':
+            raise
+        return root / '.state'
+
+
 def lock_path(root):
-    return Path(root) / '.state' / 'daemon.lock'
+    return state_dir(root) / 'daemon.lock'
 
 
 @contextmanager

@@ -48,7 +48,7 @@ def test_describe_names_the_file_bytes_and_the_preparation_given(tmp_path):
         header, body = core.call('embed.describe', {})
     assert header['ok'] is True, header
     assert body == {'tokenizer_identity': 'sha256:' + hashlib.sha256(data).hexdigest(),
-                    'preparation': preparation}
+                    'preparation': preparation, 'provider': False}
 
 
 @NEEDS_KELMOD

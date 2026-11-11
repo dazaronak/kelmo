@@ -4,6 +4,7 @@
 //! kelmod --version
 //! kelmod serve --spec FILE [--ephemeral]
 //! kelmod embed --tokenizer FILE [--additions JSON] [--preparation DIGEST]
+//!              [--provider-command JSON_ARGV] [--provider-env JSON_OBJECT]
 //! kelmod status (--root DIR | --runtime-dir DIR)
 //! kelmod call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K]
 //! kelmod attach --client-id ID [--protocol 1|2|auto] (default 1) (--root DIR | --runtime-dir DIR)
@@ -23,6 +24,7 @@ mod attach;
 mod embed;
 mod hook;
 mod http;
+mod provider;
 use serde_json::{Value, json};
 
 /// Exit code for a spec the daemon cannot serve (sysexits EX_CONFIG).
@@ -50,7 +52,7 @@ fn pep440(version: &str) -> String {
     format!("{release}{label}{number}")
 }
 
-const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | embed --tokenizer FILE [--additions JSON] [--preparation DIGEST] | status (--root DIR | --runtime-dir DIR) \
+const USAGE: &str = "usage: kelmod --version | serve --spec FILE [--ephemeral] | embed --tokenizer FILE [--additions JSON] [--preparation DIGEST] [--provider-command JSON_ARGV] [--provider-env JSON_OBJECT] | status (--root DIR | --runtime-dir DIR) \
 | call OP (--root DIR | --runtime-dir DIR) [--body JSON] [--lane L] [--deadline-ms N] [--key K] \
 | attach --client-id ID [--protocol 1|2|auto] (default 1) (--root DIR | --runtime-dir DIR) | mcp-stdio (--root DIR | --runtime-dir DIR) \
 | hook ACTION [--provider P] [--state DIR] (--root DIR | --runtime-dir DIR) \
@@ -188,10 +190,15 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 .get("preparation")
                 .cloned()
                 .unwrap_or_default();
+            let provider = provider::Config::parse(
+                options.named.get("provider-command").map(String::as_str),
+                options.named.get("provider-env").map(String::as_str),
+            )?;
             let code = embed::serve(embed::Options {
                 tokenizer: PathBuf::from(tokenizer),
                 additions,
                 preparation,
+                provider,
             });
             Ok(ExitCode::from(code as u8))
         }

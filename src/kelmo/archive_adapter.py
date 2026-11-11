@@ -898,7 +898,7 @@ class LocalArchiveAdapter:
         return SearchResult(tuple(hits), found['mode'], found['reason'] is not None, found['reason'],
                             found['index_identity'])
 
-    def backfill_vectors(self, *, batch=None, sleep=None):
+    def backfill_vectors(self, *, batch=None, sleep=None, limit=None, after=None):
         """Coordinator maintenance: embed the missing vectors of the configured profile with the configured
         provider (backfill's per-chunk rechecks under the writer lock and epoch). Stops, never fails over,
         when the provider is unavailable."""
@@ -912,7 +912,8 @@ class LocalArchiveAdapter:
         if index.provider is None:
             return {'missing': None, 'written': 0,
                     'stopped': f'embedding provider unavailable ({index.unavailable or "embedding_unavailable"})'}
-        options = {key: value for key, value in (('batch', batch), ('sleep', sleep)) if value is not None}
+        options = {key: value for key, value in (('batch', batch), ('sleep', sleep), ('limit', limit), ('after', after))
+                   if value is not None}
         return backfill_module.backfill(self.connection, index.provider, profile_id=profile_id,
                                         progress=lambda line: None, writer_check=self._writer, **options)
 

@@ -281,7 +281,7 @@ def hub_diagnostics(config):
     return result
 
 
-def diagnose(root):
+def diagnose(root, *, archive=None):
     root = Path(root).expanduser()
     checks = {name: False for name in CHECK_NAMES}
     warnings = []
@@ -449,13 +449,22 @@ def diagnose(root):
                          'or broker channel. Search can use the lexical fallback.')
     if config.embedding is not None:
         try:
-            from .embeddings import provider_from_settings
-            provider = provider_from_settings(config.embedding)
-            provider.embed_queries(['Synthetic model health check']).validate_count(1)
-            checks['embedding_model'] = True
+            if (config.embedding.get('provider') == 'broker' and config.embedding.get('command')
+                    and callable(getattr(archive, 'embedding_health', None))):
+                health = archive.embedding_health()
+                checks['embedding_model'] = health.get('ok') is True
+                if not checks['embedding_model']:
+                    embedding_warning = f"Embedding provider unavailable: {health.get('reason', 'unknown')}."
+            else:
+                from .embeddings import provider_from_settings
+                provider = provider_from_settings(config.embedding)
+                provider.embed_queries(['Synthetic model health check']).validate_count(1)
+                checks['embedding_model'] = True
         except Exception:  # noqa: BLE001 - Provider failures are a health result.
             channel = config.embedding.get('fds_env')
-            if config.embedding.get('provider') == 'broker' and channel and not os.environ.get(channel):
+            if (config.embedding.get('command') and callable(getattr(archive, 'embedding_health', None))):
+                embedding_warning = 'The archive could not report embedding provider health.'
+            elif config.embedding.get('provider') == 'broker' and channel and not os.environ.get(channel):
                 embedding_warning = (f'{channel} is unset: doctor ran outside the embedding broker, so the '
                                      'provider was not reached; run it under kelmo broker to probe the channel.')
     elif model is not None and model.is_dir() and not model.is_symlink():

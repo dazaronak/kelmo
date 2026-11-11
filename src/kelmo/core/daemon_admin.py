@@ -20,9 +20,8 @@ STOP_SECONDS = 45.0
 
 
 def _state(root):
-    from ..config import ClientProfile
-    root = Path(root).expanduser().resolve()
-    return ClientProfile.load(root).state if ClientProfile.selected(root) else root / '.state'
+    from .instance import state_dir
+    return state_dir(root)
 
 
 OPTIONS = 'kelmod.options.json'
@@ -63,9 +62,17 @@ def build_spec(root):
     if options['role'] == 'edge':
         return build_edge(root, core_command=command, http_port=options['port'], runtime_dir=options['runtime'])
     profile = options.get('server_profile')
+    in_process = False
+    if profile:
+        # A server profile that says `"archive_process": "in-process"` is the operator's word that this host
+        # runs the archive without confinement (no sandbox launcher for its platform); the archive core obeys
+        # it, as the archive process of 0.1 did.
+        from ..server import ServerProfile
+        profile = str(Path(profile).expanduser().resolve())
+        in_process = ServerProfile.load(profile).archive_process == 'in-process'
     return build(root, core_command=command, server_profile=profile, schedule=True,
                  worker_config=options.get('worker_config'),
-                 archive_core=True, embed_core=True, kelmod=options['kelmod'],
+                 archive_core=True, archive_in_process=in_process, embed_core=True, kelmod=options['kelmod'],
                  http_port=None if profile else options['port'],
                  runtime_dir=options['runtime'])
 
@@ -84,6 +91,10 @@ def run(root):
             raise KelmoError('E_CONFIG', 'The legacy worker may still be loaded; run kelmo setup without '
                                         '--no-start to unload it before the daemon starts.')
     spec = build_spec(root)
+    if any(core['name'] == 'archive' and '--in-process' in core['argv'] for core in spec['cores']):
+        # Said in the service's log at every start, so an unconfined archive is never a silent state.
+        print('kelmo: the archive core runs without confinement, as the server profile says '
+              '("archive_process": "in-process").', file=sys.stderr, flush=True)
     state = _state(root)
     path = state / 'kelmod.spec.json'
     write_private(path, (json.dumps(spec, indent=2) + '\n').encode())
@@ -97,7 +108,13 @@ def _client_root(root):
 
 
 def status(root):
-    return daemon_client.call(root, 'daemon.status', {}, seconds=5.0)
+    result = daemon_client.call(root, 'daemon.status', {}, seconds=5.0)
+    if any(core.get('name') == 'state' for core in result.get('cores', [])):
+        try:
+            result['jobs'] = daemon_client.call(root, 'state.scheduler_status', {}, seconds=5.0)
+        except KelmoError as error:
+            result['jobs'] = {'unavailable': error.code}
+    return result
 
 
 def _pid(root):

@@ -549,8 +549,32 @@ class ArchiveWorker:
     def op_counts(self):
         return self.adapter.counts()
 
+    def op_backfill_vectors(self, batch=None, limit=None, after=None):
+        # No limit is the whole missing set in one call, as the offline `kelmo admin backfill` asks; the daemon's
+        # scheduler always names one.
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 10000):
+            raise KelmoError('E_INPUT', 'Limit must be between 1 and 10000.')
+        if batch is not None and (type(batch) is not int or not 1 <= batch <= 10000):
+            raise KelmoError('E_INPUT', 'Batch must be between 1 and 10000.')
+        if after is not None and (not isinstance(after, str) or not after.isascii() or not after.isdecimal()):
+            raise KelmoError('E_INPUT', 'Invalid backfill cursor.')
+        result = self.adapter.backfill_vectors(batch=batch, limit=limit, after=after)
+        result.setdefault('remaining', None)
+        result.setdefault('cursor', None)
+        return result
+
     def op_stats(self):
         return self.adapter.stats()
+
+    def op_embedding_health(self):
+        index = self.adapter.chunk_index
+        if index is None or index.provider is None:
+            return {'ok': False, 'reason': getattr(index, 'unavailable', None) or 'embedding_unavailable'}
+        try:
+            index.provider.verify()
+        except Exception as error:  # noqa: BLE001 - doctor reports provider failures as health state
+            return {'ok': False, 'reason': getattr(error, 'data', {}).get('reason', 'embedding_unavailable')}
+        return {'ok': True}
 
     def op_hidden_at(self, archive_id):
         return self.adapter.hidden_at(archive_id)
@@ -806,7 +830,7 @@ def snapshot_graph(service, operation, params=None):
     return result
 
 
-def chunk_index(settings):
+def chunk_index(settings, provider_factory=None):
     """The archive's configured chunk index from validated [embedding] settings, built as Service builds
     it: no settings, no index; a provider that cannot be opened leaves vectors pending, never replaced."""
     if settings is None:
@@ -815,7 +839,7 @@ def chunk_index(settings):
     from .archive_adapter import ChunkIndex
     from .embeddings import provider_from_settings
     try:
-        return ChunkIndex(settings, provider_from_settings(settings))
+        return ChunkIndex(settings, (provider_factory or provider_from_settings)(settings))
     except ArchiveEmbeddingError as error:
         return ChunkIndex(settings, None, unavailable=error.data.get('reason') or 'embedding_unavailable')
 
@@ -1144,8 +1168,14 @@ class ArchiveProcess:
     def counts(self):
         return self._call('counts')
 
+    def backfill_vectors(self, *, batch=None, limit=None, after=None):
+        return self._call('backfill_vectors', batch=batch, limit=limit, after=after)
+
     def stats(self):
         return self._call('stats')
+
+    def embedding_health(self):
+        return self._call('embedding_health')
 
     def hidden_at(self, archive_id):
         return self._call('hidden_at', archive_id=archive_id)

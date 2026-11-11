@@ -69,9 +69,10 @@ def embed_inputs(settings):
 
 
 def http_token(root):
-    """The bearer token of the root's HTTP MCP endpoint: 256 random bits in `.state/http-token` (0600),
+    """The bearer token of the root's HTTP MCP endpoint: 256 random bits in `<state>/http-token` (0600),
     created on first use. Clients registered with the endpoint carry it."""
-    return http_token_at(Path(root) / '.state')
+    from .instance import state_dir
+    return http_token_at(state_dir(root))
 
 
 def http_token_at(state, value=None):
@@ -165,20 +166,30 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
         inputs = None
         if embed_core:
             from ..config import Config
-            inputs = embed_inputs(Config.load(root).embedding)
+            embedding = Config.load(root).embedding
+            inputs = embed_inputs(embedding)
         if inputs is not None:
             archive_argv.append('--embed-core')
             tokenizer, additions, preparation = inputs
+            embed_argv = [str(kelmod or _kelmod()), 'embed', '--tokenizer', tokenizer,
+                          '--additions', json.dumps(additions), '--preparation', preparation]
+            if embedding.get('command'):
+                provider_env = {name: value for name, value in _environment(source_root).items()
+                                if not name.startswith('GIT_')}
+                embed_argv += ['--provider-command', json.dumps(embedding['command']),
+                               '--provider-env', json.dumps(provider_env)]
             cores.append({'name': 'embed', 'env': {}, 'lanes': _lanes(EMBED_LANES),
-                          'argv': [str(kelmod or _kelmod()), 'embed', '--tokenizer', tokenizer,
-                                   '--additions', json.dumps(additions), '--preparation', preparation],
+                          'argv': embed_argv,
                           'budget': {'soft_mb': EMBED_BUDGET_MB[0], 'hard_mb': EMBED_BUDGET_MB[1]}})
             served += [(op, EMBED_LANES) for op in operations.table() if op.name.startswith('embed.')]
         cores.append({'name': 'archive', 'argv': archive_argv, 'env': _environment(source_root),
                       'lanes': _lanes(ARCHIVE_LANES),
                       'budget': {'soft_mb': ARCHIVE_BUDGET_MB[0], 'hard_mb': ARCHIVE_BUDGET_MB[1]}})
         served += [(op, ARCHIVE_LANES) for op in operations.table() if op.name.startswith('archive.')]
-    spec = {'root': str(root), 'origin': LOCAL_ORIGIN, 'cores': cores,
+    from .instance import state_dir
+    # kelmod keeps its lock and the executor records in the vault's state directory, which a vault with bound
+    # storage has outside the vault directory; without this it would default to `<root>/.state`.
+    spec = {'root': str(root), 'state_dir': str(state_dir(root)), 'origin': LOCAL_ORIGIN, 'cores': cores,
             'meta': {'role': 'vault', 'server_profile': None if server_profile is None
                      else str(Path(server_profile).expanduser().resolve())},
             'operations': [{'name': op.name, 'lanes': [lane for lane in op.lanes if lane in table],

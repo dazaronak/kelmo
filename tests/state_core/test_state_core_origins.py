@@ -100,6 +100,95 @@ def test_a_removed_client_is_refused_and_a_fence_refuses_only_writes(shared, cor
     assert succeed(core.client_request(a, request('status')))['writer'] == 'shared'
 
 
+def test_the_daemons_own_caller_is_local_on_a_server_vault_and_is_no_client(shared, core_factory):
+    value = profile_value(shared.world, shared.tmp_path)
+    path = profile_path(shared, value)
+    core = core_factory(shared.world.root, profile_path=path)
+    local = Origin('local')
+
+    def context(name, origin):
+        return Context.local(name, 30, origin=origin)
+
+    # The operator's CLI, jobs and status come with the daemon's own origin, which the profile does not enroll.
+    assert core._operator(local) is True and core._operator(None) is True
+    assert core._operator(Origin('mac-a')) is False
+    status = core.handle_cli(context('operator-status', local),
+                             {'argv': ['status', '--vault', str(shared.world.root), '--json']})
+    assert isinstance(status, dict)
+    assert 'schedule' in core.handle_scheduler_status(context('operator-jobs', local), {})
+
+    # It is no client: what a client does there still needs an enrolled one.
+    for refused in (lambda: core.client_request(local, request('status')),
+                    lambda: core.handle_hook(context('local-hook', local), {'action': 'session-start'}),
+                    lambda: core.handle_tool(context('local-tool', local), {'tool': 'memory_status'}),
+                    lambda: core._operator(Origin('mac-unknown'))):
+        with pytest.raises(KelmoError) as error:
+            refused()
+        assert error.value.code == 'E_ORIGIN'
+    for handler, body in ((core.handle_cli, {'argv': ['status']}),
+                          (core.handle_job_run, {'job': 'graph'}),
+                          (core.handle_scheduler_status, {}),
+                          (core.handle_embedding_health, {})):
+        with pytest.raises(KelmoError) as error:
+            handler(context('client-call', Origin('mac-a')), body)
+        assert error.value.code == 'E_FORBIDDEN'
+
+    # A fenced server runs no job and no CLI command that writes, whoever asks; it still answers reads.
+    value['fenced'] = True
+    path.write_text(json.dumps(value))
+    with pytest.raises(KelmoError) as error:
+        core.handle_job_run(context('operator-job', local), {'job': 'graph'})
+    assert error.value.code == 'E_FENCED'
+    vault = ['--vault', str(shared.world.root)]
+    for argv in (['worker', 'run'], ['queue', 'retry', 'no-such-operation'], ['graph', 'rebuild']):
+        with pytest.raises(KelmoError) as error:
+            core.handle_cli(context('operator-write', local), {'argv': [*argv, *vault]})
+        assert error.value.code == 'E_FENCED'
+    for argv in (['status'], ['queue', 'list']):
+        core.handle_cli(context('operator-read', local), {'argv': [*argv, *vault, '--json']})
+
+    # A profile that enrolls a client named `local` serves that name as a client, not as the operator.
+    value['fenced'] = False
+    value['clients'] = value['clients'] + [{'client_id': 'local', 'machine_tag': 'server-itself'}]
+    path.write_text(json.dumps(value))
+    assert core._operator(local) is False
+
+
+def test_operator_reads_are_answered_while_a_job_holds_the_writer(shared, core_factory):
+    """A Dreaming pass holds the baton for minutes; `kelmo status` and the other reads must not wait for it."""
+    import threading
+    core = core_factory(shared.world.root)
+    local = Origin('local')
+    vault = ['--vault', str(shared.world.root), '--json']
+    held, release = threading.Event(), threading.Event()
+
+    def job():
+        with core.storage.baton.hold():
+            held.set()
+            release.wait(60)
+    holder = threading.Thread(target=job, daemon=True)
+    holder.start()
+    assert held.wait(10)
+    try:
+        reads = (['status'], ['list', '--limit', '3'], ['search', 'synthetic', '--limit', '3'], ['queue', 'list'],
+                 ['pages'], ['graph', 'stats'])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            for argv in reads:
+                future = pool.submit(core.handle_cli, Context.local('operator-read', 30, origin=local),
+                                     {'argv': [*argv, *vault]})
+                assert isinstance(future.result(timeout=20), (dict, list)), argv
+            write = pool.submit(core.handle_cli, Context.local('operator-write', 30, origin=local),
+                                {'argv': ['queue', 'retry', 'no-such-operation', *vault]})
+            with pytest.raises(TimeoutError):
+                write.result(timeout=1)  # a command that writes waits for the writer
+            release.set()
+            with pytest.raises(KelmoError):
+                write.result(timeout=20)  # then runs: the operation does not exist
+    finally:
+        release.set()
+        holder.join(10)
+
+
 def test_twenty_clients_share_one_writer_and_at_most_four_readers(shared, core_factory):
     clients = [{'client_id': f'client-{index:02d}', 'machine_tag': f'machine-{index:02d}'}
                for index in range(20)]

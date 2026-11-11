@@ -172,7 +172,8 @@ def bound_space(conn, provider, profile_id: str):
 
 
 def backfill(conn: sqlite3.Connection, provider, *, profile_id: str, batch: int = BATCH,
-             rest_factor: float = REST_FACTOR, progress=print, sleep=time.sleep, writer_check=None) -> dict:
+             rest_factor: float = REST_FACTOR, progress=print, sleep=time.sleep, writer_check=None,
+             limit: int | None = None, after: str | None = None) -> dict:
     """Embed the missing vectors. Returns a summary; `stopped` names why a run ended early, including a
     provider that cannot establish its space or input policy at all (then `missing` is None)."""
     require_idle(conn, "backfill")
@@ -188,8 +189,10 @@ def backfill(conn: sqlite3.Connection, provider, *, profile_id: str, batch: int 
     space_id = identity_id(space)
     missing = missing_chunks(conn, space_id, profile_id)
     stopped = None
-    for start in range(0, len(missing), batch):
-        rows = chunk_states(conn, missing[start:start + batch])
+    eligible = missing if after is None else [chunk_id for chunk_id in missing if chunk_id > int(after)]
+    selected = eligible if limit is None else eligible[:limit]
+    for start in range(0, len(selected), batch):
+        rows = chunk_states(conn, selected[start:start + batch])
         if not rows:
             continue
         began = time.monotonic()
@@ -216,9 +219,15 @@ def backfill(conn: sqlite3.Connection, provider, *, profile_id: str, batch: int 
             totals[key] += value
         if stopped is not None:
             break
-        progress(f"[{min(start + batch, len(missing))}/{len(missing)}] chunks, {totals['written']} vectors "
+        progress(f"[{min(start + batch, len(selected))}/{len(selected)}] chunks, {totals['written']} vectors "
                  f"written, {totals['stale']} stale, {len(failed)} failed")
-        if start + batch < len(missing):
+        if start + batch < len(selected):
             sleep((time.monotonic() - began) * rest_factor)
-    return {"missing": len(missing), **totals, "failed": failed, "stopped": stopped, "space_id": space_id,
-            "seconds": round(time.monotonic() - started, 1)}
+    result = {"missing": len(missing), **totals, "failed": failed, "stopped": stopped, "space_id": space_id,
+              "seconds": round(time.monotonic() - started, 1)}
+    if limit is not None:
+        result['remaining'] = len(missing_chunks(conn, space_id, profile_id))
+        # A run the provider stopped did not look at everything it selected: no cursor, the next walk starts over.
+        result['cursor'] = (str(selected[-1]) if selected and stopped is None and len(eligible) > len(selected)
+                            else None)
+    return result

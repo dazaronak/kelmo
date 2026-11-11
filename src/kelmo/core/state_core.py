@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -243,7 +244,8 @@ class StateCore:
         install(self.storage.baton)
         self.jobs = Jobs(self, worker_config=worker_config)
         from .. import daemon as executors
-        groups = self.root / '.state' / 'executors' / 'state'
+        from .instance import state_dir
+        groups = state_dir(self.root) / 'executors' / 'state'
         groups.mkdir(mode=0o700, parents=True, exist_ok=True)
         executors.executor_groups = groups
         if schedule:
@@ -275,6 +277,25 @@ class StateCore:
                                         profile_path=self.profile_path, keys_in_flight=self.keys_in_flight)
                 self._sessions[origin.client_id] = session
             return session
+
+    def _operator(self, origin):
+        """True for the machine's own operator: a caller on the daemon's control socket (owner only), which
+        arrives with no origin or with the daemon's own (`local`). On a vault with a server profile that origin
+        is no enrolled client, so the operator surfaces (the CLI, jobs, scheduler status) ask this instead of
+        `_enrolled`; hooks, tools and client requests there still need an enrolled client. A remote client
+        reaches the daemon under the id its channel was enrolled with and may call `state.client_request` only.
+        A profile that enrolls a client named `local` serves that name as a client, not as the operator."""
+        if origin is None:
+            return True
+        if self.profile is None or origin.client_id != 'local':
+            return self._enrolled(origin) is None
+        from ..server import ServerProfile
+        current = ServerProfile.load(self.profile_path) if self.profile_path is not None else self.profile
+        try:
+            current.bindings.origin('local')
+        except ValueError:
+            return True
+        return False
 
     def client_request(self, origin, frame):
         """One kelmo-client/1 request, as a client sends it, under the calling client's session rules. A
@@ -357,7 +378,7 @@ class StateCore:
     def handle_cli(self, context, body):
         """One installed-CLI call, run on the writer Service. Only a local caller may send it."""
         from ..cli import run_borrowed
-        if self._enrolled(context.origin) is not None:
+        if not self._operator(context.origin):
             raise KelmoError('E_FORBIDDEN', 'CLI calls are served to local callers only.')
         argv = body.get('argv') if isinstance(body, dict) else None
         if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
@@ -368,11 +389,21 @@ class StateCore:
                 or not all(isinstance(pair, list) and len(pair) == 2 and all(isinstance(part, str) for part in pair)
                            for pair in sources.values())):
             raise KelmoError('E_PROTOCOL', 'state.cli sources are {name: [content, filename]}, stdin a string.')
-        # On this handler thread, holding the baton: a `--wait` that reaches a model call lets go of the baton
-        # for it, and the writer thread keeps serving everyone else meanwhile.
-        with self.storage.baton.hold():
-            result = run_borrowed(self.storage.writer, argv, {name: tuple(pair) for name, pair in sources.items()},
-                                  stdin)
+        # A command that changes nothing (`status`, `search`, `show` ...) reads through the reader Services, so it
+        # is answered while a job holds the baton. Any other runs on this handler thread holding the baton: a
+        # `--wait` that reaches a model call lets go of the baton for it, and everyone else is served meanwhile.
+        storage = self.storage
+
+        @contextmanager
+        def lease(reads_only):
+            if reads_only:
+                yield Routed(storage)
+            else:
+                with storage.baton.hold():
+                    yield storage.writer
+        fenced = self.jobs._fenced()
+        result = run_borrowed(None, argv, {name: tuple(pair) for name, pair in sources.items()}, stdin,
+                              fenced=fenced, lease=lease)
         return json.loads(json.dumps(result, default=str))
 
     def handle_hook(self, context, body):
@@ -443,7 +474,8 @@ class StateCore:
         first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`;
         a hook that fails otherwise stays for the next start."""
         from . import spool
-        names = spool.entries(self.root / '.state' / 'hook-spool')
+        from .instance import state_dir
+        names = spool.entries(state_dir(self.root) / 'hook-spool')
         ingested = 0
         for path in names:
             try:
@@ -471,12 +503,31 @@ class StateCore:
 
     def handle_job_run(self, context, body):
         """Runs one job now (`kelmo worker run`, `kelmo dream apply`); E_BUSY while one of its kind runs."""
-        if self._enrolled(context.origin) is not None:
+        if not self._operator(context.origin):
             raise KelmoError('E_FORBIDDEN', 'Jobs are started by local callers only.')
         if not isinstance(body, dict) or not isinstance(body.get('job'), str):
             raise KelmoError('E_PROTOCOL', 'state.job_run carries {job, options}.')
+        if self.jobs._fenced():
+            # As shared background work in 0.1: a fenced server performs none, whoever asks.
+            raise KelmoError('E_FENCED', 'This server profile is fenced; background writes wait for the cutover.')
         result = self.jobs.run(body['job'], body.get('options') or {})
         return json.loads(json.dumps(result, default=str))
+
+    def handle_scheduler_status(self, context, body):
+        if not self._operator(context.origin):
+            raise KelmoError('E_FORBIDDEN', 'Scheduler status is served to local callers only.')
+        return self.jobs.status()
+
+    def handle_embedding_health(self, context, body):
+        """`{ok, reason}` of the configured embedding provider, asked of the archive this core uses: the only
+        process that reaches a provider the daemon started."""
+        if not self._operator(context.origin):
+            raise KelmoError('E_FORBIDDEN', 'Embedding health is served to local callers only.')
+        health = getattr(getattr(self, 'archive', None), 'embedding_health', None)
+        if not callable(health):
+            return {'ok': False, 'reason': 'embedding_unavailable'}
+        answer = health()
+        return {'ok': answer.get('ok') is True, 'reason': answer.get('reason')}
 
     def handlers(self):
         from ..server import OPERATIONS
@@ -486,6 +537,8 @@ class StateCore:
                  'state.hook': (self.handle_hook, 'hook'),
                  'state.ack': (self.handle_ack, 'hook'),
                  'state.job_run': (self.handle_job_run, 'admin')}
+        table['state.scheduler_status'] = (self.handle_scheduler_status, 'admin')
+        table['state.embedding_health'] = (self.handle_embedding_health, 'admin')
         from .operations import JOURNAL_WRITING_READS
         for op, (mutating, _spec) in OPERATIONS.items():
             mutating = True if op in JOURNAL_WRITING_READS else mutating
@@ -514,11 +567,12 @@ WRITER_LOCK_SECONDS = 30.0
 
 
 def _writer_lock(root):
-    """Holds `.state/state-core.lock` for the life of the process. kelmod's instance lock ends with kelmod; a
+    """Holds `<state>/state-core.lock` for the life of the process. kelmod's instance lock ends with kelmod; a
     state core of a crashed daemon may still be finishing a write, and a new daemon's state core waits here
     until it has gone instead of writing beside it."""
     import fcntl
-    path = Path(root).expanduser().resolve() / '.state' / 'state-core.lock'
+    from .instance import state_dir
+    path = state_dir(root) / 'state-core.lock'
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     limit = time.monotonic() + WRITER_LOCK_SECONDS
     while True:

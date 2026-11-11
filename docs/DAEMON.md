@@ -16,11 +16,26 @@ persistent daemon and accept remote clients through the SSH gateway.
 (`--once` for one tick). Without executor configuration, ordinary queued work
 runs and resolution requests remain pending.
 
-The scheduler runs queue passes and Dreaming. Backfill, re-embedding and graph
-rebuild jobs require explicit submission. External backup and Git sync schedules
-remain operator-managed. The supervised archive core does not yet receive the
-external embedding broker's channels; upgrading a broker-backed server requires
-that integration before semantic search and vector backfill can work there.
+The scheduler runs queue passes, Dreaming and vector backfill when `[embedding]`
+is configured. Backfill starts five minutes after the scheduler, then ten minutes
+after each run ends. Re-embedding and graph rebuild require explicit submission.
+External backup and Git sync schedules remain operator-managed.
+
+Dreaming runs daily and also applies when 20 first-pass notes are waiting.
+Scheduled apply waits 15 minutes after a pass, or two hours from its start if
+none of its notes was published. Paused or deferred Dreaming waits until it can
+run. A server fence holds all scheduled jobs until it is lifted: no job starts,
+and a running backfill stops before its next batch. The daemon also refuses a job
+submitted by hand and any command that changes the vault (`worker run`,
+`queue retry`) with `E_FENCED`. It still answers `status`, `search` and other
+reads. A Dreaming run that started before the fence finishes, so wait until
+`kelmo daemon status` shows no active job before fencing for a copy. A vault
+served by the daemon needs no separate Dreaming or backfill timer.
+
+`kelmo daemon status --json` reports the jobs under `jobs`: `active`, the recent
+outcomes, the last outcome and the last failure of each kind (the failure is kept
+across restarts, with its end time), and `schedule` with the reason a job is held
+(`paused`, `deferred`, `no_progress`, `min_interval` or `fenced`).
 
 The trusted executor configuration is JSON with argv (an absolute executable followed by
 arguments), timeout_seconds (default 120), max_attempts (default 3) and poll_seconds

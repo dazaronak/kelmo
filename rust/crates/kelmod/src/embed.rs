@@ -17,13 +17,16 @@ use std::time::{Duration, Instant};
 use kelmo_embed::window::{Addition, Window};
 use serde_json::{Value, json};
 
+use crate::provider::{Config, Provider};
+
 const IDLE: Duration = Duration::from_secs(300);
-const OPERATIONS: &[&str] = &["embed.count", "embed.describe"];
+const OPERATIONS: &[&str] = &["embed.count", "embed.describe", "embed.embed"];
 
 pub struct Options {
     pub tokenizer: PathBuf,
     pub additions: Vec<Addition>,
     pub preparation: String,
+    pub provider: Option<Config>,
 }
 
 struct Loaded {
@@ -35,6 +38,7 @@ struct Core {
     options: Options,
     loaded: Mutex<Option<Loaded>>,
     writer: Mutex<UnixStream>,
+    provider: Provider,
 }
 
 /// Parses the JSON list Python's `special_token_additions` validates: strings or AddedToken mappings.
@@ -65,7 +69,7 @@ pub fn additions(text: &str) -> Result<Vec<Addition>, String> {
         .collect()
 }
 
-fn error(code: &str, message: &str, retryable: bool) -> Value {
+pub(crate) fn error(code: &str, message: &str, retryable: bool) -> Value {
     json!({"code": code, "message": message, "retryable": retryable})
 }
 
@@ -166,7 +170,11 @@ impl Core {
             .map_err(|e| error("E_EMBEDDING", &format!("tokenizer unreadable: {e}"), false))?;
         use sha2::Digest;
         let identity = format!("sha256:{:x}", sha2::Sha256::digest(&data));
-        Ok(json!({"tokenizer_identity": identity, "preparation": self.options.preparation}))
+        Ok(json!({
+            "tokenizer_identity": identity,
+            "preparation": self.options.preparation,
+            "provider": self.provider.configured(),
+        }))
     }
 
     fn handle(self: &Arc<Self>, header: Value, body: Value) -> bool {
@@ -177,12 +185,17 @@ impl Core {
                 let loaded = self.loaded.lock().map(|l| l.is_some()).unwrap_or(false);
                 self.reply(
                     &id,
-                    Ok(json!({"pid": std::process::id(), "tokenizer_loaded": loaded})),
+                    Ok(json!({
+                        "pid": std::process::id(),
+                        "tokenizer_loaded": loaded,
+                        "provider": self.provider.status(),
+                    })),
                 );
             }
             "admin.trim" => {
-                let trimmed = self.unload_idle(true);
-                self.reply(&id, Ok(json!({"trimmed": trimmed})));
+                let tokenizer = self.unload_idle(true);
+                let provider = self.provider.trim();
+                self.reply(&id, Ok(json!({"trimmed": tokenizer || provider})));
             }
             "admin.stop" => {
                 self.reply(&id, Ok(json!({"stopping": true})));
@@ -192,6 +205,13 @@ impl Core {
                 let core = self.clone();
                 std::thread::spawn(move || {
                     let result = core.count(&body);
+                    core.reply(&id, result);
+                });
+            }
+            "embed.embed" => {
+                let core = self.clone();
+                std::thread::spawn(move || {
+                    let result = core.provider.call(&body);
                     core.reply(&id, result);
                 });
             }
@@ -221,10 +241,12 @@ pub fn serve(options: Options) -> i32 {
     let Ok(writer) = stream.try_clone() else {
         return 1;
     };
+    let provider = Provider::new(options.provider.clone());
     let core = Arc::new(Core {
         options,
         loaded: Mutex::new(None),
         writer: Mutex::new(writer),
+        provider,
     });
     core.send(
         &json!({"v": 2, "kind": "hello", "id": format!("{:032x}", std::process::id()), "body_type": "json",
@@ -243,14 +265,19 @@ pub fn serve(options: Options) -> i32 {
     let mut buffer = vec![0u8; 1 << 20];
     loop {
         let read = match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => return 0,
+            Ok(0) | Err(_) => {
+                core.provider.stop();
+                return 0;
+            }
             Ok(read) => read,
         };
         let Ok(frames) = reader.feed(&buffer[..read]) else {
+            core.provider.stop();
             return 1;
         };
         for (header, body) in frames {
             if header["kind"] == "call" && !core.handle(header, body) {
+                core.provider.stop();
                 return 0;
             }
         }

@@ -535,7 +535,8 @@ def local_daemon(args, executable, vault, server_profile):
     from ..core.daemon_client import runtime_dir
     port = None if server_profile else int(getattr(args, 'http_port', None) or DEFAULT_HTTP_PORT)
     # Nothing is written here: the vault must still be empty when `initialize` runs.
-    state = Path(vault) / '.state'
+    from ..core.instance import state_dir
+    state = state_dir(vault)
     return {'kelmod': kelmod, 'state': state, 'port': port,
             'url': None if server_profile else f'http://127.0.0.1:{port}/mcp',
             'runtime': runtime_dir(Path(vault)), 'spec': state / 'kelmod.spec.json'}

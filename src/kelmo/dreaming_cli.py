@@ -136,7 +136,7 @@ def dispatch(root, args):
             return run_dream(service, args.action, contexts=contexts)
 
 
-def run_dream(service, action, *, contexts=None):
+def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
     The caller makes sure no other Dreaming run is in progress."""
     dream = service.dreaming
@@ -146,11 +146,13 @@ def run_dream(service, action, *, contexts=None):
     if dream._state("paused", True):
         return {"state": "paused"}
     reset = dream._state("next_attempt", 0)
-    if reset > time.time():
+    if reset > clock():
         return {"state": "deferred", "reset_at": reset}
+    service.archive_api.assert_writer()
+    if on_start is not None:
+        on_start()
     config = validate_config(read_spec(settings["executor_config"]))
     executor = CommandExecutor(config["argv"], config["timeout_seconds"])
-    service.archive_api.assert_writer()
     # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
     # is the owner's "run the editor now".
     from .creation import apply_pending

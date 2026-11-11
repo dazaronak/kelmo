@@ -17,8 +17,8 @@ VARIABLES = {
                                             '`internal_job`'),
     'KELMO_MACHINE_TAG': ('daemon', 3, 'the machine tag comes from the enrollment or the profile, never from '
                                        "the daemon's environment"),
-    'KELMO_EMBED_FDS': ('removed', 6, 'the broker channel is handed to the embed core as descriptors by the '
-                                      'supervisor; the configured fds_env name goes with it'),
+    'KELMO_EMBED_FDS': ('cli', None, 'the offline broker launcher passes its pipe descriptors to the archive; '
+                                    'the daemon starts a configured broker through the embed core'),
     'KELMO_VAULT': ('cli', None, 'selects the vault of a CLI invocation'),
     'KELMO_TIMINGS': ('cli', None, 'turns on timing output of a CLI invocation'),
     'KELMO_INIT_PARENT': ('cli', None, 'staging directory of `kelmo init`'),

@@ -1149,7 +1149,7 @@ class Service:
     def doctor(self):
         """This vault's health checks, as `kelmo doctor` reports them."""
         from .doctor import diagnose
-        return diagnose(self.root)
+        return diagnose(self.root, archive=self.archive_api)
 
     def forget(self, memory_id, *, reason=None):
         """Hide one archived record from search and list. No byte is removed, ever."""

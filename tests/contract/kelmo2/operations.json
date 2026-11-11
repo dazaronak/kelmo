@@ -65,6 +65,34 @@
   {
     "access": "write",
     "arguments": {
+      "after": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      },
+      "batch": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      },
+      "limit": {
+        "required": false,
+        "types": [
+          "any"
+        ]
+      }
+    },
+    "lanes": [
+      "write"
+    ],
+    "name": "archive.backfill_vectors",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {
       "operation_id": {
         "required": true,
         "types": [
@@ -147,6 +175,15 @@
       "read"
     ],
     "name": "archive.counts",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "read"
+    ],
+    "name": "archive.embedding_health",
     "replay": "read"
   },
   {
@@ -814,6 +851,12 @@
         "types": [
           "array"
         ]
+      },
+      "timeout": {
+        "required": false,
+        "types": [
+          "number"
+        ]
       }
     },
     "lanes": [
@@ -1092,6 +1135,15 @@
       "read"
     ],
     "name": "state.editor_context",
+    "replay": "read"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "state.embedding_health",
     "replay": "read"
   },
   {
@@ -1390,6 +1442,15 @@
     ],
     "name": "state.retry",
     "replay": "keyed"
+  },
+  {
+    "access": "read",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
+    "name": "state.scheduler_status",
+    "replay": "read"
   },
   {
     "access": "read",
