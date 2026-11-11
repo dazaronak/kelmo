@@ -119,8 +119,10 @@ impl Settings {
             call_deadline: Duration::from_millis(number(http, "call_deadline_ms", 660_000)?),
             request_timeout: Duration::from_millis(number(http, "request_timeout_ms", 700_000)?),
             header_timeout: Duration::from_millis(number(http, "header_timeout_ms", 10_000)?),
-            max_connections: number(http, "max_connections", 256)?.max(1) as usize,
-            max_sessions: number(http, "max_sessions", 256)?.max(1) as usize,
+            // An MCP session holds two connections (its requests and its event stream): 1280 serves the 512
+            // sessions with room for reconnects.
+            max_connections: number(http, "max_connections", 1280)?.max(1) as usize,
+            max_sessions: number(http, "max_sessions", 512)?.max(1) as usize,
             max_body_bytes: number(http, "max_body_bytes", 4 * 1_048_576)?.max(1024) as usize,
         })
     }
@@ -481,10 +483,17 @@ pub fn start(
                     let opening = opening.clone();
                     async move {
                         if !authorized(&request, &token) {
-                            return Ok::<_, Infallible>(plain(
+                            // The connection closes after the refusal: a caller without the token must not keep
+                            // one of the endpoint's connection slots.
+                            let mut refused = plain(
                                 StatusCode::UNAUTHORIZED,
                                 "A valid bearer token is required.",
-                            ));
+                            );
+                            refused.headers_mut().insert(
+                                http::header::CONNECTION,
+                                HeaderValue::from_static("close"),
+                            );
+                            return Ok::<_, Infallible>(refused);
                         }
                         let new_session = request.method() == Method::POST
                             && !request.headers().contains_key("mcp-session-id");

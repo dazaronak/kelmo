@@ -1,9 +1,11 @@
 """Stub core for the daemon black-box tests. kelmod starts it with its channel on descriptor 3.
 
-    stub_core.py CORE SCRATCH [--crash-at-start]
+    stub_core.py CORE SCRATCH [--crash-at-start] [--linger SECONDS]
 
 CORE is `state` or `archive`. Each invocation a test checks is appended to SCRATCH/CORE.seen as a
 JSON line, so a test reads from the files what the core really received, and in what order.
+`--linger SECONDS` sleeps that long after LINK.serve() returns, then writes SCRATCH/CORE.finished
+(content: the pid), so a test can tell whether the core got to finish its own shutdown.
 """
 import json
 import os
@@ -98,6 +100,13 @@ def trim_handler(core, scratch):
     return trim
 
 
+def linger_seconds(argv):
+    """The value of `--linger SECONDS`, or None when the option is absent."""
+    if "--linger" not in argv:
+        return None
+    return float(argv[argv.index("--linger") + 1])
+
+
 def main(argv):
     global LINK
     if "--crash-at-start" in argv:
@@ -109,6 +118,10 @@ def main(argv):
     LINK = CoreLink.from_descriptor(3, handlers=handlers(core, scratch),
                                     lanes={"fast": 8, "work": 2}, trim=trim)
     LINK.serve()
+    linger = linger_seconds(argv)
+    if linger is not None:
+        time.sleep(linger)
+        (scratch / f"{core}.finished").write_text(f"{os.getpid()}\n")
 
 
 if __name__ == "__main__":

@@ -4,8 +4,14 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::process::Command;
+
+/// The open-file soft limit kelmod was started with, once `raise_open_files` raised it (0 before). Cores get it
+/// back: Python code that uses select(2) fails on a descriptor past 1024, which a core under a raised limit
+/// could be handed.
+static INHERITED_OPEN_FILES: AtomicU64 = AtomicU64::new(0);
 
 /// Highest descriptor number the child sweep looks at; a soft limit of "unlimited" would make the sweep
 /// endless, and a daemon that holds more descriptors than this has a different problem.
@@ -22,8 +28,9 @@ const SWEEP_LIMIT: RawFd = 1 << 16;
 pub fn map_descriptors(command: &mut Command, fds: Vec<(RawFd, RawFd)>) {
     // SAFETY: getdtablesize has no memory effects.
     let limit = unsafe { libc::getdtablesize() }.clamp(4, SWEEP_LIMIT);
-    // SAFETY: the closure runs in the forked child before exec and calls only dup2 and fcntl, which are
-    // async-signal-safe; it allocates nothing.
+    let inherited = INHERITED_OPEN_FILES.load(Ordering::Relaxed);
+    // SAFETY: the closure runs in the forked child before exec and calls only dup2, fcntl, getrlimit and
+    // setrlimit, which are async-signal-safe; it allocates nothing.
     unsafe {
         command.pre_exec(move || {
             for &(source, target) in &fds {
@@ -45,6 +52,16 @@ pub fn map_descriptors(command: &mut Command, fds: Vec<(RawFd, RawFd)>) {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
                     libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
+            }
+            if inherited > 0 {
+                let mut open_files = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut open_files) == 0 {
+                    open_files.rlim_cur = inherited;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &open_files);
                 }
             }
             Ok(())
@@ -107,6 +124,33 @@ pub fn alive(pid: i32) -> bool {
 pub fn uid() -> u32 {
     // SAFETY: getuid cannot fail and has no memory effects.
     unsafe { libc::getuid() }
+}
+
+/// Raises the soft limit on open descriptors toward the hard limit, to at most `cap`, and returns the soft limit
+/// in force afterwards. Service managers start daemons low (launchd 256, systemd 1024), and every HTTP connection
+/// and core channel holds a descriptor. macOS refuses a soft limit above `OPEN_MAX` (10240), so callers cap there.
+pub fn raise_open_files(cap: u64) -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write the struct passed to them.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 0;
+    }
+    // `rlim_t` is u64 on every target kelmod builds for (macOS, 64-bit Linux).
+    let wanted: libc::rlim_t = limit.rlim_max.min(cap);
+    if wanted > limit.rlim_cur {
+        let raised = libc::rlimit {
+            rlim_cur: wanted,
+            rlim_max: limit.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            INHERITED_OPEN_FILES.store(limit.rlim_cur, Ordering::Relaxed);
+            return wanted;
+        }
+    }
+    limit.rlim_cur
 }
 
 /// This process's resident memory.

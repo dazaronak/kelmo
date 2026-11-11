@@ -268,6 +268,116 @@ def role(command):
     return Path(words[0]).name if words else '?'
 
 
+# struct vnode_fdinfowithpath (proc_fileinfo 24 bytes, vnode_info 152, then the path) for PROC_PIDFDVNODEPATHINFO.
+VNODE_PATH_INFO_SIZE, VNODE_PATH_OFFSET = 1200, 176
+
+
+def open_paths(pid):
+    """The paths of the files `pid` has open, or an empty set once it is gone (or may not be inspected)."""
+    if sys.platform != 'darwin':
+        paths = set()
+        try:
+            entries = list((Path('/proc') / str(pid) / 'fd').iterdir())
+        except OSError:
+            return paths
+        for entry in entries:
+            try:
+                paths.add(os.readlink(entry))
+            except OSError:
+                continue
+        return paths
+    import ctypes
+    libproc = ctypes.CDLL('/usr/lib/libproc.dylib', use_errno=True)
+    size = libproc.proc_pidinfo(pid, 1, 0, None, 0)  # PROC_PIDLISTFDS: an array of (int32 fd, uint32 type)
+    if size <= 0:
+        return set()
+    listing = ctypes.create_string_buffer(size + 512)
+    size = libproc.proc_pidinfo(pid, 1, 0, listing, len(listing))
+    info, paths = ctypes.create_string_buffer(VNODE_PATH_INFO_SIZE), set()
+    for offset in range(0, max(size, 0) - max(size, 0) % 8, 8):
+        fd = int.from_bytes(listing.raw[offset:offset + 4], 'little', signed=True)
+        if int.from_bytes(listing.raw[offset + 4:offset + 8], 'little') != 1:  # PROX_FDTYPE_VNODE
+            continue
+        if libproc.proc_pidfdinfo(pid, fd, 2, info, VNODE_PATH_INFO_SIZE) != VNODE_PATH_INFO_SIZE:
+            continue
+        raw = info.raw[VNODE_PATH_OFFSET:]
+        paths.add(raw[:raw.index(b'\0')].decode(errors='replace'))
+    return paths
+
+
+def check_open_paths():
+    """`open_paths` must see a file this process holds open, or the structural check would pass on no evidence."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(prefix='kelmo-open-') as held:
+        seen = open_paths(os.getpid())
+        if not any(Path(path).name == Path(held.name).name for path in seen):
+            raise RuntimeError(f'open_paths cannot see this process\'s own open file ({held.name})')
+
+
+def daemon_tree(pid):
+    """(pid, role) of kelmod and every process below it."""
+    return [(pid, role(command_of(pid)))] + [(child, role(command)) for child, _rss, command in descendants(pid)]
+
+
+WATCHED = {'journal': ('journal.sqlite3',), 'archive': ('archive.db',), 'outbox': ('outbox',)}
+
+
+def watched_name(vault, path):
+    """Which watched store an open path belongs to (its -wal and -shm files included), or None."""
+    if not path.startswith(str(vault)):
+        return None
+    for name, needles in WATCHED.items():
+        if any(needle in Path(path).name or f'/{needle}' in path for needle in needles):
+            return name
+    return None
+
+
+class Structure:
+    """Every `interval` seconds: the size of kelmod's process tree and which roles hold the watched stores open."""
+
+    def __init__(self, vault, pid, interval=2.0):
+        self.vault, self.pid, self.interval = Path(vault).resolve(), pid, interval
+        self.counts, self.holders, self.error = [], {}, None
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._guarded, daemon=True)
+
+    def sample(self):
+        tree = daemon_tree(self.pid)
+        self.counts.append(len(tree))
+        for pid, name in tree:
+            for path in open_paths(pid):
+                store = watched_name(self.vault, path)
+                if store is not None:
+                    by_role = self.holders.setdefault(store, {})
+                    by_role[name] = by_role.get(name, 0) + 1
+
+    def _guarded(self):
+        try:
+            while not self.stopped.wait(self.interval):
+                self.sample()
+        except Exception as error:  # a run without this evidence proves nothing: reported as an error
+            self.error = error
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stopped.set()
+        self.thread.join()
+
+
+def settled_tree(pid, limit=60.0):
+    """The size of kelmod's tree once it holds still for three samples a second apart."""
+    end, sizes = time.monotonic() + limit, []
+    while time.monotonic() < end:
+        sizes.append(len(daemon_tree(pid)))
+        if len(sizes) >= 3 and len(set(sizes[-3:])) == 1:
+            return sizes[-1]
+        time.sleep(1)
+    raise RuntimeError(f'kelmod\'s process tree did not settle: {sizes[-5:]}')
+
+
 class Sampler:
     def __init__(self, interval=1.0):
         self.interval, self.samples, self.stopped = interval, [], threading.Event()
@@ -462,6 +572,10 @@ async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
     results, ids, ready = Results(), seed_ids(vault), []
     logs = Path(vault).parent / f'{Path(vault).name}-logs'
     logs.mkdir(exist_ok=True)
+    structure, tree = None, {}
+    if daemon:
+        check_open_paths()
+        tree['before'] = settled_tree(daemon['process'].pid)
     with Sampler() as sampler:
         deadline = time.monotonic() + warmup + seconds
         try:
@@ -469,9 +583,16 @@ async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
                      for n in range(sessions)]
             await asyncio.sleep(warmup)
             measured_from = time.monotonic()
+            if daemon:
+                structure = Structure(vault, daemon['process'].pid).__enter__()
             # A session stuck on a dead daemon must not hold the run forever.
             await asyncio.wait_for(asyncio.gather(*tasks), timeout=seconds + 120)
+            if daemon:
+                structure.__exit__()
+                tree['after'] = len(daemon_tree(daemon['process'].pid))
         finally:
+            if structure is not None:
+                structure.__exit__()
             if daemon:
                 daemon['process'].terminate()
                 try:
@@ -479,8 +600,15 @@ async def drive(kelmo, vault, sessions, seconds, warmup, daemon=None):
                 except subprocess.TimeoutExpired:
                     daemon['process'].kill()
                     daemon['process'].wait()
-    return {'sessions': sessions, 'sessions_ready': len(ready), 'seconds': seconds, 'warmup_seconds': warmup,
-            'operations': results.summary(), 'processes': sampler.summary(measured_from)}
+    report = {'sessions': sessions, 'sessions_ready': len(ready), 'seconds': seconds, 'warmup_seconds': warmup,
+              'operations': results.summary(), 'processes': sampler.summary(measured_from)}
+    if structure is not None:
+        if structure.error is not None:
+            raise RuntimeError(f'structural sampling failed: {structure.error!r}') from structure.error
+        tree.update(during_min=min(structure.counts, default=None), during_max=max(structure.counts, default=None),
+                    samples=len(structure.counts))
+        report['structure'] = {'daemon_tree': tree, 'open_by_role': structure.holders}
+    return report
 
 
 def run(args):
@@ -516,6 +644,163 @@ def run(args):
     print(document)
 
 
+# --- drain under load ----------------------------------------------------------------------------------------
+
+def is_refusal(code):
+    return code.startswith('E_')
+
+
+async def drain_session(number, daemon, stop, writes, results):
+    """Writes (store, create) and reads (search) until the daemon is gone. Every write is recorded with its
+    marker, when it started relative to the stop signal, and how it ended."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+    rng = random.Random(1000 + number)
+    transport = StreamableHttpTransport(daemon['url'], headers={'Authorization': 'Bearer ' + daemon['token']})
+    sequence = 0
+    try:
+        async with Client(transport) as client:
+            while True:
+                # A create with `wait` stays in flight for seconds, so the SIGTERM always meets writes mid-call.
+                op = rng.choices(('store', 'create', 'create_wait', 'search'), (50, 15, 10, 25))[0]
+                sequence += 1
+                marker = f'drain-{number:03d}-{sequence:05d}'
+                begin = time.monotonic()
+                entry = {'marker': marker, 'op': op, 'begin': begin}
+                try:
+                    if op == 'store':
+                        stored = await client.call_tool('memory_store', {
+                            'content': text(rng, marker), 'kind': 'event', 'domain': 'dev',
+                            'project': PROJECT, 'tags': ['loadtest', 'drain']})
+                        entry.update(ok=True, id=stored.data['id'])
+                    elif op in ('create', 'create_wait'):
+                        await client.call_tool('memory_create', {
+                            'content': f'---\ndate: 2026-11-11\nproject: {PROJECT}\ndomain: dev\nstatus: shipped\n'
+                                       f'tags: [loadtest, synthetic, drain]\n---\n\n{text(rng, marker)}\n',
+                            'project': PROJECT, 'idempotency_key': marker,
+                            'wait': 3 if op == 'create_wait' else 0})
+                        entry.update(ok=True)
+                    else:
+                        await client.call_tool('memory_search', {'query_en': ' '.join(rng.sample(EN, 3)),
+                                                                 'query_ru': ' '.join(rng.sample(RU, 3)),
+                                                                 'limit': 5})
+                        entry.update(ok=True)
+                    results.add(op, time.monotonic() - begin)
+                except Exception as error:  # every failure is classified below; none is retried here
+                    code = error_code(error)
+                    entry.update(ok=False, error=code)
+                    results.add(op, time.monotonic() - begin, code)
+                entry['end'] = time.monotonic()
+                if op != 'search':
+                    writes.append(entry)
+                if not entry['ok'] and stop['exited']:
+                    return
+                if not entry['ok'] and stop['at'] is not None:
+                    await asyncio.sleep(0.2)  # the daemon is stopping: refusals come at once, so pace them
+    except Exception as error:  # the session's own transport ended: after the daemon exited this is expected
+        results.add('session', 0.0, error_code(error))
+
+
+def archived(vault, writes):
+    """Which writes left a trace, by the marker each one carries: a store in the archive, a create in the
+    archive or in its captured source (a create is captured into the journal first and archived later).
+    Read only after kelmod exited, so nothing writes while this reads."""
+    import re
+    import sqlite3
+    database = Path(vault) / '.state' / 'archive.db'
+    candidates = [database] + sorted(Path(vault).glob('**/archive.db'))
+    archive = next((path for path in candidates if path.exists()), None)
+    journal = Path(vault) / '.state' / 'journal.sqlite3'
+    found, sources = set(), 0
+    pattern = re.compile(r'Record (drain-\d{3}-\d{5})\.')
+    if archive is not None:
+        with sqlite3.connect(f'file:{archive}?mode=ro', uri=True) as connection:
+            for (content,) in connection.execute("SELECT content FROM memories WHERE content LIKE '%Record drain-%'"):
+                found.update(pattern.findall(content))
+    in_archive = len(found)
+    if journal.exists():
+        with sqlite3.connect(f'file:{journal}?mode=ro', uri=True) as connection:
+            for (path,) in connection.execute("SELECT source_path FROM operations WHERE intent = 'create'"):
+                source = Path(path) if path.startswith('/') else Path(vault) / path
+                try:
+                    found.update(pattern.findall(source.read_text()))
+                    sources += 1
+                except OSError:
+                    continue
+    for entry in writes:
+        entry['persisted'] = entry['marker'] in found
+    return {'archive': str(archive), 'markers_in_archive': in_archive, 'create_sources_read': sources}
+
+
+async def drain_drive(vault, daemon, sessions, stop_after):
+    results, writes = Results(), []
+    stop = {'at': None, 'exited': False}
+    tasks = [asyncio.create_task(drain_session(n, daemon, stop, writes, results)) for n in range(sessions)]
+    await asyncio.sleep(stop_after)
+    process = daemon['process']
+    stop['at'] = time.monotonic()
+    process.terminate()
+    while process.poll() is None and time.monotonic() - stop['at'] < 60:
+        await asyncio.sleep(0.05)
+    stopped_in = time.monotonic() - stop['at']
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+    stop['exited'] = True
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=60)
+    return results, writes, process.returncode, stop['at'], stopped_in
+
+
+def drain(args):
+    """SIGTERM to kelmod in the middle of a write load; afterwards every acknowledged write must be found."""
+    vault = Path(args.vault).absolute()
+    copy = vault.parent / f'{vault.name}-drain'
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(vault, copy, symlinks=True)
+    logs = copy.parent / f'{copy.name}-logs'
+    logs.mkdir(exist_ok=True)
+    daemon = start_daemon(args.daemon, copy, logs, args.archive_in_process)
+    results, writes, exit_code, stop_at, stopped_in = asyncio.run(
+        drain_drive(copy, daemon, args.sessions, args.stop_after))
+    trace = archived(copy, writes)
+    acknowledged = [w for w in writes if w['ok']]
+    lost = [w for w in acknowledged if not w['persisted']]
+    refused = [w for w in writes if not w['ok'] and is_refusal(w['error'])]
+    broken = [w for w in writes if not w['ok'] and not is_refusal(w['error'])]
+    # In flight at the SIGTERM: begun before it, ended after it. Each must end with its reply or a refusal.
+    in_flight = [w for w in writes if w['begin'] < stop_at <= w['end']]
+    unanswered = [w for w in broken if w['begin'] < stop_at]
+
+    def counts(entries):
+        return {code: sum(1 for w in entries if w['error'] == code) for code in sorted({w['error'] for w in entries})}
+
+    report = {
+        'sessions': args.sessions, 'stop_after_seconds': args.stop_after,
+        'archive_in_process': bool(args.archive_in_process), 'platform': sys.platform,
+        'kelmod_exit_code': exit_code, 'stop_seconds': round(stopped_in, 2),
+        'writes': len(writes), 'acknowledged': len(acknowledged),
+        'in_flight_at_stop': len(in_flight),
+        'in_flight_acknowledged': sum(1 for w in in_flight if w['ok']),
+        'in_flight_refused': counts([w for w in in_flight if not w['ok'] and is_refusal(w['error'])]),
+        'lost': [f'{w["op"]} {w["marker"]}' for w in lost],
+        'unanswered_before_stop': [f'{w["op"]} {w["marker"]} {w["error"]}' for w in unanswered],
+        'refused': counts(refused),
+        'refused_but_persisted': [f'{w["op"]} {w["marker"]}' for w in refused if w['persisted']],
+        'transport_failures_after_stop': counts([w for w in broken if w['begin'] >= stop_at]),
+        'transport_failures_persisted': [f'{w["op"]} {w["marker"]}' for w in broken if w['persisted']],
+        'operations': results.summary(), 'trace': trace,
+        'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+    }
+    report['passed'] = not lost and not unanswered and exit_code == 0 and stopped_in < 40
+    document = json.dumps(report, indent=2, ensure_ascii=False)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(document + '\n')
+    print(document)
+    if not args.keep:
+        shutil.rmtree(copy, ignore_errors=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest='command', required=True)
@@ -534,6 +819,15 @@ def main(argv=None):
     r.add_argument('--daemon', metavar='KELMOD', help='measure the 0.2 shape: one kelmod serve for the vault')
     r.add_argument('--archive-in-process', action='store_true',
                    help='with --daemon: no confined archive worker (needed inside a sandbox that forbids nesting)')
+    d = commands.add_parser('drain', help='stop kelmod in the middle of a write load and check every write')
+    d.add_argument('--vault', required=True)
+    d.add_argument('--daemon', metavar='KELMOD', required=True)
+    d.add_argument('--sessions', type=int, default=20)
+    d.add_argument('--stop-after', type=float, default=20.0, help='seconds of load before the SIGTERM')
+    d.add_argument('--out')
+    d.add_argument('--keep', action='store_true', help='keep the vault copy')
+    d.add_argument('--archive-in-process', action='store_true',
+                   help='no confined archive worker (needed inside a sandbox that forbids nesting)')
     k = commands.add_parser('broker', help='the synthetic embedding broker (stdio), used by sessions')
     k.add_argument('--tokenizer', required=True)
     args = parser.parse_args(argv)
@@ -541,6 +835,8 @@ def main(argv=None):
         build(args)
     elif args.command == 'run':
         run(args)
+    elif args.command == 'drain':
+        drain(args)
     else:
         serve_broker(args.tokenizer, sys.stdin.buffer, sys.stdout.buffer)
 

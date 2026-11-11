@@ -150,7 +150,8 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             let value: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
             let spec = Spec::from_json(&value)?;
             let ephemeral = options.named.contains_key("ephemeral");
-            let code = runtime().block_on(async move {
+            let runtime = runtime();
+            let code = runtime.block_on(async move {
                 let Some(http) = spec.http.clone() else {
                     return daemon::serve(spec, ephemeral).await;
                 };
@@ -170,6 +171,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 });
                 daemon::serve_with(spec, ephemeral, Some(prepare)).await
             });
+            // Dropping the runtime would wait for a task that never yields (a stalled router) and keep the
+            // process from exiting; past the timeout the process exits and leaves such a thread behind.
+            runtime.shutdown_timeout(Duration::from_secs(5));
             Ok(ExitCode::from(code as u8))
         }
         Some("embed") => {

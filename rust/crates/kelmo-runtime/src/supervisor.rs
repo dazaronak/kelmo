@@ -171,7 +171,9 @@ pub async fn supervise(
     } = supervised;
     let mut budget = Budget::new(restart_max, restart_window);
     let mut first = true;
-    // Once the router is gone its command channel stays closed: read it once, not on every turn of the loop.
+    // A closed command channel (every sender gone) stays closed: read it once, not on every turn of the loop.
+    // While the daemon runs it keeps a sender of its own, so the channel stays open and a stop arrives as
+    // `Command::Stop`, from the router or, when the router is lost, from the daemon itself.
     let mut commands_open = true;
     loop {
         if !first && !budget.restart(Instant::now()) {
@@ -185,6 +187,9 @@ pub async fn supervise(
             Err(_) => {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let _ = events.send(Event::CoreExited { core: index });
+                if stop_waiting(&mut commands) {
+                    return;
+                }
                 continue;
             }
         };
@@ -198,14 +203,15 @@ pub async fn supervise(
         });
         let writer_task = tokio::spawn(write_frames(writer, queue));
         let forward = events.clone();
+        // The channel is read until the core closes it, even once the router is gone: a stopping core answers
+        // `admin.stop` before it drains, and that answer must not end the read (and with it the core).
         let mut reader_task = tokio::spawn(read_frames(reader, move |header, body| {
-            forward
-                .send(Event::CoreFrame {
-                    core: index,
-                    header,
-                    body,
-                })
-                .is_ok()
+            let _ = forward.send(Event::CoreFrame {
+                core: index,
+                header,
+                body,
+            });
+            true
         }));
         let mut sampler = tokio::time::interval(sample);
         sampler.tick().await;
@@ -229,20 +235,25 @@ pub async fn supervise(
                 }
                 ended = &mut reader_task, if !reader_task.is_finished() => {
                     let reason = ended.ok().flatten();
+                    if stop_deadline.is_some() && reason.is_none() {
+                        // A core asked to stop or restart closes its channel as it ends: wait for its exit or
+                        // the deadline.
+                        continue;
+                    }
                     // A core that is ending closes its channel first: a moment for it to exit names its status.
-                    let exited = if reason.is_none() && !stopping {
+                    let exited = if reason.is_none() {
                         tokio::time::timeout(Duration::from_secs(1), child.wait()).await.ok().and_then(Result::ok)
                     } else {
                         None
                     };
+                    let then = if stopping { "" } else { "; restarting it" };
                     match (reason, exited) {
                         (Some(reason), _) => eprintln!(
-                            "kelmod: the channel of core {} stopped ({reason}); restarting it", core.name),
+                            "kelmod: the channel of core {} stopped ({reason}){then}", core.name),
                         (None, Some(status)) => eprintln!(
-                            "kelmod: core {} exited ({status}); restarting it", core.name),
-                        (None, None) if !stopping => eprintln!(
-                            "kelmod: the channel of core {} stopped; restarting it", core.name),
-                        (None, None) => {}
+                            "kelmod: core {} exited ({status}){then}", core.name),
+                        (None, None) => eprintln!(
+                            "kelmod: the channel of core {} stopped{then}", core.name),
                     }
                     sys::kill_group(pid);
                     let _ = child.kill().await;
@@ -263,6 +274,9 @@ pub async fn supervise(
                     Some(Command::Stop) => {
                         stopping = true;
                         stop_deadline.get_or_insert(tokio::time::Instant::now() + drain);
+                        // Closing kelmod's half of the channel is a stop the core sees even when the router that
+                        // would send `admin.stop` is stuck: the core reads end of file, drains and exits.
+                        writer_task.abort();
                     }
                     None => {
                         commands_open = false;
@@ -278,6 +292,8 @@ pub async fn supervise(
                 } => {
                     sys::kill_group(pid);
                     let _ = child.kill().await;
+                    // Spent: the killed core's exit ends the loop, and a past deadline must not spin it.
+                    stop_deadline = None;
                 }
             }
         }
@@ -286,21 +302,27 @@ pub async fn supervise(
         sys::kill_group(pid);
         kill_leftovers(&executors);
         let _ = events.send(Event::CoreExited { core: index });
-        // A stop that came while the core was ending must not let a new one start.
-        loop {
-            match commands.try_recv() {
-                Ok(Command::Stop) | Err(TryRecvError::Disconnected) => {
-                    stopping = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(TryRecvError::Empty) => break,
-            }
-        }
-        if stopping {
+        // A stop that came while the core was ending, or during the pause before the next start, must not let a
+        // new one start.
+        if stopping || stop_waiting(&mut commands) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+        if stop_waiting(&mut commands) {
+            return;
+        }
+    }
+}
+
+/// True when a stop waits in the command channel, or every sender is gone. Other commands are dropped: no core
+/// runs to apply them to.
+fn stop_waiting(commands: &mut UnboundedReceiver<Command>) -> bool {
+    loop {
+        match commands.try_recv() {
+            Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return true,
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => return false,
+        }
     }
 }
 

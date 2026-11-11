@@ -6,6 +6,8 @@
 //! Nothing here blocks: every send is to an unbounded channel whose depth is bounded by calls in flight.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
@@ -15,6 +17,39 @@ use crate::lane::{Entry, Lane};
 use crate::spec::{Replay, Spec};
 
 pub type Outbound = UnboundedSender<Vec<u8>>;
+
+/// When the router last finished handling an event. The daemon's tick reaches it every 50 ms, so a router that
+/// is stuck or gone shows here as a growing age, and the daemon withholds its watchdog pings.
+#[derive(Clone)]
+pub struct Beat {
+    epoch: Instant,
+    last_ms: Arc<AtomicU64>,
+}
+
+impl Default for Beat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Beat {
+    pub fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn mark(&self) {
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(now, Ordering::Relaxed);
+    }
+
+    pub fn age(&self) -> Duration {
+        let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+        self.epoch.elapsed().saturating_sub(last)
+    }
+}
 
 /// Who sent a call, and so where its reply goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,7 +180,6 @@ pub struct Router {
     next: u64,
     last_heartbeat: Instant,
     started: Instant,
-    pub fatal: Option<i32>,
     shutting_down: bool,
     /// Set by a shutdown: admitted calls may finish until then, new client calls are refused as retryable.
     drain_until: Option<Instant>,
@@ -249,7 +283,6 @@ impl Router {
             next: 1,
             last_heartbeat: now,
             started: now,
-            fatal: None,
             shutting_down: false,
             drain_until: None,
             stopped: false,
@@ -264,10 +297,13 @@ impl Router {
         mut self,
         mut events: UnboundedReceiver<Event>,
         ready: UnboundedSender<()>,
+        beat: Beat,
     ) -> Self {
         let mut announced = false;
+        beat.mark();
         while let Some(event) = events.recv().await {
             self.handle(event);
+            beat.mark();
             if !announced && self.all_ready() {
                 announced = true;
                 let _ = ready.send(());
@@ -275,7 +311,7 @@ impl Router {
             if self.shutting_down {
                 self.stop_when_drained();
             }
-            if self.stopped || self.fatal.is_some() {
+            if self.stopped {
                 break;
             }
         }

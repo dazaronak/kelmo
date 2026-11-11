@@ -43,7 +43,9 @@ def memory_limits(spec):
 
 def service_definition(home, launcher, root, platform, limits=None):
     """One user service that keeps the machine daemon running. On Linux it is a `Type=notify` unit with a
-    watchdog (kelmod sends READY and WATCHDOG) and, given `limits`, the memory bounds of the tree."""
+    watchdog (kelmod sends READY and WATCHDOG) and, given `limits`, the memory bounds of the tree. A stop
+    signals kelmod alone (`KillMode=mixed`): kelmod drains its cores, and whatever outlives it is killed. A core
+    the kernel kills at `MemoryMax` is restarted by kelmod (`OOMPolicy=continue`) instead of the whole unit."""
     import plistlib
     # The launcher rebuilds the spec at every start, then execs kelmod: systemd's main pid stays kelmod.
     argv = [str(launcher), 'daemon', 'run', '--vault', str(root)]
@@ -59,7 +61,8 @@ def service_definition(home, launcher, root, platform, limits=None):
         memory = '' if limits is None else f'\nMemoryHigh={limits[0]}M\nMemoryMax={limits[1]}M'
         data = ('[Unit]\nDescription=Kelmo daemon\n[Service]\nType=notify\nNotifyAccess=main\nExecStart='
                 + ' '.join(quote(a) for a in argv)
-                + '\nRestart=on-failure\nRestartSec=2\nRestartPreventExitStatus=78\nTimeoutStopSec=40'
+                + '\nRestart=on-failure\nRestartSec=2\nRestartPreventExitStatus=78\nKillMode=mixed\nOOMPolicy=continue'
+                + '\nTimeoutStopSec=40'
                 + '\nWatchdogSec=30' + memory + '\n[Install]\nWantedBy=default.target\n').encode()
     else:
         raise KelmoError('E_CONFIG', 'The machine daemon runs as a launchd or systemd user service.')

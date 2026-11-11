@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+/// The longest drain a core gets on a stop.
+pub const MAX_DRAIN: Duration = Duration::from_secs(25);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
     /// One queue, first in first out.
@@ -159,7 +162,10 @@ impl Spec {
             sample: millis(value, "sample_ms", 10_000)?,
             restart_max: number(value, "restart_max", 5)? as usize,
             restart_window: millis(value, "restart_window_ms", 60_000)?,
-            drain_timeout: millis(value, "drain_timeout_ms", 20_000)?,
+            // A stop takes the router's wait (at most 13 s), then the cores' drain from their stop: with 25 s
+            // that is about 38 s, inside the service managers' 40 s stop timeout; a longer drain would be cut by
+            // their SIGKILL.
+            drain_timeout: millis(value, "drain_timeout_ms", 20_000)?.min(MAX_DRAIN),
             http: value.get("http").filter(|http| !http.is_null()).cloned(),
             meta: value.get("meta").cloned().unwrap_or(Value::Null),
         })
