@@ -7,9 +7,21 @@ use std::os::fd::RawFd;
 
 use tokio::process::Command;
 
+/// Highest descriptor number the child sweep looks at; a soft limit of "unlimited" would make the sweep
+/// endless, and a daemon that holds more descriptors than this has a different problem.
+const SWEEP_LIMIT: RawFd = 1 << 16;
+
 /// Arranges for `fds[i].0` (open in this process, close-on-exec) to appear as descriptor `fds[i].1` in the
 /// child, and for nothing else beyond stdio to be inherited.
+///
+/// Where the platform has no atomic close-on-exec (macOS: `pipe` and `socketpair` set the flag in a second
+/// call), a descriptor another thread created a moment before the fork reaches the child without the flag.
+/// A long-lived core holding the write end of another spawn's exec-status pipe blocks that spawn forever, and
+/// cores holding each other's channels outlive the daemon. So the child marks every descriptor from 3 up,
+/// except the mapped targets, close-on-exec before it execs.
 pub fn map_descriptors(command: &mut Command, fds: Vec<(RawFd, RawFd)>) {
+    // SAFETY: getdtablesize has no memory effects.
+    let limit = unsafe { libc::getdtablesize() }.clamp(4, SWEEP_LIMIT);
     // SAFETY: the closure runs in the forked child before exec and calls only dup2 and fcntl, which are
     // async-signal-safe; it allocates nothing.
     unsafe {
@@ -24,6 +36,15 @@ pub fn map_descriptors(command: &mut Command, fds: Vec<(RawFd, RawFd)>) {
                     }
                 } else if libc::dup2(source, target) < 0 {
                     return Err(io::Error::last_os_error());
+                }
+            }
+            for fd in 3..limit {
+                if fds.iter().any(|&(_, target)| target == fd) {
+                    continue;
+                }
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
                 }
             }
             Ok(())
