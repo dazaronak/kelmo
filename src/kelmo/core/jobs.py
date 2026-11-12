@@ -47,6 +47,9 @@ APPLY_QUICK_RESUMES = 2
 # DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day; one the core's stop ended costs no try.
 DREAM_TRIES = 3
 DREAM_RETRY_SECONDS = 900
+# Answers of a started daily run that complete the day; answers that give the try back.
+DREAM_DAY_STATES = ('finished', 'idle')
+DREAM_HELD_STATES = ('deferred', 'paused')
 # After a core agrees to a recycle, no job starts for this long: kelmod stops it at once, and if no stop comes
 # the core goes on as before.
 RECYCLE_GATE_SECONDS = 30.0
@@ -257,7 +260,15 @@ class Jobs:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
                 self._record_apply_end(stopped=stopped)
         if daily:
-            self._record_dream_day()
+            state = result.get('state') if isinstance(result, dict) else None
+            if state in DREAM_DAY_STATES:
+                self._record_dream_day()
+            elif state in DREAM_HELD_STATES:
+                # A usage limit or a pause met after the start: Dreaming's own hold brings the run back, and the
+                # try is not the run's failure.
+                self._record_dream_try(undo=True)
+            # Any other answer (a failed findings pass) keeps its try: the run is tried again after
+            # DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day.
         return result
 
     def _admin(self):

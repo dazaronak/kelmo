@@ -1,6 +1,7 @@
 """A state core told to stop: a job's model call ends at once, the job ends as stopped with nothing held and
 nothing charged, and a recycle request is declined while a job runs and closes the gate when none does."""
 import os
+import sys
 import threading
 import time
 
@@ -12,7 +13,7 @@ from test_action_state import world_factory as world_factory  # noqa: F401
 from kelmo import stopping
 from kelmo.core.jobs import RECYCLE_GATE_SECONDS
 from kelmo.daemon import execute
-from kelmo.errors import KelmoError
+from kelmo.errors import KelmoError, Stopping
 
 
 def alive(pid):
@@ -53,6 +54,37 @@ def test_a_stop_ends_a_jobs_model_call_and_the_job_ends_stopped_with_its_claim_r
     assert 'graph' not in core.jobs.last_failure
     assert claim_rows(core, tokens[0]) == 0
     wait_for(lambda: not alive(pid), timeout=10, what='the executor to be killed')
+
+
+def test_a_stop_ends_a_model_call_whose_provider_closed_its_output_and_kept_running(tmp_path):
+    """The stop is checked while the provider ends, not only while it writes."""
+    marker = tmp_path / 'quiet.pid'
+    script = tmp_path / 'quiet_executor.py'
+    script.write_text('import os, sys, time\n'
+                      'sys.stdin.read()\n'
+                      f'open({str(marker)!r}, "w").write(str(os.getpid()))\n'
+                      'os.close(1); os.close(2)\n'
+                      'time.sleep(60)\n')
+    failures = []
+
+    def call():
+        try:
+            execute([sys.executable, str(script)], {}, timeout=120)
+        except BaseException as error:  # noqa: BLE001 - the test inspects what ended the call
+            failures.append(error)
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    wait_for(marker.exists, timeout=20, what='the provider to close its output')
+    pid = int(marker.read_text())
+    time.sleep(0.3)  # past the end of its output
+    began = time.monotonic()
+    stopping.request()
+    thread.join(20)
+    assert not thread.is_alive()
+    assert time.monotonic() - began < 5, 'the call ends at the stop, not at its timeout'
+    assert len(failures) == 1 and isinstance(failures[0], Stopping)
+    wait_for(lambda: not alive(pid), timeout=10, what='the provider to be killed')
 
 
 def test_no_job_starts_once_the_stop_is_requested(world_factory, core_factory):

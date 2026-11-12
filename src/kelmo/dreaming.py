@@ -214,9 +214,14 @@ class Dreaming:
                 return self._finish(run_id, 'failed', {'code': outcome.error_code or 'E_PROPOSAL',
                                                        'reason': outcome.reason or 'no findings answer'})
             accepted, rejected = self._validate(outcome.result, packet)
+        except Stopping:
+            # The core's stop cut the model call: the run is closed as stopped, the cursor stays for the next run.
+            self._finish(run_id, 'stopped', {})
+            raise
         except KelmoError as error:
             from . import stopping
             if stopping.requested():
+                self._finish(run_id, 'stopped', {})
                 raise Stopping() from error  # the core's stop caused it; the cursor stays for the next run
             return self._finish(run_id, 'failed', {'code': error.code, 'reason': str(error)})
         new, seen, repeated = [], [], 0
@@ -228,18 +233,25 @@ class Dreaming:
             else:
                 repeated += 1
         published, own = {}, {}
+        from . import stopping
         try:
             # A repeated finding still open (an earlier environment failure) is published again here.
             for fingerprint in dict.fromkeys(seen):
+                # Between publications the stop ends the run; the findings stay recorded and open, and the
+                # next run publishes the rest.
+                stopping.check()
                 row = self._row(fingerprint)
                 if row['kind'] == 'link' and row['state'] == 'open':
                     published[fingerprint] = self._publish(row, origin, contexts, budget_tokens, own)
+        except Stopping:
+            self._finish(run_id, 'stopped', {'published': published})
+            raise
         except Exception as error:
             # The findings stay recorded and open; the cursor stays, so the next run sees them again.
-            self._finish(run_id, 'failed', {'code': getattr(error, 'code', 'E_INTERNAL'), 'reason': str(error),
-                                            'published': published})
-            from . import stopping
-            if stopping.requested():
+            stopped = stopping.requested()
+            self._finish(run_id, 'stopped' if stopped else 'failed',
+                         {'code': getattr(error, 'code', 'E_INTERNAL'), 'reason': str(error), 'published': published})
+            if stopped:
                 raise Stopping() from error
             raise
         # Every finding of this window is recorded before the cursor moves past its evidence.

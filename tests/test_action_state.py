@@ -505,3 +505,65 @@ def test_action_revision_changes_when_an_authoritative_field_changes():
     record = fictional_push_record()
     assert action_revision({**record, 'state': 'pending'}) != action_revision(record)
     assert action_revision({**record, 'remote_ref': 'origin/main'}) != action_revision(record)
+
+
+def test_an_action_publication_lets_go_of_the_baton_and_keeps_the_journal_inside_it(world, monkeypatch):
+    """A StateAPI action publishes its pages and Git commit like an editor note: with the baton released, so an
+    interactive writer goes first meanwhile, and every use of the shared journal connection still holds it."""
+    import threading
+    import time
+    from kelmo.core import baton as batons
+    from kelmo.service import Service
+    from kelmo.state import ActionState
+    from kelmo.wiki import engine
+    ref = world.archive('I pushed the shared feature.\r\n')
+    update = world.update(ref)
+    world.service.close()
+    world.service = world.stack.enter_context(Service(world.root, bindings=world.bindings, shared_journal=True))
+    world.state = ActionState(world.service, world.contexts)
+    baton = batons.Baton()
+    entered, release, wrote = threading.Event(), threading.Event(), threading.Event()
+    real = engine.publish_action
+
+    def held(*args, **kwargs):
+        entered.set()
+        if not release.wait(30):
+            raise AssertionError('the publication was never let go')
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine, 'publish_action', held)
+    outcome = {}
+
+    def act():
+        try:
+            with baton.hold():
+                outcome['receipt'] = world.state.apply(update, world.origins['requester'], 'complete-push')
+        except Exception as error:  # noqa: BLE001 - reported below
+            outcome['error'] = error
+
+    def writer():
+        with baton.hold():
+            wrote.set()
+
+    world.service.journal.guard = baton.check
+    batons.install(baton)
+    act_thread = threading.Thread(target=act, daemon=True)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    try:
+        act_thread.start()
+        assert entered.wait(30), 'the publication never started'
+        began = time.monotonic()
+        writer_thread.start()
+        fast = wrote.wait(3)
+        took = time.monotonic() - began
+        release.set()
+        writer_thread.join(30)
+        act_thread.join(60)
+    finally:
+        release.set()
+        batons.install(None)
+        world.service.journal.guard = None
+    assert fast, f'the writer waited for the action publication ({took:.1f} s)'
+    assert 'error' not in outcome, outcome.get('error')
+    assert world.action()['state'] == 'completed'
+    assert outcome['receipt'].generation is not None

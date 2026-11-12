@@ -120,6 +120,44 @@ def test_a_failed_daily_run_is_tried_again_later_and_at_most_three_times(tmp_pat
     assert not jobs._dream_try_allowed(), 'the day has spent its tries'
 
 
+def test_a_daily_run_whose_findings_pass_answers_failed_is_tried_again(tmp_path, monkeypatch):
+    """Dreaming reports a failed findings pass (a timeout, a non-JSON answer) as its result, not as an exception;
+    that run did not complete, so it takes no day and keeps its try."""
+    from kelmo import dreaming_cli
+    from kelmo.core.jobs import DREAM_RETRY_SECONDS, DREAM_TRIES
+    now = [100]
+    jobs = scheduler(tmp_path, now, [])
+    monkeypatch.setattr(dreaming_cli, 'run_dream', started_then({'state': 'failed', 'code': 'E_EXECUTOR'}))
+    for _ in range(DREAM_TRIES):
+        assert jobs._dream_try_allowed()
+        assert jobs._dream({'scheduled': True, 'action': 'run'})['state'] == 'failed'
+        assert jobs._last_dream_day() is None
+        assert not jobs._dream_try_allowed(), 'a failed try waits before the next'
+        now[0] += DREAM_RETRY_SECONDS
+    assert not jobs._dream_try_allowed(), 'the day has spent its tries'
+
+
+@pytest.mark.parametrize('state', ['deferred', 'paused'])
+def test_a_daily_run_deferred_or_paused_after_its_start_takes_no_day_and_no_try(tmp_path, monkeypatch, state):
+    """A usage limit or a pause met after the start is not a failure of the run: no day, the try is given back,
+    and the run starts again once Dreaming's own hold (the limit's reset, the pause) lets it."""
+    from kelmo import dreaming_cli
+    jobs = scheduler(tmp_path, [100], [])
+    monkeypatch.setattr(dreaming_cli, 'run_dream', started_then({'state': state, 'reset_at': 500}))
+    assert jobs._dream({'scheduled': True, 'action': 'run'})['state'] == state
+    assert jobs._last_dream_day() is None
+    assert jobs._dream_try_allowed()
+
+
+@pytest.mark.parametrize('state', ['finished', 'idle'])
+def test_a_daily_run_that_finished_or_found_nothing_takes_its_day(tmp_path, monkeypatch, state):
+    from kelmo import dreaming_cli
+    jobs = scheduler(tmp_path, [100], [])
+    monkeypatch.setattr(dreaming_cli, 'run_dream', started_then({'state': state}))
+    jobs._dream({'scheduled': True, 'action': 'run'})
+    assert jobs._last_dream_day() == jobs._today()
+
+
 def test_a_daily_run_the_stop_ended_costs_no_try(tmp_path, monkeypatch):
     from kelmo import dreaming_cli
     from kelmo.errors import Stopping

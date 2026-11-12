@@ -479,15 +479,19 @@ class StateCoordinator:
             # Only an unpublished intent reaches the publisher, which reads the working registry: a
             # local edit there is named as DirtyKnowledge with its paths, not mislabelled by that read.
             # A publication already committed was recognized above and settles despite later edits.
-            engine.require_clean_baseline(self.service.root, baseline)
-            try:
-                engine.publish_action(self.service.root, operation_id)
-            except KelmoError:
-                raise
-            except ValueError as error:
-                # A page the publisher cannot render stays a typed refusal; the intent stays prepared.
-                raise KelmoError('E_CONFLICT', 'The prepared action cannot be published: ' + str(error)
-                                + ' Its intent stays pending until the page is repaired.') from error
+            # The publication (renders, registry, Git commit) reads the prepared intent through its own connection
+            # and runs under the worker lock the caller holds, so interactive writes go first meanwhile; the
+            # receipt below is written with the baton again.
+            with outside_journal():
+                engine.require_clean_baseline(self.service.root, baseline)
+                try:
+                    engine.publish_action(self.service.root, operation_id)
+                except KelmoError:
+                    raise
+                except ValueError as error:
+                    # A page the publisher cannot render stays a typed refusal; the intent stays prepared.
+                    raise KelmoError('E_CONFLICT', 'The prepared action cannot be published: ' + str(error)
+                                    + ' Its intent stays pending until the page is repaired.') from error
         generation = self._generation()
         if self.service.knowledge.registry(generation)['actions'].get(intent['action_id']) != intent['record']:
             raise KelmoError('E_PUBLICATION', 'The committed generation lacks the prepared action record.')

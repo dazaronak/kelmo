@@ -20,7 +20,7 @@ from kelmo.store.errors import ArchiveEmbeddingError, ArchiveValidationError
 from kelmo.store.memory.store import resolve_valid_from
 
 from .config import Config
-from .errors import KelmoError, sqlite_busy
+from .errors import KelmoError, Stopping, sqlite_busy
 from .journal import Journal, now
 from .contracts import (CONTRACT_VERSION, INTAKE_BEHAVIOR_VERSION, ISO_DAY,
                         EvidenceRef, Origin, SearchFilters, SourcePacket, iso_day)
@@ -907,6 +907,10 @@ class Service:
             except Exception as error:  # noqa: BLE001 - Preserve failed operations across backend faults.
                 if isinstance(error, KelmoError) and error.code == 'E_CLAIM':
                     raise
+                from . import stopping
+                if stopping.requested():
+                    # The core's stop caused it (a call no core answers any more): the note waits, uncharged.
+                    raise Stopping() from error
                 if isinstance(error, KelmoError):
                     code = error.code
                 elif isinstance(error, ArchiveEmbeddingError):

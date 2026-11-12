@@ -291,6 +291,8 @@ class CoreLink:
         except Exception as error:  # a handler bug must still answer, or the call waits for its deadline
             self._reply(context.request_id, error={'code': 'E_PROCESSING', 'message': type(error).__name__,
                                                    'retryable': False})
+        # Stopping (a BaseException) gets no reply on purpose: the core is ending, and kelmod answers the open call
+        # when it exits, replaying a read or a keyed write once the core is back.
         else:
             self._reply(context.request_id, result)
         finally:

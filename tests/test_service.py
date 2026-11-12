@@ -100,6 +100,24 @@ def test_failed_wiki_commit_keeps_receipt_and_retry_does_not_duplicate_archive(s
     assert service.status()['archive_records'] == 1
 
 
+def test_a_failure_the_core_stop_caused_leaves_the_operation_waiting_and_uncharged(service):
+    from kelmo import stopping
+    from kelmo.errors import KelmoError, Stopping
+    from kelmo.wiki import engine
+    op = service.capture(note(service), 'source.md', 'lead', 'promote')
+
+    def cut_by_the_stop(*args, **kwargs):
+        stopping.request()
+        raise KelmoError('E_ARCHIVE_PROCESS', 'The archive core is stopping.')
+
+    with patch.object(engine, 'recover_transaction', side_effect=cut_by_the_stop):
+        with pytest.raises(Stopping):
+            service.run(op['id'])
+    after = service.journal.get(op['id'])
+    assert after['state'] != 'failed' and not after['terminal']
+    assert 'failed' not in [event['stage'] for event in service.trace(op['id'])['events']]
+
+
 def test_source_tampering_stops_before_archival(service):
     op = service.capture(note(service), 'source.md', 'lead', 'promote')
     (service.root / op['source_path']).write_text('replaced')

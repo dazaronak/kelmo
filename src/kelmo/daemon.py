@@ -98,14 +98,16 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
                                        env=dict(os.environ,KELMO_INTERNAL_JOB='1'))
         except OSError:
             raise KelmoError('E_EXECUTOR', 'Executor could not be started.') from None
-        record = _record_group(process.pid)
+        record = selector = None
         output = bytearray()
         errors = bytearray()
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, output)
-        selector.register(process.stderr, selectors.EVENT_READ, errors)
         deadline = time.monotonic() + timeout
+        # Everything after the spawn is inside the try, so the group is killed whatever fails first.
         try:
+            record = _record_group(process.pid)
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ, output)
+            selector.register(process.stderr, selectors.EVENT_READ, errors)
             while selector.get_map():
                 # A stopping core ends the call now; the executor group is killed below, and the attempt is not
                 # charged.
@@ -122,13 +124,17 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
                     if len(key.data) + len(chunk) > 1048576:
                         raise KelmoError('E_EXECUTOR', 'Executor timed out or exceeded output limit.')
                     key.data.extend(chunk)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise KelmoError('E_EXECUTOR', 'Executor timed out or exceeded output limit.')
-            try:
-                return_code = process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                raise KelmoError('E_EXECUTOR', 'Executor timed out or exceeded output limit.') from None
+            # A provider can close its output and keep running; the stop is still checked while it ends.
+            while True:
+                stopping.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise KelmoError('E_EXECUTOR', 'Executor timed out or exceeded output limit.')
+                try:
+                    return_code = process.wait(timeout=min(0.02, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
             if return_code != 0:
                 if json_on_failure and not raw_output:
                     try:
@@ -152,7 +158,8 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
                 raise KelmoError('E_EXECUTOR', 'Executor must return a JSON object.')
             return result
         finally:
-            selector.close()
+            if selector is not None:
+                selector.close()
             for stream in (process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()

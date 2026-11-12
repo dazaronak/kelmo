@@ -26,6 +26,9 @@ after each run ends. Re-embedding and graph rebuild require explicit submission.
 External backup and Git sync schedules remain operator-managed.
 
 Dreaming runs daily and also applies when 20 first-pass notes are waiting.
+A daily run that does not complete (its findings pass fails, or the core dies
+under it) is tried again 15 minutes later, at most three times a day. A daily
+run ended by the daemon's own stop or by a usage limit costs no try.
 Scheduled apply waits 15 minutes after a pass, or two hours from its start if
 none of its notes was published. A pass cut short by the daemon's own stop does
 not count against progress. It resumes a minute after the stop while any of its

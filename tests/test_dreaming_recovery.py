@@ -79,6 +79,50 @@ def test_link_publication_fails_once_stays_open_then_publishes(world, monkeypatc
     assert calls == 2
 
 
+def newest_run(world):
+    return tuple(world.service.dreaming.journal.conn.execute(
+        'SELECT state, finished_at FROM dream_runs ORDER BY started_at DESC LIMIT 1').fetchone())
+
+
+def test_a_stop_during_the_findings_call_closes_the_run_as_stopped(world):
+    from kelmo.errors import Stopping
+
+    class CutByTheStop:
+        def execute(self, job):
+            raise Stopping()
+
+    with pytest.raises(Stopping):
+        world.service.dreaming.run(CutByTheStop(), origin=world.origins['editor'], contexts=world.contexts())
+    state, finished = newest_run(world)
+    assert state == 'stopped' and finished is not None, 'no run is left reading as running'
+
+
+def test_a_stop_after_the_findings_answer_publishes_nothing_more_and_keeps_them_open(world):
+    from kelmo import stopping
+    from kelmo.errors import Stopping
+    finding = {
+        'kind': 'link',
+        'pages': [NOTES, OTHER],
+        'sources': [{'fact_key': 'app.notes-scope', 'revision': world.fact('app.notes-scope')['revision']}],
+        'reason': 'Notes and archive are related.',
+    }
+    scripted = Scripted(ModelOutcome('proposal', {'findings': [finding]}))
+
+    class StopArrivesWithTheAnswer:
+        def execute(self, job):
+            outcome = scripted.execute(job)
+            stopping.request()
+            return outcome
+
+    with pytest.raises(Stopping):
+        world.service.dreaming.run(StopArrivesWithTheAnswer(), origin=world.origins['editor'],
+                                   contexts=world.contexts())
+    assert newest_run(world)[0] == 'stopped'
+    rows = world.service.dreaming.journal.conn.execute('SELECT state FROM dream_findings').fetchall()
+    assert [tuple(row) for row in rows] == [('open',)], 'recorded, not published, published by the next run'
+    assert 'app-archive' not in world.registry()['pages'][NOTES]['links']
+
+
 def test_two_link_findings_same_first_page_both_published(world):
     finding1 = {
         'kind': 'link',

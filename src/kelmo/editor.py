@@ -1862,15 +1862,18 @@ class Editor:
             return self._refuse_batch(row, batch, keys, 'E_PROPOSAL', 'The proposal cannot enter the registry: '
                                       + str(error), dispositions)
         try:
-            result, changes = engine.semantic_projection(self.service.root, registry, intent)
+            # As in the single path: renders and audits read files only, so interactive writes go first meanwhile.
+            with outside_journal():
+                result, changes = engine.semantic_projection(self.service.root, registry, intent)
         except (engine.OwnershipConflict, engine.SemanticRefusal) as error:
             return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
         except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
             self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The pages could not be rendered: '
                                   + str(error) + '. Repair the page, then retry the same request.')
         try:
-            engine.require_clean_baseline(self.service.root, result, previous=registry)
-            engine.check_budget(self.service.root, result)
+            with outside_journal():
+                engine.require_clean_baseline(self.service.root, result, previous=registry)
+                engine.check_budget(self.service.root, result)
         except KelmoError as error:
             if error.code == 'E_OWNERSHIP':
                 return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
