@@ -77,7 +77,9 @@ def handlers(core, scratch):
 
     def freeze(context, body):
         os.kill(os.getpid(), signal.SIGSTOP)
-        return {}
+        # On Linux the group stop is not synchronous for the sending thread: it could still return and send a
+        # reply before the whole process stops. The call must stay unanswered, so this handler never returns.
+        threading.Event().wait()
 
     if core == "archive":
         table = {"echo": (echo, "fast"), "relay": (relay, "fast")}

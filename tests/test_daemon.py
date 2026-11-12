@@ -625,15 +625,26 @@ def test_execute_timeout_cleans_up_child_process_group(tmp_path):
     import os
     from kelmo.daemon import execute
     pid_file = tmp_path / 'child.pid'
+    survived = tmp_path / 'child-survived.txt'
+    # The grandchild proves it survived by writing a file: a killed one can stay a zombie until init reaps it,
+    # and signal 0 still reaches a zombie.
+    child = f"import pathlib,time;time.sleep(1.5);pathlib.Path({str(survived)!r}).write_text('alive')"
     body = ("import subprocess,sys,time\n"
-            "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\n"
+            f"p=subprocess.Popen([sys.executable,'-c',{child!r}])\n"
             f"open({str(pid_file)!r},'w').write(str(p.pid))\n"
             "time.sleep(30)\n")
     with pytest.raises(KelmoError):
-        execute(executor(tmp_path, body), {}, timeout=0.2)
-    child_pid = int(pid_file.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+        execute(executor(tmp_path, body), {}, timeout=1.0)
+    try:
+        assert pid_file.exists(), 'the grandchild was never started'
+        __import__('time').sleep(2)
+        assert not survived.exists()
+    finally:
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), __import__('signal').SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
 
 
 @pytest.mark.parametrize("successful", [False, True])
