@@ -170,10 +170,13 @@ class CoreLink:
         import signal
         # `kill -USR1 <core pid>` writes every thread's stack to the core's stderr (kelmod's log).
         faulthandler.register(signal.SIGUSR1, all_threads=True)
-        if not self.hold_hello:
-            self.say_hello()
         reader = wire.FrameReader()
         try:
+            if not self.hold_hello:
+                try:
+                    self.say_hello()
+                except OSError:
+                    return  # kelmod closed the channel first; the stop still runs through _finish
             while not self._stopping.is_set():
                 try:
                     data = self.sock.recv(1048576)

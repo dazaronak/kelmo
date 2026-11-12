@@ -91,6 +91,20 @@ def test_when_kelmod_closes_the_channel_the_core_hears_of_the_stop_before_its_ca
     assert order == ['stop', 'failed']
 
 
+def test_a_channel_closed_before_the_hello_still_stops_the_core_and_fails_its_calls():
+    parent, child = socket.socketpair()
+    order = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    future.add_done_callback(lambda _: order.append('failed'))
+    parent.close()
+    serving = serve(link)
+    serving.join(30)
+    assert not serving.is_alive()
+    assert order == ['stop', 'failed']
+
+
 def test_recycle_is_declined_while_the_owner_is_busy_and_agreed_when_it_is_not():
     parent, child = socket.socketpair()
     busy = ['dream']

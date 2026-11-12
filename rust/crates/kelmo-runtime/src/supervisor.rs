@@ -62,6 +62,9 @@ where
     loop {
         let read = match reader.read(&mut buffer).await {
             Ok(0) => return None,
+            // Linux resets a Unix socket closed with unread data in it: a core that stopped reading and then
+            // closed its channel (heartbeats still queued for it) ends it as surely as end of file does.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return None,
             Err(error) => return Some(format!("read failed: {error}")),
             Ok(read) => read,
         };
@@ -412,4 +415,22 @@ pub fn start_all(
         )));
     }
     (senders, tasks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_frames;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn a_core_closing_its_channel_with_unread_frames_ends_it_without_a_reason() {
+        let (ours, core) = std::os::unix::net::UnixStream::pair().unwrap();
+        // A heartbeat the core never reads, then the core closes its end: Linux reports ECONNRESET, macOS EOF.
+        (&ours).write_all(b"unread heartbeat").unwrap();
+        drop(core);
+        ours.set_nonblocking(true).unwrap();
+        let reader = tokio::net::UnixStream::from_std(ours).unwrap();
+        let reason = read_frames(reader, |_, _| true).await;
+        assert_eq!(reason, None);
+    }
 }
