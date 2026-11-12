@@ -53,10 +53,13 @@ def service_definition(home, launcher, root, platform, limits=None):
     # The launcher rebuilds the spec at every start, then execs kelmod: systemd's main pid stays kelmod.
     argv = [str(launcher), 'daemon', 'run', '--vault', str(root)]
     if platform == 'darwin':
+        from ..core.instance import state_dir
         path = Path(home) / f'Library/LaunchAgents/{SERVICE_LABEL}.plist'
+        # launchd drops a job's output unless it names a file; kelmod says there why a core stopped or restarted.
+        log = str(state_dir(root) / 'kelmod.log')
         data = plistlib.dumps({'Label': SERVICE_LABEL, 'ProgramArguments': argv, 'RunAtLoad': True,
                                'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 5,
-                               'ExitTimeOut': STOP_TIMEOUT})
+                               'ExitTimeOut': STOP_TIMEOUT, 'StandardOutPath': log, 'StandardErrorPath': log})
     elif platform == 'linux':
         path = Path(home) / f'.config/systemd/user/{SERVICE_UNIT}'
         def quote(value):

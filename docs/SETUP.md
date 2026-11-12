@@ -240,7 +240,9 @@ evidence still requires explicit promotion through the CLI or MCP tools.
 
 macOS uses a launchd user agent; Linux uses a systemd user service
 (`Type=notify` with a watchdog and memory bounds). The latter requires a working
-user manager. Logout persistence on Linux depends on the host's
+user manager. kelmod's messages, such as why it stopped or restarted a core, go to
+`kelmod.log` in the daemon's state directory on macOS and to the user journal
+(`journalctl --user -u kelmod`) on Linux. Logout persistence on Linux depends on the host's
 user-service policy. `--no-start` prepares files without starting a service and
 reports complete=false. Omitting an executor leaves memory usable and resolutions
 pending; executor_ready and complete remain false.

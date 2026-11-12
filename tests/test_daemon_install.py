@@ -109,6 +109,8 @@ def test_darwin_service_runs_the_daemon_through_the_launcher(tmp_path):
     assert plist['Label'] == 'org.kelmo.daemon'
     assert plist['ProgramArguments'] == [str(launcher), 'daemon', 'run', '--vault', str(root)]
     assert plist['KeepAlive'] == {'SuccessfulExit': False}
+    # launchd keeps a job's output only in a named file: kelmod's reasons for a core stop land in the state dir.
+    assert plist['StandardErrorPath'] == plist['StandardOutPath'] == str(root.resolve() / '.state' / 'kelmod.log')
 
 
 def test_linux_unit_quotes_the_daemon_command_and_does_not_restart_on_status_78(tmp_path):
