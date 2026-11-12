@@ -190,6 +190,12 @@ async fn run_core(
     let mut commands_open = true;
     loop {
         if charge_restart && !budget.restart(Instant::now()) {
+            eprintln!(
+                "kelmod: core {} restarted more than {restart_max} times within {} s; giving up, kelmod exits {}",
+                core.name,
+                restart_window.as_secs(),
+                EXIT_RESTART_BUDGET
+            );
             let _ = fatal.send(EXIT_RESTART_BUDGET);
             return;
         }
@@ -197,7 +203,11 @@ async fn run_core(
         kill_leftovers(&executors);
         let (mut child, stream) = match spawn(&core) {
             Ok(spawned) => spawned,
-            Err(_) => {
+            Err(error) => {
+                eprintln!(
+                    "kelmod: core {} could not be started ({error}); trying again",
+                    core.name
+                );
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let _ = events.send(Event::CoreExited { core: index });
                 if stop_waiting(&mut commands) {
@@ -236,13 +246,16 @@ async fn run_core(
             tokio::select! {
                 status = child.wait() => {
                     planned_restart &= status.as_ref().is_ok_and(|status| status.success());
-                    if let Ok(status) = status
-                        && !stopping
-                        && !status.success()
-                    {
-                        eprintln!("kelmod: core {} exited ({status}); restarting it", core.name);
-                    } else if planned_restart && !stopping {
-                        eprintln!("kelmod: core {} stopped for its planned restart; starting it again", core.name);
+                    match status {
+                        _ if stopping => {}
+                        Ok(_) if planned_restart => {
+                            eprintln!("kelmod: core {} stopped for its planned restart; starting it again", core.name);
+                        }
+                        Ok(status) => eprintln!("kelmod: core {} exited ({status}); restarting it", core.name),
+                        Err(error) => eprintln!(
+                            "kelmod: core {} ended and its status could not be read ({error}); restarting it",
+                            core.name
+                        ),
                     }
                     // A reply the core wrote just before it ended is still in the channel: read it out first.
                     if !reader_task.is_finished() {

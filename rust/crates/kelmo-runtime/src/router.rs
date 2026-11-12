@@ -889,6 +889,11 @@ impl Router {
     /// stay queued for the restarted core.
     fn core_exited(&mut self, core: usize) {
         let state = &mut self.cores[core];
+        if !state.restarting {
+            // An exit kelmod did not ask for (a crash, an unplanned end) is never a planned restart, even right
+            // after one: the core it replaces is trimmed and recycled, not pinned.
+            state.planned = false;
+        }
         state.out = None;
         state.pid = None;
         state.ready = false;
@@ -956,7 +961,9 @@ impl Router {
         if state.samples > PIN_SAMPLES {
             state.planned = false;
         }
-        if let Some(hard) = state.hard.filter(|hard| bytes > *hard) {
+        // A core already told to stop is draining: its supervisor kills it at the end of its drain time, so a
+        // kill now would only cut the drain short.
+        if let Some(hard) = state.hard.filter(|hard| bytes > *hard && !state.stop_sent) {
             eprintln!(
                 "kelmod: core {} uses {} MiB, over its hard budget of {} MiB; killing and restarting it",
                 state.name,
@@ -1141,7 +1148,8 @@ impl Router {
     fn restart_stuck_lanes(&mut self) {
         for core in 0..self.cores.len() {
             let state = &self.cores[core];
-            if !state.ready || state.restarting {
+            // A stopping core is not restarted; its drain deadline ends it.
+            if !state.ready || state.restarting || state.stop_sent {
                 continue;
             }
             let stuck = state.lanes.iter().find(|(name, lane)| {

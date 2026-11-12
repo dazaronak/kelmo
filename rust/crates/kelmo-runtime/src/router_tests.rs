@@ -548,6 +548,34 @@ fn a_kill_after_a_planned_restart_is_not_a_planned_restart() {
 }
 
 #[test]
+fn a_crash_after_a_planned_restart_is_not_a_planned_restart() {
+    let mut harness = Harness::new(spec(60_000, 5_000));
+    harness.router.cores[STATE].hard = Some(8 * MIB);
+    harness.planned_restart();
+    // The restarted core crashes on its own: the core after it is trimmed and recycled, not pinned.
+    harness.restart(STATE);
+    assert!(!harness.router.cores[STATE].planned);
+    harness.sample(STATE, 2 * MIB);
+    assert_eq!(ops(&harness.frames(STATE)), ["admin.trim"]);
+    harness.sample(STATE, 2 * MIB);
+    assert_eq!(ops(&harness.frames(STATE)), ["admin.recycle"]);
+    assert_eq!(harness.router.cores[STATE].soft, Some(MIB));
+}
+
+#[test]
+fn a_stopping_core_over_its_hard_budget_is_left_to_its_drain() {
+    let mut harness = Harness::new(spec(60_000, 5_000));
+    harness.router.cores[STATE].hard = Some(4 * MIB);
+    harness.router.cores[STATE].stop_sent = true;
+    harness.sample(STATE, 5 * MIB);
+    assert!(
+        harness.commands(STATE).is_empty(),
+        "no kill: the drain deadline ends a stopping core"
+    );
+    assert!(!harness.router.cores[STATE].restarting);
+}
+
+#[test]
 fn the_pin_stays_below_the_hard_budget_and_recycles_resume_once_the_restart_is_old() {
     let mut harness = Harness::new(spec(60_000, 5_000));
     harness.router.cores[STATE].hard = Some(3 * MIB);
