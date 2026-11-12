@@ -14,17 +14,23 @@ repository, so no API token is stored in the repository or in GitHub secrets.
 
 ## Each release
 
-1. Set `version` in `pyproject.toml` (for example `0.1.0`) and commit it to `main`.
-2. Tag that commit `v` plus the same version and push the tag:
+1. Set the version in three places and commit them to `main`: `version` in `pyproject.toml` (for
+   example `0.2.0`), `__version__` in `src/kelmo/__init__.py`, and `workspace.package.version` in
+   `rust/Cargo.toml` (`0.2.0`; a development version is spelled `0.2.0-dev.0` there and
+   `0.2.0.dev0` in Python). `tests/test_distribution.py::test_versions_agree` fails when they
+   differ. Refresh `uv.lock` with `uv lock`.
+2. Run `ci.yml` by hand once (Actions, CI, "Run workflow"): a manual run builds the full matrix.
+3. Tag that commit `v` plus the same version and push the tag:
 
    ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.2.0
+   git push origin v0.2.0
    ```
 
-`release.yml` runs the full CI (source tests on Linux and macOS, artifact build and inspection,
-fresh installed-launcher tests), checks that the tag matches the built version, and publishes the
-exact wheel and sdist CI tested. A failed check publishes nothing. PyPI never accepts the same
+`release.yml` runs the full CI (source tests on Linux and macOS, Rust checks, a wheel for each of
+Linux x86_64 and aarch64 and macOS arm64 and x86_64, each carrying the `kelmod` binary, the sdist,
+artifact inspection, fresh installed-launcher tests), checks that the tag matches the built version,
+and publishes the exact four wheels and the sdist CI tested. A failed check publishes nothing. PyPI never accepts the same
 version twice, so a broken release is fixed by a new version, not by a re-upload.
 
 CI does not download the embedding model, so a green run does not exercise real model search. After a

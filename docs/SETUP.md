@@ -211,9 +211,10 @@ Setup registers the daemon's HTTP endpoint, `http://127.0.0.1:47821/mcp` unless
 `kelmod http-headers`, prints the bearer header only while this user's daemon
 serves that port, so no client file holds the token. Hooks call `kelmod hook`,
 which spools a capture when no daemon runs and never fails the session.
-Setup recognizes a matching registration made by `client migrate-mcp` and
-records ownership when installing hooks and instructions. It still refuses an
-unrelated registration using the same name. Removal recognizes the 0.1 stdio
+An existing `kelmo` entry that setup did not write is accepted only when it is
+identical to the entry setup would write; setup then records ownership when
+installing hooks and instructions. Any other entry with that name is refused
+(`E_CONFIG`); remove it first. Removal recognizes the 0.1 stdio
 registrations (the plain command and `mcp --reconnect`) and the HTTP ones.
 The result lists backup paths. A partial failure identifies the completed client
 steps so rerunning setup can resume without replacing unrelated configuration.
