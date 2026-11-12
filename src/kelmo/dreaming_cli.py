@@ -4,13 +4,13 @@ import json
 import plistlib
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 
 from .config import Config
 from .creation import CommandExecutor
 from .daemon import validate_config
-from .errors import KelmoError
+from .errors import KelmoError, Stopping
 from .migration_cli import read_spec
 from .service import Service
 
@@ -136,31 +136,41 @@ def dispatch(root, args):
             return run_dream(service, args.action, contexts=contexts)
 
 
-def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None):
+def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
-    The caller makes sure no other Dreaming run is in progress."""
-    dream = service.dreaming
-    settings = dream._state("settings")
-    if not settings:
-        return {"state": "unconfigured"}
-    if dream._state("paused", True):
-        return {"state": "paused"}
-    reset = dream._state("next_attempt", 0)
-    if reset > clock():
-        return {"state": "deferred", "reset_at": reset}
-    service.archive_api.assert_writer()
+    The caller makes sure no other Dreaming run is in progress.
+
+    In the state core `step` is the job step, entered once per unit of work (the settings, each note, the
+    findings pass), and `should_stop` ends the run between units and cuts a model call in flight: the run then
+    raises Stopping, holds nothing and charges no note."""
+    step = step or nullcontext
+    with step():
+        # Built inside the step: its first use creates the Dreaming tables on the shared journal connection.
+        dream = service.dreaming
+        settings = dream._state("settings")
+        if not settings:
+            return {"state": "unconfigured"}
+        if dream._state("paused", True):
+            return {"state": "paused"}
+        reset = dream._state("next_attempt", 0)
+        if reset > clock():
+            return {"state": "deferred", "reset_at": reset}
+        service.archive_api.assert_writer()
     if on_start is not None:
         on_start()
     config = validate_config(read_spec(settings["executor_config"]))
-    executor = CommandExecutor(config["argv"], config["timeout_seconds"])
+    executor = CommandExecutor(config["argv"], config["timeout_seconds"], should_stop)
     # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
     # is the owner's "run the editor now".
     from .creation import apply_pending
-    applied = apply_pending(service, executor)
+    applied = apply_pending(service, executor, should_stop=should_stop, step=step)
     if action == "apply":
         return {"state": "finished", "apply": applied}
-    result = dream.run(executor, origin=service.origin, contexts=contexts,
-                       **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
-    service.archive_api.assert_writer()
-    dream._set_state("next_attempt", result.get("reset_at", 0) if result["state"] == "deferred" else 0)
+    if should_stop is not None and should_stop():
+        raise Stopping()
+    with step():
+        result = dream.run(executor, origin=service.origin, contexts=contexts,
+                           **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
+        service.archive_api.assert_writer()
+        dream._set_state("next_attempt", result.get("reset_at", 0) if result["state"] == "deferred" else 0)
     return dict(result, apply=applied)

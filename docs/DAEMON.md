@@ -9,7 +9,11 @@ one edge core. The user service runs it as `kelmo daemon run`; see
 
 Background work runs as jobs on the state core: one queue pass (`worker`), Dreaming (`dream`), vector
 backfill, re-embedding and the graph rebuild. At most one job of a kind runs at
-a time, and a job step yields to interactive writes. Server profiles use the same
+a time, and a job step yields to interactive writes. A job holds the journal's
+writer only while it changes the journal. Model calls, waits for another lock and
+a note's publication (rendering pages, checking the registry, the Git commit) run
+without the writer, so a capture waits for the journal change in progress, not for
+a whole publication. Publications still run one at a time. Server profiles use the same
 persistent daemon and accept remote clients through the SSH gateway.
 `kelmo worker daemon --vault PATH
 --executor-config executor.json` runs the same queue pass in the foreground
@@ -23,7 +27,12 @@ External backup and Git sync schedules remain operator-managed.
 
 Dreaming runs daily and also applies when 20 first-pass notes are waiting.
 Scheduled apply waits 15 minutes after a pass, or two hours from its start if
-none of its notes was published. Paused or deferred Dreaming waits until it can
+none of its notes was published. A pass cut short by the daemon's own stop does
+not count against progress. It resumes a minute after the stop while any of its
+notes still waits, even when fewer notes wait than would start a new pass; the
+third cut in a row waits the 15 minutes. A pass the daemon did not see end,
+because the core died under it, waits 15 minutes from its start, or two hours if
+none of its notes was published by then. Paused or deferred Dreaming waits until it can
 run. A server fence holds all scheduled jobs until it is lifted: no job starts,
 and a running backfill stops before its next batch. The daemon also refuses a job
 submitted by hand and any command that changes the vault (`worker run`,
@@ -35,7 +44,7 @@ served by the daemon needs no separate Dreaming or backfill timer.
 `kelmo daemon status --json` reports the jobs under `jobs`: `active`, the recent
 outcomes, the last outcome and the last failure of each kind (the failure is kept
 across restarts, with its end time), and `schedule` with the reason a job is held
-(`paused`, `deferred`, `no_progress`, `min_interval` or `fenced`).
+(`paused`, `deferred`, `stopped`, `no_progress`, `min_interval` or `fenced`).
 
 The trusted executor configuration is JSON with argv (an absolute executable followed by
 arguments), timeout_seconds (default 120), max_attempts (default 3) and poll_seconds

@@ -10,7 +10,9 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -223,8 +225,101 @@ def load_registry(vault):
     file = config.checked_path(config.registry)
     if not file.is_file():
         raise KelmoError('E_STATE', 'Bound registry is missing; opening a store cannot initialize an authority.')
-    registry = json.loads(file.read_bytes())
-    return validate_registry(registry)
+    return parse_registry(file.read_bytes())
+
+
+# Set by the test suite: every view gets its fingerprint when parsed, and the commit path proves it left the
+# registry it was handed unchanged, so code that changes a shared registry in place fails a test.
+CHECK_VIEWS = False
+_VIEWS = OrderedDict()  # sha256 of registry bytes -> [parsed registry, its fingerprint or None]
+_VIEWS_LIMIT = 3
+_VIEWS_LOCK = threading.Lock()
+
+
+def registry_view(raw):
+    """The parsed registry for these bytes, one object per content for the whole process, never to be changed.
+
+    Read-only callers (a comparison, a lookup, the baseline of a transform that copies first, as every
+    `apply_*` does) use it instead of a private parse: one parse of a large registry costs hundreds of MiB.
+    A caller that changes a registry starts from `load_registry` or `copy.deepcopy`. The committed generation
+    and the working file carry the same bytes after a publication, so both resolve to the same object."""
+    key = hashlib.sha256(raw).digest()
+    with _VIEWS_LOCK:
+        entry = _VIEWS.get(key)
+        if entry is not None:
+            _VIEWS.move_to_end(key)
+            return entry[0]
+    registry = parse_registry(raw)
+    # Under the test suite every view gets its fingerprint at once, so changed_views() can prove none was changed.
+    known = digest(encoded(registry)) if CHECK_VIEWS else None
+    with _VIEWS_LOCK:
+        entry = _VIEWS.setdefault(key, [registry, known])
+        _VIEWS.move_to_end(key)
+        while len(_VIEWS) > _VIEWS_LIMIT:
+            _VIEWS.popitem(last=False)
+        return entry[0]
+
+
+def load_registry_view(vault):
+    """`registry_view` of the bound working registry."""
+    config = Config.load(vault)
+    file = config.checked_path(config.registry)
+    if not file.is_file():
+        raise KelmoError('E_STATE', 'Bound registry is missing; opening a store cannot initialize an authority.')
+    return registry_view(file.read_bytes())
+
+
+def fingerprint(registry):
+    """digest(encoded(registry)), computed once per shared view; any other registry is encoded each time."""
+    with _VIEWS_LOCK:
+        entry = next((entry for entry in _VIEWS.values() if entry[0] is registry), None)
+        if entry is not None and entry[1] is not None:
+            return entry[1]
+    value = digest(encoded(registry))
+    if entry is not None:
+        with _VIEWS_LOCK:
+            entry[1] = value
+    return value
+
+
+def drop_views():
+    """Forgets the kept views (a core over its memory budget); a caller still holding one keeps it."""
+    with _VIEWS_LOCK:
+        _VIEWS.clear()
+
+
+def changed_views():
+    """Shared views whose content no longer matches their fingerprint: a caller changed one (tests check this)."""
+    with _VIEWS_LOCK:
+        entries = [entry for entry in _VIEWS.values() if entry[1] is not None]
+    return [entry[1] for entry in entries if digest(encoded(entry[0])) != entry[1]]
+
+
+_VALIDATED = OrderedDict()  # sha256 of registry bytes that passed validate_registry in this process
+_VALIDATED_LIMIT = 8
+_VALIDATED_LOCK = threading.Lock()
+
+
+def parse_registry(raw):
+    """Registry bytes, parsed and validated; a fresh object every call, so a caller may change it.
+
+    Validation depends on the bytes alone, so bytes that passed once in this process are not walked again: a
+    doctor run or a HOT check reads the same registry many times, and one walk of a large registry costs
+    seconds."""
+    key = hashlib.sha256(raw).digest()
+    registry = json.loads(raw)
+    with _VALIDATED_LOCK:
+        known = key in _VALIDATED
+        if known:
+            _VALIDATED.move_to_end(key)
+    if known:
+        return registry
+    validate_registry(registry)
+    with _VALIDATED_LOCK:
+        _VALIDATED[key] = True
+        while len(_VALIDATED) > _VALIDATED_LIMIT:
+            _VALIDATED.popitem(last=False)
+    return registry
 
 
 REGISTRY_VERSION = 3
@@ -715,21 +810,54 @@ def wiki_lock(wiki_root, vault_id):
         yield
 
 
+def is_view(registry):
+    """True for a shared registry view, which was validated when it was parsed."""
+    with _VIEWS_LOCK:
+        return any(entry[0] is registry for entry in _VIEWS.values())
+
+
+def head_blobs(repository, relatives):
+    """{relative path: its bytes at HEAD, or None when HEAD has no such blob}, read by one `git cat-file`."""
+    request = ''.join('HEAD:' + relative + '\n' for relative in relatives).encode('utf-8')
+    result = subprocess.run(['git', '-C', str(repository), 'cat-file', '--batch'], input=request,
+                            capture_output=True, check=False)
+    if result.returncode:
+        raise RuntimeError('Git object inspection failed')
+    output, position, blobs = result.stdout, 0, {}
+    for relative in relatives:
+        end = output.index(b'\n', position)
+        header = output[position:end].split(b' ')
+        position = end + 1
+        if header[-1] == b'missing' or len(header) != 3:
+            blobs[relative] = None
+            continue
+        size = int(header[2])
+        blobs[relative] = output[position:position + size] if header[1] == b'blob' else None
+        position += size + 1
+    return blobs
+
+
 def wiki_committed(vault, registry=None, wiki_root=None):
     vault = Path(vault).resolve()
     config = Config.load(vault)
     wiki_root = (Path(wiki_root) if wiki_root is not None else config.wiki).resolve()
-    registry = load_registry(vault) if registry is None else validate_registry(registry)
+    if registry is None:
+        registry = load_registry_view(vault)
+    elif not is_view(registry):
+        validate_registry(registry)
     rendered = render_registry(vault, registry, wiki_root)
     rendered[config.registry] = encoded(registry)
     try:
+        roots = {'data': repository_root(config.knowledge_git_root), 'wiki': repository_root(wiki_root)}
+        expected_at_head = {}
         for path, expected in rendered.items():
-            repository = repository_root(config.knowledge_git_root if path == config.registry
-                                         else wiki_root)
-            relative = str(path.relative_to(repository))
-            if not path.exists() or path.read_bytes() != expected.encode('utf-8'):
+            repository = roots['data' if path == config.registry else 'wiki']
+            data = expected.encode('utf-8')
+            if not path.exists() or path.read_bytes() != data:
                 return False
-            if git(repository, 'show', 'HEAD:' + relative, binary=True) != expected.encode('utf-8'):
+            expected_at_head.setdefault(repository, {})[str(path.relative_to(repository))] = data
+        for repository, expected in expected_at_head.items():
+            if head_blobs(repository, list(expected)) != expected:
                 return False
         if repository_root(wiki_root) == config.knowledge_git_root:
             generation_path = config.registry.with_name('generation.json')
@@ -1675,15 +1803,17 @@ def apply_project_rename(registry, old, new):
     return result, moves
 
 
-def semantic_projection(vault, registry, intent):
+def semantic_projection(vault, registry, intent, *, result=None):
     """The registry and exact page bytes one editor intent produces at the next publication.
 
     Changes name every page whose rendering differs because of the intent, stale labels included,
     with its current bytes as the baseline. Unmanaged bytes come from the current file unchanged.
     A created page needs an absent file: an existing, even unregistered, page is never claimed.
+    `result` is the validated `apply_semantic_intent(registry, intent)` when the caller already holds it.
     """
     config = Config.load(vault)
-    result = validate_registry(apply_semantic_intent(registry, intent))
+    if result is None:
+        result = validate_registry(apply_semantic_intent(registry, intent))
     wiki = config.wiki.resolve()
     _refuse_claimed_files(wiki, registry, result)
     for target in sorted(result['pages'].keys() & registry['pages'].keys()):
@@ -1791,7 +1921,14 @@ def _preserve_v3(previous, result, vault, action_operation, semantic_operation=N
         return ownership_guard(previous, result, action_id=intent['action_id'])
     if semantic_operation is not None:
         intent = _prepared_intent(vault, semantic_operation, semantic=True)
-        if result != apply_semantic_intent(previous, intent):
+        # The intent was prepared as apply_semantic_intent(baseline) and stores both digests, so a baseline that
+        # still matches and a result that matches prove result == apply_semantic_intent(previous, intent) without
+        # building a second copy of the whole registry to compare against.
+        baseline, expected = intent.get('baseline_digest'), intent.get('result_digest')
+        if baseline is None or expected is None:
+            if result != apply_semantic_intent(previous, intent):
+                raise OwnershipConflict('Semantic publication differs from its exact prepared journal intent')
+        elif fingerprint(previous) != baseline or fingerprint(result) != expected:
             raise OwnershipConflict('Semantic publication differs from its exact prepared journal intent')
         return ownership_guard(previous, result, rule_change=intent.get('rule_change') is not None,
                                enrollment=intent.get('feature_enrollment'),
@@ -1805,8 +1942,9 @@ def _preserve_v3(previous, result, vault, action_operation, semantic_operation=N
 
 def _preserve_metadata(previous, proposed, *, vault=None, action_operation=None, semantic_operation=None,
                        registration=None, project_map=None):
-    return _preserve_v3(previous, copy.deepcopy(proposed), vault, action_operation, semantic_operation,
-                        registration, project_map)
+    # The checks only read the proposed registry, and the commit path never changes it, so it is not copied:
+    # one more copy of a large registry is the largest allocation of a publication.
+    return _preserve_v3(previous, proposed, vault, action_operation, semantic_operation, registration, project_map)
 
 
 def _projected_tree(repository, base, changes):
@@ -1913,6 +2051,30 @@ def check_budget(vault, registry):
         raise _budget_error(budget)
 
 
+def _porcelain_by_path(repository, relatives):
+    """`git status --porcelain` of many paths in one process: {path: its status entry}, paths relative to the
+    repository root. A rename or copy is listed under both of its paths, as a status of either path alone shows it;
+    a clean path is absent."""
+    if not relatives:
+        return {}
+    raw = git(repository, 'status', '--porcelain', '-z', '--untracked-files=all', '--', *relatives, binary=True)
+    fields = raw.decode('utf-8').split('\0')
+    statuses = {}
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        statuses[entry[3:]] = entry
+        if 'R' in entry[:2] or 'C' in entry[:2]:
+            # -z puts a rename's source path in the next field.
+            if index < len(fields) and fields[index]:
+                statuses[fields[index]] = entry
+            index += 1
+    return statuses
+
+
 def require_clean_baseline(vault, registry, *, previous=None):
     """Refuse, with the paths, while the registry, manifest or a registered page has local edits.
 
@@ -1990,11 +2152,13 @@ def _commit_registry(vault, registry, title, wiki_root=None, *, _wiki_locked=Fal
             raise Conflict('Explicit empty-store initialization cannot replace existing knowledge')
         previous = initial_registry(config.vault_id)
     else:
-        previous = load_registry(vault)
+        previous = load_registry_view(vault)
+        # The checks return the registry they were handed, validated above, or refuse it.
         registry = _preserve_metadata(previous, registry, vault=vault, action_operation=_action_operation,
                                       semantic_operation=_semantic_operation, registration=_registration,
                                       project_map=_project_map)
-        validate_registry(registry)
+    # Under the test suite the caller's registry must leave the commit path unchanged, since it is not copied.
+    unchanged = fingerprint(registry) if CHECK_VIEWS else None
     wiki_root = (Path(wiki_root) if wiki_root is not None else config.wiki).resolve()
     if wiki_root != config.wiki:
         raise Conflict('Publication wiki differs from its bound configuration')
@@ -2078,11 +2242,18 @@ def _commit_registry(vault, registry, title, wiki_root=None, *, _wiki_locked=Fal
                        if 'index_target' in fact}
     changed_pages = {}
     dirty = []
+    wanted = {}
+    for path in rendered:
+        name = 'data' if path == config.registry else wiki_name
+        wanted.setdefault(name, []).append(str(path.relative_to(repositories[name])))
+    # One status per repository, not one Git process per page: a vault of a few thousand pages spent most of a
+    # publication here, with the writer baton held.
+    statuses = {name: _porcelain_by_path(repositories[name], relatives) for name, relatives in wanted.items()}
     for path, text in rendered.items():
         name = 'data' if path == config.registry else wiki_name
         repository = repositories[name]
         relative = str(path.relative_to(repository))
-        status = git(repository, 'status', '--porcelain', '--', relative)
+        status = statuses[name].get(relative, '')
         wiki_relative = str(path.relative_to(wiki_root)) if path.is_relative_to(wiki_root) else None
         first_adoption = (name == 'wiki' and status.startswith('?? ')
                           and START not in (path.read_bytes().decode('utf-8') if path.exists() else '')
@@ -2172,6 +2343,8 @@ def _commit_registry(vault, registry, title, wiki_root=None, *, _wiki_locked=Fal
             raise recovery_error from error
         raise
     clear_transaction(vault)
+    if unchanged is not None and fingerprint(registry) != unchanged:
+        raise AssertionError('the commit path changed the registry it was handed')
 
 
 def initialize_registry(vault, project, title):
@@ -2204,7 +2377,7 @@ def publish_action(vault, operation_id):
     def publish(locked):
         (_recover_transaction if locked else recover_transaction)(vault)
         intent = _prepared_intent(vault, operation_id)
-        registry = load_registry(vault)
+        registry = load_registry_view(vault)
         if registry['actions'].get(intent['action_id']) == intent['record']:
             return False
         _commit_registry(vault, apply_action_intent(registry, intent),
@@ -2239,8 +2412,8 @@ def publish_semantic(vault, operation_id):
     def publish(locked):
         (_recover_transaction if locked else recover_transaction)(vault)
         intent = _prepared_intent(vault, operation_id, semantic=True)
-        registry = load_registry(vault)
-        state = digest(encoded(registry))
+        registry = load_registry_view(vault)
+        state = fingerprint(registry)
         if state == intent['result_digest']:
             return False
         if state != intent['baseline_digest']:

@@ -172,6 +172,194 @@ def test_a_held_note_waits_for_an_older_note_still_in_the_intake(world):
     assert world.fact('app.export')['text'] == 'Exports run at 12:00.'
 
 
+def test_a_pass_waiting_for_an_older_note_lets_go_of_the_baton(world):
+    """The worker that archives the older note, and every capture, write under the same baton as the pass. The
+    pass lets the baton go while it waits; holding it would stall them all until its wait budget is spent."""
+    import threading
+    from kelmo.core import baton as batons
+    from kelmo.creation import apply_pending
+    nightly(world)
+    older = world.service.create('Exports run at 11:00.', project='app', selected=[FEATURE])
+    newer = world.service.create('Exports run at 12:00.', project='app', selected=[FEATURE])
+    world.service.run(newer['id'])
+    baton = batons.Baton()
+
+    def sleep(seconds):
+        took = threading.Event()
+
+        def writer():
+            with baton.hold():
+                took.set()
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        if not took.wait(5):
+            raise AssertionError('a writer could not take the baton while the pass waited')
+        thread.join(5)
+        world.service.run(older['id'])  # the worker's write, which needed that baton
+
+    batons.install(baton)
+    try:
+        report = apply_pending(world.service, echo_export(world), sleep=sleep,
+                               step=lambda: baton.hold(interactive=False))
+    finally:
+        batons.install(None)
+    assert report['applied'] == [older['id'], newer['id']] and report['stalled'] == []
+
+
+@pytest.mark.parametrize('slow', ['semantic_projection', 'publish_semantic'])
+def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch, slow):
+    """A note's publication renders pages and commits Git; the journal sees only its prepare and its finish. A
+    capture that arrives meanwhile is written at once instead of waiting for the whole publication, and every use
+    of the shared journal connection still holds the baton."""
+    import threading
+    import time
+    from kelmo.core import baton as batons
+    from kelmo.creation import apply_pending
+    from kelmo.service import Service
+    from kelmo.wiki import engine
+    nightly(world)
+    # The state core's writer: one journal connection shared by its threads under the baton.
+    world.service = Service(world.root, shared_journal=True)
+    note = world.service.create('Exports run at 13:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    baton = batons.Baton()
+    entered, release, captured = threading.Event(), threading.Event(), threading.Event()
+    real = getattr(engine, slow)
+
+    def held(*args, **kwargs):
+        entered.set()
+        if not release.wait(30):
+            raise AssertionError('the publication was never let go')
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine, slow, held)
+    outcome = {}
+
+    def apply():
+        outcome['report'] = apply_pending(world.service, echo_export(world),
+                                          step=lambda: baton.hold(interactive=False))
+
+    def capture():
+        with baton.hold():
+            outcome['capture'] = world.service.create('Exports run at 14:00.', project='app', selected=[FEATURE])
+        captured.set()
+
+    world.service.journal.guard = baton.check
+    batons.install(baton)
+    pass_thread = threading.Thread(target=apply, daemon=True)
+    capture_thread = threading.Thread(target=capture, daemon=True)
+    try:
+        pass_thread.start()
+        assert entered.wait(30), 'the publication never started'
+        began = time.monotonic()
+        capture_thread.start()
+        fast = captured.wait(3)
+        took = time.monotonic() - began
+        release.set()
+        capture_thread.join(30)
+        pass_thread.join(60)
+    finally:
+        release.set()
+        batons.install(None)
+        world.service.journal.guard = None
+    assert fast, f'the capture waited for the publication ({took:.1f} s)'
+    assert outcome['report']['applied'] == [note['id']]
+    assert world.service.journal.get(outcome['capture']['id'])['terminal'] == 0
+
+
+def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finish(world, monkeypatch):
+    """A publisher holds the worker lock and publishes with the baton released. An interactive writer that holds the
+    baton and asks for the worker lock waits for it without the baton, so the publication takes the baton back to
+    write its receipt, and both finish in seconds: no wait until the worker lock times out, no E_BUSY."""
+    import threading
+    import time
+    from kelmo.core import baton as batons
+    from kelmo.creation import apply_pending
+    from kelmo.publication import coordinator_lock
+    from kelmo.service import Service
+    from kelmo.wiki import engine
+    nightly(world)
+    world.service = Service(world.root, shared_journal=True)
+    note = world.service.create('Exports run at 15:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    baton = batons.Baton()
+    entered, release = threading.Event(), threading.Event()
+    real = engine.publish_semantic
+
+    def held(*args, **kwargs):
+        entered.set()
+        if not release.wait(30):
+            raise AssertionError('the publication was never let go')
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(engine, 'publish_semantic', held)
+    outcome, order = {}, []
+
+    def apply():
+        outcome['report'] = apply_pending(world.service, echo_export(world),
+                                          step=lambda: baton.hold(interactive=False))
+        order.append('pass')
+
+    def writer():
+        try:
+            with baton.hold(), coordinator_lock(world.service.config):
+                order.append('writer')
+        except Exception as error:  # noqa: BLE001 - reported below
+            outcome['writer'] = error
+
+    world.service.journal.guard = baton.check
+    batons.install(baton)
+    pass_thread = threading.Thread(target=apply, daemon=True)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    try:
+        pass_thread.start()
+        assert entered.wait(30), 'the publication never started'
+        writer_thread.start()
+        time.sleep(0.3)  # the writer now holds the baton's turn and waits for the worker lock
+        began = time.monotonic()
+        release.set()
+        pass_thread.join(20)
+        writer_thread.join(20)
+        took = time.monotonic() - began
+    finally:
+        release.set()
+        batons.install(None)
+        world.service.journal.guard = None
+    assert 'writer' not in outcome, outcome.get('writer')
+    assert outcome['report']['applied'] == [note['id']]
+    assert sorted(order) == ['pass', 'writer'] and took < 10, (order, took)
+
+
+def test_a_dream_apply_reaches_the_journal_only_inside_its_steps(world, tmp_path):
+    """In the state core every use of the shared journal connection holds the baton. A dream apply on a service
+    that has not dreamed yet (as after a start), under a guard that refuses any other use, parks its note when
+    the editor fails and raises nothing."""
+    import sys
+    from kelmo.core import baton as batons
+    from kelmo.dreaming_cli import run_dream
+    nightly(world)
+    operation = world.service.create('Exports run at 16:00.', project='app', selected=[FEATURE])
+    world.service.run(operation['id'])
+    stub = tmp_path / 'failing_editor.py'
+    stub.write_text('import sys\nsys.stdin.read()\nsys.exit(3)\n', encoding='utf-8')
+    config = tmp_path / 'editor.json'
+    config.write_text(json.dumps({'argv': [sys.executable, str(stub)], 'timeout_seconds': 30}), encoding='utf-8')
+    world.service.dreaming._set_state('settings', {'executor_config': str(config), 'max_sources': 10,
+                                                   'max_pages': 10, 'budget_tokens': 100000})
+    world.service.dreaming._set_state('paused', False)
+    vars(world.service).pop('_dreaming', None)
+    baton = batons.Baton()
+    world.service.journal.guard = baton.check
+    batons.install(baton)
+    try:
+        result = run_dream(world.service, 'apply', step=lambda: baton.hold(interactive=False))
+    finally:
+        batons.install(None)
+        world.service.journal.guard = None
+    assert result['state'] == 'finished'
+    assert result['apply']['parked'] == [operation['id']]
+
+
 def test_an_older_note_the_pass_waited_an_hour_for_is_reported_and_passed(world):
     import time
     from kelmo.creation import ORDER_WAIT_SECONDS, apply_pending
@@ -487,6 +675,77 @@ def test_doubled_frontmatter_is_merged_and_an_empty_body_is_refused_at_capture(w
     plain = world.service.create('No frontmatter at all.', project='app', idempotency_key='plain')
     assert world.service.source_path(world.service.journal.get(plain['id'])).read_text(encoding='utf-8') \
         == 'No frontmatter at all.'
+
+
+def attempts_charged(world, operation_id):
+    from kelmo.creation import _parked
+    return _parked(world.service.trace(operation_id))[1]
+
+
+def test_a_pass_told_to_stop_ends_between_notes_and_holds_none(world):
+    from kelmo.creation import apply_pending, pending_operations
+    from kelmo.errors import Stopping
+    nightly(world)
+    first = world.service.create('Exports run at 13:00.', project='app', selected=[FEATURE])
+    second = world.service.create('Exports run at 14:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    world.service.run(second['id'])
+    executor = echo_export(world)
+    stop = []
+
+    def should_stop():
+        # Told to stop once the first note is placed.
+        return bool(stop) or (len(executor.jobs) == 1 and not stop.append(True))
+
+    with pytest.raises(Stopping):
+        apply_pending(world.service, executor, should_stop=should_stop)
+    assert [job.payload['source']['text'] for job in executor.jobs] == ['Exports run at 13:00.']
+    assert [operation['id'] for operation, _ in pending_operations(world.service)] == [second['id']]
+    assert world.service.journal.conn.execute('SELECT COUNT(*) FROM claims').fetchone()[0] == 0
+
+
+def test_a_failure_the_stop_causes_charges_no_attempt(world):
+    from kelmo import stopping
+    from kelmo.creation import apply_pending, pending_operations
+    from kelmo.errors import KelmoError, Stopping
+    nightly(world)
+    operation = world.service.create('Exports run at 15:00.', project='app', selected=[FEATURE])
+    world.service.run(operation['id'])
+
+    def cut(job):
+        # The core is told to stop while the editor waits for the archive, which no longer answers.
+        stopping.request()
+        raise KelmoError('E_TRANSPORT', 'The channel to kelmod closed.')
+
+    with pytest.raises(Stopping):
+        apply_pending(world.service, Scripted(cut))
+    assert world.service.journal.get(operation['id'])['state'] == 'archived'
+    assert attempts_charged(world, operation['id']) == 0
+    assert [op['id'] for op, _ in pending_operations(world.service)] == [operation['id']]
+
+
+def test_a_fault_on_one_note_skips_that_note_and_the_pass_goes_on(world, capsys):
+    from kelmo.creation import apply_pending, pending_operations
+    nightly(world)
+    broken = world.service.create('Exports run at 16:00.', project='app', selected=[FEATURE])
+    healthy = world.service.create('Exports run at 17:00.', project='app', selected=[FEATURE])
+    world.service.run(broken['id'])
+    world.service.run(healthy['id'])
+
+    def fault(job):
+        raise ValueError('a bug in one note')
+
+    def place(job):
+        return world.propose(facts=[world.change('app.export', job.payload['source']['text'])])
+
+    report = apply_pending(world.service, Scripted(fault, place))
+    assert report['skipped'] == [{'operation_id': broken['id'], 'error_code': 'E_INTERNAL'}]
+    assert report['applied'] == [healthy['id']]
+    assert world.service.journal.get(broken['id'])['state'] == 'archived', 'its journal state is untouched'
+    assert attempts_charged(world, broken['id']) == 0
+    assert [op['id'] for op, _ in pending_operations(world.service)] == [broken['id']], 'tried on the next pass'
+    assert 'ValueError: a bug in one note' in capsys.readouterr().err
+    assert world.fact('app.export')['text'] == 'Exports run at 17:00.'
 
 
 def test_dream_apply_cli_publishes_waiting_notes_and_run_applies_first(world, tmp_path, capsys):

@@ -86,15 +86,27 @@ def _decode(kind, value):
     return value
 
 
+_SHAPES = {}
+
+
+def _shape(cls):
+    """A record class's field names and resolved type hints. `get_type_hints` compiles and evaluates every
+    annotation string on each call, so it runs once per class, not once per decoded object."""
+    shape = _SHAPES.get(cls)
+    if shape is None:
+        shape = _SHAPES[cls] = (frozenset(field.name for field in fields(cls)), get_type_hints(cls))
+    return shape
+
+
 class Record:
     def to_dict(self):
         return _encode(self)
 
     @classmethod
     def from_dict(cls, value):
-        if not isinstance(value, dict) or set(value) - {field.name for field in fields(cls)}:
+        names, hints = _shape(cls)
+        if not isinstance(value, dict) or set(value) - names:
             raise ValueError('Unknown fields in ' + cls.__name__ + '.')
-        hints = get_type_hints(cls)
         try:
             return cls(**{key: _decode(hints[key], item) for key, item in value.items()})
         except TypeError as error:

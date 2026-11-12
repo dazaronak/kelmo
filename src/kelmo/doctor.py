@@ -392,7 +392,7 @@ def diagnose(root, *, archive=None):
     registry_path = _internal(config, config.registry_relative)
     if registry_path is not None and registry_path.is_file():
         try:
-            registry = engine.load_registry(config.root)
+            registry = engine.load_registry_view(config.root)
             checks['registry_integrity'] = True
         except (OSError, UnicodeError, ValueError):
             pass

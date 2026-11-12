@@ -188,6 +188,7 @@ class StateCore:
         from ..server import KeysInFlight, ServerProfile, open_archive
         from ..service import Service
         self.root = Path(root).expanduser().resolve()
+        self._spool = None
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.profile_path = Path(profile_path) if profile_path is not None else None
@@ -475,9 +476,12 @@ class StateCore:
         a hook that fails otherwise stays for the next start."""
         from . import spool
         from .instance import state_dir
+        from .. import stopping
         names = spool.entries(state_dir(self.root) / 'hook-spool')
         ingested = 0
         for path in names:
+            if stopping.requested():
+                return {'ingested': ingested, 'stopped': 'stopping'}
             try:
                 body = json.loads(path.read_text(encoding='utf-8'))
                 if (not isinstance(body, dict) or not isinstance(body.get('action'), str)
@@ -489,6 +493,9 @@ class StateCore:
             try:
                 self.serve_hook(body)
             except KelmoError as error:
+                if stopping.requested():
+                    # The stop caused it (the archive no longer answers): the capture stays for the next start.
+                    return {'ingested': ingested, 'stopped': 'stopping'}
                 if not getattr(error, 'retryable', False) and error.code not in ('E_BUSY',):
                     spool.reject(path)
                     continue
@@ -551,12 +558,49 @@ class StateCore:
                     sessions=len(self._sessions), profile=self.profile is not None, jobs=self.jobs.status())
 
     def trim(self):
+        """Over the soft budget: drop what is kept only to be fast (registry views, generation snapshots), collect,
+        and hand freed heap back to the system where the C library allows it."""
         import gc
+        from ..store.graph import parser
+        from ..wiki import engine, pages
+        engine.drop_views()
+        pages.drop_cached_snapshots()
+        parser.drop_parsed()
         gc.collect()
+        if sys.platform.startswith('linux'):
+            try:
+                import ctypes
+                ctypes.CDLL('libc.so.6').malloc_trim(0)
+            except (OSError, AttributeError):
+                pass
+
+    def recycle(self):
+        """admin.recycle: the background work running now; none means the core may be restarted, and no job starts
+        until it is (`Jobs.quiesce`)."""
+        if self._spool is not None and self._spool.is_alive():
+            return ['hook-spool']
+        return self.jobs.quiesce()
+
+    def begin_stop(self):
+        """The core is told to stop: model calls end now, and every job ends at its next step."""
+        from .. import stopping
+        stopping.request()
+        self.jobs.request_stop()
+
+    def wait_stopped(self):
+        """Waits for the jobs and the spooled-capture pass to end; kelmod kills the core at its drain deadline."""
+        self.jobs.stop()
+        if self._spool is not None:
+            self._spool.join()
+
+    def start_spool(self):
+        """Applies the captures spooled while no daemon ran, beside serving."""
+        self._spool = threading.Thread(target=self.ingest_spool, name='hook-spool', daemon=True)
+        self._spool.start()
 
     def close(self):
         from .baton import install
-        self.jobs.stop()
+        self.wait_stopped()
         with self._sessions_lock:
             self._sessions.clear()
         self.storage.close()
@@ -596,10 +640,13 @@ def main(argv=None):
     parser.add_argument('--archive-core', action='store_true', help='The archive is the supervised archive core')
     args = parser.parse_args(argv)
     writer_lock = _writer_lock(args.vault)  # noqa: F841 - held until the process ends
+    from .. import stopping
     from .corelink import CoreLink
-    # The channel exists before the core: the archive proxy calls through it while the core starts.
+    # The channel exists before the core: the archive proxy calls through it while the core starts. A stop that
+    # comes meanwhile still reaches every model call and job the core starts afterwards.
     link = CoreLink.from_descriptor(handlers={}, lanes={'handler': HANDLER_LANE, 'hook': HOOK_LANE,
-                                                        'read': args.readers, 'write': 8, 'admin': 4})
+                                                        'read': args.readers, 'write': 8, 'admin': 4},
+                                    begin_stop=stopping.request)
     serving = threading.Thread(target=link.serve, name='corelink', daemon=True) if args.archive_core else None
     if serving is not None:
         link.hold_hello = True
@@ -608,9 +655,12 @@ def main(argv=None):
                      worker_config=args.worker_config, schedule=args.schedule,
                      archive_link=link if args.archive_core else None)
     link.handlers, link.trim, link.status = core.handlers(), core.trim, core.status
+    link.recycle, link.begin_stop, link.wait_stopped = core.recycle, core.begin_stop, core.wait_stopped
     link.operations = sorted(link.handlers)
+    if stopping.requested():
+        core.begin_stop()  # the stop came while the core was starting
     # Captures spooled while no daemon ran are applied beside serving, not before it.
-    threading.Thread(target=core.ingest_spool, name='hook-spool', daemon=True).start()
+    core.start_spool()
     try:
         if serving is None:
             link.serve()

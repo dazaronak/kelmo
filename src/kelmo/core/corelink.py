@@ -1,14 +1,21 @@
 """The Python side of a core's channel to kelmod: descriptor 3, kelmo/2 frames, one reader thread.
 
-The reader thread answers heartbeats and cancels itself, so a busy core still answers `admin.ping`. Calls
-go to one thread pool per lane, sized by the core; replies are written under a lock and matched by id.
-Calls this core makes to other cores go out with their own ids and come back as futures.
+The reader thread answers heartbeats and cancels itself and runs no core code, so a busy core still answers
+`admin.ping`. Calls go to one thread pool per lane, sized by the core; replies are written under a lock and
+matched by id. Calls this core makes to other cores go out with their own ids and come back as futures.
+
+A stop is a drain. On `admin.stop` the channel stays open: the core's owner is asked to end its background
+work (`begin_stop`), new calls are refused as retryable, and the reader goes on delivering the replies to the
+core's own calls until the running handlers and the owner's work have ended (`wait_stopped`); then the channel
+closes. When kelmod closes the channel instead (its router is lost), no reply can come any more: the owner is
+asked to stop first, so the failures of its open calls count as the stop's, then those calls fail.
 
     link = CoreLink.from_descriptor(3, handlers={'state.status': (status, 'read')}, lanes={'read': 4})
-    link.serve()          # blocks until kelmod closes the channel or sends admin.stop
+    link.serve()          # blocks until the core has drained after admin.stop, or kelmod closed the channel
 """
 import os
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -69,14 +76,22 @@ class DescriptorChannel:
 
 
 class CoreLink:
-    def __init__(self, sock, handlers, lanes, *, trim=None, status=None):
+    def __init__(self, sock, handlers, lanes, *, trim=None, status=None, recycle=None, begin_stop=None,
+                 wait_stopped=None):
         """`handlers`: op -> (function(context, body) -> body, lane). `lanes`: lane -> thread count.
         `trim`: called on admin.trim to drop caches and unload what can be loaded again. `status`: returns
-        the core's own fields for admin.status."""
+        the core's own fields for admin.status. `recycle`: called on admin.recycle, returns the names of the
+        background work running now; none is the core's consent to be stopped and started again, and the
+        owner then starts no new work for a while. Without it a core with no call in flight agrees.
+        `begin_stop`: asks the owner's background work to end, without waiting. `wait_stopped`: waits until
+        it has ended."""
         self.sock = sock
         self.handlers = handlers
         self.trim = trim
         self.status = status
+        self.recycle = recycle
+        self.begin_stop = begin_stop
+        self.wait_stopped = wait_stopped
         self.pools = {lane: ThreadPoolExecutor(max_workers=size, thread_name_prefix=f'lane-{lane}')
                       for lane, size in lanes.items()}
         self._write_lock = threading.Lock()
@@ -84,6 +99,9 @@ class CoreLink:
         self._outgoing = {}  # call id -> Future
         self._state = threading.Lock()
         self._stopping = threading.Event()
+        self._draining = threading.Event()  # admin.stop came: new calls are refused, replies still delivered
+        self._owner_stop_lock = threading.Lock()
+        self._owner_stop_asked = False
         self.operations = sorted(handlers)
 
     @classmethod
@@ -168,9 +186,43 @@ class CoreLink:
         finally:
             self._finish()
 
+    def _ask_owner_to_stop(self):
+        """`begin_stop`, once."""
+        with self._owner_stop_lock:
+            if self._owner_stop_asked:
+                return
+            self._owner_stop_asked = True
+        if self.begin_stop is not None:
+            try:
+                self.begin_stop()
+            except Exception as error:  # noqa: BLE001 - the stop goes on
+                print(f'kelmo core: asking the core to stop failed ({type(error).__name__})', file=sys.stderr)
+
+    def _wait_for_owner(self):
+        if self.wait_stopped is not None:
+            try:
+                self.wait_stopped()
+            except Exception as error:  # noqa: BLE001 - the stop goes on
+                print(f'kelmo core: waiting for the core to stop failed ({type(error).__name__})', file=sys.stderr)
+
+    def _drain(self):
+        """After admin.stop: the owner stops its work and the running handlers finish while their calls to other
+        cores still get replies; then the reader is woken to close the channel."""
+        self._ask_owner_to_stop()
+        for pool in self.pools.values():
+            pool.shutdown(wait=True, cancel_futures=False)
+        self._wait_for_owner()
+        self._stopping.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RD)
+        except OSError:
+            pass
+
     def _finish(self):
         self._stopping.set()
-        # Outgoing calls first: no reply can arrive any more, and a handler waiting on one would hold the pool.
+        # The owner hears of the stop before its open calls fail, so it counts those failures as the stop's.
+        self._ask_owner_to_stop()
+        # Outgoing calls next: no reply can arrive any more, and a handler waiting on one would hold the pool.
         with self._state:
             pending, self._outgoing = list(self._outgoing.values()), {}
         for future in pending:
@@ -178,6 +230,7 @@ class CoreLink:
                 future.set_exception(KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
         for pool in self.pools.values():
             pool.shutdown(wait=True, cancel_futures=False)
+        self._wait_for_owner()
         try:
             self.sock.close()
         except OSError:
@@ -207,6 +260,10 @@ class CoreLink:
         op = header['op']
         if op.startswith('admin.'):
             self._admin(op, header)
+            return
+        if self._draining.is_set():
+            self._reply(header['id'], error={'code': 'E_UNAVAILABLE', 'message': 'The core is stopping.',
+                                             'retryable': True})
             return
         handler = self.handlers.get(op)
         if handler is None:
@@ -251,21 +308,14 @@ class CoreLink:
                 self._reply(call_id, {'trimmed': False})
         elif op == 'admin.stop':
             self._reply(call_id, {'stopping': True})
-            self._stopping.set()
-            try:
-                self.sock.shutdown(socket.SHUT_RD)
-            except OSError:
-                pass
+            if not self._draining.is_set():
+                self._draining.set()
+                threading.Thread(target=self._drain, name='corelink-drain', daemon=True).start()
         elif op == 'admin.status':
-            with self._state:
-                open_calls = len(self._open)
-            extra = {}
-            if self.status is not None:
-                try:
-                    extra = self.status()
-                except Exception as error:  # noqa: BLE001 - a status probe must answer
-                    extra = {'status_error': type(error).__name__}
-            self._reply(call_id, {**extra, 'pid': os.getpid(), 'open_calls': open_calls})
+            # The core's own fields may wait on a lock; the reader thread must stay free for heartbeats.
+            threading.Thread(target=self._status_then_reply, args=(call_id,), daemon=True).start()
+        elif op == 'admin.recycle':
+            threading.Thread(target=self._recycle_then_reply, args=(call_id,), daemon=True).start()
         else:
             self._reply(call_id, error={'code': 'E_PROTOCOL', 'message': f'{op} is not served here.',
                                         'retryable': False})
@@ -275,3 +325,28 @@ class CoreLink:
             self.trim()
         finally:
             self._reply(call_id, {'trimmed': True})
+
+    def _status_then_reply(self, call_id):
+        with self._state:
+            open_calls = len(self._open)
+        extra = {}
+        if self.status is not None:
+            try:
+                extra = self.status()
+            except Exception as error:  # noqa: BLE001 - a status probe must answer
+                extra = {'status_error': type(error).__name__}
+        self._reply(call_id, {**extra, 'pid': os.getpid(), 'open_calls': open_calls})
+
+    def _recycle_then_reply(self, call_id):
+        """Consent to a recycle: only a core with no call open and no background work running agrees."""
+        if self._draining.is_set():
+            self._reply(call_id, {'recycle': False, 'busy': ['stopping']})
+            return
+        with self._state:
+            busy = ['calls'] if self._open else []
+        if not busy and self.recycle is not None:
+            try:
+                busy = list(self.recycle())
+            except Exception as error:  # noqa: BLE001 - a failed probe is a decline, never a restart
+                busy = [f'probe failed: {type(error).__name__}']
+        self._reply(call_id, {'recycle': not busy, 'busy': busy} if busy else {'recycle': True})

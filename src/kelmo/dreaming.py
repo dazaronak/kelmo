@@ -17,7 +17,7 @@ import json
 from datetime import UTC, datetime
 
 from .contracts import ContextBundle, EvidenceRef, SourcePacket
-from .errors import KelmoError
+from .errors import KelmoError, Stopping
 from .executor import ModelExecutor, ModelJob, ModelOutcome
 from .wiki import engine, pages, views
 
@@ -187,7 +187,7 @@ class Dreaming:
             return {'state': 'paused'}
         reader = self.service.knowledge
         generation = reader.generation()
-        registry = reader.registry(generation)
+        registry = reader.registry_view(generation)
         evidence, last = self._changed_evidence(max_sources)
         if not evidence:
             if last != self._state('cursor'):
@@ -215,6 +215,9 @@ class Dreaming:
                                                        'reason': outcome.reason or 'no findings answer'})
             accepted, rejected = self._validate(outcome.result, packet)
         except KelmoError as error:
+            from . import stopping
+            if stopping.requested():
+                raise Stopping() from error  # the core's stop caused it; the cursor stays for the next run
             return self._finish(run_id, 'failed', {'code': error.code, 'reason': str(error)})
         new, seen, repeated = [], [], 0
         for finding in accepted:
@@ -235,6 +238,9 @@ class Dreaming:
             # The findings stay recorded and open; the cursor stays, so the next run sees them again.
             self._finish(run_id, 'failed', {'code': getattr(error, 'code', 'E_INTERNAL'), 'reason': str(error),
                                             'published': published})
+            from . import stopping
+            if stopping.requested():
+                raise Stopping() from error
             raise
         # Every finding of this window is recorded before the cursor moves past its evidence.
         self._set_state('cursor', last)
@@ -387,7 +393,7 @@ class Dreaming:
     def _stale(self, row, own=None):
         """The pages, facts and evidence a finding cites, as they stand now, differ from what it was found
         against. `own` maps a page to the revision Dreaming's own link left this run: not a change."""
-        registry = self.service.knowledge.registry(self.service.knowledge.generation())
+        registry = self.service.knowledge.registry_view(self.service.knowledge.generation())
         for target, revision in row['baseline']['pages'].items():
             current = (registry['pages'].get(target) or {}).get('revision')
             if current != revision and current != (own or {}).get(target):
@@ -419,7 +425,7 @@ class Dreaming:
         if stale:
             return self._settle(fingerprint, 'stale', {'reason': stale})
         first, second = finding['pages']
-        registry = self.service.knowledge.registry(self.service.knowledge.generation())
+        registry = self.service.knowledge.registry_view(self.service.knowledge.generation())
         note = '\n'.join([
             '# Dreaming link finding ' + fingerprint[:12], '',
             'Link ' + first + ' to ' + second + '.', '',
@@ -449,7 +455,7 @@ class Dreaming:
             return self._settle(fingerprint, state, {'code': error.code, 'reason': str(error)})
         outcome = getattr(receipt, 'outcome', None)
         if outcome == 'published' and own is not None:
-            current = self.service.knowledge.registry(self.service.knowledge.generation())
+            current = self.service.knowledge.registry_view(self.service.knowledge.generation())
             own[first] = current['pages'][first]['revision']
         return self._settle(fingerprint, 'published' if outcome == 'published' else 'refused',
                             {'outcome': outcome, 'operation_id': getattr(receipt, 'operation_id', None)})

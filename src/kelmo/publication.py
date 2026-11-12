@@ -15,6 +15,7 @@ from contextlib import contextmanager
 
 from . import outcomes
 from .contracts import EvidenceRef, Generation, KnowledgeProposal, OperationReceipt, SourcePacket
+from .core.baton import outside_journal
 from .errors import KelmoError
 from .state import ActionDecision, ActionFrame, action_revision, event_revision
 from .wiki import engine, pages
@@ -42,7 +43,10 @@ def coordinator_lock(config, timeout=LOCK_WAIT_SECONDS):
             except BlockingIOError as error:
                 if time.monotonic() >= deadline:
                     raise KelmoError('E_BUSY', 'Another worker is processing this vault.') from error
-                time.sleep(0.05)
+                # Never wait for the worker lock holding the baton: its holder publishes with the baton
+                # released and needs it back to write the receipt.
+                with outside_journal():
+                    time.sleep(0.05)
         yield
 
 

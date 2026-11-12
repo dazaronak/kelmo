@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import threading
+import weakref
 
 from kelmo.contracts import ContextBinding, ContextBudget, EvidenceRef, Generation, PageBatch, PageSnapshot
 from kelmo.errors import KelmoError
@@ -41,7 +42,53 @@ MAX_PARENT_DEPTH = 3
 REVISION_FIELDS = ('fact_key', 'target', 'text', 'status')
 INDEX_ROW_LIMIT = 200
 PROJECT = re.compile(r'[a-z0-9_-]{1,60}')
-GENERATION_CACHE_LIMIT = 96
+GENERATION_CACHE_LIMIT = 96  # answers about adoption per commit (booleans)
+
+# Generation snapshots, one per committed generation for the whole process, shared by every KnowledgeReader. A
+# snapshot holds the parsed registry (hundreds of MiB on a large vault) and the pages read from it, so a daemon
+# that lives for days keeps the current generation and the one before it (a reader still finishing on it), not a
+# copy per reader per generation. A snapshot is read-only once built; `KnowledgeReader.registry` hands out copies.
+SNAPSHOT_CACHE_LIMIT = 2
+_SNAPSHOTS = OrderedDict()  # (vault id, repository scope, manifest path, commit) -> snapshot, kept
+_IN_USE = weakref.WeakValueDictionary()  # the same keys -> every snapshot someone still holds, kept or not
+_SNAPSHOTS_LOCK = threading.Lock()
+# One snapshot is built at a time: a build parses a whole registry, and readers that ask for the same generation
+# at once must get the one copy, not one each.
+_SNAPSHOT_BUILD = threading.Lock()
+
+
+class _Snapshot(dict):
+    """A generation snapshot; a dict subclass only so that the in-use index can refer to it weakly."""
+
+
+def cached_snapshots():
+    """How many generation snapshots this process keeps (those still in use beyond them are not counted)."""
+    with _SNAPSHOTS_LOCK:
+        return len(_SNAPSHOTS)
+
+
+def _cached_snapshot(key):
+    with _SNAPSHOTS_LOCK:
+        snapshot = _SNAPSHOTS.get(key)
+        if snapshot is None:
+            snapshot = _IN_USE.get(key)
+            if snapshot is None:
+                return None
+            _SNAPSHOTS[key] = snapshot
+            _evict()
+        _SNAPSHOTS.move_to_end(key)
+        return snapshot
+
+
+def _evict():
+    while len(_SNAPSHOTS) > SNAPSHOT_CACHE_LIMIT:
+        _SNAPSHOTS.popitem(last=False)
+
+
+def drop_cached_snapshots():
+    """Forgets the kept snapshots (a core over its memory budget); one still in use stays shared while it is."""
+    with _SNAPSHOTS_LOCK:
+        _SNAPSHOTS.clear()
 
 
 def digest(value):
@@ -702,7 +749,6 @@ class KnowledgeReader:
             # adopted() stays answerable; every generation read still refuses through _head.
             self.root, self.registry_path, self.manifest_path = committed_paths(config)
             self.wiki_path = None
-        self._snapshots = OrderedDict()
         # Whether a commit carries a supported registry: a commit never changes, so the answer is kept.
         self._adopted = OrderedDict()
         self._held = threading.local()
@@ -757,9 +803,22 @@ class KnowledgeReader:
         return _read_git(self.root, 'cat-file', 'blob', entry[2].decode('ascii'))
 
     def _load(self, commit):
-        if commit in self._snapshots:
-            self._snapshots.move_to_end(commit)
-            return self._snapshots[commit]
+        key = (self.config.vault_id, self._scope, self.manifest_path, commit)
+        snapshot = _cached_snapshot(key)
+        if snapshot is not None:
+            return snapshot
+        with _SNAPSHOT_BUILD:
+            snapshot = _cached_snapshot(key)
+            if snapshot is not None:
+                return snapshot
+            snapshot = _Snapshot(self._build_snapshot(commit))
+            with _SNAPSHOTS_LOCK:
+                _SNAPSHOTS[key] = snapshot
+                _IN_USE[key] = snapshot
+                _evict()
+            return snapshot
+
+    def _build_snapshot(self, commit):
         entries = _knowledge_tree(self.config, commit)
         try:
             manifest_bytes = self._blob(entries, self.manifest_path)
@@ -771,9 +830,8 @@ class KnowledgeReader:
                     or type(parent) is not int or parent != sequence - 1
                     or manifest['managed_digest'] != _tree_digest(self.config, entries)):
                 raise ValueError('Invalid generation sequence or managed digest.')
-            registry = json.loads(self._blob(entries, self.registry_path))
-            from .engine import validate_registry
-            validate_registry(registry)
+            from .engine import registry_view
+            registry = registry_view(self._blob(entries, self.registry_path))
             if 'counts' in manifest and manifest['counts'] != {
                 'facts': len(registry['facts']), 'pages': len(registry.get('pages', {})),
                 'notes': len(registry['notes']),
@@ -798,12 +856,8 @@ class KnowledgeReader:
         registered |= {fact['index_target'] for fact in registry['facts'].values() if 'index_target' in fact}
         if registered - set(paths):
             raise KelmoError('E_GENERATION', 'A registered page is absent from the pinned knowledge tree.')
-        snapshot = {'commit': commit, 'generation': generation, 'registry': registry,
-                    'entries': entries, 'paths': tuple(sorted(paths)), 'pages': {}}
-        self._snapshots[commit] = snapshot
-        while len(self._snapshots) > GENERATION_CACHE_LIMIT:
-            self._snapshots.popitem(last=False)
-        return snapshot
+        return {'commit': commit, 'generation': generation, 'registry': registry,
+                'entries': entries, 'paths': tuple(sorted(paths)), 'pages': {}}
 
     def generation(self):
         return self._load(self._head())['generation']
@@ -849,6 +903,16 @@ class KnowledgeReader:
     def registry(self, generation):
         """The exact registry one reachable generation pins; a copy, never a write handle."""
         return copy.deepcopy(self._pinned(generation)['registry'])
+
+    def registry_view(self, generation):
+        """The registry one generation pins, shared by the whole process and never to be changed; for lookups
+        and comparisons, where `registry` would copy hundreds of MiB."""
+        return self._pinned(generation)['registry']
+
+    def registry_fingerprint(self, generation):
+        """digest(encoded(registry)) of a generation's registry, computed once per process."""
+        from .engine import fingerprint
+        return fingerprint(self._pinned(generation)['registry'])
 
     def _pinned(self, generation):
         if not isinstance(generation, Generation) or generation.authority_id != self.config.vault_id:

@@ -20,6 +20,7 @@ import uuid
 
 from . import conversation, fact_checks, outcomes, quota
 from .contracts import EvidenceRef, Generation, KnowledgeChange, KnowledgeProposal, OperationReceipt, Origin
+from .core.baton import outside_journal
 from .errors import KelmoError
 from .executor import ModelExecutor, ModelJob, ModelOutcome
 from .publication import KnowledgeService, StateCoordinator, coordinator_lock, recover_publications
@@ -1759,8 +1760,8 @@ class Editor:
         if self.service.knowledge.generation() != generation:
             return self._refuse_batch(row, batch, keys, 'E_STALE', 'The knowledge generation moved after the '
                                   'editor read it; requeue the sources under new requests.', dispositions)
-        registry = engine.load_registry(self.service.root)
-        if _fingerprint(registry) != _fingerprint(self.service.knowledge.registry(generation)):
+        registry = engine.load_registry_view(self.service.root)
+        if engine.fingerprint(registry) != self.service.knowledge.registry_fingerprint(generation):
             self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The working registry differs from the '
                                   'generation the editor read; restore the committed registry, then retry the '
                                   'same request.')
@@ -1848,7 +1849,7 @@ class Editor:
                   'idempotency_key': idem[publisher], 'batch': accepted, 'sources': sources,
                   'rule_change': sources[publisher]['rule_change'],
                   'feature_enrollment': features, 'enrolled_subjects': subjects,
-                  'baseline_digest': _fingerprint(registry), 'expected_generation': generation.to_dict(),
+                  'baseline_digest': engine.fingerprint(registry), 'expected_generation': generation.to_dict(),
                   'project': observation['project'], 'scope': observation['scope'],
                   'context_complete': observation['complete']}
         try:
@@ -1886,6 +1887,8 @@ class Editor:
             self.journal.action_prepare(publisher_row['operation_id'], intent,
                                         outcome=_outcome('unresolved', 'editor publication prepared, not yet committed'),
                                         result=_result(publisher_row['operation_id'], 'prepared'))
+        # As in the single path: the publication recomputes from the intent, these registry-sized copies go first.
+        del result, changes, registry
         try:
             receipt = self._complete(publisher_row['operation_id'])
         except KelmoError as error:
@@ -2297,8 +2300,8 @@ class Editor:
         if self.service.knowledge.generation() != generation:
             self._refuse(operation_id, source_id, 'E_STALE', 'The knowledge generation moved after the editor '
                                                              'read it; requeue the source under a new request.')
-        registry = engine.load_registry(self.service.root)
-        if _fingerprint(registry) != _fingerprint(self.service.knowledge.registry(generation)):
+        registry = engine.load_registry_view(self.service.root)
+        if engine.fingerprint(registry) != self.service.knowledge.registry_fingerprint(generation):
             self._retryable(operation_id, source_id, 'E_CONFLICT', 'The working registry differs from the '
                             'generation the editor read; restore the committed registry, then retry the same '
                             'request.')
@@ -2348,7 +2351,7 @@ class Editor:
                   'rule_change': ({'origin': origin.to_dict(), 'source_operation_id': source_id}
                                   if rule_change else None),
                   'feature_enrollment': features, 'enrolled_subjects': subjects,
-                  'baseline_digest': _fingerprint(registry), 'expected_generation': generation.to_dict(),
+                  'baseline_digest': engine.fingerprint(registry), 'expected_generation': generation.to_dict(),
                   'project': observation['project'], 'scope': observation['scope'],
                   'context_complete': observation['complete']}
         try:
@@ -2361,8 +2364,11 @@ class Editor:
             self._refuse(operation_id, source_id, 'E_PROPOSAL', 'The proposal cannot enter the registry: '
                          + str(error))
         try:
-            # Includes the commit's managed-link audit on this projection, before anything is prepared.
-            result, changes = engine.semantic_projection(self.service.root, registry, intent)
+            # Includes the commit's managed-link audit on this projection, before anything is prepared. Renders
+            # and audits read files only, so interactive writes go first meanwhile; publishers wait on the worker
+            # lock this request holds.
+            with outside_journal():
+                result, changes = engine.semantic_projection(self.service.root, registry, intent, result=result)
         except (engine.OwnershipConflict, engine.SemanticRefusal) as error:
             self._refuse(operation_id, source_id, error.code, str(error))
         except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
@@ -2373,8 +2379,9 @@ class Editor:
             # Every file the real publication writes (all registered pages, the registry and the
             # manifest) must be clean, and the next generation must fit the wiki budget; both stay
             # retryable here, before any intent exists.
-            engine.require_clean_baseline(self.service.root, result, previous=registry)
-            engine.check_budget(self.service.root, result)
+            with outside_journal():
+                engine.require_clean_baseline(self.service.root, result, previous=registry)
+                engine.check_budget(self.service.root, result)
         except KelmoError as error:
             if error.code == 'E_OWNERSHIP':
                 self._refuse(operation_id, source_id, error.code, str(error))
@@ -2389,6 +2396,9 @@ class Editor:
             operation_id, intent,
             outcome=_outcome('unresolved', 'editor publication prepared, not yet committed'),
             result=_result(operation_id, 'prepared'))
+        # The publication recomputes its registry from the prepared intent; this frame's copies (each the size of
+        # the whole registry) must not stay alive underneath it.
+        del result, changes, registry, delta, proposal, baselines
         return self._complete(operation_id)
 
     def _recheck_rule_change(self, operation_id, intent):
@@ -2422,8 +2432,8 @@ class Editor:
         """Publish one prepared intent, or recognize its committed generation, then store the receipt."""
         intent = self.journal.action_intent(operation_id)
         source_id = intent['source_operation_id']
-        registry = engine.load_registry(self.service.root)
-        state = _fingerprint(registry)
+        registry = engine.load_registry_view(self.service.root)
+        state = engine.fingerprint(registry)
         if state != intent['result_digest']:
             if (state != intent['baseline_digest']
                     or self.service.knowledge.generation().to_dict() != intent['expected_generation']):
@@ -2435,9 +2445,13 @@ class Editor:
                 # The verified receipts are checked again against the registry this publication changes.
                 verify_fact_checks(self.journal.conn, registry, intent['delta']['facts'],
                                    intent.get('fact_checks', []))
-                engine.require_clean_baseline(self.service.root, engine.apply_semantic_intent(registry, intent),
-                                              previous=registry)
-                engine.publish_semantic(self.service.root, operation_id)
+                # The publication (renders, registry, Git commit) needs no journal: it reads the prepared intent
+                # through its own connection and runs under the worker lock this caller holds and the wiki lock.
+                # Interactive writes go first meanwhile; the receipt below is written with the baton again.
+                with outside_journal():
+                    engine.require_clean_baseline(self.service.root,
+                                                  engine.apply_semantic_intent(registry, intent), previous=registry)
+                    engine.publish_semantic(self.service.root, operation_id)
             except KelmoError as error:
                 # Typed refusals are final for this intent; environment failures keep it prepared so a
                 # retry or the next recovery publishes it without another model call.
@@ -2452,7 +2466,7 @@ class Editor:
                 # The baseline moved between the check above and the publication lock: stale, final.
                 self._refuse(operation_id, source_id, 'E_STALE', str(error))
         generation = self.service.knowledge.generation()
-        if _fingerprint(self.service.knowledge.registry(generation)) != intent['result_digest']:
+        if self.service.knowledge.registry_fingerprint(generation) != intent['result_digest']:
             raise KelmoError('E_PUBLICATION', 'The committed generation lacks the prepared editor registry.')
         reference = EvidenceRef.from_dict(intent['evidence_ref'])
         receipt = OperationReceipt(operation_id, intent['idempotency_key'], intent['source_id'], 'published',

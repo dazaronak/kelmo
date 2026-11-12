@@ -87,6 +87,8 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
     if (isinstance(termination_grace, bool) or not isinstance(termination_grace, (int, float))
             or not math.isfinite(termination_grace) or not 0 <= termination_grace <= 1):
         raise KelmoError('E_EXECUTOR', 'Executor termination grace is invalid.')
+    from . import stopping
+    stopping.check()
     with tempfile.TemporaryFile() as source:
         source.write(json.dumps(payload).encode())
         source.seek(0)
@@ -105,6 +107,9 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
         deadline = time.monotonic() + timeout
         try:
             while selector.get_map():
+                # A stopping core ends the call now; the executor group is killed below, and the attempt is not
+                # charged.
+                stopping.check()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise KelmoError('E_EXECUTOR', 'Executor timed out or exceeded output limit.')
@@ -390,6 +395,8 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
                     service.run(operation_id)
             processed += 1
         except KelmoError as error:
+            if stopping():
+                break  # a failure the stop caused (a call no core answers any more) is not the operation's
             if error.code not in ('E_BUSY', 'E_CLAIM'):
                 raise
             skipped.append({'operation_id': operation_id, 'error_code': error.code})

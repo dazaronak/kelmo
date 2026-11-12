@@ -135,7 +135,7 @@ def render(config, cwd=None, *, project=None, reader=None):
         paths += hot['projects'][project]['pages']
     budget = hot['max_bytes'] if hot else 48000
     # Unconfigured HOT stays an explicit empty selection, with or without a committed registry.
-    if hot is not None and adopted(config):
+    if hot is not None and adopted(config, reader):
         return _render_generation(config, project, paths, budget, reader)
     blocks, pages = [], []
     size = 0
@@ -253,9 +253,14 @@ def pending_block(items):
 
 
 def check_all(config):
+    # One reader for every selection: it loads each committed generation once instead of once per project.
+    reader = None
+    if config.hot is not None and (Path(getattr(config, 'knowledge_git_root', config.root)) / '.git').exists():
+        from .wiki.pages import KnowledgeReader
+        reader = KnowledgeReader(config)
     selections = []
     for project in [None, *sorted(config.hot['projects'] if config.hot else {})]:
-        result = render(config, project=project)
+        result = render(config, project=project, reader=reader)
         result.pop('context')
         selections.append(result)
     return {'configured': config.hot is not None, 'selections': selections,

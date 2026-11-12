@@ -1,8 +1,12 @@
 """Parse explicit wiki relationships using markdown-it source maps."""
 
+import copy
+import hashlib
 import posixpath
 import re
+import threading
 import unicodedata
+from collections import OrderedDict
 from pathlib import PurePosixPath
 
 import yaml
@@ -155,8 +159,43 @@ def _label(value: str) -> str:
     return unicodedata.normalize('NFC', value).strip()
 
 
+# The parse of each page content, for the graph scan and the link audit that read the same pages one after
+# the other (a doctor run, a publication). A wiki of a few thousand pages fits; older contents fall out.
+_PARSED = OrderedDict()
+_PARSED_LIMIT = 4096
+_PARSED_LOCK = threading.Lock()
+
+
+def drop_parsed():
+    """Forgets the kept parses (a core over its memory budget)."""
+    with _PARSED_LOCK:
+        _PARSED.clear()
+
+
 def parse_text(raw: str | bytes) -> dict:
-    """Parse supplied content without reopening a file or replacing bad UTF-8."""
+    """Parse supplied content without reopening a file or replacing bad UTF-8. The same content is parsed once
+    per process while it stays among the last _PARSED_LIMIT; every caller gets its own copy."""
+    try:
+        data = raw.encode('utf-8') if isinstance(raw, str) else raw
+    except UnicodeError:
+        data = None
+    if not isinstance(data, bytes):
+        return _parse_text(raw)
+    key = hashlib.sha256(data).digest()
+    with _PARSED_LOCK:
+        known = _PARSED.get(key)
+        if known is not None:
+            _PARSED.move_to_end(key)
+    if known is None:
+        known = _parse_text(raw)
+        with _PARSED_LOCK:
+            _PARSED[key] = known
+            while len(_PARSED) > _PARSED_LIMIT:
+                _PARSED.popitem(last=False)
+    return copy.deepcopy(known)
+
+
+def _parse_text(raw):
     result = _empty_result()
     try:
         if isinstance(raw, bytes):

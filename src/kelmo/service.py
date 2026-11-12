@@ -1098,7 +1098,7 @@ class Service:
         return report
 
     def status(self):
-        registry = engine.load_registry(self.root)
+        registry = engine.load_registry_view(self.root)
         counts = {row['state']: row['n'] for row in self.journal.conn.execute(
             'SELECT state,COUNT(*) AS n FROM operations GROUP BY state')}
         settled = outcomes.summary(self.journal.conn)

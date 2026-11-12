@@ -45,7 +45,7 @@ def test_queued_request_follows_rename_without_rewriting_archived_metadata(monke
     reader = SimpleNamespace(conn=SimpleNamespace(execute=lambda sql, *params: SimpleNamespace(fetchall=lambda: [{'id': 'op'}])),
                              get=lambda identifier: {'id': identifier},
                              source_metadata=lambda identifier: {'metadata': {'editor_request': saved}})
-    monkeypatch.setattr(creation.engine, 'load_registry', lambda root: registry)
+    monkeypatch.setattr(creation.engine, 'load_registry_view', lambda root: registry)
     pending = creation.pending_operations(SimpleNamespace(root='/unused', journal=reader), 'new')
     assert len(pending) == 1
     current = pending[0][1]
@@ -73,7 +73,7 @@ def test_hook_pending_includes_captured_notes_without_making_them_editor_work(mo
                              source_metadata=lambda state: {'metadata': {'editor_request': {
                                  'project': 'app', 'selected': [], 'pending': state}}})
     service = SimpleNamespace(root='/unused', journal=reader)
-    monkeypatch.setattr(creation.engine, 'load_registry', lambda root: {'pages': {}, 'redirects': {}})
+    monkeypatch.setattr(creation.engine, 'load_registry_view', lambda root: {'pages': {}, 'redirects': {}})
     try:
         assert [item['pending'] for item in creation.pending_summaries(service, 'app')] == states[:4]
         assert [operation['state'] for operation, _ in creation.pending_operations(service, 'app')] == states[2:4]

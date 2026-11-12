@@ -83,22 +83,52 @@ def test_fence_holds_every_job_and_resume(tmp_path, monkeypatch):
     assert started == ['worker', 'dream', 'backfill']
 
 
-def test_daily_run_records_day_only_after_start(tmp_path, monkeypatch):
+def started_then(outcome):
+    """A run_dream stand-in that starts (on_start), then returns `outcome` or raises it."""
+    def run(*args, **kwargs):
+        kwargs['on_start']()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+    return run
+
+
+def test_daily_run_takes_its_day_when_it_completes(tmp_path, monkeypatch):
     from kelmo import dreaming_cli
     jobs = scheduler(tmp_path, [100], [])
-    monkeypatch.setattr(jobs, 'step', nullcontext)
     monkeypatch.setattr(dreaming_cli, 'run_dream', lambda *args, **kwargs: {'state': 'paused'})
     assert jobs._dream({'scheduled': True, 'action': 'run'})['state'] == 'paused'
-    assert jobs._last_dream_day() is None
-
-    def failed(*args, **kwargs):
-        kwargs['on_start']()
-        raise RuntimeError('failure after start')
-
-    monkeypatch.setattr(dreaming_cli, 'run_dream', failed)
-    with pytest.raises(RuntimeError):
-        jobs._dream({'scheduled': True, 'action': 'run'})
+    assert jobs._last_dream_day() is None  # it never started
+    monkeypatch.setattr(dreaming_cli, 'run_dream', started_then({'state': 'finished'}))
+    assert jobs._dream({'scheduled': True, 'action': 'run'})['state'] == 'finished'
     assert jobs._last_dream_day() == jobs._today()
+
+
+def test_a_failed_daily_run_is_tried_again_later_and_at_most_three_times(tmp_path, monkeypatch):
+    from kelmo import dreaming_cli
+    from kelmo.core.jobs import DREAM_RETRY_SECONDS, DREAM_TRIES
+    now = [100]
+    jobs = scheduler(tmp_path, now, [])
+    monkeypatch.setattr(dreaming_cli, 'run_dream', started_then(RuntimeError('failure after start')))
+    for _ in range(DREAM_TRIES):
+        assert jobs._dream_try_allowed()
+        with pytest.raises(RuntimeError):
+            jobs._dream({'scheduled': True, 'action': 'run'})
+        assert jobs._last_dream_day() is None
+        assert not jobs._dream_try_allowed(), 'a failed try waits before the next'
+        now[0] += DREAM_RETRY_SECONDS
+    assert not jobs._dream_try_allowed(), 'the day has spent its tries'
+
+
+def test_a_daily_run_the_stop_ended_costs_no_try(tmp_path, monkeypatch):
+    from kelmo import dreaming_cli
+    from kelmo.errors import Stopping
+    jobs = scheduler(tmp_path, [100], [])
+    monkeypatch.setattr(dreaming_cli, 'run_dream', started_then(Stopping()))
+    with pytest.raises(Stopping):
+        jobs._dream({'scheduled': True, 'action': 'run'})
+    assert jobs._last_dream_day() is None
+    assert jobs._dream_try_allowed(), 'the next start runs it at once'
 
 
 def test_failed_backfill_is_logged_and_retried(tmp_path, monkeypatch, capsys):
@@ -352,3 +382,86 @@ def test_concurrent_state_updates_keep_both_keys(tmp_path):
             future.result()
     state = json.loads((tmp_path / '.state' / 'jobs.json').read_text())
     assert state['first'] == state['second'] == 199
+
+
+def test_a_stopped_apply_is_never_no_progress_and_resumes_shortly_after_the_stop(tmp_path):
+    from kelmo.core.jobs import APPLY_RESUME_SECONDS
+    now = [100]
+    notes = [note('a'), note('b')]
+    jobs = scheduler(tmp_path, now, notes)
+    jobs._record_apply_start()
+    now[0] = 130  # the core's stop cut the first note: nothing published, both notes wait again
+    jobs._record_apply_end(stopped=True)
+    restarted = scheduler(tmp_path, now, notes)
+    assert restarted._apply_hold() == ('stopped', 130 + APPLY_RESUME_SECONDS)
+    now[0] = 130 + APPLY_RESUME_SECONDS
+    assert restarted._apply_hold() == (None, None)
+
+
+def test_repeated_stops_fall_back_to_the_min_interval_and_a_completed_pass_resets_them(tmp_path):
+    from kelmo.core.jobs import APPLY_QUICK_RESUMES, APPLY_RESUME_SECONDS
+    now = [100]
+    notes = [note('a')]
+    jobs = scheduler(tmp_path, now, notes)
+    for stop in range(1, APPLY_QUICK_RESUMES + 2):
+        jobs._record_apply_start()
+        now[0] += 10
+        jobs._record_apply_end(stopped=True)
+        if stop <= APPLY_QUICK_RESUMES:
+            assert jobs._apply_hold() == ('stopped', now[0] + APPLY_RESUME_SECONDS)
+        else:
+            assert jobs._apply_hold() == ('min_interval', now[0] + APPLY_MIN_INTERVAL_SECONDS)
+        now[0] += APPLY_MIN_INTERVAL_SECONDS
+    jobs._record_apply_start()
+    notes.clear()
+    now[0] += 10
+    jobs._record_apply_end()
+    jobs._record_apply_start()
+    now[0] += 10
+    jobs._record_apply_end(stopped=True)
+    assert jobs._apply_hold() == ('stopped', now[0] + APPLY_RESUME_SECONDS)
+
+
+def test_a_stop_during_a_scheduled_apply_is_recorded_as_stopped(tmp_path, monkeypatch):
+    from kelmo import dreaming_cli
+    from kelmo.errors import Stopping
+    now = [100]
+    jobs = scheduler(tmp_path, now, [note('a'), note('b')])
+    monkeypatch.setattr(jobs, 'step', nullcontext)
+
+    def cut(*args, on_start=None, **kwargs):
+        on_start()
+        now[0] = 140
+        raise Stopping()
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', cut)
+    assert jobs.run('dream', {'action': 'apply', 'scheduled': True}) == {'state': 'stopped'}
+    apply = json.loads((tmp_path / '.state' / 'jobs.json').read_text())['apply']
+    assert apply['finished'] == 140 and apply['stopped'] is True and apply['no_progress'] is False
+    assert apply['stops'] == 1
+
+
+def test_a_cut_apply_is_taken_up_again_below_the_note_count_and_a_complete_one_is_not(tmp_path, monkeypatch):
+    from kelmo import dreaming_cli
+    from kelmo.core.jobs import APPLY_RESUME_SECONDS, DREAM_WAITING_NOTES
+    monkeypatch.setattr(dreaming_cli, 'status', lambda root: {'paused': False})
+    now = [100]
+    notes = [note('a'), note('b')]
+    assert len(notes) < DREAM_WAITING_NOTES
+    jobs = scheduler(tmp_path, now, notes)
+    jobs._write_state(dream_day=jobs._today())  # today's daily run is done: only the apply rule can start a job
+    jobs._record_apply_start()
+    notes[0]['terminal'] = True  # one note published before the stop
+    now[0] = 130
+    jobs._record_apply_end(stopped=True)
+    assert jobs._dream_due() is None  # held for APPLY_RESUME_SECONDS
+    now[0] = 130 + APPLY_RESUME_SECONDS
+    assert jobs._dream_due() == 'apply'
+    notes[1]['terminal'] = True  # nothing of the cut pass waits any more
+    assert jobs._dream_due() is None
+    notes[1]['terminal'] = False
+    jobs._record_apply_start()
+    now[0] += 10
+    jobs._record_apply_end()  # a complete pass that left a note: the count rule decides again
+    now[0] += APPLY_MIN_INTERVAL_SECONDS
+    assert jobs._dream_due() is None

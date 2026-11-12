@@ -21,7 +21,6 @@ from pathlib import Path
 from ..errors import KelmoError
 
 READERS = 4
-READER_CACHE_KIB = 16000
 
 
 def _worker_factory(start, *, confined, provider_factory=None):

@@ -1,13 +1,15 @@
 """Plain-text intake through the existing archive, editor and operation journal."""
+from contextlib import nullcontext
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import time
 
-from . import outcomes, quota
+from . import outcomes, quota, stopping
 from .daemon import execute, validate_config
 from .errors import KelmoError, Stopping, sqlite_busy
 from .journal import now as journal_now
@@ -298,7 +300,7 @@ def _editor_request(service, request):
     that page, which is how the editor tells an opening request from one whose page is already there.
     A request never rewrites its captured metadata, exactly as `current_request` never does; a target
     registered as a different page is left unresolved and stays the editor's refusal."""
-    registry = engine.load_registry(service.root)
+    registry = engine.load_registry_view(service.root)
     request = current_request(registry, request)
     result = {name: value for name, value in request.items() if name not in ('pending',)}
     result['budget_tokens'] = max(request['budget_tokens'], service.config.editor_budget)
@@ -430,6 +432,8 @@ def publish(service, operation_id, request, executor=None, *, now=False):
         except quota.QuotaWait:
             return service.journal.get(operation_id)
         except KelmoError as error:
+            if stopping.requested():
+                raise Stopping() from error  # the core's stop caused it; the note waits, uncharged
             if error.code in UNCHARGED:
                 raise
             return park(service, operation_id, error, token, attempts)
@@ -533,6 +537,8 @@ def publish_batch(service, batch, executor):
             return dict(waiting, **{operation_id: {'state': 'deferred', 'code': 'E_QUOTA'}
                                     for operation_id in claimed})
         except KelmoError as error:
+            if stopping.requested():
+                raise Stopping() from error  # the core's stop caused it; every member waits, uncharged
             if error.code in UNCHARGED:
                 raise
             if error.code in BATCH_SHAPE:
@@ -585,7 +591,7 @@ def pending_operations(service, project=None, *, include_unarchived=False, regis
         + placeholders + ') ORDER BY created_at', states).fetchall()
     result = []
     if registry is None and rows:
-        registry = engine.load_registry(service.root)
+        registry = engine.load_registry_view(service.root)
     for row in rows:
         operation = service.journal.get(row['id'])
         saved = service.journal.source_metadata(row['id'])
@@ -674,7 +680,7 @@ class _Turns:
         return False
 
 
-def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.time):
+def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.time, should_stop=None, step=None):
     """One `kelmo dream apply` pass: publish every note captured before the pass began through the
     editor, oldest first.
 
@@ -685,81 +691,108 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     are published as one batch (see `publish_batch`), never more of them than this pass may still
     handle; with the flag off every source goes through `publish` alone, exactly as before. The result
     counts what happened, by operation id.
+
+    In the state core `step` is the job step: each note is one step, so an interactive write waits for one
+    note at most, and the pass lets the baton go while it waits for an older note. `should_stop` is read
+    before every note and after every wait; once it is true the pass raises Stopping, with no note held.
     """
     if type(limit) is not int or limit < 1:
         raise KelmoError('E_INPUT', 'The apply limit is a positive integer.')
     report = {'applied': [], 'parked': [], 'failed': [], 'deferred': [], 'skipped': [], 'stalled': []}
-    turns = _Turns(report, sleep, clock)
+    step = step or nullcontext
+
+    def rest(seconds):
+        # A wait holds no journal transaction: interactive writes go first meanwhile.
+        from .core.baton import model_call
+        with model_call():
+            sleep(seconds)
+        if should_stop is not None and should_stop():
+            raise Stopping()
+
+    turns = _Turns(report, rest, clock)
     started = journal_now()
     seen = set()
     while len(seen) < limit:
-        try:
-            waiting = [(operation, request) for operation, request in pending_operations(service)
-                       if operation['created_at'] <= started and operation['id'] not in seen]
-            if not waiting:
-                break
-            operation, request = waiting[0]
-            # Polling the intake alone is cheap. Once an older note leaves it, the pending list is read
-            # again, because that note now goes first.
-            moved = False
-            while True:
-                ahead = [row for row in notes_in_intake(service, operation['created_at'])
-                         if row['id'] not in report['stalled']]
-                if not ahead:
+        if should_stop is not None and should_stop():
+            raise Stopping()
+        with step():
+            try:
+                waiting = [(operation, request) for operation, request in pending_operations(service)
+                           if operation['created_at'] <= started and operation['id'] not in seen]
+                if not waiting:
                     break
-                moved = True
-                turns.ahead(ahead[0])
-        except sqlite3.Error as error:
-            # The journal is busy before any note was chosen: wait, or leave the rest for the next pass.
-            if not sqlite_busy(error):
-                raise
-            if turns.busy_listing():
-                continue
-            break
-        if moved:
-            continue
-        try:
-            batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)))
-                     if service.config.batch_apply else [])
-            if len(batch) > 1:
-                # One conversation and one commit for the head of the waiting list and the later sources
-                # of its project; each member still settles on its own row and in its own bucket.
-                outcome = publish_batch(service, batch, executor)
+                operation, request = waiting[0]
+                # Polling the intake alone is cheap. Once an older note leaves it, the pending list is read
+                # again, because that note now goes first.
                 moved = False
-                for operation_id, item in outcome.items():
-                    if item['state'] == 'waiting':
-                        continue
-                    seen.add(operation_id)
-                    report[item['state']].append(operation_id)
+                while True:
+                    ahead = [row for row in notes_in_intake(service, operation['created_at'])
+                             if row['id'] not in report['stalled']]
+                    if not ahead:
+                        break
                     moved = True
-                if not moved:
-                    # Nothing this batch touched left the waiting list: name the head and move on, so a
-                    # source another attempt holds never spins the pass.
+                    turns.ahead(ahead[0])
+            except sqlite3.Error as error:
+                # The journal is busy before any note was chosen: wait, or leave the rest for the next pass.
+                if not sqlite_busy(error):
+                    raise
+                if turns.busy_listing():
+                    continue
+                break
+            if moved:
+                continue
+            try:
+                batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)))
+                         if service.config.batch_apply else [])
+                if len(batch) > 1:
+                    # One conversation and one commit for the head of the waiting list and the later sources
+                    # of its project; each member still settles on its own row and in its own bucket.
+                    outcome = publish_batch(service, batch, executor)
+                    moved = False
+                    for operation_id, item in outcome.items():
+                        if item['state'] == 'waiting':
+                            continue
+                        seen.add(operation_id)
+                        report[item['state']].append(operation_id)
+                        moved = True
+                    if not moved:
+                        # Nothing this batch touched left the waiting list: name the head and move on, so a
+                        # source another attempt holds never spins the pass.
+                        seen.add(operation['id'])
+                        report['skipped'].append({'operation_id': operation['id'],
+                                                  'error_code': outcome[operation['id']]['code'] or 'E_BUSY'})
+                    continue
+                if service.editor.deferred_until(operation['id']) is not None:
                     seen.add(operation['id'])
-                    report['skipped'].append({'operation_id': operation['id'],
-                                              'error_code': outcome[operation['id']]['code'] or 'E_BUSY'})
-                continue
-            if service.editor.deferred_until(operation['id']) is not None:
+                    report['deferred'].append(operation['id'])
+                    continue
+                result = publish(service, operation['id'], request, executor, now=True)
+            except (KelmoError, sqlite3.Error) as error:
+                contention = (sqlite_busy(error) if isinstance(error, sqlite3.Error)
+                              else error.code in UNCHARGED)
+                if not contention:
+                    raise
+                if turns.held(operation['id']):
+                    continue
                 seen.add(operation['id'])
-                report['deferred'].append(operation['id'])
+                report['skipped'].append({'operation_id': operation['id'], 'error_code': 'E_BUSY'
+                                          if isinstance(error, sqlite3.Error) else error.code})
                 continue
-            result = publish(service, operation['id'], request, executor, now=True)
-        except (KelmoError, sqlite3.Error) as error:
-            contention = (sqlite_busy(error) if isinstance(error, sqlite3.Error)
-                          else error.code in UNCHARGED)
-            if not contention:
-                raise
-            if turns.held(operation['id']):
+            except AssertionError:
+                raise  # a broken invariant (the baton's, a shared registry changed in place) ends the pass
+            except Exception as error:  # noqa: BLE001 - one note's fault must not end the pass for every note
+                # The note keeps its journal state: a publication it already committed is finished by recovery
+                # on its next turn, as after a crash. It is named here, and the pass goes on with the next note.
+                print(f'kelmo: note {operation["id"]} failed in the apply pass ({type(error).__name__}: {error}); '
+                      'it is tried again on the next pass', file=sys.stderr, flush=True)
+                seen.add(operation['id'])
+                report['skipped'].append({'operation_id': operation['id'], 'error_code': 'E_INTERNAL'})
                 continue
             seen.add(operation['id'])
-            report['skipped'].append({'operation_id': operation['id'], 'error_code': 'E_BUSY'
-                                      if isinstance(error, sqlite3.Error) else error.code})
-            continue
-        seen.add(operation['id'])
-        state = result['state']
-        bucket = ('applied' if state == 'applied' else 'parked' if state == 'parked'
-                  else 'failed' if state == 'failed' else 'deferred')
-        report[bucket].append(operation['id'])
+            state = result['state']
+            bucket = ('applied' if state == 'applied' else 'parked' if state == 'parked'
+                      else 'failed' if state == 'failed' else 'deferred')
+            report[bucket].append(operation['id'])
     return report
 
 

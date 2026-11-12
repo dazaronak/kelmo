@@ -14,6 +14,10 @@ from test_dreaming_batched import fact_change, fact_entry, page_entry, registry_
 from test_editor_scoping import FEATURE, build_world
 
 
+class Died(BaseException):
+    """The process ending mid-pass. The apply pass goes on past one note's ordinary fault; nothing outlives this."""
+
+
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     built = build_world(tmp_path, monkeypatch, other_project=True)
@@ -524,8 +528,8 @@ def test_a_pass_that_died_after_the_answer_settles_each_member_from_its_own_row(
     ids = capture(world, notes(2))
     before = commits(world)
     monkeypatch.setattr(Editor, '_settle_batch', lambda *args, **kwargs: (_ for _ in ()).throw(
-        RuntimeError('the pass died between the answer and the settle')))
-    with pytest.raises(RuntimeError):
+        Died('the pass died between the answer and the settle')))
+    with pytest.raises(Died):
         apply_pending(world.service, counted(BatchModel(world)))
     monkeypatch.undo()
     settled = counted(BatchModel(world))
@@ -834,10 +838,10 @@ def test_a_crash_after_the_commit_does_not_park_published_notes(world, monkeypat
     real = Editor._member_disposition
 
     def crash(self, *args, **kwargs):
-        raise RuntimeError('the process died after the commit')
+        raise Died('the process died after the commit')
 
     monkeypatch.setattr(Editor, '_member_disposition', crash)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Died):
         apply_pending(world.service, model)
     assert len(facts_of(world)) == 3, 'the commit landed before the crash'
     calls = len(model.jobs)
@@ -864,10 +868,10 @@ def test_a_source_dismissed_after_a_batch_committed_is_not_settled_applied(world
     real = Editor._member_disposition
 
     def crash(self, *args, **kwargs):
-        raise RuntimeError('the process died after the commit')
+        raise Died('the process died after the commit')
 
     monkeypatch.setattr(Editor, '_member_disposition', crash)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Died):
         apply_pending(world.service, model)
     monkeypatch.setattr(Editor, '_member_disposition', real)
     assert len(facts_of(world)) == 3, 'the batch committed before the crash'
@@ -943,10 +947,10 @@ def test_a_batch_that_accepts_nothing_refuses_with_the_code_its_members_met(worl
 
     def died_after_the_commit(self, operation_id):
         real(self, operation_id)
-        raise RuntimeError('the process died after the commit, before the source was staged')
+        raise Died('the process died after the commit, before the source was staged')
 
     monkeypatch.setattr(Editor, '_complete', died_after_the_commit)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Died):
         apply_pending(world.service, BatchModel(world))
     assert len(facts_of(world)) == 1, 'the first note published before the crash'
     assert sorted(waiting_ids(world)) == sorted(ids), 'neither source left the waiting list'
@@ -970,10 +974,10 @@ def test_a_crash_after_the_intent_is_prepared_publishes_the_batch_on_the_next_pa
     real = Editor._complete
 
     def crash(self, *args, **kwargs):
-        raise RuntimeError('the process died before the commit')
+        raise Died('the process died before the commit')
 
     monkeypatch.setattr(Editor, '_complete', crash)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(Died):
         apply_pending(world.service, model)
     assert facts_of(world) == {}, 'nothing committed before the crash'
     calls = len(model.jobs)

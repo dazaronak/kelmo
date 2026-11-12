@@ -128,7 +128,7 @@ def test_memory_limits_sum_the_core_budgets_and_the_linux_unit_carries_them(tmp_
                                         'linux', (high, hard))
     lines = data.decode('utf-8').splitlines()
     for line in ('Type=notify', 'NotifyAccess=main', 'WatchdogSec=30', 'KillMode=mixed',
-                 'Restart=on-failure', 'RestartPreventExitStatus=78', 'TimeoutStopSec=40', 'OOMPolicy=continue',
+                 'Restart=on-failure', 'RestartPreventExitStatus=78', 'TimeoutStopSec=90', 'OOMPolicy=continue',
                  f'MemoryHigh={high}M', f'MemoryMax={hard}M'):
         assert line in lines
 

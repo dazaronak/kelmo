@@ -102,6 +102,13 @@ def install(baton):
     _installed = baton
 
 
+def outside_journal():
+    """Around work that never touches the shared journal connection (a model call, a wait for another lock, a
+    publication's renders and Git commit): the installed baton is released for it when the calling thread holds
+    it, so interactive writes go first meanwhile. The journal guard refuses any journal use inside."""
+    return _installed.released() if _installed is not None else nullcontext()
+
+
 def model_call():
     """Around a model call: the installed baton is released for it when the calling thread holds it."""
-    return _installed.released() if _installed is not None else nullcontext()
+    return outside_journal()

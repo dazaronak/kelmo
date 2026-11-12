@@ -257,6 +257,44 @@ def test_native_executor_sigterm_cleans_nested_provider_group(tmp_path):
             process.wait()
 
 
+@pytest.mark.parametrize('signals', [('SIGHUP',), ('SIGTERM', 'SIGHUP')], ids=['hangup', 'term-then-hangup'])
+def test_native_executor_hangup_cleans_nested_provider_group(tmp_path, signals):
+    """Under `sudo` with use_pty the executor's terminal hangs up when sudo dies, often right after sudo relayed a
+    SIGTERM: either way the provider group is cleaned, and a second signal does not cut the cleanup short."""
+    import signal as signals_module
+    import subprocess
+    import time
+    marker = tmp_path / 'hangup-child-survived'
+    started = tmp_path / 'provider-started'
+    child = f"import pathlib,time;time.sleep(0.8);pathlib.Path({str(marker)!r}).write_text('alive')"
+    provider = tmp_path / 'provider'
+    provider.write_text("#!/usr/bin/env python3\nimport pathlib,subprocess,sys,time\n"
+                        f"pathlib.Path({str(started)!r}).write_text('ready')\n"
+                        f"subprocess.Popen([sys.executable,'-c',{child!r}])\n"
+                        "time.sleep(30)\n")
+    provider.chmod(0o755)
+    process = subprocess.Popen(
+        [sys.executable, '-m', 'kelmo.cli', 'executor', '--provider', 'claude',
+         '--model', 'synthetic', '--provider-executable', str(provider), '--timeout', '30', '--json'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        process.stdin.write('{"task":"probe"}')
+        process.stdin.close()
+        deadline = time.monotonic() + 2
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert started.exists()
+        for name in signals:
+            process.send_signal(getattr(signals_module, name))
+        assert process.wait(timeout=2) != 0
+        time.sleep(1)
+        assert not marker.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_outer_timeout_allows_native_wrapper_to_clean_nested_provider(tmp_path):
     import time
     from pathlib import Path

@@ -242,12 +242,20 @@ def termination_forwarding():
         yield
         return
     previous = {}
+    raised = []
 
     def interrupted(*_):
+        # Once: under sudo with use_pty the terminal hangs up right after sudo relays SIGTERM, and that second
+        # signal must not cut short the group cleanup the first one started.
+        if raised:
+            return
+        raised.append(True)
         raise KelmoError('E_EXECUTOR', 'Executor was interrupted.')
 
     try:
-        for number in (signal.SIGTERM, signal.SIGINT):
+        # A hangup is a termination request too; its default action would end this process with the provider's
+        # group left running.
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             previous[number] = signal.signal(number, interrupted)
         yield
     finally:

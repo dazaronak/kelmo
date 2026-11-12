@@ -18,6 +18,9 @@ from .setup import apply_clients, client_paths, prepare_clients, profile_options
 DEFAULT_HTTP_PORT = 47821
 SERVICE_LABEL = 'org.kelmo.daemon'
 SERVICE_UNIT = 'kelmod.service'
+# kelmod's own stop ends within 78 s: the client drain, then the cores group by group (the callers drain first,
+# so a stopping state core still reaches the archive). The service manager waits a little longer before SIGKILL.
+STOP_TIMEOUT = 90
 
 
 def edge_plan(args, root, profile):
@@ -53,7 +56,7 @@ def service_definition(home, launcher, root, platform, limits=None):
         path = Path(home) / f'Library/LaunchAgents/{SERVICE_LABEL}.plist'
         data = plistlib.dumps({'Label': SERVICE_LABEL, 'ProgramArguments': argv, 'RunAtLoad': True,
                                'KeepAlive': {'SuccessfulExit': False}, 'ThrottleInterval': 5,
-                               'ExitTimeOut': 40})
+                               'ExitTimeOut': STOP_TIMEOUT})
     elif platform == 'linux':
         path = Path(home) / f'.config/systemd/user/{SERVICE_UNIT}'
         def quote(value):
@@ -62,7 +65,7 @@ def service_definition(home, launcher, root, platform, limits=None):
         data = ('[Unit]\nDescription=Kelmo daemon\n[Service]\nType=notify\nNotifyAccess=main\nExecStart='
                 + ' '.join(quote(a) for a in argv)
                 + '\nRestart=on-failure\nRestartSec=2\nRestartPreventExitStatus=78\nKillMode=mixed\nOOMPolicy=continue'
-                + '\nTimeoutStopSec=40'
+                + f'\nTimeoutStopSec={STOP_TIMEOUT}'
                 + '\nWatchdogSec=30' + memory + '\n[Install]\nWantedBy=default.target\n').encode()
     else:
         raise KelmoError('E_CONFIG', 'The machine daemon runs as a launchd or systemd user service.')

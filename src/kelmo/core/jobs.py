@@ -22,7 +22,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..errors import KelmoError
+from .. import stopping
+from ..errors import KelmoError, Stopping
 
 KINDS = ('worker', 'dream', 'backfill', 'reembed', 'graph')
 DEFAULT_POLL_SECONDS = 5.0
@@ -38,6 +39,22 @@ BACKFILL_REST_FACTOR = 2.0
 BACKFILL_REST_MAX_SECONDS = 30.0
 APPLY_MIN_INTERVAL_SECONDS = 900
 APPLY_NO_PROGRESS_SECONDS = 7200
+# A scheduled apply the core's own stop cut resumes this long after the stop, for up to APPLY_QUICK_RESUMES cuts
+# in a row; further cuts wait APPLY_MIN_INTERVAL_SECONDS, so a run of restarts cannot restart model calls at will.
+APPLY_RESUME_SECONDS = 60
+APPLY_QUICK_RESUMES = 2
+# A daily Dreaming run that did not complete (it failed, or the core died under it) is tried again after
+# DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day; one the core's stop ended costs no try.
+DREAM_TRIES = 3
+DREAM_RETRY_SECONDS = 900
+# After a core agrees to a recycle, no job starts for this long: kelmod stops it at once, and if no stop comes
+# the core goes on as before.
+RECYCLE_GATE_SECONDS = 30.0
+
+
+def _count(value):
+    """A count kept in jobs.json; anything else reads as none."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 class JobBusy(KelmoError):
@@ -70,6 +87,11 @@ class Jobs:
         self._sequence = 0
         self._backfill_due = self.clock() + BACKFILL_FIRST_SECONDS
         self._backfill_scheduled = False
+        self._gate_until = 0.0
+
+    def should_stop(self):
+        """True once the jobs or the whole core are stopping: a job ends at its next step."""
+        return self._stop.is_set() or stopping.requested()
 
     # --- running one job --------------------------------------------------------------------------------
 
@@ -90,6 +112,14 @@ class Jobs:
             raise JobBusy(kind)
         began = time.monotonic()
         with self._active_lock:
+            # Checked under the lock `quiesce` reads `_active` with: a job either shows as running there or
+            # does not start.
+            if time.monotonic() < self._gate_until or self.should_stop():
+                lock.release()
+                why = 'is stopping' if self.should_stop() else 'is about to restart'
+                error = KelmoError('E_BUSY', f'The state core {why}; run the job again shortly.')
+                error.retryable = True
+                raise error
             self._active[kind] = {'started_at': self.clock(), 'thread': threading.get_ident()}
         claims = set()
         outcome = {'kind': kind}
@@ -100,6 +130,13 @@ class Jobs:
                 result = getattr(self, '_' + kind)(options)
             outcome.update(state='finished', result=result)
             return result
+        except Stopping:
+            # The core's stop ended it between steps or cut its model call: nothing is charged, and the work
+            # resumes on the next start.
+            outcome.update(state='stopped')
+            print(f'kelmo: {kind} job stopped for the core\'s stop; it resumes on the next start',
+                  file=sys.stderr, flush=True)
+            return {'state': 'stopped'}
         except Exception as error:
             outcome.update(state='failed', error_code=getattr(error, 'code', type(error).__name__))
             raise
@@ -158,7 +195,7 @@ class Jobs:
         from ..daemon import tick
         config = self._executor()
         return tick(self.storage.writer, config['argv'], max_attempts=config['max_attempts'],
-                    timeout=config['timeout_seconds'], should_stop=self._stop.is_set, step=self.step,
+                    timeout=config['timeout_seconds'], should_stop=self.should_stop, step=self.step,
                     open_service=self._session_service())
 
     def _session_service(self):
@@ -194,19 +231,34 @@ class Jobs:
         if scheduled and self._fenced():
             return {'state': 'fenced'}
 
+        # The daily run counts once it really started: a paused or deferred Dreaming takes no day and no try.
+        daily = []
+
         def started():
             if scheduled and action == 'run':
-                self._record_dream_day()
+                daily.append(True)
+                self._record_dream_try()
             elif scheduled and action == 'apply':
                 self._record_apply_start()
 
-        with self.step():
-            try:
-                return run_dream(self.storage.writer, action, contexts=getattr(self.core.profile, 'contexts', None),
-                                 clock=self.clock, on_start=started)
-            finally:
-                if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
-                    self._record_apply_end()
+        stopped = False
+        try:
+            # One step per unit (each note, the findings pass), never the whole run. Inside a unit the writer is held
+            # only for journal transactions; model calls and the publication run without it, so an interactive write
+            # waits for the transaction in progress, not for the unit.
+            result = run_dream(self.storage.writer, action, contexts=getattr(self.core.profile, 'contexts', None),
+                               clock=self.clock, on_start=started, should_stop=self.should_stop, step=self.step)
+        except Stopping:
+            stopped = True
+            if daily:
+                self._record_dream_try(undo=True)
+            raise
+        finally:
+            if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
+                self._record_apply_end(stopped=stopped)
+        if daily:
+            self._record_dream_day()
+        return result
 
     def _admin(self):
         from ..archive_admin import ArchiveAdmin, operator_grant
@@ -219,7 +271,7 @@ class Jobs:
         result = {'written': 0, 'stale': 0, 'hidden': 0, 'present': 0, 'failed': [],
                   'remaining': None, 'stopped': None}
         cursor = None
-        while not self._stop.is_set():
+        while not self.should_stop():
             if options.get('scheduled') and self._fenced():
                 result['stopped'] = 'fenced'
                 break
@@ -276,6 +328,31 @@ class Jobs:
     def _record_dream_day(self):
         self._write_state(dream_day=self._today())
 
+    def _record_dream_try(self, undo=False):
+        """Counts a start of today's scheduled run, or takes back the one the core's stop ended."""
+        def counted():
+            tries = self._read_state().get('dream_tries')
+            today = self._today()
+            count = tries.get('count', 0) if isinstance(tries, dict) and tries.get('day') == today else 0
+            if undo:
+                return {'day': today, 'count': max(0, count - 1), 'at': self.clock()}
+            return {'day': today, 'count': count + 1, 'at': self.clock()}
+        self._write_state(dream_tries=counted)
+
+    def _dream_try_allowed(self):
+        """Today's scheduled run may start: no try yet, or fewer than DREAM_TRIES and the last one long enough ago."""
+        tries = self._read_state().get('dream_tries')
+        if not isinstance(tries, dict) or tries.get('day') != self._today():
+            return True
+        count, at = tries.get('count', 0), tries.get('at', 0)
+        if not isinstance(count, int) or not isinstance(at, (int, float)):
+            return True
+        return count == 0 or count < DREAM_TRIES and self.clock() >= at + DREAM_RETRY_SECONDS
+
+    def _daily_due(self):
+        return (time.localtime(self.clock()).tm_hour >= DREAM_HOUR and self._last_dream_day() != self._today()
+                and self._dream_try_allowed())
+
     def _fenced(self):
         if getattr(self.core, 'profile_path', None) is not None:
             from ..server import ServerProfile
@@ -309,13 +386,22 @@ class Jobs:
 
     def _record_apply_start(self):
         notes = self._queue_notes()
-        self._write_state(apply={'started': self.clock(), 'ids': sorted(notes['archived']), 'finished': None})
+        previous = self._read_state().get('apply') or {}
+        # Cuts in a row: carried while every pass since the last complete one was ended by the core's stop.
+        stops = _count(previous.get('stops')) if previous.get('stopped') is True else 0
+        self._write_state(apply={'started': self.clock(), 'ids': sorted(notes['archived']), 'finished': None,
+                                 'stops': stops})
         self._apply_started = True
 
-    def _record_apply_end(self):
+    def _record_apply_end(self, stopped=False):
         state = self._read_state().get('apply', {})
-        notes = self._queue_notes()
-        state['no_progress'] = bool(state.get('ids')) and set(state['ids']) <= notes['archived'] | notes['parked']
+        if stopped:
+            # A pass the core's stop cut says nothing about whether its notes can progress.
+            state.update(stopped=True, no_progress=False, stops=_count(state.get('stops')) + 1)
+        else:
+            notes = self._queue_notes()
+            state['no_progress'] = bool(state.get('ids')) and set(state['ids']) <= notes['archived'] | notes['parked']
+            state.update(stopped=False, stops=0)
         state['finished'] = self.clock()
         self._write_state(apply=state)
         self._apply_started = False
@@ -325,6 +411,11 @@ class Jobs:
         started, ended = last.get('started'), last.get('finished')
         if not isinstance(started, (int, float)):
             return None, None
+        if (last.get('stopped') is True and isinstance(ended, (int, float))
+                and 0 < _count(last.get('stops')) <= APPLY_QUICK_RESUMES):
+            if self.clock() < ended + APPLY_RESUME_SECONDS:
+                return 'stopped', ended + APPLY_RESUME_SECONDS
+            return None, None
         if ended is None:
             notes = self._queue_notes()
             no_progress = bool(last.get('ids')) and set(last['ids']) <= notes['archived'] | notes['parked']
@@ -332,21 +423,35 @@ class Jobs:
             no_progress = last.get('no_progress', False)
         if no_progress and self.clock() < started + APPLY_NO_PROGRESS_SECONDS:
             return 'no_progress', started + APPLY_NO_PROGRESS_SECONDS
-        # An apply the daemon did not see end (it was stopped or died meanwhile) counts from its start, so a
-        # restart never brings the next apply at once.
+        # An apply the daemon did not see end (the core died under it) counts from its start, so a crash never
+        # brings the next apply at once; an ended one, stopped or complete, counts from its end.
         since = ended if isinstance(ended, (int, float)) else started
         if self.clock() < since + APPLY_MIN_INTERVAL_SECONDS:
             return 'min_interval', since + APPLY_MIN_INTERVAL_SECONDS
         return None, None
 
     def _dream_due(self):
-        """Dreaming runs once a day from DREAM_HOUR (the day is kept in .state/jobs.json, so a restart does
-        not run it twice), and at once when DREAM_WAITING_NOTES notes wait."""
+        """Dreaming runs once a day from DREAM_HOUR, and at once when DREAM_WAITING_NOTES notes wait. The day is
+        kept in .state/jobs.json once a run completes, so a restart does not run it twice; a run that did not
+        complete is tried again (see DREAM_TRIES)."""
         if self._dream_hold()[0] is not None:
             return None
-        if time.localtime(self.clock()).tm_hour >= DREAM_HOUR and self._last_dream_day() != self._today():
+        if self._daily_due():
             return 'run'
-        return 'apply' if self._waiting_notes() >= DREAM_WAITING_NOTES and self._apply_hold()[0] is None else None
+        if self._apply_hold()[0] is not None:
+            return None
+        return 'apply' if self._waiting_notes() >= DREAM_WAITING_NOTES or self._cut_apply_waits() else None
+
+    def _cut_apply_waits(self):
+        """A scheduled apply the core's stop cut is taken up again whatever the count, while a note it was given
+        still waits for its first pass."""
+        last = self._read_state().get('apply') or {}
+        if last.get('stopped') is not True or not isinstance(last.get('ids'), list):
+            return False
+        try:
+            return bool(set(last['ids']) & self._queue_notes()['archived'])
+        except Exception:  # noqa: BLE001 - a schedule probe never stops the scheduler
+            return False
 
     def _waiting_notes(self):
         try:
@@ -373,8 +478,8 @@ class Jobs:
                 self._backfill_scheduled = False
 
     def _background(self, kind, options):
-        """Starts a job thread unless one of its kind runs; True when started."""
-        if self._running[kind].locked():
+        """Starts a job thread unless one of its kind runs or the core is about to restart; True when started."""
+        if self._running[kind].locked() or time.monotonic() < self._gate_until or self.should_stop():
             return False
         thread = threading.Thread(target=self._quietly, args=(kind, options), name=f'job-{kind}', daemon=True)
         thread.start()
@@ -382,9 +487,9 @@ class Jobs:
 
     def _quietly(self, kind, options):
         """A scheduled job: its failure is recorded and written to the core's stderr (kelmod's log), and the
-        scheduler keeps going. A failed daily Dreaming run is not retried until the next day (its day is taken
-        when it starts, so a broken configuration cannot restart it every few seconds); `kelmo dream run`
-        starts one by hand."""
+        scheduler keeps going. A failed daily Dreaming run is tried again after DREAM_RETRY_SECONDS, at most
+        DREAM_TRIES times a day, so a broken configuration cannot restart it every few seconds; `kelmo dream
+        run` starts one by hand."""
         attempted = False
         try:
             if options.get('scheduled') and self._fenced():
@@ -412,8 +517,22 @@ class Jobs:
             except Exception as error:  # noqa: BLE001 - one failed tick must not end scheduling for good
                 print(f'kelmo: scheduler tick failed: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
 
+    def quiesce(self):
+        """A recycle request: the kinds of the jobs running now. When none runs, no job starts for
+        RECYCLE_GATE_SECONDS, since kelmod is about to stop the core and start it again."""
+        with self._active_lock:
+            busy = sorted(self._active)
+            if not busy:
+                self._gate_until = time.monotonic() + RECYCLE_GATE_SECONDS
+        return busy
+
+    def request_stop(self):
+        """Asks every job to end at its next step, without waiting."""
+        self._stop.set()
+
     def stop(self, timeout=None):
-        """Stops scheduling and waits for running jobs; a running model call is not killed (drain waits)."""
+        """Stops scheduling and waits for running jobs. A model call in flight ends once the core's stop is
+        requested (`kelmo.stopping`); without it, as in a test, the call runs to its end."""
         self._stop.set()
         if self._scheduler is not None:
             self._scheduler.join(timeout)
@@ -433,8 +552,7 @@ class Jobs:
         fenced = self._fenced()
         try:
             reason, allowed = ('fenced', None) if fenced else self._dream_hold()
-            daily_due = (time.localtime(self.clock()).tm_hour >= DREAM_HOUR
-                         and self._last_dream_day() != self._today())
+            daily_due = self._daily_due()
             if reason is None and not daily_due:
                 reason, allowed = self._apply_hold()
             if reason is None:
