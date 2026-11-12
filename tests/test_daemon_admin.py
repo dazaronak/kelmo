@@ -118,6 +118,65 @@ def test_uninstall_apply_unloads_the_service_and_removes_its_file(tmp_path, monk
     assert unloads == [['launchctl', 'bootout', f'gui/{os.getuid()}/org.kelmo.daemon']]
 
 
+@pytest.mark.parametrize('platform, relative, expected', [
+    ('darwin', 'Library/LaunchAgents/org.kelmo.daemon.plist',
+     [['launchctl', 'kickstart', f'gui/{os.getuid()}/org.kelmo.daemon']]),
+    ('linux', '.config/systemd/user/kelmod.service', [['systemctl', '--user', 'start', 'kelmod.service']]),
+])
+def test_start_after_a_stop_asks_the_service_manager_and_waits_for_the_daemon(tmp_path, monkeypatch, platform,
+                                                                               relative, expected):
+    # A stop ends kelmod with status 0, which neither launchd nor systemd restarts: `start` brings it back.
+    home = tmp_path / 'home'
+    (home / relative).parent.mkdir(parents=True)
+    (home / relative).write_text('synthetic', encoding='utf-8')
+    commands, running = [], []
+    monkeypatch.setattr(subprocess, 'run', lambda command, **kwargs: commands.append(command)
+                        or running.append(True) or subprocess.CompletedProcess(command, 0))
+    monkeypatch.setattr(daemon_admin, 'lock_free', lambda root: not running)
+    monkeypatch.setattr(daemon_admin, '_pid', lambda root: 4242)
+    monkeypatch.setattr(daemon_client, 'call', lambda root, op, args, seconds=None: {'cores': []})
+
+    result = daemon_admin.start(tmp_path / 'vault', home, platform=platform)
+
+    assert commands == expected
+    assert result == {'started': True, 'running': True, 'pid': 4242}
+
+
+def test_start_bootstraps_a_launchd_job_that_is_no_longer_loaded(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    plist = home / 'Library/LaunchAgents/org.kelmo.daemon.plist'
+    plist.parent.mkdir(parents=True)
+    plist.write_text('synthetic', encoding='utf-8')
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 113 if command[1] == 'kickstart' else 0)
+    monkeypatch.setattr(subprocess, 'run', run)
+    monkeypatch.setattr(daemon_admin, 'lock_free', lambda root: len(commands) < 2)
+    monkeypatch.setattr(daemon_admin, '_pid', lambda root: 7)
+    monkeypatch.setattr(daemon_client, 'call', lambda root, op, args, seconds=None: {'cores': []})
+
+    assert daemon_admin.start(tmp_path / 'vault', home, platform='darwin')['started'] is True
+    assert commands[1] == ['launchctl', 'bootstrap', f'gui/{os.getuid()}', str(plist.resolve())]
+
+
+def test_start_without_an_installed_service_refuses_and_runs_nothing(tmp_path, monkeypatch):
+    from kelmo.errors import KelmoError
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('nothing may run'))
+    with pytest.raises(KelmoError) as error:
+        daemon_admin.start(tmp_path / 'vault', tmp_path / 'home', platform='linux')
+    assert error.value.code == 'E_CONFIG'
+
+
+def test_start_leaves_a_running_daemon_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('nothing may run'))
+    monkeypatch.setattr(daemon_admin, 'lock_free', lambda root: False)
+    monkeypatch.setattr(daemon_admin, '_pid', lambda root: 99)
+    assert daemon_admin.start(tmp_path / 'vault', tmp_path / 'home', platform='darwin') == {
+        'started': False, 'running': True, 'pid': 99}
+
+
 def test_memory_limits_sum_the_core_budgets_and_the_linux_unit_carries_them(tmp_path):
     daemon_spec = {'cores': [{'budget': {'soft_mb': 100, 'hard_mb': 200}},
                              {'budget': {'soft_mb': 50, 'hard_mb': 80}}]}
@@ -152,7 +211,7 @@ def test_the_service_command_is_one_the_command_line_accepts(tmp_path, platform)
     assert (args.command, args.action, args.vault) == ('daemon', 'run', root)
 
 
-@pytest.mark.parametrize('action', ['status', 'stop', 'run', 'uninstall'])
+@pytest.mark.parametrize('action', ['status', 'start', 'stop', 'run', 'uninstall'])
 def test_every_daemon_action_takes_the_vault_before_or_after_it(tmp_path, action):
     from kelmo.interface import build_parser
     parser, _ = build_parser('')

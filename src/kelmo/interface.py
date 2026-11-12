@@ -349,11 +349,16 @@ def build_parser(version):
     uninstall.add_argument('--executable', type=Path, required=True)
     uninstall.add_argument('--client', choices=['claude', 'codex', 'both'], default='both')
     uninstall.add_argument('--apply', action='store_true', help='Apply removal; otherwise preview only')
-    daemon_command = command('daemon', 'Show, stop or uninstall the machine daemon of the selected root.')
+    daemon_command = command('daemon', 'Show, start, stop or uninstall the machine daemon of the selected root.')
     daemon_actions = daemon_command.add_subparsers(dest='action', required=True)
     # Each action takes `--vault` after it: the service definition runs `kelmo daemon run --vault ROOT`.
     common(daemon_actions.add_parser('status', help='Cores, lanes and memory of the running daemon'))
-    common(daemon_actions.add_parser('stop', help='Stop the running daemon after its calls in flight finish'))
+    daemon_start = daemon_actions.add_parser(
+        'start', help='Start the installed kelmod service again (after a stop) and wait until it answers')
+    common(daemon_start)
+    daemon_start.add_argument('--home', type=Path, default=Path.home())
+    common(daemon_actions.add_parser('stop', help='Stop the running daemon after its calls in flight finish; '
+                                                  'the service stays stopped until `kelmo daemon start`'))
     common(daemon_actions.add_parser('run', help='Rebuild the daemon spec from the setup options and run kelmod '
                                                  '(the service command)'))
     daemon_uninstall = daemon_actions.add_parser(

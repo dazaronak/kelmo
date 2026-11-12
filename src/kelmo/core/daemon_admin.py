@@ -1,7 +1,8 @@
-"""`kelmo daemon status|stop|uninstall`: the operator's view of the machine daemon of one root.
+"""`kelmo daemon status|start|stop|uninstall`: the operator's view of the machine daemon of one root.
 
 `stop` asks the running daemon to stop (SIGTERM): it stops taking requests, lets the calls in flight finish within
-their drain and exits. `uninstall` is the way back to a 0.1 install: it unloads and removes the kelmod service
+their drain and exits with status 0, so the service manager leaves it stopped. `start` asks the service manager
+to run the installed service again. `uninstall` is the way back to a 0.1 install: it unloads and removes the kelmod service
 (a keep-alive service would otherwise start the daemon again beside a 0.1 process that knows nothing of
 `daemon.lock`), stops a daemon still running, and checks that nothing holds the root's `daemon.lock` any more.
 Client registrations are removed by `kelmo uninstall`.
@@ -9,6 +10,7 @@ Client registrations are removed by `kelmo uninstall`.
 import fcntl
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -156,6 +158,45 @@ def stop(root, seconds=STOP_SECONDS):
             return {'stopped': True, 'running': False, 'pid': pid}
         time.sleep(0.1)
     raise KelmoError('E_RUNTIME', f'The daemon (pid {pid}) did not stop within {int(seconds)} s.')
+
+
+def start(root, home, *, platform=None, seconds=30.0):
+    """Starts the installed kelmod service and waits until the daemon holds its lock and answers. A stop ends kelmod
+    with status 0, which neither launchd nor systemd restarts, so this is the way back from `daemon stop`."""
+    from ..install.shared import SERVICE_LABEL, SERVICE_UNIT
+    platform = platform or sys.platform
+    home = Path(home).expanduser().resolve()
+    if not lock_free(root):
+        return {'started': False, 'running': True, 'pid': _pid(root)}
+    if platform == 'darwin':
+        service = home / f'Library/LaunchAgents/{SERVICE_LABEL}.plist'
+        domain = f'gui/{os.getuid()}'
+        commands = [['launchctl', 'kickstart', f'{domain}/{SERVICE_LABEL}']]
+        # kickstart needs a loaded job; one unloaded by hand is bootstrapped from its file instead.
+        fallback = ['launchctl', 'bootstrap', domain, str(service)]
+    else:
+        service = home / f'.config/systemd/user/{SERVICE_UNIT}'
+        commands, fallback = [['systemctl', '--user', 'start', SERVICE_UNIT]], None
+    if not service.exists():
+        raise KelmoError('E_CONFIG', f'No kelmod service is installed at {service}; run kelmo setup.')
+    try:
+        result = subprocess.run(commands[0], capture_output=True, timeout=30)
+        if result.returncode and fallback is not None:
+            result = subprocess.run(fallback, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise KelmoError('E_RUNTIME', f'The service manager could not start kelmod: {error}') from error
+    if result.returncode:
+        raise KelmoError('E_RUNTIME', f'The service manager refused to start kelmod (status {result.returncode}).')
+    limit = time.monotonic() + seconds
+    while time.monotonic() < limit:
+        if not lock_free(root):
+            try:
+                daemon_client.call(root, 'daemon.status', {}, seconds=2.0)
+                return {'started': True, 'running': True, 'pid': _pid(root)}
+            except KelmoError:
+                pass
+        time.sleep(0.2)
+    raise KelmoError('E_RUNTIME', f'kelmod did not answer within {int(seconds)} s of its start; see its log.')
 
 
 def uninstall(root, home, *, apply=False, platform=None):

@@ -183,7 +183,10 @@ configuration for recovery.
 `kelmo daemon status` reports the daemon and its cores, `kelmo daemon stop`
 stops it (calls already accepted finish first; new ones are refused as
 retryable), and `kelmo daemon uninstall --apply` removes the service, which is
-the first step back to a 0.1 install.
+the first step back to a 0.1 install. A stopped daemon stays stopped: it exits
+cleanly, and neither launchd nor systemd restarts a clean exit. Sessions get no
+memory until `kelmo daemon start` asks the service manager to run it again (or
+the next login does). Open sessions reconnect on their own once it answers.
 
 Installed agent guidance uses the absolute runtime executable and selected vault,
 so it works when the private runtime is absent from PATH and the data is outside

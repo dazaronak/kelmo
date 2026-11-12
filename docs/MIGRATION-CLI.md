@@ -11,9 +11,9 @@ Save a JSON source specification:
 
 ```json
 {
-  "archive": {"kind": "sqlite", "path": "/srv/old/archive.db"},
-  "vault": {"kind": "git", "path": "/srv/old/knowledge-repository"},
-  "journal": {"kind": "sqlite", "path": "/srv/old/state/journal.sqlite3"}
+  "archive": { "kind": "sqlite", "path": "/srv/old/archive.db" },
+  "vault": { "kind": "git", "path": "/srv/old/knowledge-repository" },
+  "journal": { "kind": "sqlite", "path": "/srv/old/state/journal.sqlite3" }
 }
 ```
 
@@ -129,7 +129,7 @@ A writer pause means: fence the server profile (`kelmo server fence --on
 write, so clients keep their writes queued, and a running worker waits between
 passes while the fence holds), stop the worker, the vault's `kelmod`
 (`kelmo daemon stop`) and vault sync, back up, then unfence and start them
-again on every exit path. The embedding
+again on every exit path (`kelmo daemon start` for the `kelmod`). The embedding
 model, caches, locks and the executor binding are not copied; they are
 installed again on a restored host.
 

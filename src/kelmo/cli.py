@@ -324,6 +324,8 @@ def dispatch(args, commands):
         target = selected_root(args)
         if args.action == 'status':
             return daemon_admin.status(target)
+        if args.action == 'start':
+            return daemon_admin.start(target, args.home)
         if args.action == 'stop':
             return daemon_admin.stop(target)
         if args.action == 'run':

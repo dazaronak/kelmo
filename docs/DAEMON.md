@@ -5,7 +5,7 @@ endpoint, hooks, the CLI and, on a vault, the background work. It starts
 and supervises its cores as child processes: on a vault the state core (journal,
 outbox and jobs), the archive core and the embedding core; on a shared client
 one edge core. The user service runs it as `kelmo daemon run`; see
-[setup](SETUP.md) for the service and `kelmo daemon status|stop|uninstall`.
+[setup](SETUP.md) for the service and `kelmo daemon status|start|stop|uninstall`.
 
 Background work runs as jobs on the state core: one queue pass (`worker`), Dreaming (`dream`), vector
 backfill, re-embedding and the graph rebuild. At most one job of a kind runs at
