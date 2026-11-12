@@ -133,7 +133,7 @@ def _fixed_operations():
     ]
 
 
-ADMIN = ('ping', 'stop', 'trim', 'status', 'drain', 'refresh')
+ADMIN = ('ping', 'stop', 'trim', 'status', 'drain', 'refresh', 'recycle')
 CORES = ('state', 'archive', 'embed', 'edge', 'uplink')
 
 

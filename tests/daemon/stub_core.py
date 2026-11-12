@@ -1,6 +1,7 @@
 """Stub core for the daemon black-box tests. kelmod starts it with its channel on descriptor 3.
 
-    stub_core.py CORE SCRATCH [--crash-at-start] [--linger SECONDS]
+    stub_core.py CORE SCRATCH [--crash-at-start] [--linger SECONDS] [--decline-recycle]
+                 [--call-archive-on-stop]
 
 CORE is `state` or `archive`. Each invocation a test checks is appended to SCRATCH/CORE.seen as a
 JSON line, so a test reads from the files what the core really received, and in what order.
@@ -11,9 +12,12 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 
+from kelmo.core.context import Context
 from kelmo.core.corelink import CoreLink
 from kelmo.errors import KelmoError
 
@@ -100,6 +104,43 @@ def trim_handler(core, scratch):
     return trim
 
 
+def watch_admin(core, scratch, argv):
+    """Answers admin.recycle (agrees unless `--decline-recycle`) and records each admin.stop in
+    SCRATCH/CORE.stops. With `--call-archive-on-stop` the core makes one archive.echo call on admin.stop,
+    records its outcome in SCRATCH/CORE.stop-call, and only then stops."""
+    original = CoreLink._admin
+
+    def stop_after_call(link, op, header):
+        try:
+            result = link.call("archive.echo", {"tag": "on-stop"},
+                               Context.local(uuid.uuid4().hex, 5.0)).result(timeout=10)
+            outcome = {"ok": True, "result": result, "at": time.time()}
+        except KelmoError as error:
+            outcome = {"ok": False, "code": error.code, "at": time.time()}
+        (scratch / f"{core}.stop-call").write_text(json.dumps(outcome))
+        original(link, op, header)
+
+    def admin(link, op, header):
+        if op == "admin.recycle":
+            with (scratch / f"{core}.recycles").open("a") as line:
+                line.write("asked\n")
+            if "--decline-recycle" in argv:
+                link._reply(header["id"], {"recycle": False, "busy": ["job"]})
+            else:
+                link._reply(header["id"], {"recycle": True})
+            return
+        if op == "admin.stop":
+            with (scratch / f"{core}.stops").open("a") as line:
+                line.write(json.dumps({"at": time.time(), "pid": os.getpid()}) + "\n")
+            if "--call-archive-on-stop" in argv:
+                # The reader thread must stay free to read the archive's reply.
+                threading.Thread(target=stop_after_call, args=(link, op, header), daemon=True).start()
+                return
+        original(link, op, header)
+
+    CoreLink._admin = admin
+
+
 def linger_seconds(argv):
     """The value of `--linger SECONDS`, or None when the option is absent."""
     if "--linger" not in argv:
@@ -115,6 +156,7 @@ def main(argv):
     with (scratch / f"{core}.pids").open("a") as pids:
         pids.write(f"{os.getpid()}\n")
     trim = trim_handler(core, scratch) if core == "state" else None
+    watch_admin(core, scratch, argv)
     LINK = CoreLink.from_descriptor(3, handlers=handlers(core, scratch),
                                     lanes={"fast": 8, "work": 2}, trim=trim)
     LINK.serve()

@@ -2,7 +2,8 @@
 //!
 //! - `embed.count {texts, prefix}`: token counts with the semantics of the Python `TokenWindow.count`;
 //! - `embed.describe {}`: the tokenizer identity and the preparation digest the window was built with;
-//! - `admin.ping`, `admin.status`, `admin.trim` (drops the tokenizer), `admin.stop`.
+//! - `admin.ping`, `admin.status`, `admin.trim` (drops the tokenizer), `admin.recycle` (always agrees),
+//!   `admin.stop`.
 //!
 //! The tokenizer loads at the first count and is dropped after `IDLE` without one. The tokenizer file and the
 //! special-token additions come from the command line (`kelmo core-spec` reads them from the vault's
@@ -197,6 +198,9 @@ impl Core {
                 let provider = self.provider.trim();
                 self.reply(&id, Ok(json!({"trimmed": tokenizer || provider})));
             }
+            // No background work runs here: kelmod asks only when no call is in flight, so a recycle is
+            // always safe.
+            "admin.recycle" => self.reply(&id, Ok(json!({"recycle": true}))),
             "admin.stop" => {
                 self.reply(&id, Ok(json!({"stopping": true})));
                 return false;

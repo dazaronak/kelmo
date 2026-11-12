@@ -13,7 +13,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::router::{Command, Event};
-use crate::spec::{CoreSpec, Spec};
+use crate::spec::{CoreSpec, MemoryScope, Spec};
 use crate::sys;
 
 /// Exit code of kelmod when a core restarts more often than its budget allows: the service manager then
@@ -154,7 +154,20 @@ pub fn kill_leftovers(directory: &Path) {
     }
 }
 
+/// Runs one core until it is stopped for good, then tells the router (`CoreStopped`), which stops the next
+/// stop group only once every core of this one has ended.
 pub async fn supervise(
+    supervised: Supervised,
+    events: UnboundedSender<Event>,
+    commands: UnboundedReceiver<Command>,
+    fatal: UnboundedSender<i32>,
+) {
+    let index = supervised.index;
+    run_core(supervised, events.clone(), commands, fatal).await;
+    let _ = events.send(Event::CoreStopped { core: index });
+}
+
+async fn run_core(
     supervised: Supervised,
     events: UnboundedSender<Event>,
     mut commands: UnboundedReceiver<Command>,
@@ -173,7 +186,7 @@ pub async fn supervise(
     let mut charge_restart = false;
     // A closed command channel (every sender gone) stays closed: read it once, not on every turn of the loop.
     // While the daemon runs it keeps a sender of its own, so the channel stays open and a stop arrives as
-    // `Command::Stop`, from the router or, when the router is lost, from the daemon itself.
+    // `Command::Stop` from the router or, when the router is lost, `Command::Close` from the daemon itself.
     let mut commands_open = true;
     loop {
         if charge_restart && !budget.restart(Instant::now()) {
@@ -228,6 +241,8 @@ pub async fn supervise(
                         && !status.success()
                     {
                         eprintln!("kelmod: core {} exited ({status}); restarting it", core.name);
+                    } else if planned_restart && !stopping {
+                        eprintln!("kelmod: core {} stopped for its planned restart; starting it again", core.name);
                     }
                     // A reply the core wrote just before it ended is still in the channel: read it out first.
                     if !reader_task.is_finished() {
@@ -263,7 +278,8 @@ pub async fn supervise(
                     break;
                 }
                 _ = sampler.tick() => {
-                    let _ = events.send(Event::Memory { core: index, bytes: sys::tree_resident_bytes(pid) });
+                    let scope = core.budget.as_ref().map_or(MemoryScope::Tree, |budget| budget.scope);
+                    let _ = events.send(Event::Memory { core: index, bytes: sys::core_resident_bytes(pid, scope) });
                 }
                 command = commands.recv(), if commands_open => match command {
                     Some(Command::Kill) => {
@@ -288,9 +304,13 @@ pub async fn supervise(
                             stop_deadline = Some(stop_deadline.map_or(deadline, |old| old.max(deadline)));
                             stopping = true;
                         }
-                        // Closing kelmod's half of the channel is a stop the core sees even when the router that
-                        // would send `admin.stop` is stuck: the core reads end of file, drains and exits.
-                        writer_task.abort();
+                        // A router's Stop comes with `admin.stop`: the channel stays open, so the core's own
+                        // calls still get their replies while it drains. When the router is lost (Close, or
+                        // every sender gone), closing kelmod's half of the channel is the stop: the core reads
+                        // end of file, drains and exits.
+                        if !matches!(command, Some(Command::Stop)) {
+                            writer_task.abort();
+                        }
                     }
                 },
                 _ = async {
@@ -299,7 +319,13 @@ pub async fn supervise(
                         None => std::future::pending::<()>().await,
                     }
                 } => {
+                    eprintln!(
+                        "kelmod: core {} did not stop within its drain time of {} s; killing it",
+                        core.name,
+                        drain.as_secs()
+                    );
                     planned_restart = false;
+                    writer_task.abort();
                     sys::kill_group(pid);
                     let _ = child.kill().await;
                     // Spent: the killed core's exit ends the loop, and a past deadline must not spin it.
@@ -330,7 +356,7 @@ pub async fn supervise(
 fn stop_waiting(commands: &mut UnboundedReceiver<Command>) -> bool {
     loop {
         match commands.try_recv() {
-            Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return true,
+            Ok(Command::Stop | Command::Close) | Err(TryRecvError::Disconnected) => return true,
             Ok(_) => {}
             Err(TryRecvError::Empty) => return false,
         }
@@ -349,6 +375,7 @@ pub fn start_all(
 ) {
     let mut senders = Vec::new();
     let mut tasks = Vec::new();
+    let groups = crate::router::spec_groups(spec);
     for (index, core) in spec.cores.iter().cloned().enumerate() {
         let (tx, rx) = unbounded_channel();
         senders.push(tx);
@@ -359,7 +386,8 @@ pub fn start_all(
             core,
             restart_max: spec.restart_max,
             restart_window: spec.restart_window,
-            drain: spec.drain_timeout,
+            // The callers get the spec's drain; a later group, stopped once they have ended, at most 10 s.
+            drain: crate::router::group_drain(spec, groups[index]),
             sample: spec.sample,
             executors,
         };

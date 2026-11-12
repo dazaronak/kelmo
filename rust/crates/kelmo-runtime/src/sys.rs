@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::process::Command;
 
+use crate::spec::MemoryScope;
+
 /// The open-file soft limit a core is started with, once `raise_open_files` raised kelmod's own (0 before).
 /// Python code that uses select(2) fails on a descriptor past 1024, which a core under kelmod's raised limit
 /// could be handed; a service manager's own soft limit (launchd 256) is too low for a core with executor
@@ -232,19 +234,68 @@ fn children(_pid: u32) -> Vec<u32> {
     Vec::new()
 }
 
-/// Resident memory of a process and every process below it: a core's launcher and the confined worker it
-/// starts (bubblewrap puts that worker in a session of its own, so its process group is not the core's).
-pub fn tree_resident_bytes(pid: u32) -> Option<u64> {
-    let mut total = resident_bytes(pid)?;
-    let mut pending = children(pid);
+/// The process group of a process.
+#[cfg(target_os = "linux")]
+fn process_group(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 5; the command name in parentheses may hold spaces, so count from its closing ')'.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(2)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_group(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns how many it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (written == size).then_some(info.pbi_pgid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_group(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// The descendants of `leader` a budget of this scope counts: every one for `Tree`, those in the leader's
+/// process group for `Group`. Every descendant is walked (a group member may sit below a process of another
+/// group), at most 4096 of them.
+fn counted_descendants(
+    leader: u32,
+    scope: MemoryScope,
+    children: impl Fn(u32) -> Vec<u32>,
+    group: impl Fn(u32) -> Option<u32>,
+) -> Vec<u32> {
+    let mut members = Vec::new();
+    let mut pending = children(leader);
     let mut seen = 0;
     while let Some(child) = pending.pop() {
         seen += 1;
         if seen > 4096 {
             break;
         }
-        total += resident_bytes(child).unwrap_or(0);
+        if scope == MemoryScope::Tree || group(child) == Some(leader) {
+            members.push(child);
+        }
         pending.extend(children(child));
+    }
+    members
+}
+
+/// Resident memory of a core, which leads its own process group (kelmod kills it with `kill_group`), and of
+/// the descendants its budget scope counts (see `MemoryScope`).
+pub fn core_resident_bytes(pid: u32, scope: MemoryScope) -> Option<u64> {
+    let mut total = resident_bytes(pid)?;
+    for member in counted_descendants(pid, scope, children, process_group) {
+        total += resident_bytes(member).unwrap_or(0);
     }
     Some(total)
 }
@@ -284,4 +335,86 @@ pub fn process_start(pid: u32) -> Option<String> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_start(_pid: u32) -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    /// (pid, parent, group) of a synthetic process tree.
+    fn tree(rows: &[(u32, u32, u32)]) -> Vec<u32> {
+        let parents: HashMap<u32, u32> = rows.iter().map(|(p, parent, _)| (*p, *parent)).collect();
+        let groups: HashMap<u32, u32> = rows.iter().map(|(p, _, g)| (*p, *g)).collect();
+        let mut members = counted_descendants(
+            100,
+            MemoryScope::Group,
+            |pid| {
+                let mut kids: Vec<u32> = parents
+                    .iter()
+                    .filter(|(_, parent)| **parent == pid)
+                    .map(|(child, _)| *child)
+                    .collect();
+                kids.sort_unstable();
+                kids
+            },
+            |pid| groups.get(&pid).copied(),
+        );
+        members.sort_unstable();
+        members
+    }
+
+    #[test]
+    fn children_in_the_cores_group_count() {
+        assert_eq!(tree(&[(101, 100, 100), (102, 101, 100)]), vec![101, 102]);
+    }
+
+    #[test]
+    fn a_child_in_a_session_of_its_own_and_its_children_do_not_count() {
+        assert_eq!(
+            tree(&[(101, 100, 100), (200, 100, 200), (201, 200, 200)]),
+            vec![101]
+        );
+    }
+
+    #[test]
+    fn a_group_member_below_a_foreign_process_still_counts() {
+        assert_eq!(tree(&[(200, 100, 200), (201, 200, 100)]), vec![201]);
+    }
+
+    #[test]
+    fn a_process_whose_group_cannot_be_read_does_not_count() {
+        let children = |pid: u32| if pid == 100 { vec![7] } else { Vec::new() };
+        assert!(counted_descendants(100, MemoryScope::Group, children, |_| None).is_empty());
+    }
+
+    #[test]
+    fn a_tree_budget_counts_a_child_in_a_session_of_its_own() {
+        // The confined archive worker: bubblewrap stays in the core's group, the worker it starts does not.
+        let parents = HashMap::from([(101, 100), (200, 101)]);
+        let groups = HashMap::from([(101, 100), (200, 200)]);
+        let children = |pid: u32| {
+            let mut kids: Vec<u32> = parents
+                .iter()
+                .filter(|(_, p)| **p == pid)
+                .map(|(c, _)| *c)
+                .collect();
+            kids.sort_unstable();
+            kids
+        };
+        let mut members = counted_descendants(100, MemoryScope::Tree, children, |pid| {
+            groups.get(&pid).copied()
+        });
+        members.sort_unstable();
+        assert_eq!(members, vec![101, 200]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_group_of_this_process_is_read() {
+        // SAFETY: getpgrp cannot fail and has no memory effects.
+        let own = unsafe { libc::getpgrp() } as u32;
+        assert_eq!(process_group(std::process::id()), Some(own));
+    }
 }

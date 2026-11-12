@@ -57,6 +57,14 @@ def main(argv):
     original_admin = CoreLink._admin
 
     def observed_admin(link, op, header):
+        if op == "admin.recycle":
+            with marker(scratch, f"{core}.recycles").open("a") as line:
+                line.write("asked\n")
+            if "--decline-recycle" in options:
+                link._reply(header["id"], {"recycle": False, "busy": ["job"]})
+            else:
+                link._reply(header["id"], {"recycle": True})
+            return
         if op == "admin.stop" and core == "state":
             marker(scratch, "state.admin-stop").touch()
             if "--hold-admin-stop" in options:

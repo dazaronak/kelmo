@@ -154,8 +154,10 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
     if archive_core:
         argv.append('--archive-core')
     lanes = dict(STATE_LANES, read=(readers, STATE_LANES['read'][1], STATE_LANES['read'][2]))
+    # Model executors run in sessions of their own and end by their own deadlines, so the state core's budget
+    # counts only its process group; the archive core's confined worker leaves that group and is counted.
     state = {'name': 'state', 'argv': argv, 'env': _environment(source_root), 'lanes': _lanes(lanes),
-             'budget': {'soft_mb': STATE_BUDGET_MB[0], 'hard_mb': STATE_BUDGET_MB[1]}}
+             'budget': {'soft_mb': STATE_BUDGET_MB[0], 'hard_mb': STATE_BUDGET_MB[1], 'scope': 'group'}}
     cores, served = [state], [(op, lanes) for op in operations.table() if op.name.startswith('state.')]
     if archive_core:
         archive_argv = [*_command(core_command, executable, 'archive'), '--vault', str(root)]

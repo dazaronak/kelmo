@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use crate::gateway::{Gateway, next_connection};
 use crate::ipc;
-use crate::router::{Beat, Command, Event, ROUTER_DRAIN, Router};
+use crate::router::{Beat, Command, Event, ROUTER_DRAIN, Router, stop_budget};
 use crate::spec::Spec;
 use crate::supervisor::{read_frames, start_all, write_frames};
 
@@ -33,6 +33,9 @@ const MIN_OPEN_FILES: u64 = 2048;
 /// How long an ephemeral daemon waits for its first client, and after its last one leaves.
 const FIRST_CLIENT_GRACE: Duration = Duration::from_secs(10);
 const LAST_CLIENT_GRACE: Duration = Duration::from_secs(2);
+/// The longest a stop takes from the signal to the end of the process: under the service managers' 90 s stop
+/// timeout, with room to spare. The client drain (10 s) and the cores' groups (at most 68 s) fit inside it.
+const STOP_LIMIT: Duration = Duration::from_secs(80);
 
 /// Connected clients and when that number last changed, for the ephemeral exit.
 struct Presence {
@@ -149,6 +152,7 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
     let (events, receiver) = unbounded_channel();
     let (fatal_tx, mut fatal_rx) = unbounded_channel::<i32>();
     let drain = spec.drain_timeout;
+    let cores_stop = stop_budget(&spec);
     let (supervisors, supervisor_tasks) = start_all(&spec, &events, &fatal_tx);
     // Kept so the daemon can stop the cores itself when the router that normally does is lost.
     let core_commands = supervisors.clone();
@@ -278,17 +282,21 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
         }
     };
     notify("STOPPING=1");
-    // The router drains first: it refuses new calls as retryable and waits for the admitted ones, whose replies
-    // still travel through the open front end. Only then does the front end close its connections.
+    let began = tokio::time::Instant::now();
+    // The router drains first: it refuses new calls as retryable and waits for the admitted ones (at most 10 s),
+    // whose replies still travel through the open front end. Then it stops the cores group by group, routing the
+    // stopping cores' own calls meanwhile, and ends once every core has ended (`cores_stop`, at most 68 s). Only
+    // then does the front end close its connections. With the waits below the stop stays inside `STOP_LIMIT`.
     let _ = events.send(Event::Shutdown);
     if !router_lost {
-        let _ = tokio::time::timeout(ROUTER_DRAIN + Duration::from_secs(3), &mut router_task).await;
+        let until = began + ROUTER_DRAIN + cores_stop + Duration::from_secs(1);
+        let _ = tokio::time::timeout_at(until, &mut router_task).await;
     }
-    // A drained router has already sent every core `admin.stop` and its supervisor a stop. One that was lost (or
-    // did not finish in time) did not: the supervisors get the stop here, and a core that does not end by its drain
-    // deadline is killed. A second stop never moves the first deadline.
+    // A router that finished has stopped every core. One that was lost (or did not finish in time) did not: the
+    // supervisors get a close here, which ends the core's channel so it stops without `admin.stop`, and a core
+    // that does not end by its drain deadline is killed. A second stop never moves the first deadline.
     for commands in &core_commands {
-        let _ = commands.send(Command::Stop);
+        let _ = commands.send(Command::Close);
     }
     let _ = stopping_tx.send(true);
     if let Some(task) = front_task {
@@ -300,7 +308,8 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
             let _ = task.await;
         }
     };
-    let _ = tokio::time::timeout(drain + Duration::from_secs(2), drained).await;
+    let own_drain = tokio::time::Instant::now() + drain + Duration::from_secs(2);
+    let _ = tokio::time::timeout_at(own_drain.min(began + STOP_LIMIT), drained).await;
     let _ = std::fs::remove_file(ipc::socket_path(&runtime));
     code
 }
@@ -372,6 +381,29 @@ mod tests {
     #[test]
     fn a_router_that_has_just_handled_an_event_keeps_the_watchdog_ping() {
         assert!(router_alive(Duration::ZERO, Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn the_longest_stop_of_three_groups_fits_the_stop_limit_and_the_limit_the_service_timeout() {
+        // The worst case: the callers' drain at its cap, then the archive and the embedder, each group with the
+        // slack the router waits for its supervisors, and the second the daemon gives the router on top.
+        let spec = Spec::from_json(&serde_json::json!({
+            "root": "/nonexistent/kelmo-stop-budget",
+            "origin": {"client_id": "test"},
+            "cores": [
+                {"name": "state", "argv": ["state"], "lanes": {}},
+                {"name": "archive", "argv": ["archive"], "lanes": {}},
+                {"name": "embed", "argv": ["embed"], "lanes": {}},
+            ],
+            "operations": [],
+            "drain_timeout_ms": 600_000,
+        }))
+        .expect("spec");
+        let router_wait = ROUTER_DRAIN + stop_budget(&spec) + Duration::from_secs(1);
+        assert_eq!(router_wait, Duration::from_secs(79));
+        assert!(router_wait <= STOP_LIMIT, "{router_wait:?}");
+        // kelmo writes TimeoutStopSec=90 and ExitTimeOut=90 (install/shared.py STOP_TIMEOUT).
+        assert!(STOP_LIMIT < Duration::from_secs(90), "{STOP_LIMIT:?}");
     }
 
     #[test]

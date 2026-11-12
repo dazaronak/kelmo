@@ -23,6 +23,15 @@
     "lanes": [
       "admin"
     ],
+    "name": "admin.recycle",
+    "replay": "never"
+  },
+  {
+    "access": "write",
+    "arguments": {},
+    "lanes": [
+      "admin"
+    ],
     "name": "admin.refresh",
     "replay": "never"
   },

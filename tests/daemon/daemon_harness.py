@@ -40,7 +40,8 @@ OPERATIONS = [
 ]
 
 
-def build_spec(root, runtime, scratch, *, lanes=None, state_argv=(), state_budget=None, **options):
+def build_spec(root, runtime, scratch, *, lanes=None, state_argv=(), state_budget=None, archive_argv=(),
+               **options):
     """A spec with a `state` and an `archive` core, both run by the stub.
 
     `lanes` replaces single lanes of the defaults; `options` override top-level keys."""
@@ -54,7 +55,7 @@ def build_spec(root, runtime, scratch, *, lanes=None, state_argv=(), state_budge
         "root": str(root),
         "runtime_dir": str(runtime),
         "origin": {"client_id": "test-cli"},
-        "cores": [core("state", state_argv, state_budget), core("archive", (), None)],
+        "cores": [core("state", state_argv, state_budget), core("archive", archive_argv, None)],
         "operations": [{"name": name, "lanes": [lane], "replay": replay}
                        for name, lane, replay in OPERATIONS],
         "heartbeat_ms": 5000,

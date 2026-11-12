@@ -16,7 +16,7 @@ from pathlib import Path
 from ..errors import KelmoError
 from . import daemon_client
 
-STOP_SECONDS = 45.0
+STOP_SECONDS = 85.0  # kelmod stops within 78 s (rust STOP_LIMIT)
 
 
 def _state(root):

@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-/// The longest drain a core gets on a stop.
-pub const MAX_DRAIN: Duration = Duration::from_secs(25);
+/// The longest drain the first stop group (the cores that call others) gets on a stop.
+pub const MAX_DRAIN: Duration = Duration::from_secs(45);
+/// The longest drain a core of a later stop group (the archive, the embedder) gets once its group is stopped.
+pub const LATER_DRAIN: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
@@ -27,10 +29,24 @@ pub struct LaneSpec {
     pub order: Order,
 }
 
+/// Which processes a core's memory budget counts besides the core itself. The budget counts the memory that
+/// stopping the core frees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryScope {
+    /// Every descendant. A core whose own work runs in a child that leaves its process group (the confined
+    /// archive worker: bubblewrap starts it with `--new-session` and `--die-with-parent`) counts it.
+    Tree,
+    /// Only the descendants in the core's process group. The state core starts model executors in sessions of
+    /// their own, each bounded by its deadline; they are not the core's memory and stopping the core's
+    /// group does not end them.
+    Group,
+}
+
 #[derive(Debug, Clone)]
 pub struct Budget {
     pub soft_bytes: u64,
     pub hard_bytes: u64,
+    pub scope: MemoryScope,
 }
 
 #[derive(Debug, Clone)]
@@ -162,9 +178,9 @@ impl Spec {
             sample: millis(value, "sample_ms", 10_000)?,
             restart_max: number(value, "restart_max", 5)? as usize,
             restart_window: millis(value, "restart_window_ms", 60_000)?,
-            // A stop takes the router's wait (at most 13 s), then the cores' drain from their stop: with 25 s
-            // that is about 38 s, inside the service managers' 40 s stop timeout; a longer drain would be cut by
-            // their SIGKILL.
+            // A stop takes the client drain (at most 10 s), then the cores' drain group by group: the callers'
+            // drain (at most 45 s), then at most 10 s for each later group. That is at most 75 s, inside the
+            // service managers' 90 s stop timeout; a longer drain would be cut by their SIGKILL.
             drain_timeout: millis(value, "drain_timeout_ms", 20_000)?.min(MAX_DRAIN),
             http: value.get("http").filter(|http| !http.is_null()).cloned(),
             meta: value.get("meta").cloned().unwrap_or(Value::Null),
@@ -217,6 +233,12 @@ fn core_from_json(core: &Value) -> Result<CoreSpec, String> {
         Some(budget) => Some(Budget {
             soft_bytes: number(budget, "soft_mb", 0)? * 1_048_576,
             hard_bytes: number(budget, "hard_mb", 0)? * 1_048_576,
+            // A spec written before the field counts the whole tree, as kelmod always did.
+            scope: match budget.get("scope").and_then(Value::as_str) {
+                None | Some("tree") => MemoryScope::Tree,
+                Some("group") => MemoryScope::Group,
+                Some(other) => return Err(format!("spec: unknown budget scope {other}")),
+            },
         }),
     };
     Ok(CoreSpec {

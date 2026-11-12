@@ -8,7 +8,8 @@ from daemon_harness import KELMOD, launch, wait_for
 def start(tmp_path):
     """`start(**options)` launches kelmod on a fresh spec and waits until both cores are ready.
 
-    `wait_ready=False` skips the wait. `options` are spec keys or `lanes`, `state_argv`, `state_budget`."""
+    `wait_ready=False` skips the wait. `options` are spec keys or `lanes`, `state_argv`, `state_budget`,
+    `archive_argv`."""
     daemons = []
 
     def launch_daemon(*, wait_ready=True, **options):

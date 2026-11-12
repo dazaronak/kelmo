@@ -70,9 +70,20 @@ memory every 10 seconds against a soft and a hard budget:
 | embedding | 450 / 900 MiB      |
 | edge      | 150 / 512 MiB      |
 
+A core's budget counts the core and the processes that stop with it. The state core counts its own process
+group, without the model executors it starts in sessions of their own; the archive counts its confined worker.
+
 A core over its hard budget is killed and started again. A core over its soft budget is asked to drop its
-caches; if it is still over at the next sample, it is restarted once it has no call in flight. More than five
-restarts within a minute end `kelmod` with exit code 70, and the service manager starts it again.
+caches. If it is still over at the next sample and has no call in flight, `kelmod` asks it whether it may be
+restarted (`admin.recycle`), and holds new calls for it until it answers. A core running background work, such
+as Dreaming or a session job, declines, keeps running and is asked again 30 seconds later. Only a core that agrees
+is restarted, so a soft budget never ends background work. More than five restarts within a minute end `kelmod`
+with exit code 70, and the service manager starts it again.
+
+Sometimes a core is back over its soft budget within three samples of a restart it agreed to. Another restart
+would not bring it down, so `kelmod` raises that core's soft budget instead, to 1.25 times what it uses and at
+most 90% of its hard budget. The raised budget holds until `kelmod` itself restarts. Growth past it is trimmed and
+recycled as before. `kelmo daemon status --json` shows each core's budget and whether it was raised.
 
 Two locks keep ownership single: `daemon.lock` allows one `kelmod` per vault, and `state-core.lock` allows one
 writing state core, even while a crashed daemon's old core is still finishing.
@@ -80,10 +91,13 @@ writing state core, even while a crashed daemon's old core is still finishing.
 ## Stopping
 
 On SIGTERM `kelmod` stops taking calls: a new call gets `E_UNAVAILABLE`, retryable after one second. Calls already
-admitted finish, for up to 10 seconds. Then every core is told to stop and gets up to 20 seconds to finish its
-own work (`drain_timeout`, at most 25 seconds); a core still running after that is killed. The HTTP endpoint
-closes only after the calls have drained, so their replies still reach the clients. The whole stop fits the
-40-second timeout of both service managers.
+admitted finish, for up to 10 seconds. Then the cores stop in order: the cores that call others first (the
+state core), then the archive, then the embedder. The state core gets up to 20 seconds to finish its own work
+(`drain_timeout`, at most 45 seconds), and the archive and embedder stay up meanwhile, so a background job that
+is ending still reaches them. The archive and the embedder get up to 10 seconds each once the state core has
+ended. A core still running after its time is killed. The HTTP endpoint closes only after the calls have drained,
+so their replies still reach the clients. The whole stop takes at most 78 seconds and fits the 90-second timeout
+of both service managers.
 
 ## Service managers
 

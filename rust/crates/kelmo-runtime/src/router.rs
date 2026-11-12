@@ -84,6 +84,11 @@ pub enum Event {
     CoreExited {
         core: usize,
     },
+    /// The core's supervisor ended for good (after a stop, or a spent restart budget): no process of it runs or
+    /// will start again.
+    CoreStopped {
+        core: usize,
+    },
     Memory {
         core: usize,
         bytes: Option<u64>,
@@ -99,8 +104,12 @@ pub enum Command {
     Kill,
     /// The core was asked to stop; kill it if it is still there after the drain timeout, then restart.
     Restart,
-    /// Stop for good (daemon shutdown).
+    /// Stop for good (daemon shutdown). The router has sent `admin.stop`; the core drains with its channel open,
+    /// so its own calls still get their replies, and is killed at its drain deadline.
     Stop,
+    /// Stop for good when the router is lost: kelmod closes its half of the channel, which a core sees as a
+    /// stop even without `admin.stop`, and kills it at its drain deadline.
+    Close,
 }
 
 struct Call {
@@ -136,10 +145,33 @@ struct CoreState {
     restarts: u64,
     pings: VecDeque<u64>,
     memory: Option<u64>,
+    /// The soft budget in force: the spec's, or higher once pinned (see `memory`).
     soft: Option<u64>,
+    /// The soft budget the spec set.
+    soft_base: Option<u64>,
     hard: Option<u64>,
     over_soft_since: Option<Instant>,
+    /// The last restart was a planned recycle. Cleared by a kill, and once the restarted core has been sampled
+    /// more than `PIN_SAMPLES` times.
+    planned: bool,
+    /// Memory samples taken since the core last started.
+    samples: u32,
     restarting: bool,
+    /// An `admin.recycle` is out (its id): no new call is dispatched to the core until it answers, but
+    /// heartbeats go on.
+    recycle_pending: Option<u64>,
+    /// When a pending recycle counts as declined for want of an answer.
+    recycle_deadline: Option<Instant>,
+    /// No new recycle is asked before this, after a decline.
+    recycle_retry_at: Option<Instant>,
+    /// The core declined the last recycle: the next decline of the streak is not logged again.
+    recycle_declined: bool,
+    /// The stop group: a core is stopped only once every core of a lower group has ended.
+    group: usize,
+    /// `admin.stop` and `Command::Stop` went out on the daemon's shutdown.
+    stop_sent: bool,
+    /// The supervisor ended for good.
+    gone: bool,
     supervisor: UnboundedSender<Command>,
 }
 
@@ -160,13 +192,68 @@ fn allowed(caller: Option<&str>, op: &str) -> bool {
     }
 }
 
+/// The stop group of each named core: 0 for a core no other core of the list may call, else one more than the
+/// highest group of its callers (`allowed`). So `state` and `edge` stop first, then `archive`, then `embed`,
+/// and a core keeps its routes to every core it calls while it drains.
+pub fn stop_groups(names: &[&str]) -> Vec<usize> {
+    let mut groups = vec![0; names.len()];
+    // A caller chain is at most as long as the list; the cap ends a cycle, which `allowed` does not have.
+    for _ in 0..names.len() {
+        for (caller, name) in names.iter().enumerate() {
+            for (callee, other) in names.iter().enumerate() {
+                if caller != callee && allowed(Some(*name), &format!("{other}.")) {
+                    groups[callee] = groups[callee].max(groups[caller] + 1).min(names.len());
+                }
+            }
+        }
+    }
+    groups
+}
+
+/// The drain a core of this stop group gets once its group is stopped.
+pub fn group_drain(spec: &Spec, group: usize) -> Duration {
+    if group == 0 {
+        spec.drain_timeout
+    } else {
+        spec.drain_timeout.min(crate::spec::LATER_DRAIN)
+    }
+}
+
+/// The stop groups of the spec's cores, in the spec's order.
+pub fn spec_groups(spec: &Spec) -> Vec<usize> {
+    let names: Vec<&str> = spec.cores.iter().map(|core| core.name.as_str()).collect();
+    stop_groups(&names)
+}
+
+/// The longest the cores' stop takes after the client drain: every group's drain and slack, one after another.
+pub fn stop_budget(spec: &Spec) -> Duration {
+    let mut groups = spec_groups(spec);
+    groups.sort_unstable();
+    groups.dedup();
+    // Each group may take its drain and the slack the router waits for its supervisors' reports.
+    groups
+        .into_iter()
+        .map(|group| group_drain(spec, group) + GROUP_SLACK)
+        .sum()
+}
+
 const GRACE: Duration = Duration::from_secs(2);
 const RETRY_AFTER_MS: u64 = 100;
 const STOPPING_RETRY_AFTER_MS: u64 = 1000;
 const LATENCY_WINDOW: usize = 1000;
-/// The longest a shutdown waits for admitted calls before it stops the cores. With the daemon's own waits and the
-/// cores' stop (`drain_timeout`, 20 s by default) it stays inside the service managers' 40 s stop timeout.
+/// The longest a shutdown waits for admitted calls before it stops the cores. The cores then stop group by group
+/// (`stop_budget`, at most 68 s), so the whole stop stays inside the service managers' 90 s stop timeout.
 pub const ROUTER_DRAIN: Duration = Duration::from_secs(10);
+/// How long a core has to answer `admin.recycle`; no answer is a decline.
+const RECYCLE_DEADLINE: Duration = Duration::from_secs(10);
+/// After a decline, the next recycle is asked no sooner than this.
+const RECYCLE_RETRY: Duration = Duration::from_secs(30);
+/// A core over soft within this many memory samples of a planned restart gets its soft budget pinned instead of
+/// another recycle.
+const PIN_SAMPLES: u32 = 3;
+/// How long past its group's drain the router waits for a stopping core's supervisor to report its end before it
+/// moves on to the next group anyway.
+const GROUP_SLACK: Duration = Duration::from_secs(1);
 
 pub struct Router {
     spec: Spec,
@@ -176,6 +263,8 @@ pub struct Router {
     calls: HashMap<u64, Call>,
     by_caller: HashMap<(Source, String), u64>,
     pings: HashMap<u64, usize>,
+    /// Ids of the `admin.recycle` calls out, and their cores: their reply bodies are read, unlike a ping's.
+    recycles: HashMap<u64, usize>,
     latency: HashMap<String, VecDeque<u32>>,
     next: u64,
     last_heartbeat: Instant,
@@ -183,6 +272,9 @@ pub struct Router {
     shutting_down: bool,
     /// Set by a shutdown: admitted calls may finish until then, new client calls are refused as retryable.
     drain_until: Option<Instant>,
+    /// The stop group being stopped, and when the router moves on without the end of its cores.
+    stopping: Option<(usize, Instant)>,
+    /// Every core has ended (or its group's time is up): the router's work is done.
     stopped: bool,
 }
 
@@ -239,8 +331,14 @@ impl Router {
     pub fn new(spec: Spec, supervisors: Vec<UnboundedSender<Command>>) -> Self {
         let mut cores = Vec::new();
         let mut by_name = HashMap::new();
+        let groups = spec_groups(&spec);
         for (index, (core, supervisor)) in spec.cores.iter().zip(supervisors).enumerate() {
             by_name.insert(core.name.clone(), index);
+            let soft = core
+                .budget
+                .as_ref()
+                .map(|b| b.soft_bytes)
+                .filter(|b| *b > 0);
             cores.push(CoreState {
                 name: core.name.clone(),
                 lanes: core
@@ -255,18 +353,24 @@ impl Router {
                 restarts: 0,
                 pings: VecDeque::new(),
                 memory: None,
-                soft: core
-                    .budget
-                    .as_ref()
-                    .map(|b| b.soft_bytes)
-                    .filter(|b| *b > 0),
+                soft,
+                soft_base: soft,
                 hard: core
                     .budget
                     .as_ref()
                     .map(|b| b.hard_bytes)
                     .filter(|b| *b > 0),
                 over_soft_since: None,
+                planned: false,
+                samples: 0,
                 restarting: false,
+                recycle_pending: None,
+                recycle_deadline: None,
+                recycle_retry_at: None,
+                recycle_declined: false,
+                group: groups[index],
+                stop_sent: false,
+                gone: false,
                 supervisor,
             });
         }
@@ -279,12 +383,14 @@ impl Router {
             calls: HashMap::new(),
             by_caller: HashMap::new(),
             pings: HashMap::new(),
+            recycles: HashMap::new(),
             latency: HashMap::new(),
             next: 1,
             last_heartbeat: now,
             started: now,
             shutting_down: false,
             drain_until: None,
+            stopping: None,
             stopped: false,
         }
     }
@@ -339,9 +445,19 @@ impl Router {
                 state.pings.clear();
                 state.restarting = false;
                 state.over_soft_since = None;
+                state.samples = 0;
+                state.recycle_pending = None;
+                state.recycle_deadline = None;
+                state.recycle_retry_at = None;
+                state.recycle_declined = false;
+                // A core that started while its stop went out (it was between restarts) stops too.
+                if state.stop_sent {
+                    self.send_stop(core);
+                }
             }
             Event::CoreFrame { core, header, body } => self.core_frame(core, header, body),
             Event::CoreExited { core } => self.core_exited(core),
+            Event::CoreStopped { core } => self.cores[core].gone = true,
             Event::Memory { core, bytes } => self.memory(core, bytes),
             Event::Tick => self.tick(),
             Event::Shutdown => self.shutdown(),
@@ -613,7 +729,8 @@ impl Router {
 
     /// Dispatches queued calls of a ready core while its lanes have free slots.
     fn pump(&mut self, core: usize) {
-        if !self.cores[core].ready || self.cores[core].restarting {
+        let state = &self.cores[core];
+        if !state.ready || state.restarting || state.recycle_pending.is_some() {
             return;
         }
         let Some(out) = self.cores[core].out.clone() else {
@@ -731,6 +848,10 @@ impl Router {
         let Some(id) = header["id"].as_str().and_then(parse_hex) else {
             return;
         };
+        if let Some(asked) = self.recycles.remove(&id) {
+            self.recycle_answer(asked, id, &header, &body);
+            return;
+        }
         if let Some(pinged) = self.pings.remove(&id) {
             self.cores[pinged].pings.retain(|p| *p != id);
             return;
@@ -773,9 +894,12 @@ impl Router {
         state.ready = false;
         state.memory = None;
         state.restarts += 1;
+        state.recycle_pending = None;
+        state.recycle_deadline = None;
         for id in state.pings.drain(..) {
             self.pings.remove(&id);
         }
+        self.recycles.retain(|_, asked| *asked != core);
         let in_flight: Vec<u64> = self
             .calls
             .iter()
@@ -828,14 +952,29 @@ impl Router {
         let (Some(bytes), true) = (bytes, state.ready && !state.restarting) else {
             return;
         };
-        if state.hard.is_some_and(|hard| bytes > hard) {
-            state.restarting = true;
-            let _ = state.supervisor.send(Command::Kill);
+        state.samples = state.samples.saturating_add(1);
+        if state.samples > PIN_SAMPLES {
+            state.planned = false;
+        }
+        if let Some(hard) = state.hard.filter(|hard| bytes > *hard) {
+            eprintln!(
+                "kelmod: core {} uses {} MiB, over its hard budget of {} MiB; killing and restarting it",
+                state.name,
+                bytes >> 20,
+                hard >> 20
+            );
+            self.kill(core);
             return;
         }
-        if state.soft.is_some_and(|soft| bytes > soft) {
+        if let Some(soft) = state.soft.filter(|soft| bytes > *soft) {
             match state.over_soft_since {
                 None => {
+                    eprintln!(
+                        "kelmod: core {} uses {} MiB, over its soft budget of {} MiB; asking it to trim",
+                        state.name,
+                        bytes >> 20,
+                        soft >> 20
+                    );
                     state.over_soft_since = Some(now);
                     if let Some(out) = state.out.clone() {
                         let id = self.next;
@@ -849,21 +988,139 @@ impl Router {
                         self.pings.insert(id, core);
                     }
                 }
+                Some(_) if state.planned => {
+                    // Still over soft after a trim, right after a planned restart: restarting does not bring
+                    // this core down, so another one would only start a restart loop. Its soft budget is
+                    // pinned above what it uses, below its hard budget, until kelmod restarts; growth past the
+                    // pin is trimmed and recycled as before.
+                    let mut pinned = soft.max(bytes / 4 * 5);
+                    if let Some(hard) = state.hard {
+                        pinned = pinned.min(hard / 10 * 9);
+                    }
+                    if pinned > soft {
+                        eprintln!(
+                            "kelmod: core {} uses {} MiB right after a planned restart, over its soft budget of \
+                             {} MiB; a restart does not bring it down, so its soft budget is pinned at {} MiB \
+                             until kelmod restarts (spec {} MiB, hard {})",
+                            state.name,
+                            bytes >> 20,
+                            soft >> 20,
+                            pinned >> 20,
+                            state.soft_base.unwrap_or(soft) >> 20,
+                            state.hard.map_or_else(
+                                || "none".to_owned(),
+                                |hard| format!("{} MiB", hard >> 20)
+                            ),
+                        );
+                        state.soft = Some(pinned);
+                    }
+                    state.over_soft_since = None;
+                }
                 Some(_) => {
+                    // A soft budget never ends background work: the core is asked, and only a core that says
+                    // it is quiescent is restarted. A stopping daemon asks nothing.
+                    let waiting = state.recycle_pending.is_some()
+                        || state.recycle_retry_at.is_some_and(|at| now < at)
+                        || state.stop_sent
+                        || self.shutting_down;
                     let idle = !self.calls.values().any(|c| c.core == core && c.dispatched);
-                    if idle {
-                        self.graceful_restart(core);
+                    if !waiting && idle {
+                        self.ask_recycle(core, now);
                     }
                 }
             }
         } else {
             state.over_soft_since = None;
+            state.recycle_declined = false;
         }
+    }
+
+    /// Sends `admin.recycle` and holds new calls for the core until it answers.
+    fn ask_recycle(&mut self, core: usize, now: Instant) {
+        let Some(out) = self.cores[core].out.clone() else {
+            return;
+        };
+        let id = self.id();
+        send(
+            &out,
+            &json!({"v": 2, "kind": "call", "id": hex(id), "op": "admin.recycle", "lane": "admin",
+                    "deadline_ms": RECYCLE_DEADLINE.as_millis() as u64, "body_type": "json"}),
+            &json!({}),
+        );
+        self.recycles.insert(id, core);
+        let state = &mut self.cores[core];
+        state.recycle_pending = Some(id);
+        state.recycle_deadline = Some(now + RECYCLE_DEADLINE);
+    }
+
+    /// The core answered `admin.recycle`. Only `{"recycle": true}` in a successful reply is consent; an error
+    /// (an older core answers E_PROTOCOL) is a decline.
+    fn recycle_answer(&mut self, core: usize, id: u64, header: &Value, body: &Value) {
+        if self.cores[core].recycle_pending != Some(id) {
+            return;
+        }
+        let agreed =
+            header["ok"].as_bool() == Some(true) && body["recycle"].as_bool() == Some(true);
+        if self.shutting_down {
+            // The daemon's stop has overtaken the recycle: the core stops with its group instead.
+            let state = &mut self.cores[core];
+            state.recycle_pending = None;
+            state.recycle_deadline = None;
+            self.pump(core);
+            return;
+        }
+        if agreed {
+            let state = &mut self.cores[core];
+            state.recycle_pending = None;
+            state.recycle_deadline = None;
+            state.recycle_declined = false;
+            self.graceful_restart(core);
+            return;
+        }
+        let reason = if header["ok"].as_bool() == Some(true) {
+            let busy: Vec<&str> = body["busy"]
+                .as_array()
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            format!("busy: {}", busy.join(", "))
+        } else {
+            format!(
+                "error: {}",
+                header["error"]["code"].as_str().unwrap_or("unknown")
+            )
+        };
+        self.recycle_declined(core, &reason);
+    }
+
+    /// A recycle the core refused, failed or left unanswered: the core is kept, its queued calls go out, and
+    /// it is not asked again for `RECYCLE_RETRY`.
+    fn recycle_declined(&mut self, core: usize, reason: &str) {
+        let state = &mut self.cores[core];
+        if let Some(id) = state.recycle_pending.take() {
+            self.recycles.remove(&id);
+        }
+        state.recycle_deadline = None;
+        state.recycle_retry_at = Some(Instant::now() + RECYCLE_RETRY);
+        if !state.recycle_declined {
+            eprintln!(
+                "kelmod: core {} declined a recycle ({reason}); keeping it",
+                state.name
+            );
+        }
+        state.recycle_declined = true;
+        self.pump(core);
     }
 
     fn graceful_restart(&mut self, core: usize) {
         let state = &mut self.cores[core];
+        eprintln!(
+            "kelmod: core {} is still over its soft budget ({} MiB) after a trim and agreed to a recycle; \
+             stopping and restarting it",
+            state.name,
+            state.memory.unwrap_or(0) >> 20
+        );
         state.restarting = true;
+        state.planned = true;
         if let Some(out) = state.out.clone() {
             let id = self.next;
             self.next += 1;
@@ -887,21 +1144,33 @@ impl Router {
             if !state.ready || state.restarting {
                 continue;
             }
-            let stuck = state.lanes.iter().any(|(name, lane)| {
+            let stuck = state.lanes.iter().find(|(name, lane)| {
                 let abandoned = self
                     .calls
                     .values()
                     .filter(|call| {
-                        call.core == core && call.dispatched && call.overdue && &call.lane == name
+                        call.core == core && call.dispatched && call.overdue && &call.lane == *name
                     })
                     .count();
                 lane.limit > 0 && abandoned >= lane.limit
             });
-            if stuck {
-                self.cores[core].restarting = true;
-                let _ = self.cores[core].supervisor.send(Command::Kill);
+            if let Some((lane, _)) = stuck {
+                eprintln!(
+                    "kelmod: every slot of lane {lane} of core {} is held by a call past its deadline; \
+                     killing and restarting it",
+                    state.name
+                );
+                self.kill(core);
             }
         }
+    }
+
+    /// Kills a core so its supervisor restarts it. A kill is never a planned restart.
+    fn kill(&mut self, core: usize) {
+        let state = &mut self.cores[core];
+        state.restarting = true;
+        state.planned = false;
+        let _ = state.supervisor.send(Command::Kill);
     }
 
     fn tick(&mut self) {
@@ -961,17 +1230,30 @@ impl Router {
             }
         }
         self.restart_stuck_lanes();
-        // Heartbeats bypass the mailboxes; a core that misses too many is killed and restarted.
+        for core in 0..self.cores.len() {
+            if self.cores[core]
+                .recycle_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                self.recycle_declined(core, "no answer before the deadline");
+            }
+        }
+        // Heartbeats bypass the mailboxes; a core that misses too many is killed and restarted. A core asked to
+        // recycle is still pinged; one draining for the daemon's stop is not, so its drain is never cut short.
         if now.duration_since(self.last_heartbeat) >= self.spec.heartbeat {
             self.last_heartbeat = now;
             for core in 0..self.cores.len() {
                 let state = &self.cores[core];
-                if !state.ready || state.restarting {
+                if !state.ready || state.restarting || state.stop_sent {
                     continue;
                 }
                 if state.pings.len() as u32 >= self.spec.heartbeat_misses {
-                    self.cores[core].restarting = true;
-                    let _ = self.cores[core].supervisor.send(Command::Kill);
+                    eprintln!(
+                        "kelmod: core {} left {} heartbeats unanswered; killing and restarting it",
+                        state.name,
+                        state.pings.len()
+                    );
+                    self.kill(core);
                     continue;
                 }
                 if let Some(out) = state.out.clone() {
@@ -991,8 +1273,9 @@ impl Router {
         }
     }
 
-    /// Starts the drain: new client calls are refused from now on, and the cores stop once every admitted call
-    /// (and every call a core makes on its behalf) has its reply, or when the drain time is up.
+    /// Starts the drain: new client calls are refused from now on, and the cores stop, group by group, once
+    /// every admitted call (and every call a core makes on its behalf) has its reply, or when the drain time is
+    /// up.
     fn shutdown(&mut self) {
         if self.shutting_down {
             return;
@@ -1005,15 +1288,100 @@ impl Router {
         if self.stopped {
             return;
         }
+        if self.stopping.is_some() {
+            self.stop_next_group();
+            return;
+        }
         let expired = self.drain_until.is_none_or(|until| Instant::now() >= until);
         if !self.calls.is_empty() && !expired {
             return;
         }
-        // The drain is over: every caller still waiting gets an answer instead of a closed connection. A queued
-        // call never ran; one a core still holds may have taken effect, so only a read or a keyed call may be
-        // sent again.
-        let ids: Vec<u64> = self.calls.keys().copied().collect();
+        // The drain is over: every client still waiting gets an answer instead of a closed connection. Calls of
+        // the cores keep their routes: a core drains with them once it is stopped.
+        self.answer_unavailable(true);
+        let first = self.cores.iter().map(|core| core.group).min().unwrap_or(0);
+        self.stopping = Some((first, Instant::now()));
+        self.stop_next_group();
+    }
+
+    /// Stops the cores group by group: the lowest group whose cores have not all ended gets `admin.stop` (once)
+    /// and its supervisors a stop; a higher group waits until every core of it has ended or its drain plus a
+    /// little slack is over. Meanwhile the router keeps routing the stopping cores' own calls to the cores still
+    /// up, and their replies back. When every group is through, the router is done.
+    fn stop_next_group(&mut self) {
+        loop {
+            let Some((group, since)) = self.stopping else {
+                return;
+            };
+            let members: Vec<usize> = (0..self.cores.len())
+                .filter(|core| self.cores[*core].group == group)
+                .collect();
+            let unsent: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|core| !self.cores[*core].stop_sent)
+                .collect();
+            for core in unsent {
+                self.cores[core].stop_sent = true;
+                self.send_stop(core);
+                let _ = self.cores[core].supervisor.send(Command::Stop);
+            }
+            let ended = members.iter().all(|core| self.cores[*core].gone);
+            let late = Instant::now() >= since + group_drain(&self.spec, group) + GROUP_SLACK;
+            if !ended && !late {
+                return;
+            }
+            let next = self
+                .cores
+                .iter()
+                .map(|core| core.group)
+                .filter(|g| *g > group)
+                .min();
+            match next {
+                Some(next) => self.stopping = Some((next, Instant::now())),
+                None => {
+                    self.stopping = None;
+                    self.stopped = true;
+                    self.answer_unavailable(false);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Answers the open calls of clients only, or of every caller, E_UNAVAILABLE. A queued call never ran; one a
+    /// core still holds may have taken effect, so only a read or a keyed call may be sent again.
+    fn answer_unavailable(&mut self, clients_only: bool) {
+        let ids: Vec<u64> = self
+            .calls
+            .iter()
+            .filter(|(_, call)| !clients_only || call.from_client)
+            .map(|(id, _)| *id)
+            .collect();
         for id in ids {
+            // A call a core still holds keeps its lane slot until the core answers it, so the cores that stay up
+            // for a draining core's calls do not run out of slots; only its caller is answered now.
+            if clients_only
+                && let Some(call) = self.calls.get_mut(&id)
+                && call.dispatched
+            {
+                if call.abandoned {
+                    continue;
+                }
+                call.abandoned = true;
+                let (source, caller_id) = (call.source, call.caller_id.clone());
+                let retryable =
+                    matches!(call.replay, Replay::Read) || call.key.is_some() && !call.cancelled;
+                self.by_caller.remove(&(source, caller_id.clone()));
+                self.refuse(
+                    source,
+                    &caller_id,
+                    "E_UNAVAILABLE",
+                    "The daemon stopped before the call finished.",
+                    retryable,
+                );
+                continue;
+            }
             if let Some(call) = self.finish(id)
                 && !call.abandoned
             {
@@ -1029,18 +1397,21 @@ impl Router {
                 );
             }
         }
-        self.stopped = true;
-        for core in &self.cores {
-            if let Some(out) = &core.out {
-                send(
-                    out,
-                    &json!({"v": 2, "kind": "call", "id": hex(0), "op": "admin.stop", "lane": "admin",
-                                  "deadline_ms": 30000, "body_type": "json"}),
-                    &json!({}),
-                );
-            }
-            let _ = core.supervisor.send(Command::Stop);
-        }
+    }
+
+    /// Sends `admin.stop` to a running core.
+    fn send_stop(&mut self, core: usize) {
+        let Some(out) = self.cores[core].out.clone() else {
+            return;
+        };
+        let id = self.id();
+        send(
+            &out,
+            &json!({"v": 2, "kind": "call", "id": hex(id), "op": "admin.stop", "lane": "admin",
+                    "deadline_ms": 30000, "body_type": "json"}),
+            &json!({}),
+        );
+        self.pings.insert(id, core);
     }
 
     pub fn restarts(&self, core: usize) -> u64 {
@@ -1063,6 +1434,8 @@ impl Router {
                     .collect();
                 json!({"name": core.name, "pid": core.pid, "ready": core.ready, "restarts": core.restarts,
                        "memory_bytes": core.memory, "lanes": lanes, "operations": core.operations,
+                       "budget": {"soft_bytes": core.soft, "hard_bytes": core.hard,
+                                  "spec_soft_bytes": core.soft_base, "pinned": core.soft != core.soft_base},
                        "index": index})
             })
             .collect();
@@ -1082,3 +1455,7 @@ impl Router {
                "meta": self.spec.meta})
     }
 }
+
+#[cfg(test)]
+#[path = "router_tests.rs"]
+mod tests;

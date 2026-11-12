@@ -110,6 +110,11 @@ pub(crate) fn integers_fit(text: &str) -> bool {
     true
 }
 
+/// A reader buffer holding more than this after a drain is shrunk when it is mostly empty.
+const SHRINK_ABOVE: usize = 1 << 20;
+/// The least capacity a shrunk buffer keeps: one ordinary read.
+const SHRINK_TO: usize = 64 * 1024;
+
 /// Incremental decoding of a byte stream into frames. Feed what arrives; take what is complete.
 ///
 /// A prefix that announces a frame over the bound is refused at once, before its bytes are buffered.
@@ -140,7 +145,18 @@ impl FrameReader {
             start += 4 + total;
         }
         self.buffer.drain(..start);
+        // One large frame leaves its capacity behind for the life of the channel: give it back once the
+        // buffer holds far less than it can.
+        let capacity = self.buffer.capacity();
+        if capacity > SHRINK_ABOVE && self.buffer.len() < capacity / 4 {
+            self.buffer.shrink_to(self.buffer.len().max(SHRINK_TO));
+        }
         Ok(frames)
+    }
+
+    /// Bytes the buffer can hold without growing.
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
     }
 
     /// Bytes received but not yet part of a complete frame.
@@ -148,3 +164,7 @@ impl FrameReader {
         self.buffer.len()
     }
 }
+
+#[cfg(test)]
+#[path = "frame_tests.rs"]
+mod tests;

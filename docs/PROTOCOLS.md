@@ -45,6 +45,7 @@ Replay class: `read` is sent again once after a core restart, `keyed` once under
 | --- | --- | --- | --- | --- |
 | `admin.drain` | admin | write | never | - |
 | `admin.ping` | admin | read | never | - |
+| `admin.recycle` | admin | write | never | - |
 | `admin.refresh` | admin | write | never | - |
 | `admin.status` | admin | read | never | - |
 | `admin.stop` | admin | write | never | - |
