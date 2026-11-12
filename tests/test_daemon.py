@@ -647,6 +647,71 @@ def test_execute_timeout_cleans_up_child_process_group(tmp_path):
                 pass
 
 
+def test_a_termination_during_the_spawn_still_kills_the_executor_group(tmp_path, monkeypatch):
+    import os
+    import signal
+    import subprocess
+    import time
+    from kelmo.daemon import execute
+    from kelmo.executor import termination_forwarding
+    survived = tmp_path / 'survived.txt'
+    body = f"import pathlib,time;time.sleep(1.0);pathlib.Path({str(survived)!r}).write_text('alive')\n"
+    real_popen = subprocess.Popen
+
+    def popen_then_terminate(*args, **kwargs):
+        # The executor is running, but the spawn has not returned yet: the window a terminated parent hits when
+        # it is slow to read the exec result.
+        process = real_popen(*args, **kwargs)
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.1)
+        return process
+
+    monkeypatch.setattr(subprocess, 'Popen', popen_then_terminate)
+    with pytest.raises(KelmoError) as raised:
+        with termination_forwarding():
+            execute(executor(tmp_path, body), {}, timeout=10)
+    assert raised.value.code == 'E_EXECUTOR'
+    time.sleep(1.5)
+    assert not survived.exists()
+
+
+def test_a_member_left_in_the_group_after_its_leader_is_reaped_is_killed(tmp_path):
+    import os
+    import subprocess
+    from kelmo.daemon import _empty_group
+    pid_file = tmp_path / 'member.pid'
+    leader = subprocess.Popen(
+        [sys.executable, '-c',
+         "import subprocess,sys,time\n"
+         "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'])\n"
+         f"open({str(pid_file)!r},'w').write(str(p.pid))\n"
+         "time.sleep(30)\n"],
+        start_new_session=True)
+    try:
+        end = time.monotonic() + 10
+        while not pid_file.exists() or not pid_file.read_text():
+            assert time.monotonic() < end, 'the member was never started'
+            time.sleep(0.02)
+        member = int(pid_file.read_text())
+        leader.kill()
+        leader.wait()
+        os.kill(member, 0)  # still running: only the leader was killed
+        _empty_group(leader.pid)
+        end = time.monotonic() + 5
+        while True:
+            try:
+                os.killpg(leader.pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < end, 'the group still has a member'
+            time.sleep(0.02)
+    finally:
+        try:
+            os.killpg(leader.pid, __import__('signal').SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 @pytest.mark.parametrize("successful", [False, True])
 def test_execute_cleans_group_after_parent_exits(tmp_path, successful):
     import os

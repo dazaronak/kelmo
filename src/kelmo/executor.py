@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from typing import Protocol, runtime_checkable
 
 from .contracts import ContextBundle
-from .daemon import execute, validate_argv, validate_timeout
+from .daemon import defer_termination, execute, validate_argv, validate_timeout
 from .errors import KelmoError
 from . import quota
 
@@ -250,7 +250,11 @@ def termination_forwarding():
         if raised:
             return
         raised.append(True)
-        raise KelmoError('E_EXECUTOR', 'Executor was interrupted.')
+        error = KelmoError('E_EXECUTOR', 'Executor was interrupted.')
+        # During a spawn the error waits until the new process group is guarded, or the group would outlive us.
+        if defer_termination(error):
+            return
+        raise error
 
     try:
         # A hangup is a termination request too; its default action would end this process with the provider's

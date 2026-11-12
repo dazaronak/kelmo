@@ -17,6 +17,42 @@ from .errors import KelmoError, Stopping, sqlite_busy
 from . import outcomes, quota
 from .journal import when_free
 
+# Main thread only, where signal handlers run: while an executor is being spawned, a termination is kept here
+# instead of raised, because between the fork and the try that kills its group nothing would kill the group.
+_SPAWN = {'active': False, 'deferred': None}
+
+
+def defer_termination(error):
+    """For a termination signal handler: True when a spawn is in progress and `error` is kept for it to raise
+    once the spawned group is guarded; False when the handler should raise `error` now."""
+    if not _SPAWN['active']:
+        return False
+    _SPAWN['deferred'] = _SPAWN['deferred'] or error
+    return True
+
+
+def _empty_group(group, seconds=1.0):
+    """Kills the group again until it is empty. A process forked while the group was being signalled can miss
+    the kill (macOS has no guard against that race), so one signal is not enough. Called once the leader is
+    reaped; a group that is already empty answers at once."""
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError:
+            return
+        if time.monotonic() >= end:
+            return
+        time.sleep(0.01)
+
+
+def _end_spawn():
+    """Ends the spawn section and raises a termination that came during it."""
+    _SPAWN['active'] = False
+    error, _SPAWN['deferred'] = _SPAWN['deferred'], None
+    if error is not None:
+        raise error
+
 
 def validate_argv(argv, code='E_EXECUTOR', *, optional=False):
     if optional and argv is None:
@@ -92,18 +128,30 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
     with tempfile.TemporaryFile() as source:
         source.write(json.dumps(payload).encode())
         source.seek(0)
+        guarded = threading.current_thread() is threading.main_thread()
+        if guarded:
+            _SPAWN['active'] = True
         try:
             process = subprocess.Popen(argv, stdin=source, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        cwd=tempfile.gettempdir(), start_new_session=True, close_fds=True,
                                        env=dict(os.environ,KELMO_INTERNAL_JOB='1'))
         except OSError:
+            if guarded:
+                _end_spawn()
             raise KelmoError('E_EXECUTOR', 'Executor could not be started.') from None
+        except BaseException:
+            if guarded:
+                _SPAWN.update(active=False, deferred=None)
+            raise
         record = selector = None
         output = bytearray()
         errors = bytearray()
         deadline = time.monotonic() + timeout
         # Everything after the spawn is inside the try, so the group is killed whatever fails first.
         try:
+            # A termination that came while the executor was being spawned is raised here, inside the try.
+            if guarded:
+                _end_spawn()
             record = _record_group(process.pid)
             selector = selectors.DefaultSelector()
             selector.register(process.stdout, selectors.EVENT_READ, output)
@@ -192,6 +240,7 @@ def _execute(argv, payload, *, timeout, raw_output, termination_grace, json_on_f
                     process.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
                     pass
+            _empty_group(process.pid)
             if record is not None:
                 try:
                     record.unlink()
