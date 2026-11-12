@@ -206,9 +206,11 @@ def build(root, *, server_profile=None, runtime_dir=None, executable=None, reade
 
 
 EDGE_LANES = {'handler': (32, 512, 'rr'), 'hook': (4, 256, 'rr')}
-# Soft: the steady edge core. Hard: room for one transcript snapshot of a long session (the outbox holds it in
-# 8 MiB pieces) without a restart loop; the per-piece streaming that would let it shrink is not built yet.
-EDGE_BUDGET_MB = (150, 512)
+# The budget counts the core's tree, its channel to the server included. Soft: the steady core plus one
+# transcript snapshot of a long session (16 MiB, which the outbox holds in 8 MiB pieces). Python keeps the memory
+# a snapshot freed, so a soft budget below that peak recycled the core after every session stop. Hard: headroom
+# above it without a restart loop; the per-piece streaming that would let the core shrink is not built yet.
+EDGE_BUDGET_MB = (300, 512)
 
 
 def build_edge(root, *, runtime_dir=None, executable=None, source_root=None, core_command=None, http_port=None):

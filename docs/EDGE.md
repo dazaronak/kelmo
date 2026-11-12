@@ -49,6 +49,7 @@ them for the agent, so a hook that dies before printing does not mark them as se
 
 ## Limits
 
-The edge core has a soft memory budget of 150 MiB and a hard one of 512 MiB; the hard budget leaves room for one
-long session's transcript snapshot, which the outbox holds in 8 MiB pieces. Supervision, stopping and the service
+The edge core has a soft memory budget of 300 MiB and a hard one of 512 MiB, counting its channel to the server.
+The soft budget leaves room for one long session's transcript snapshot, which the outbox holds in 8 MiB pieces:
+Python keeps the memory a snapshot used, so a lower soft budget would restart the core after every session stop. Supervision, stopping and the service
 are the same as on a vault machine; see [architecture](ARCHITECTURE.md).

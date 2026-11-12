@@ -68,7 +68,7 @@ memory every 10 seconds against a soft and a hard budget:
 | state     | 1536 / 3072 MiB    |
 | archive   | 768 / 1536 MiB     |
 | embedding | 450 / 900 MiB      |
-| edge      | 150 / 512 MiB      |
+| edge      | 300 / 512 MiB      |
 
 A core's budget counts the core and the processes that stop with it. The state core counts its own process
 group, without the model executors it starts in sessions of their own; the archive counts its confined worker.
