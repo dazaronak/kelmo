@@ -1,8 +1,15 @@
 # Continuous integration
 
-Pushes and pull requests run one `ubuntu-24.04` / Python 3.13 lane. Release tags, the weekly schedule and a manual run add the full cross-product of `ubuntu-24.04` and `macos-26` with Python 3.12 and 3.13: four source lanes and four fresh installed-launcher lanes. Every lane uses the repository's locked dependencies.
+`ci.yml` has four jobs. Pushes and pull requests run one `ubuntu-24.04` / Python 3.13 lane of the source and
+installed-launcher jobs. Release tags, the weekly schedule and a manual run add the full cross-product of
+`ubuntu-24.04` and `macos-26` with Python 3.12 and 3.13: four source lanes and four installed-launcher lanes.
+Every lane uses the repository's locked dependencies.
 
-Each source lane checks `uv.lock`, runs Ruff, and selects `src` explicitly for the default source profile. It excludes:
+Rust checks run `tools/check_rust.sh` on `ubuntu-24.04`: format, clippy and the Rust tests, with the toolchain
+`rust-toolchain.toml` pins.
+
+Each source lane checks `uv.lock`, runs Ruff, builds `kelmod` with `tools/build_kelmod.sh` and runs the suite
+in four pytest processes (`tools/pytest_shards.py`) with `src` selected explicitly. It excludes:
 
 - `tests/test_runtime.py`
 - `tests/test_runtime_macos.py`
@@ -11,14 +18,24 @@ Each source lane checks `uv.lock`, runs Ruff, and selects `src` explicitly for t
 
 The first three files describe retained isolation experiments requiring separate host acceptance. Installed-launcher tests run separately; the default launcher uses the caller's OS permissions.
 
-After all source lanes succeed, one `ubuntu-24.04` / Python 3.12 artifacts job builds the wheel and source distribution, checks deployment exclusions and source parity, and uploads `kelmo-dist` as a seven-day CI artifact. Each installed lane depends explicitly on source and artifacts, downloads that exact artifact by ID, verifies its ZIP digest, and installs the same wheel into an empty runtime with locked runtime constraints.
+The artifacts job runs after the Rust checks and every source lane pass, on every event. It builds one wheel
+per platform with maturin, each carrying the `kelmod` binary: Linux x86_64 and Linux aarch64 inside a
+`manylinux2014` image pinned by tag and digest, and macOS arm64 on `macos-26`. The x86_64 job also builds the
+source distribution. `tests/test_distribution.py` checks each wheel's contents, deployment exclusions and source
+parity, and the job uploads `kelmo-wheel-<target>` and `kelmo-sdist` as seven-day CI artifacts. There is no
+Intel Mac wheel: onnxruntime, which the embedding library needs, publishes none for macOS x86_64.
+
+Each installed-launcher lane downloads the wheel of its own platform and the source distribution, rejects a
+digest mismatch, and installs the wheel into an empty runtime with locked runtime constraints.
 
 The installed test harness syncs dependencies with `--no-install-project`, selects installed site-packages, and runs from a temporary directory with `--import-mode=importlib --noconftest`. A preflight rejects project-package origins outside the fresh prefix. Fixture launcher copies come from the installation. Tests exercise CLI and stdio MCP graph navigation after a wiki edit and compare the checkout's Python modules, SQLite schema and shared entrypoints with both wheel and installed bytes. The missing-entry test checks incomplete-install refusal; it does not authenticate the interpreter.
 
-All jobs retain a temporary `HOME`, synthetic Git identity, no client/provider credentials, and no model download. Existing action pins, the uv version, and dependency versions are unchanged. The added `actions/download-artifact` action is pinned to v8.0.0's commit and rejects digest mismatches. Artifact retrieval uses the ephemeral workflow token with `actions: read`, including when retrying failed jobs. The workflow does not publish a package or configure a native service, provider, model, or real user profile.
+All jobs run with a temporary `HOME`, a synthetic Git identity, no client or provider credentials and no model
+download. Actions are pinned to commits. `ci.yml` itself publishes nothing and configures no native service,
+provider, model or real user profile; `release.yml` runs it on a tag and publishes the exact wheels and source
+distribution it tested (see [releasing](RELEASING.md)).
 
-Both matrices use `fail-fast: false`. Clean-machine bootstrap, native launchd/systemd lifecycle, real Claude/Codex acceptance, and broader OS/CPU support remain separate from these component and packaging checks.
-
+Every matrix uses `fail-fast: false`. Clean-machine bootstrap, native launchd/systemd lifecycle, real Claude/Codex acceptance, and broader OS/CPU support remain separate from these component and packaging checks.
 ## Standalone measurement gate
 
 Standalone source uses `bash run-tests.sh` as its test entry point. The bundled `tools/gate.py` reads
@@ -49,9 +66,9 @@ and builds with the existing locked toolchain. From the selected repository root
 ```sh
 uv build --no-sources
 mkdir -p /path/to/empty-sdist-check
-tar -xzf dist/kelmo-0.1.0.tar.gz -C /path/to/empty-sdist-check
-GATE_PYTHON=/path/to/python bash /path/to/empty-sdist-check/kelmo-0.1.0/run-tests.sh --list
-PYTHONPATH=/path/to/empty-sdist-check/kelmo-0.1.0/src /path/to/python -B /path/to/empty-sdist-check/kelmo-0.1.0/tests/test_gate_contract.py -v
+tar -xzf dist/kelmo-0.2.0.tar.gz -C /path/to/empty-sdist-check
+GATE_PYTHON=/path/to/python bash /path/to/empty-sdist-check/kelmo-0.2.0/run-tests.sh --list
+PYTHONPATH=/path/to/empty-sdist-check/kelmo-0.2.0/src /path/to/python -B /path/to/empty-sdist-check/kelmo-0.2.0/tests/test_gate_contract.py -v
 ```
 
 Retain the complete archive contents. A wheel installs the runtime guard from `packaging/gate.py`; it does
@@ -71,7 +88,7 @@ GATE_PYTHON=/path/to/python bash run-tests.sh --only 6,8
 # lane probes .venv/bin/kelmo, which is a console script answering E_RUNTIME, and reports a SKIP that says so.
 GATE_PYTHON=/path/to/python KELMO_GATE_MODEL_DIR=/path/to/model-dir KELMO_TEST_PREFIX=/path/to/runtime bash run-tests.sh --only 7
 # Existing artifact parity cases, with freshly built artifacts and a fresh selected runtime.
-PYTHONPATH=/absolute/path/to/kelmo/src KELMO_TEST_WHEEL=/absolute/path/to/kelmo/dist/kelmo-0.1.0-py3-none-any.whl KELMO_TEST_SDIST=/absolute/path/to/kelmo/dist/kelmo-0.1.0.tar.gz KELMO_TEST_PREFIX=/path/to/runtime /path/to/python -m pytest tests/test_distribution.py -q -ra
+PYTHONPATH=/absolute/path/to/kelmo/src KELMO_TEST_WHEEL=/absolute/path/to/kelmo/dist/kelmo-0.2.0-py3-none-<platform>.whl KELMO_TEST_SDIST=/absolute/path/to/kelmo/dist/kelmo-0.2.0.tar.gz KELMO_TEST_PREFIX=/path/to/runtime /path/to/python -m pytest tests/test_distribution.py -q -ra
 ```
 
 Run supported host checks on macOS and Linux with Python 3.12 and 3.13. `KELMO_GATE_MODEL_DIR` wins over

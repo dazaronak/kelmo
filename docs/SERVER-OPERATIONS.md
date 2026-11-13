@@ -3,7 +3,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/kelmo-server-dark.png">
-    <img alt="Optional server for several machines (a single machine needs only a local vault): each client reaches the server through a channel command; the recommended one is an SSH forced command, where one key is one enrolled client that cannot pick the vault or the command; the server holds one vault with one writer, the wiki every client reads, kelmod with the worker and its editor, and one archive; kelmo sync can push the wiki to an optional Git remote, explicitly and never forced." src="assets/kelmo-server-light.png" width="900">
+    <img alt="Optional server for several machines (a single machine needs only a local vault): each client reaches the server through a channel command; the recommended one is an SSH forced command, where one key is one enrolled client that cannot pick the vault or the command; the server holds one vault with one writer, the wiki every client reads, kelmod and the editor, and one archive; kelmo sync can push the wiki to an optional Git remote, explicitly and never forced." src="assets/kelmo-server-light.png" width="900">
   </picture>
 </p>
 
