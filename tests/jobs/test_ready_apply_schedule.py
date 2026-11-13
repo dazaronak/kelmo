@@ -297,3 +297,4 @@ def test_a_dream_call_to_a_daemon_started_for_it_waits_for_the_pass(tmp_path, mo
         cli.through_daemon(args, [], str(tmp_path / 'kelmo'))
     assert refused.value.code == 'E_DEADLINE'
     assert waits == [daemon_client.LONGEST_CALL_SECONDS]
+    assert daemon_client.LONGEST_CALL_SECONDS * 1000 <= 86_400_000, 'the wire refuses a deadline past one day'

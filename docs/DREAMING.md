@@ -44,9 +44,10 @@ pass; a note older than that is listed under `stalled` and the pass moves on.
 
 ## Batched apply
 
-With `[editor] batch_apply = true`, an `apply` pass holds one conversation with
-the model per batch of waiting notes from one project instead of one per note. A
-batch conversation takes up to 8 model calls. It is off by default.
+With `[editor] batch_apply = true`, the pass over waiting notes (`dream apply`,
+and the first part of `dream run`) holds one conversation with the model per
+batch of waiting notes from one project instead of one per note. A batch
+conversation takes up to 8 model calls. It is off by default.
 `batch_max_sources` (default 8) caps how many notes go into one batch; the editor
 budget usually decides the real size.
 
