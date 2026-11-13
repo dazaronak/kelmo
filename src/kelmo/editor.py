@@ -21,17 +21,17 @@ import uuid
 from . import conversation, fact_checks, outcomes, quota
 from .contracts import EvidenceRef, Generation, KnowledgeChange, KnowledgeProposal, OperationReceipt, Origin
 from .core.baton import outside_journal
-from .errors import KelmoError
+from .errors import HeadRefusal, KelmoError
 from .executor import WORK_FIELDS, ModelExecutor, ModelJob, ModelOutcome
 from .publication import KnowledgeService, StateCoordinator, coordinator_lock, recover_publications
 from .quota import QuotaWait
 from .wiki import engine, pages, views
 
 MAX_ROUNDS = 5
-# A batch is one conversation for every source of it, so it gets more of them: a batch of seven notes
-# spent its five single-source rounds on the first pages it read and ran out before answering the rest,
-# which is how the first production batches lost a third of their notes. MAX_EXPANSIONS and MAX_REPAIRS
-# are not raised with it: a batch that runs out of rounds is sent apart, not repaired harder.
+# A batch is one conversation for every source of it, so it gets more rounds: with the five a single source
+# has, a batch of seven notes spends them on the first pages it reads and runs out before answering the
+# rest. MAX_EXPANSIONS and MAX_REPAIRS are not raised with it: a batch that runs out of rounds is sent
+# apart, not repaired harder.
 MAX_BATCH_ROUNDS = 8
 MAX_EXPANSIONS = 2
 # Answers a refused proposal may get to fix itself, inside the rounds of its own conversation.
@@ -696,8 +696,8 @@ def _reattribute_created_pages(slices, delta, accepted):
     `split_delta` attributes a created page to the source the answer named — the note whose request opened
     it — and that is the source a cross-source collision refuses most often: the note that opens a work
     page is the one whose open-work fact overlaps a neighbour's. A page whose owner is refused leaves the
-    commit with its owner, so the batch publishes the facts the other notes put on it onto a page it never
-    creates, which is the production loss this rule ends. The owner is therefore read back from the slices
+    commit with its owner, so the batch would publish the facts the other notes put on it onto a page it
+    never creates. The owner is therefore read back from the slices
     the split returns: the earliest accepted source, in capture order, whose own slice keeps a fact on that
     target — the next accepted note with a fact on the page when the opener is refused. A page no accepted
     source keeps a fact on is dropped, with the narratives that target it: a created page is published only
@@ -841,15 +841,11 @@ def _batch_opened_pages(requests, batch, registry):
     requests opened the same page are each named with it, so both put their open work on the one page the
     batch creates once (`_batch_opened_work` injects one entry per target, owned by the earliest note).
     """
-    pages, seen = [], set()
+    pages = []
     for operation_id in batch:
         work = requests[operation_id].get('new_work')
-        if work is None or work['target'] in registry['pages']:
-            continue
-        if (work['target'], operation_id) in seen:
-            continue
-        seen.add((work['target'], operation_id))
-        pages.append({**work, 'source': operation_id})
+        if work is not None and work['target'] not in registry['pages']:
+            pages.append({**work, 'source': operation_id})
     return pages
 
 
@@ -1185,6 +1181,19 @@ def _expansion_refusal(wanted, payload, expanded):
     return None
 
 
+_BEHIND = 'an older source of this batch was left out by the answer and this one waits behind it'
+
+
+def _union_refused(code, error):
+    return 'what the batch proposed was refused as a whole (' + code + ': ' + str(error) + ')'
+
+
+def _lapsed(row):
+    """An open request whose consulting lease is over: ended, released, or left by an attempt that died."""
+    observation = json.loads(row['observation'] or '{}')
+    return 'consulting' in observation and observation['expires_at'] <= time.time()
+
+
 def _batch_answered(row):
     """A request row that already carries this batch's recorded answer, so it settles from the split.
 
@@ -1386,6 +1395,15 @@ class Editor:
         receipt = StateCoordinator._replay(row, fingerprint)
         if receipt is not None:
             return receipt
+        if row is not None and row['state'] == 'open' and _batch_answered(row):
+            # A pass died on a batch and this source now comes alone (the flag was turned off, or the pass
+            # takes one note at a time). The row holds that batch's answer, which is not a single-source
+            # answer and cannot be settled as one.
+            self._leave_batch(request_key, source_operation_id, idempotency_key)
+            row = self.journal.action_request(request_key)
+            receipt = StateCoordinator._replay(row, fingerprint)
+            if receipt is not None:
+                return receipt
         if resolution_claim is not None:
             from .resolution import validate_editor_claim
             validate_editor_claim(self.service, source_operation_id, resolution_claim, executor, idempotency_key)
@@ -1487,25 +1505,116 @@ class Editor:
         # already paid for and answer the batch with E_BUSY.
         own = [operation_id for operation_id in order
                if operation_id not in settled and _own_answer(rows[operation_id])]
-        if own:
+        answered = [operation_id for operation_id in order
+                    if operation_id not in settled and _batch_answered(rows[operation_id])]
+        if own or answered:
             with coordinator_lock(self.service.config):
                 self._recover()
                 for operation_id in own:
                     settled[operation_id] = self._own_answer_disposition(rows[operation_id], operation_id, origin,
                                                                          requests[operation_id], idem[operation_id],
                                                                          enrollment)
+                if answered:
+                    rows = self._end_orphaned_answers(order, keys)
         live = [operation_id for operation_id in order
                 if operation_id not in settled and not _batch_answered(rows[operation_id])]
         dropped = {}
+        if live and any(operation_id not in settled and _batch_answered(rows[operation_id])
+                        for operation_id in order):
+            # A pass that died left a batch answered and not settled. That answer is settled first and this
+            # call consults nothing: what the settle leaves decides who goes next, and a source consulted now
+            # could be published ahead of an older one that batch sends alone.
+            dropped = {operation_id: {'disposition': 'dropped', 'code': None,
+                                      'reason': 'an answer an earlier pass recorded is settled first; this '
+                                                'source spends no attempt and keeps its turn'}
+                       for operation_id in live}
+            live = []
         if live:
-            # The budget is read before any row opens, so a source the batch cannot carry has no request
-            # row of this attempt and the same pass publishes it alone under its own single-source key.
-            sources, live, dropped = self._preflight_batch(live, requests, origin)
-            self._answer_batch(live[0], live, origin, requests, keys, idem, fingerprints, enrollment, executor,
-                               sources, dropped)
+            lead = live[0]
+            try:
+                # The budget is read before any row opens, so a source the batch cannot carry has no request
+                # row of this attempt and the same pass publishes it alone under its own single-source key.
+                sources, live, dropped = self._preflight_batch(live, requests, origin)
+                self._answer_batch(lead, live, origin, requests, keys, idem, fingerprints, enrollment, executor,
+                                   sources, dropped)
+            except KelmoError as error:
+                # The source this call led with is not always the first one it was given: an older one may
+                # be settled already. A refusal that belongs to the lead alone names it for the caller.
+                error.lead = lead
+                raise
         with coordinator_lock(self.service.config):
             self._recover()
             return self._settle_pass(order, keys, idem, requests, origin, enrollment, fingerprints, dropped)
+
+    def _batch_group(self, observation, own):
+        """The batch a recorded answer names: its lead's row id, that row, and every row of the batch by id.
+
+        The rows are read from the journal by the sources the answer lists, not from the batch a caller
+        happens to hold, so the row that carried the commit is found also when its source has left the pass.
+        """
+        lead = observation.get('batch_lead') or own
+        group = {row['operation_id']: row for row in self.journal.action_requests_of(observation.get('batch', ()))
+                 if row['operation_id'] == lead
+                 or json.loads(row['observation'] or '{}').get('batch_lead') == lead}
+        return lead, self.journal.action_row(lead), group
+
+    def _leave_batch(self, request_key, source_operation_id, idempotency_key):
+        """Take a source that comes alone out of the batch whose recorded answer its row still holds.
+
+        If that batch committed and carries the source, the row settles from the stored intent, with no model
+        call. If its commit is still to be recovered, the request is busy. Otherwise nothing of the source
+        was published: its attempt is ended without a refusal and the caller consults it alone, as it
+        consults any note a batch sends alone.
+        """
+        with coordinator_lock(self.service.config):
+            self._recover()
+            row = self.journal.action_request(request_key)
+            if row is None or row['state'] != 'open' or not _batch_answered(row):
+                return
+            observation = json.loads(row['observation'])
+            lead, lead_row, group = self._batch_group(observation, row['operation_id'])
+            if any(other['state'] == 'prepared' for other in group.values()):
+                raise KelmoError('E_BUSY', 'The batch that answered this source is still publishing; retry it '
+                                           'under the same key.')
+            committed = self._batch_committed(lead, group)
+            if committed is not None and source_operation_id in (committed.get('sources') or {}):
+                recorded = _recorded_keys(json.loads((lead_row or {}).get('observation') or '{}'))
+                self._member_disposition(request_key, {source_operation_id: idempotency_key}, intent=committed,
+                                         recorded=recorded.get(source_operation_id, ()))
+                return
+            self.journal.action_end_attempt(row['operation_id'], observation.get('attempt') or uuid.uuid4().hex)
+
+    def _end_orphaned_answers(self, order, keys):
+        """End the attempt of every member whose recorded batch answer nothing can settle any more.
+
+        A member's row names the row that led its batch, and the member is settled with what that row holds.
+        A pass that died while it was sending a batch's notes alone has ended the lead's attempt already, and
+        the next consultation of the lead writes another answer into the same row. A member still naming that
+        row would be settled from an answer that never included it: finished with no fact though no model
+        answered it. So a member whose lead no longer holds the answer the member recorded, and that no
+        commit of its batch carries, is an ended attempt: it spends nothing and joins the batch this call
+        consults. Runs after recovery, under the worker lock, and returns the rows as they are now.
+        """
+        rows = {operation_id: self.journal.action_request(keys[operation_id]) for operation_id in order}
+        for operation_id in order:
+            row = rows[operation_id]
+            if row is None or row['state'] != 'open' or not _batch_answered(row):
+                continue
+            observation = json.loads(row['observation'])
+            lead, lead_row, group = self._batch_group(observation, row['operation_id'])
+            if lead == row['operation_id']:
+                continue
+            held = json.loads((lead_row or {}).get('observation') or '{}').get('attempt')
+            if held is not None and held == observation.get('attempt'):
+                continue
+            if any(other['state'] == 'prepared' for other in group.values()):
+                continue  # its batch's commit is still to be recovered, and may carry this member
+            committed = self._batch_committed(lead, group)
+            if committed is not None and operation_id in (committed.get('sources') or {}):
+                continue
+            if self.journal.action_end_attempt(row['operation_id'], observation.get('attempt') or uuid.uuid4().hex):
+                rows[operation_id] = self.journal.action_request(keys[operation_id])
+        return rows
 
     def _batch_state(self, order, keys, fingerprints):
         """Each member's request row and the dispositions a replay answers without consulting: receipt or refusal."""
@@ -1627,6 +1736,14 @@ class Editor:
                                                   if operation_id in mine
                                                   and operation_id not in (committed or {}).get('sources', {})],
                                          keys, dispositions)
+                if committed is not None and answer.get('attempt') is not None:
+                    # Any other member the commit does not carry was refused or left behind by a settle the
+                    # pass did not live to record. That batch has published, so nothing more of its answer
+                    # will: the member spends no attempt and is consulted again in this pass.
+                    self._end_alone_attempts(answer, [operation_id for operation_id in mine
+                                                      if operation_id not in dispositions
+                                                      and operation_id not in committed.get('sources', {})],
+                                             keys, dispositions, rejoin='its batch published without this source')
                 for operation_id in mine:
                     if operation_id in dispositions:
                         continue
@@ -1724,7 +1841,17 @@ class Editor:
                                                   outcome=_outcome('unresolved', str(error), error.code),
                                                   result=_result(action_id, 'unresolved', error.code)):
                     raise busy from error
-                self._refuse_batch_members(live, keys, error.code, str(error))
+                # The refusal is the conversation's, so it settles the sources still in it. One the budget
+                # shrank out along the way was not asked about: its lease is ended and it stays waiting. A
+                # head refusal is raised from inside that shrink, before the dropped sources left `sources`,
+                # and by its own meaning leaves the head alone.
+                asked = [lead] if isinstance(error, HeadRefusal) else [operation_id for operation_id in live
+                                                                       if operation_id in sources]
+                self._refuse_batch_members(asked, keys, error.code, str(error))
+                for operation_id in live[1:]:
+                    member = self.journal.action_request(keys[operation_id])
+                    if operation_id not in asked and member is not None and member['state'] == 'open':
+                        self.journal.action_release(member['operation_id'], token)
                 raise
             self._release_batch(action_id, live, keys, token)
             self._record(lead, 'unresolved', str(error), request=action_id, code=error.code)
@@ -1747,8 +1874,9 @@ class Editor:
         """Record the batch answer, with each member's own slice, into every member row under the same token.
 
         The recorded member answer carries no consulting lease: it is the row's own answer, and the settle
-        pass reads it even when the lead's row is gone. A source the consultation itself shrank out is
-        not a member of the answer: its row keeps its lease so the settle pass can end it, and a row left
+        pass reads it even when the lead's row is gone. It names the attempt that produced it, which is how a
+        later pass tells whether the lead's row still holds that same answer. A source the consultation itself
+        shrank out is not a member of the answer: its row keeps its lease so the settle pass can end it, and a row left
         with a slice-less answer would answer every later pass with a drop it could never settle.
         """
         for operation_id in live[1:]:
@@ -1758,20 +1886,23 @@ class Editor:
             if row is None or row['state'] != 'open':
                 continue
             member = {'batch_lead': observation['batch_lead'], 'batch': list(observation['batch']),
+                      'attempt': token,
                       'generation': observation['generation'], 'project': observation['project'],
                       'scope': observation['scope'], 'omitted': observation['omitted'],
                       'readable': observation['readable'], 'complete': observation['complete'],
                       'budget': observation.get('budget'),
                       'link_pages': observation['link_pages'], 'receipts': observation['receipts'],
                       'slice': observation.get('slices', {}).get(operation_id)}
-            if 'declined' in observation:
-                member['declined'] = observation['declined']
             if observation.get('new_work'):
                 member['new_work'] = observation['new_work']
             self.journal.action_observe(row['operation_id'], token, member)
 
     def _source_batch(self, live, requests, origin):
-        """The archived evidence of every member; a member that cannot be read is dropped, never failed."""
+        """The archived evidence of the batch's members, up to the first one that cannot be read.
+
+        That member is dropped, never failed, and the batch ends there: the members after it are dropped with
+        it, because a batch never publishes a note ahead of an older one. The unreadable member is refused on
+        its own turn, as the head of a later batch, and the notes behind it follow."""
         sources, dropped = {}, {}
         for index, operation_id in enumerate(live):
             try:
@@ -1781,6 +1912,11 @@ class Editor:
                 if index == 0:
                     raise
                 dropped[operation_id] = {'disposition': 'dropped', 'code': error.code, 'reason': str(error)}
+                for later in live[index + 1:]:
+                    dropped[later] = {'disposition': 'dropped', 'code': error.code,
+                                      'reason': 'the batch ended at an older source it could not read; '
+                                                'this one stays waiting behind it'}
+                break
         return sources, dropped
 
     def _preflight_batch(self, live, requests, origin):
@@ -1839,9 +1975,14 @@ class Editor:
                                                   'reason': 'The batch budget cannot hold this source with the '
                                                             'older ones (' + reason + '); it stays waiting.'}
             kept.pop()
-        return views.editor_view(reader, generation, project, selected, budget, sources=kept,
-                                 expansions=expansions, reconciliations=reconciliations,
-                                 candidates=candidates), dropped
+        try:
+            return views.editor_view(reader, generation, project, selected, budget, sources=kept,
+                                     expansions=expansions, reconciliations=reconciliations,
+                                     candidates=candidates), dropped
+        except KelmoError as error:
+            if error.code != 'E_BUDGET':
+                raise
+            raise HeadRefusal('E_BUDGET', str(error)) from error
 
     def _consult_batch(self, live, sources, requests, executor, action_id, token, enrollment, dropped):
         """Expand, reconcile and propose for the whole batch within MAX_BATCH_ROUNDS model calls.
@@ -1859,9 +2000,17 @@ class Editor:
         is refused and repaired, so no note is left with a page asked for and never opened.
 
         A conversation that ends with no proposal at all is returned the same way, naming every source of
-        the batch in `alone` with `exhausted`: the batch spent its rounds, none of its notes spent an
-        attempt, and the same pass consults each one alone. Refusing it whole would park every member of
-        a conversation that never answered any of them, which is the loss this step is about.
+        the batch in `alone` with `exhausted` and the reason it ended: it spent its rounds, its executor
+        produced nothing, or it asked for what no further round can serve (an expansion nobody can send, a
+        page request or a receipt round still refused after its repairs). None of its notes spent an
+        attempt, and the same pass consults each one alone, where a note the model cannot place is refused
+        under its own key. Refusing the batch whole would park every member of a conversation that never
+        answered any of them, which is the loss this step is about. A conversation that ends that way after
+        a proposal returns that proposal, as one that ran out of rounds does.
+
+        One refusal is still raised from here: the batch shrank to its oldest source and the budget cannot
+        carry even that one (`HeadRefusal`). It is that source's own refusal, and the sources the shrink
+        dropped on the way are not part of it.
 
         An answer of `unresolved` is returned the same way, naming every source in `alone` with
         `unresolved`: that answer names no source, so it says nothing about any note of the batch and
@@ -1883,6 +2032,10 @@ class Editor:
                   for operation_id in live if operation_id in sources]
         expansions, reconciliations, candidates, expanded, repairs, refused = [], [], [], 0, [], None
         unaccounted = []
+        # Why the conversation ended before its rounds ran out, when it did: the executor produced nothing,
+        # or it asked for something no further round can serve. Either is the conversation's end, not a
+        # refusal of any note in it (see the return below).
+        ended = None
         # An earlier park's refusal is the first thing the model reads; it is not one of this batch's repairs.
         hinted = [requests[operation_id]['hint'] for operation_id in live if requests[operation_id].get('hint')]
         work = _batch_opened_pages(requests, live, registry)
@@ -1901,7 +2054,7 @@ class Editor:
             if not view['scope']:
                 # The shrink left a batch whose budget sends no page it may edit: the model would only be
                 # asked to expand a page the budget already omitted. Refuse it with the numbers instead.
-                raise KelmoError('E_BUDGET', _budget_refusal(view['omitted_budget'], budget, view['used_tokens']))
+                raise HeadRefusal('E_BUDGET', _budget_refusal(view['omitted_budget'], budget, view['used_tokens']))
             ceiling = _receipt_ceiling(budget, view['fixed_tokens'])
             view['payload']['budget']['receipt_ceiling'] = ceiling
             view['payload']['expansions_left'] = MAX_EXPANSIONS - expanded
@@ -1930,7 +2083,6 @@ class Editor:
                 # attempt the way a released lease ends, and the same pass consults each note on the
                 # single-source path — where a note that holds a fact publishes it, and a note that holds
                 # none is declined by that path's own rule, with its work page opened and one more ask.
-                # Settling them here is how the first production batches lost a third of their notes.
                 return {'batch_lead': action_id, 'batch': [operation_id for operation_id in live
                                                            if operation_id in sources],
                         'generation': generation.to_dict(), 'project': project,
@@ -1941,8 +2093,9 @@ class Editor:
                         'attempt': token, 'receipts': {}, 'slices': {},
                         'alone': [operation_id for operation_id in live if operation_id in sources]}
             if outcome.kind == 'failure':
-                reason = outcome.reason or outcomes.cause(outcome.error_code)
-                raise KelmoError(outcome.error_code, 'The editor executor produced no proposal: ' + reason)
+                ended = ('the editor executor produced no proposal (' + outcome.error_code + '): '
+                         + (outcome.reason or outcomes.cause(outcome.error_code)))
+                break
             if outcome.kind in ('open_work', 'open_works'):
                 # The batch opens every page the answer names, in the round it names them: one page per
                 # note, each parent joining the selection so the next round sends it in full. A request
@@ -1957,7 +2110,8 @@ class Editor:
                     work = [*work, *fresh]
                     continue
                 if len(repairs) >= MAX_REPAIRS:
-                    raise KelmoError('E_PROPOSAL', refusal)
+                    ended = refusal
+                    break
                 repairs.append({'code': 'E_PROPOSAL', 'reason': refusal})
                 continue
             if outcome.kind == 'proposal':
@@ -1997,18 +2151,26 @@ class Editor:
                 wanted = list(dict.fromkeys(outcome.result['pages']))
                 refusal = _expansion_refusal(wanted, view['payload'], expanded)
                 if refusal:
-                    raise KelmoError('E_PROPOSAL', refusal)
+                    ended = refusal
+                    break
                 expansions += wanted
                 expanded += 1
                 continue
             asked = outcome.result['facts'][:LIMITS['facts']]
             # The same ceiling as the single-source loop: the batch's receipts and their candidates are
             # measured before its searches run, so they cannot crowd the batch's pages out of its budget.
-            found, fresh, projected = _receipt_round(self.journal.conn, facts, asked, reconciliations,
-                                                     candidates, ceiling)
+            try:
+                found, fresh, projected = _receipt_round(self.journal.conn, facts, asked, reconciliations,
+                                                         candidates, ceiling)
+            except KelmoError as error:
+                if error.code != 'E_PROPOSAL':
+                    raise
+                ended = str(error)
+                break
             if found is None:
                 if len(repairs) >= MAX_REPAIRS:
-                    raise KelmoError('E_PROPOSAL', _receipt_ceiling_refusal(ceiling, projected, budget))
+                    ended = _receipt_ceiling_refusal(ceiling, projected, budget)
+                    break
                 repairs.append({'code': 'E_PROPOSAL',
                                 'reason': _receipt_ceiling_refusal(ceiling, projected, budget)})
                 continue
@@ -2018,18 +2180,20 @@ class Editor:
             if unaccounted:
                 refused['alone'] = unaccounted
             return refused
-        # The batch spent every round of its conversation with nothing proposed. Refusing it whole would
-        # charge every member of it for a conversation that answered none of them, which is how the first
-        # production batches lost a third of their notes: the rounds are the batch's, the attempts are not.
-        # The answer is recorded naming every source of the batch in `alone`, so `_settle_batch` ends each
-        # member's attempt the way a released lease ends and the same pass consults each one alone.
+        # The conversation ended with nothing proposed: it spent every round, its executor produced nothing,
+        # or it asked for what no further round can serve. Refusing it whole would charge every member of it
+        # for a conversation that answered none of them: the conversation is the batch's, the attempts are
+        # not. The answer is recorded
+        # naming every source of the batch in `alone`, so `_settle_batch` ends each member's attempt the way a
+        # released lease ends and the same pass consults each one alone, where a note the model cannot place
+        # is refused under its own key.
         return {'batch_lead': action_id, 'batch': [operation_id for operation_id in live if operation_id in sources],
                 'generation': generation.to_dict(), 'project': project,
                 'scope': view['scope'], 'omitted': view['omitted'], 'readable': view['readable'],
                 'complete': view['bundle'].complete, 'expansions': expansions,
                 'budget': _budget_observation(view, budget), 'link_pages': link_pages, 'new_work': opened,
                 'attempt': token, 'receipts': {}, 'slices': {},
-                'exhausted': 'the batch spent its ' + str(MAX_BATCH_ROUNDS) + ' rounds with no proposal',
+                'exhausted': ended or 'the batch spent its ' + str(MAX_BATCH_ROUNDS) + ' rounds with no proposal',
                 'alone': [operation_id for operation_id in live if operation_id in sources]}
 
     @staticmethod
@@ -2049,10 +2213,10 @@ class Editor:
         pages the repair needs in front of the model, which the consult loop sends itself.
 
         A source with no item of its own must be named in `recorded` with keys a reconciliation of this
-        conversation returned: a batch answer that leaves one silent is refused whole here, so no intent
-        is prepared over a note nobody answered and the note goes back with the rest of the batch. The
-        silent sources travel with the refusal as `alone`, because the consult loop is what decides what
-        happens to them once the repair budget is spent.
+        conversation returned. An answer that leaves one silent is returned as a problem naming the silent
+        sources in `alone`: the consult loop sends it back for repair while it has repairs left, and once
+        they are spent `_settle_batch` publishes the sources that were answered and sends the silent ones
+        alone.
         """
         batch = list(observation['batch'])
         try:
@@ -2179,8 +2343,10 @@ class Editor:
         attempts and the same pass consults it again under the same key, which is what publishes it. The
         accounting is read from the recorded answer here, not from the consult loop's last refusal, which
         names only the first problem it met. A source whose slice did carry an item is published with the
-        rest. A batch that accepted no source is refused whole as before; one whose answer accounted for none
-        of its sources sends every one of them alone, as an `unresolved` batch does.
+        rest, unless it was captured after a source the answer left out: it then waits behind that source,
+        its attempt ended the same way, and joins the pass's next batch, so the batch never publishes a note
+        ahead of an older one. A batch that accepted no source is refused whole as before; one whose answer
+        accounted for none of its sources sends every one of them alone, as an `unresolved` batch does.
 
         The intent is prepared on the row of the first source the commit publishes something of: a source
         whose own slice holds no item — the batch's lead included — is not the row that carries the batch,
@@ -2205,10 +2371,8 @@ class Editor:
             # Nothing was published, so nothing is settled on a reason: every member keeps its turn, spends
             # none of its attempts, and the same pass consults each one alone, the way a source the answer
             # left unaccounted for is sent. Refusing the batch whole, or settling its members on one answer
-            # that named none of them, is the loss the first production batches measured.
-            self._end_alone_attempts(observation, [operation_id for operation_id in batch
-                                                   if operation_id not in dispositions], keys, dispositions)
-            return self._batch_result(batch[0], batch, dispositions)
+            # that named none of them, would lose notes the conversation never answered.
+            return self._apart(observation, batch, keys, dispositions)
         if 'declined' in observation:
             # A batch answer recorded before an `unresolved` answer sent its members alone: the row of a
             # pass that died mid-batch can still carry it, and that answer is settled as it was.
@@ -2234,11 +2398,12 @@ class Editor:
                                       readable=observation.get('readable', ()),
                                       link_pages=observation.get('link_pages', False), sources=authorities)
             slices, collisions = split_delta(delta, checks, batch)
-        except ProposalError as error:
-            return self._refuse_batch(row, batch, keys, 'E_PROPOSAL', 'The proposal is malformed or unauthorized: '
-                                      + str(error), dispositions)
-        except engine.OwnershipConflict as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
+        except (ProposalError, engine.OwnershipConflict) as error:
+            # The answer cannot be read as a whole, and the conversation had its repairs: that is the
+            # conversation's failure, so no note of it is refused for it. Each one is consulted alone, where a
+            # note whose own proposal is malformed or unauthorized is refused under its own key.
+            return self._apart(observation, batch, keys, dispositions,
+                               'the batch answer is malformed or unauthorized (' + str(error) + ')')
         for operation_id in batch:
             if collisions.get(operation_id):
                 dispositions[operation_id] = {'disposition': 'refused', 'code': 'E_PROPOSAL',
@@ -2263,14 +2428,21 @@ class Editor:
         # loop's last refusal named: the precheck stops at the first problem it meets, so a collision or a
         # fact-check refusal still standing when the repairs ran out hides the silent sources behind it.
         # The accounting is therefore decided here, from the recorded answer itself. A source whose slice
-        # does carry an item is published with the rest, named in `alone` or not: the batch answered it.
+        # does carry an item was answered, named in `alone` or not.
         recorded = _recorded_keys(observation)
         reconciled = _reconciled_keys(self.journal.conn, observation.get('receipts', {}))
         silent = [operation_id for operation_id in accepted
                   if not _has_item(slices[operation_id]['delta'])
                   and not (recorded.get(operation_id)
                            and all(key in reconciled for key in recorded[operation_id]))]
-        publish = [operation_id for operation_id in accepted if operation_id not in silent]
+        # A note the answer left out has not had its turn, so no note captured after it is published with
+        # this batch: a newer note may correct an older one, and the other order would leave the older claim
+        # standing. Those notes go back to the waiting list unconsulted for the pass's next batch, which the
+        # pass starts once the note ahead of them has been consulted alone.
+        behind = ([operation_id for operation_id in accepted[accepted.index(silent[0]):]
+                   if operation_id not in silent] if silent else [])
+        publish = [operation_id for operation_id in accepted
+                   if operation_id not in silent and operation_id not in behind]
         union = {name: [] for name in LIMITS}
         union_checks = []
         for operation_id in publish:
@@ -2288,21 +2460,27 @@ class Editor:
             first = codes[0] if codes else {'code': 'E_PROPOSAL', 'reason': 'The batch left nothing to publish.'}
             return self._refuse_batch(row, batch, keys, first['code'], first['reason'], dispositions)
         if not any(union.values()):
-            references = [EvidenceRef.from_dict(self.service.journal.evidence_record(operation_id))
-                          for operation_id in accepted]
-            if any(engine.resolvable_note(registry, reference.to_dict()) for reference in references):
-                return self._refuse_batch(row, accepted, keys, 'E_PROPOSAL',
-                                          'A batch that resolves a legacy note publishes one source at a time.', dispositions)
+            # A batch that publishes nothing cannot resolve a legacy note, and the single-source path can:
+            # such a note takes that path in this same pass, its attempt ended without a refusal. Refusing
+            # the batch for it would charge every member for a note none of them is.
+            legacy = [operation_id for operation_id in accepted if engine.resolvable_note(
+                registry, EvidenceRef.from_dict(self.service.journal.evidence_record(operation_id)).to_dict())]
+            self._end_alone_attempts(observation, legacy, keys, dispositions,
+                                     reason='a batch that publishes nothing does not resolve a legacy note')
+            silent = [operation_id for operation_id in silent if operation_id not in legacy]
             if not observation['complete']:
-                return self._refuse_batch(row, accepted, keys, 'E_BUDGET',
-                                          _observed_budget_refusal(observation, 'the model saw incomplete context '
-                                                                   'and proposed nothing'), dispositions)
+                # The model read only part of what the batch selected and proposed nothing. What it did not
+                # read is the batch's selection, not any one note's: each note is consulted alone, where its
+                # own context decides whether it is refused for the budget or settled.
+                return self._apart(observation, batch, keys, dispositions,
+                                   'the batch read incomplete context and proposed nothing')
             # The sources that were accounted for and proposed nothing of their own end `archive-only` on
             # what the answer said for each of them: a source named in `recorded` names the keys it recorded.
             # The ones nobody answered keep their turn, also when the answer accounted for none of the batch:
             # an answer that says nothing about a note is no answer for it, exactly as `unresolved` is not,
             # and settling those notes `archive-only` on the batch's text is the loss this path exists to stop.
             self._end_alone_attempts(observation, silent, keys, dispositions)
+            self._end_alone_attempts(observation, behind, keys, dispositions, rejoin=_BEHIND)
             return self._finish_batch(batch, dispositions, keys, idem, generation,
                                       _settle_reasons(observation, batch))
         # The publisher is the first accepted member whose own slice holds an item, not the first accepted
@@ -2310,14 +2488,15 @@ class Editor:
         # source with no published item — the batch's lead included — never reports `applied`.
         publishers = [operation_id for operation_id in publish if _has_item(slices[operation_id]['delta'])]
         publisher = publishers[0]
-        # The outcome is decided here, before the intent exists: a reason the outcome store refuses
-        # refuses the whole batch with nothing committed, and the sources keep their turn.
+        # The outcome is decided here, before the intent exists. From here to the commit a refusal is the
+        # union's: it names no source, so no note is refused for it. Nothing is committed and each note is
+        # consulted alone, where the one whose own proposal is at fault meets the refusal under its own key.
         try:
             applied_reason = _applied_reason(union)
             member_reasons = {operation_id: _applied_reason(slices[operation_id]['delta'])
                               for operation_id in publishers}
         except KelmoError as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
+            return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
         sources = {operation_id: {'evidence_ref': EvidenceRef.from_dict(
             self.service.journal.evidence_record(operation_id)).to_dict(),
             'filename': self.service.source_packet(operation_id).filename,
@@ -2345,16 +2524,16 @@ class Editor:
             engine.ownership_guard(registry, result, rule_change=False, enrollment=features, subjects=subjects,
                                    rule_scope=engine._rule_scope(intent))
         except engine.OwnershipConflict as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
+            return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
         except (engine.WikiProblem, ValueError) as error:
-            return self._refuse_batch(row, batch, keys, 'E_PROPOSAL', 'The proposal cannot enter the registry: '
-                                      + str(error), dispositions)
+            return self._apart(observation, batch, keys, dispositions, _union_refused(
+                'E_PROPOSAL', 'the proposal cannot enter the registry: ' + str(error)))
         try:
             # As in the single path: renders and audits read files only, so interactive writes go first meanwhile.
             with outside_journal():
                 result, changes = engine.semantic_projection(self.service.root, registry, intent)
         except (engine.OwnershipConflict, engine.SemanticRefusal) as error:
-            return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
+            return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
         except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
             self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The pages could not be rendered: '
                                   + str(error) + '. Repair the page, then retry the same request.')
@@ -2364,7 +2543,7 @@ class Editor:
                 engine.check_budget(self.service.root, result)
         except KelmoError as error:
             if error.code == 'E_OWNERSHIP':
-                return self._refuse_batch(row, batch, keys, error.code, str(error), dispositions)
+                return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
             self._retryable_batch(action_id, batch, error.code, str(error))
         baselines = self._baselines(action_id, publisher, generation, changes)
         references = tuple(EvidenceRef.from_dict(entry['evidence_ref']) for entry in sources.values())
@@ -2379,22 +2558,19 @@ class Editor:
                                         outcome=_outcome('unresolved', 'editor publication prepared, not yet committed'),
                                         result=_result(publisher_row['operation_id'], 'prepared'))
         # As in the single path: the publication recomputes from the intent, these registry-sized copies go first.
-        del result, changes, registry
+        del result, changes, registry, delta, checks, union, union_checks, intent, proposal, baselines
         try:
             receipt = self._complete(publisher_row['operation_id'])
         except KelmoError as error:
-            # A batch publishes whole: the refusal already settled the publisher's own row, and every
-            # member of the batch settles refused with it rather than landing a partial commit.
-            for operation_id in accepted:
-                if operation_id == publisher:
-                    continue
-                member = self.journal.action_request(keys[operation_id])
-                if member is not None and member['state'] in ('open', 'prepared'):
-                    self.journal.action_refuse(member['operation_id'], error.code, str(error),
-                                               outcome=_outcome('unresolved', str(error), error.code),
-                                               result=_result(member['operation_id'], 'unresolved', error.code))
-                dispositions[operation_id] = {'disposition': 'refused', 'code': error.code, 'reason': str(error)}
-            raise
+            if self.journal.action_request(keys[publisher])['state'] != 'refused':
+                # Contention or an environment failure kept the intent prepared: nothing is settled, and the
+                # recovery publishes the whole union on its turn, each member's slice already on its row.
+                # Refusing a member here would leave a refused row whose fact the recovery then commits.
+                raise
+            # The commit was refused whole and the refusal settled the row that carried it. Nothing of the
+            # other notes was published and none of them is refused with it: each is consulted alone.
+            dispositions[publisher] = {'disposition': 'refused', 'code': error.code, 'reason': str(error)}
+            return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
         dispositions[publisher] = {'disposition': 'applied', 'receipt': receipt}
         recorded = _recorded_keys(observation)
         for operation_id in publish:
@@ -2403,22 +2579,24 @@ class Editor:
             dispositions[operation_id] = self._member_disposition(keys[operation_id], idem,
                                                                   slices[operation_id],
                                                                   recorded=recorded.get(operation_id, ()))
-        # The batch committed its part; the sources it left unaccounted for keep their turn.
+        # The batch committed its part; the sources it left unaccounted for keep their turn, and the ones
+        # captured after the first of them wait for it.
         self._end_alone_attempts(observation, silent, keys, dispositions)
-        for operation_id in batch:
-            if operation_id in dispositions:
-                continue
-            member = self.journal.action_request(keys[operation_id])
-            if member is not None and member['state'] in ('open', 'prepared'):
-                self.journal.action_refuse(member['operation_id'], dispositions[operation_id]['code'],
-                                           dispositions[operation_id]['reason'],
-                                           outcome=_outcome('unresolved', dispositions[operation_id]['reason'],
-                                                            dispositions[operation_id]['code']),
-                                           result=_result(member['operation_id'], 'unresolved',
-                                                          dispositions[operation_id]['code']))
+        self._end_alone_attempts(observation, behind, keys, dispositions, rejoin=_BEHIND)
         return self._batch_result(publisher, batch, dispositions)
 
-    def _end_alone_attempts(self, observation, silent, keys, dispositions):
+    def _apart(self, observation, batch, keys, dispositions, reason=None):
+        """End a batch that settles none of its notes: every source not settled yet is consulted alone.
+
+        What ended the batch names no source of it (the conversation ran out, the answer could not be read,
+        the union was refused), so no note pays for it. Each one keeps its turn and spends no attempt.
+        """
+        self._end_alone_attempts(observation, [operation_id for operation_id in batch
+                                               if operation_id not in dispositions], keys, dispositions,
+                                 reason=reason)
+        return self._batch_result(batch[0], batch, dispositions)
+
+    def _end_alone_attempts(self, observation, silent, keys, dispositions, reason=None, rejoin=None):
         """End the attempt of every source the batch answer left unaccounted for, spending none of its attempts.
 
         Their rows go back to the form `action_release` leaves — open, with the lease ended — through
@@ -2432,30 +2610,41 @@ class Editor:
         A batch that ran out of its rounds names every one of its sources here, and its reason names the
         rounds rather than the accounting: the conversation is what ran out, not any note's attempts. A
         batch answered `unresolved` names them the same way, and its reason names that answer: it named no
-        source, so it is no note's answer and settles no note.
+        source, so it is no note's answer and settles no note. `reason` names any other cause a caller sends
+        a source alone for.
+
+        `rejoin` ends the attempt the same way for a source that was not left unanswered but cannot settle
+        with this batch (it waits behind an older source the answer left out, or the batch published
+        without it): it is `dropped` with that reason, not `alone`, so the pass takes it into its next batch
+        instead of consulting it alone.
         """
         token = observation.get('attempt')
         exhausted = observation.get('exhausted')
         unresolved = observation.get('unresolved')
+        ending = '; its attempt was ended without a refusal, so it spends none of them and is consulted again'
         for operation_id in silent:
             member = self.journal.action_request(keys[operation_id])
+            # A row whose attempt a pass that died had ended already is in the form this call leaves.
             ended = (token is not None and member is not None and member['state'] == 'open'
-                     and self.journal.action_end_attempt(member['operation_id'], token))
+                     and (self.journal.action_end_attempt(member['operation_id'], token) or _lapsed(member)))
+            if ended and rejoin:
+                dispositions[operation_id] = {'disposition': 'dropped', 'code': None,
+                                              'reason': rejoin + '; it spends no attempt and is consulted again'}
+                continue
             dispositions[operation_id] = (
                 {'disposition': 'alone', 'code': 'E_PROPOSAL',
-                 'reason': ('the batch spent its rounds with nothing proposed; its attempt was ended without '
-                            'a refusal, so it spends none of them and is consulted again' if exhausted else
-                            'the batch answered unresolved, which names no source of it; its attempt was ended '
-                            'without a refusal, so it spends none of them and is consulted again'
-                            if unresolved else
+                 'reason': (reason if reason is not None else
+                            'the batch conversation ended with nothing proposed' if exhausted else
+                            'the batch answered unresolved, which names no source of it' if unresolved else
                             'the batch answer left this source with no item and no recorded entry through both '
-                            'repair rounds; its attempt was ended without a refusal, so it spends none of them '
-                            'and is consulted again')} if ended else
+                            'repair rounds') + ending} if ended else
                 {'disposition': 'dropped', 'code': 'E_CLAIM',
                  'reason': 'another attempt holds this source; it stays waiting and spends no attempt'})
 
     def _retryable_batch(self, action_id, batch, code, message):
-        """An environment failure before preparation: every member of the batch stays open for the same keys."""
+        """An environment failure before preparation: no member row is refused, and the failure is raised.
+
+        The apply pass then parks every member for it, as it parks a single source for the same failure."""
         for operation_id in batch:
             self._record(operation_id, 'unresolved', message, request=action_id, code=code)
         raise KelmoError(code, message)
@@ -2489,10 +2678,11 @@ class Editor:
         `recorded` names the fact keys it recorded, and only a source with no recorded entry of its own
         settles on the text the batch as a whole carries. A member this call already ended `alone` (the
         answer never accounted for it) is left out: its row is open with its attempt ended, and settling it
-        here is exactly the loss this path exists to stop.
+        here is exactly the loss this path exists to stop. One whose attempt could not be ended (`dropped`)
+        is left out for the same reason.
         """
         for operation_id in batch:
-            if dispositions.get(operation_id, {}).get('disposition') in ('refused', 'alone'):
+            if dispositions.get(operation_id, {}).get('disposition') in ('refused', 'alone', 'dropped'):
                 continue
             member = self.journal.action_request(keys[operation_id])
             if member['state'] not in ('open', 'prepared'):
@@ -2692,8 +2882,8 @@ class Editor:
                 continue
             if outcome.kind == 'open_works':
                 # A page list is a batch answer: a request with one source opens one page, from its own
-                # creation request or from one `open_work` ask. The answer comes back as a repair of this
-                # source's own conversation, which is what a badly shaped page list gets too.
+                # creation request or from one `open_work` ask. The answer is repaired inside this source's
+                # own conversation, as a badly shaped page list is.
                 if len(repairs) >= MAX_REPAIRS:
                     raise KelmoError('E_PROPOSAL', _works_answer_refusal())
                 repairs.append({'code': 'E_PROPOSAL', 'reason': _works_answer_refusal()})
@@ -2754,13 +2944,13 @@ class Editor:
         Each page is opened for the note it names and its parent joins the selection, so the next round
         sends that parent in full and the page can be created under it. A slug the registry already holds
         is never claimed: the page opens under the next free slug (`-2`, `-3`, …), as the single-source ask
-        does (`new_work_page` with `allocate`). One slug is one page: a target this batch
-        already opens, from a note's stored `new_work` or from an earlier ask of the same answer, is
-        shared, named with each note that asked for it and created once under the identity it was first
-        opened with, so no note is refused or charged for asking the page its neighbour asked. Returns the
-        opened pages, the selection and the refusal the answer gets when the request breaks the
-        one-page-per-note rule; a page the project cannot host is that refusal too, never a failure,
-        because a failure parks every member of the batch while a refusal spends one of its own rounds.
+        does (`new_work_page` with `allocate`). One slug is one page: a target this batch already opens,
+        from a note's stored `new_work` or from an earlier ask of the same answer, is shared, named with
+        each note that asked for it and created once under the identity it was first opened with, so no
+        note is refused or charged for asking the page its neighbour asked. Returns the opened pages, the
+        selection and the refusal the answer gets when the request breaks the one-page-per-note rule; a
+        page the project cannot host is that refusal too, never a failure, because a refusal is repaired
+        inside the conversation the answer came from.
         """
         for page in asked:
             named = {key: value for key, value in page.items() if key != 'source'}

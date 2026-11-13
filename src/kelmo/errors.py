@@ -23,3 +23,11 @@ class Stopping(BaseException):
     A BaseException, so no failure handler records it: the attempt in flight releases its claim and
     consulting lease on the way out and resumes on the next start, without a charged attempt.
     """
+
+
+class HeadRefusal(KelmoError):
+    """A batch shrank to its oldest source and the budget cannot carry even that one.
+
+    The refusal is that source's alone, exactly as on the single-source path: every other source of the
+    batch was dropped before the model read it, spends no attempt and keeps its place in the pass.
+    """

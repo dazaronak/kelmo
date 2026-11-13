@@ -395,6 +395,14 @@ class Journal:
         row = self.conn.execute('SELECT * FROM action_requests WHERE operation_id=?', (operation_id,)).fetchone()
         return dict(row) if row else None
 
+    def action_requests_of(self, source_operation_ids):
+        """Every request row of these sources, under whatever key and in whatever state; a read only."""
+        ids = list(source_operation_ids)
+        if not ids:
+            return []
+        return [dict(row) for row in self.conn.execute(
+            'SELECT * FROM action_requests WHERE source_operation_id IN (' + ','.join('?' for _ in ids) + ')', ids)]
+
     def action_begin(self, request_key, kind, fingerprint, origin, source_operation_id, *,
                      operation_id=None, observation=None, error=None, outcome=None):
         """Record a request once; its creation time is the action's single ingestion time.

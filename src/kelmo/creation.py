@@ -11,7 +11,7 @@ import time
 
 from . import outcomes, quota, stopping
 from .daemon import execute, validate_config
-from .errors import KelmoError, Stopping, sqlite_busy
+from .errors import HeadRefusal, KelmoError, Stopping, sqlite_busy
 from .journal import now as journal_now
 from .executor import ModelOutcome, normalize_answer
 from .wiki import engine, pages
@@ -511,12 +511,19 @@ def publish_batch(service, batch, executor):
 
     Each member is claimed under its own token, so a batch never holds a lock over a source it does not
     settle, and a member another attempt holds ends the batch there: the sources after it stay out too,
-    because a batch never passes an older note it could not claim. `Editor.edit_batch`
-    consults the model once and settles every member on its own request row; each disposition then
-    reaches that source's journal exactly as a single source's does: `applied` for a receipt (its own or
-    one this pass replayed), `parked`/`failed` for a refusal charged to that source's own attempt count,
-    and nothing at all for a source the batch dropped or left busy — it spends no attempt and stays
-    waiting for the next batch of the same pass.
+    because a batch never passes an older note it could not claim. A member whose stored request cannot
+    be read ends the batch there as well, and is refused on its own turn at the head of a later batch.
+    `Editor.edit_batch` holds one conversation with the model and settles every member on its own request row; each
+    disposition then reaches that source's journal exactly as a single source's does: `applied` for a
+    receipt (its own or one this pass replayed), `parked`/`failed` for a refusal charged to that source's
+    own attempt count, and nothing at all for a source the batch dropped or left busy: it spends no
+    attempt. A dropped source stays waiting for the next batch of the same pass; one another attempt holds
+    waits for the next pass, with the notes of its project behind it.
+
+    A refusal that is the head's alone (`BATCH_SHAPE`, `HeadRefusal`, or the head's own unreadable request)
+    charges the head and leaves the rest waiting. The head is the source the editor led with, which is a
+    later one when the oldest is settled already. Any other refusal raised for the batch as a whole is the
+    vault's or the environment's, and every claimed member is parked for it, as each would be alone.
 
     Returns {operation_id: {'state': 'applied' | 'parked' | 'failed' | 'deferred' | 'waiting',
     'code': the refusal or contention code, or None}} for every source of the batch. A `waiting` source
@@ -525,22 +532,43 @@ def publish_batch(service, batch, executor):
     path by this same pass (see `apply_pending`).
     """
     claimed, attempts, items, origins = {}, {}, [], {}
+    # What ended the batch early: 'E_CLAIM' when another attempt holds the next source, which holds the
+    # sources behind it back; None when the next source's own request could not be read, which only ends
+    # the batch there, so that source takes its turn as the head of a later one.
+    cut = None
     try:
         for operation, request, origin in batch:
             token = service.journal.claim(operation['id'], lease_seconds=3600)
             if token is None:
+                cut = 'E_CLAIM'
                 break
             claimed[operation['id']] = token
             key, hint, charged = _attempt(service, operation['id'])
             attempts[operation['id']] = charged
             origins[operation['id']] = origin
-            entry = {'source_operation_id': operation['id'], 'idempotency_key': key,
-                     'request': _editor_request(service, request)}
+            try:
+                entry = {'source_operation_id': operation['id'], 'idempotency_key': key,
+                         'request': _editor_request(service, request)}
+            except KelmoError as error:
+                if stopping.requested():
+                    raise Stopping() from error
+                if error.code in UNCHARGED:
+                    raise
+                if items:
+                    # A later source whose stored request cannot be read ends the batch before it. It is
+                    # refused on its own turn, as the head of the next batch, never with the notes ahead of it.
+                    break
+                # The head's own request is the refusal: it is charged for it alone, as `publish` charges it.
+                row = park(service, operation['id'], error, token, charged)
+                return {member['id']: ({'state': 'failed' if row['state'] == 'failed' else 'parked',
+                                        'code': error.code} if member['id'] == operation['id']
+                                       else {'state': 'waiting', 'code': None})
+                        for member, _request, _origin in batch}
             if hint is not None:
                 entry['request']['hint'] = hint
             items.append(entry)
         head = items[0]['source_operation_id'] if items else batch[0][0]['id']
-        waiting = {operation['id']: {'state': 'waiting', 'code': 'E_CLAIM'}
+        waiting = {operation['id']: {'state': 'waiting', 'code': cut}
                    for operation, _request, _origin in batch if operation['id'] not in claimed}
         if not items:
             return waiting
@@ -555,9 +583,12 @@ def publish_batch(service, batch, executor):
                 raise Stopping() from error  # the core's stop caused it; every member waits, uncharged
             if error.code in UNCHARGED:
                 raise
-            if error.code in BATCH_SHAPE:
-                # The batch itself could not be opened (its head is dismissed, unarchivable, unowned):
-                # only the head is charged for it, exactly as a single source would be.
+            if error.code in BATCH_SHAPE or isinstance(error, HeadRefusal):
+                # The batch itself could not be opened (its head is dismissed, unarchivable, unowned), or it
+                # shrank to a head the budget cannot carry: only the head is charged for it, exactly as a
+                # single source would be. The head is the source the editor led with, which is a later one
+                # when the oldest was settled by a pass that died before it recorded that.
+                head = getattr(error, 'lead', head)
                 row = park(service, head, error, claimed[head], attempts[head])
                 return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code}
                                         for operation_id in claimed if operation_id != head},
@@ -753,11 +784,12 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     are published as one batch (see `publish_batch`), never more of them than this pass may still
     handle; with the flag off every source goes through `publish` alone, exactly as before. A batch
     never passes an older note of its own project, and that rule holds across the batches of one pass:
-    when the head of a project is left waiting — a batch could not claim it, its quota deferral is still
-    ahead, or the pass spent its waiting budget on it — the rest of that project is held back for the rest
-    of the pass and named in `skipped`, so no newer note of it is published ahead of the older one in a
-    batch or alone. A source of another project keeps its own turn. A note whose turn fails with a fault
-    holds nothing back: it is named `E_INTERNAL` and the pass goes on (see below).
+    when a note is left waiting — a batch could not claim it, its quota deferral is still ahead, or the
+    pass spent its waiting budget on it — the notes of its project captured after it are held back for the
+    rest of the pass and named in `skipped`, so no newer note is published ahead of the older one in a
+    batch or alone. The notes ahead of it are older and keep their turn. A source of another project keeps
+    its own turn. A note whose turn fails with a fault that is no Kelmo refusal holds nothing back: it is
+    named `E_INTERNAL` and the pass goes on (see below).
     A source a batch answer left unaccounted for (see `publish_batch` and `Editor._settle_batch`) is kept
     in this pass's own `alone` set for the rest of it: `batch_members` never takes it into a batch again,
     and the same pass runs it through the single-source path with a real model call, so a note never
@@ -830,9 +862,16 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                 # The later sources of a project this pass could not get past: they stay waiting, named here
                 # before anything else narrows the list, so one blocked note never lets the notes behind it
                 # overtake it inside the same pass and is never silently dropped from the pass's own report.
+                # Only the notes captured after the blocker are held: a note ahead of it is older, overtakes
+                # nothing, and one of them a batch sent alone still owes its single-source turn to this pass.
+                place = {operation['id']: index for index, (operation, _request) in enumerate(pending)}
                 for project, (blocker, code) in held_back.items():
+                    if blocker not in place:
+                        continue  # another attempt settled it meanwhile: nothing is left to overtake
+                    first_held = place[blocker]
                     for operation, request in waiting:
-                        if request.get('project') != project or operation['id'] in seen:
+                        if (request.get('project') != project or operation['id'] in seen
+                                or place[operation['id']] < first_held):
                             continue
                         seen.add(operation['id'])
                         reason = ('held by another attempt' if operation['id'] == blocker
@@ -893,8 +932,8 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                     # The earliest member this batch could not claim, or one its quota deferral left
                     # unconsulted, holds the rest of its project back for the rest of the pass: a batch never
                     # passes an older note, and the pass must not start a later batch of that project that
-                    # does. A source the batch dropped for its own budget (no code) keeps its place in the
-                    # next batch.
+                    # does. A source the batch dropped for its own budget (`E_BUDGET`, which no other attempt
+                    # stands behind) or left behind an older note (no code) keeps its place in the next batch.
                     for member, _request, _origin in batch:
                         item = outcome.get(member['id']) or {}
                         if item.get('state') == 'deferred' or (item.get('state') == 'waiting'
