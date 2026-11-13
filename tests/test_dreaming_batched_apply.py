@@ -3763,9 +3763,12 @@ def test_a_refusal_at_the_batch_commit_charges_only_the_row_that_carried_it(worl
         return real(root, operation_id)
 
     monkeypatch.setattr(engine, 'publish_semantic', refuses_the_first_commit)
-    report = pending_pass(world, counted(BatchModel(world)))
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
     assert report['parked'] == [ids[0]], 'the publisher row carried the refused commit'
     assert sorted(report['applied']) == sorted(ids[1:]), report
+    assert [len(job.payload['sources']) if 'sources' in job.payload else 1
+            for job in model.inner.jobs] == [3, 1, 1], 'the batch, then each other note alone'
     for operation_id in ids[1:]:
         assert charged_parkings(world, operation_id) == ([], 0), 'no member pays for the refused commit'
 
@@ -3910,3 +3913,97 @@ def test_a_note_that_comes_alone_after_its_batch_committed_settles_from_that_com
     assert model.calls == 0, 'a published note is settled from the commit, never asked again'
     assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == ['applied'] * 3
     assert len(facts_of(world)) == 3
+
+
+# ---------------------------------------------------------------------------
+# What can still settle a recorded batch answer
+#
+# A member's answer is settled from the commit that carries its source, or with the lead's row while that
+# row is open and still holds the answer. A lead that was refused, dismissed or finished without the member
+# settles nothing for it: the member's attempt is ended without a refusal and it is consulted again.
+# ---------------------------------------------------------------------------
+
+
+def test_a_note_its_batch_did_not_commit_is_asked_again_when_a_later_pass_holds_part_of_that_batch(world,
+                                                                                                    monkeypatch):
+    """The batch committed two of four notes and the pass died; the next passes take two notes each.
+
+    The second of them holds neither the lead nor the row that carried the commit. The notes it holds were
+    not in that commit, so neither is finished from it: both are asked again and publish their own fact."""
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = capture(world, notes(4))
+    real = Editor._member_disposition
+    monkeypatch.setattr(Editor, '_member_disposition', crash_with('the process died after the commit'))
+    with pytest.raises(Died):
+        apply_pending(world.service, counted(PartlyAnswered(world, recorded=ids[0], silent={ids[2]})))
+    monkeypatch.setattr(Editor, '_member_disposition', real)
+    assert len(facts_of(world)) == 1, 'the batch committed the one note ahead of the note it left out'
+    model = counted(BatchModel(world))
+    applied = [operation_id for _pass in range(2)
+               for operation_id in apply_pending(world.service, model, limit=2)['applied']]
+    assert applied == ids
+    assert world.outcome(ids[0])['disposition'] == 'archive-only', 'the commit carried it as recorded'
+    facts = facts_of(world)
+    for operation_id in ids[1:]:
+        assert world.outcome(operation_id)['disposition'] == 'applied', world.outcome(operation_id)
+        assert 'app.replay-' + evidence_of(world, operation_id) in facts, 'a published note has its own fact'
+    for operation_id in ids:
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+class DismissesItsLead(BatchModel):
+    """The batch replay, during whose first conversation the oldest note of the batch is dismissed."""
+
+    def __init__(self, world, lead):
+        super().__init__(world)
+        self.world, self.lead, self.dismissed = world, lead, False
+
+    def execute(self, job):
+        if 'sources' in job.payload and not self.dismissed:
+            self.dismissed = True
+            self.world.service.editor.dismiss(self.lead, origin=self.world.origins['editor'], reason='not wanted')
+        return super().execute(job)
+
+
+def test_a_lead_dismissed_while_the_model_answers_takes_no_other_note_with_it(world):
+    """The dismissal is the lead's alone: the other notes are asked again in the same pass, charged nothing."""
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    model = counted(DismissesItsLead(world, ids[0]))
+    report = pending_pass(world, model)
+    assert report['applied'] == ids[1:], report
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [3, 2], \
+        'the batch the dismissal ended, then the two notes it left'
+    assert len(facts_of(world)) == 2
+    for operation_id in ids[1:]:
+        assert charged_parkings(world, operation_id) == ([], 0), 'no note pays for the dismissal of another'
+
+
+def test_a_refused_commit_the_pass_did_not_live_to_settle_charges_only_the_row_that_carried_it(world, monkeypatch):
+    """The commit was refused on the publisher's row and the pass died before it sent the other notes alone."""
+    from kelmo.editor import Editor
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import engine
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    real, refused = engine.publish_semantic, []
+
+    def refuses_the_first_commit(root, operation_id):
+        if not refused:
+            refused.append(operation_id)
+            raise KelmoError('E_FACT_CHECK', 'a receipt no longer matches the registry')
+        return real(root, operation_id)
+
+    monkeypatch.setattr(engine, 'publish_semantic', refuses_the_first_commit)
+    real_apart = Editor._apart
+    monkeypatch.setattr(Editor, '_apart', crash_with('the process died before the notes were sent alone'))
+    with pytest.raises(Died):
+        pending_pass(world, counted(BatchModel(world)))
+    monkeypatch.setattr(Editor, '_apart', real_apart)
+    report = pending_pass(world, counted(BatchModel(world)))
+    assert report['parked'] == [ids[0]], 'the refusal stays on the row that carried the commit'
+    assert report['applied'] == ids[1:], report
+    for operation_id in ids[1:]:
+        assert charged_parkings(world, operation_id) == ([], 0), 'no member pays for the refused commit'
