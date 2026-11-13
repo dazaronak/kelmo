@@ -44,17 +44,36 @@ pass; a note older than that is listed under `stalled` and the pass moves on.
 
 ## Batched apply
 
-With `[editor] batch_apply = true`, an `apply` pass asks the model once per batch
-of waiting notes from one project instead of once per note. It is off by
-default. `batch_max_sources` (default 8) caps how many notes go into one batch;
-the editor budget usually decides the real size.
+With `[editor] batch_apply = true`, an `apply` pass holds one conversation with
+the model per batch of waiting notes from one project instead of one per note. A
+batch conversation takes up to 8 model calls. It is off by default.
+`batch_max_sources` (default 8) caps how many notes go into one batch; the editor
+budget usually decides the real size.
 
 Each note in a batch still ends on its own: published with its own facts,
 recorded as already stated (its reason names the fact keys that say so), refused
 with its own error code, or handed back to the same pass to run alone. A note the
 model's answer never mentions is not settled on the batch's word. The same goes
-for a batch the model answers `unresolved` or that runs out of rounds: each note
-gets its own consultation in the same pass and spends none of its attempts.
+for a batch whose conversation ends without a proposal the editor can read: the
+model answers `unresolved`, the rounds run out, the executor fails, the answer
+stays malformed after its repairs, the model keeps asking for something the
+editor cannot serve, or what the batch proposed is refused as a whole. Each note
+then gets its own consultation in the same pass and spends none of its attempts
+for the batch. A note that cannot be placed alone either is refused there, under
+its own attempt count.
+
+A batch never takes a note past an older note of the same project that it could
+not consult. When another process holds a note, a note waits for a quota reset,
+or its source cannot be read, the batch ends there and the notes captured after
+it wait; older notes still take their turn. The same holds inside a batch: when
+the model's answer leaves a note out, the batch publishes only the notes captured
+before it, that note is consulted alone next, and the notes after it are
+consulted again in the same pass.
+
+A pass that dies in the middle of a batch loses no note and publishes none
+twice. On the next pass a note the batch had committed is settled from that
+commit, and any other note is settled from the answer the batch recorded or
+asked again. This also holds when `batch_apply` was turned off in between.
 
 ```sh
 kelmo --vault /srv/memory dream apply --ready --json
@@ -67,11 +86,23 @@ default is the value of `batch_max_sources`, and parked notes do not count. The
 pass leaves a project once fewer notes than that remain, so a small project
 waits for the next full pass. Without `batch_apply`, `--ready` is refused with
 `E_CONFIG`. `dream status` reports `waiting` (first-pass notes per project) and
-`ready` (the projects ready now) from the journal alone, without opening the
-store or calling the model.
+`ready` (the projects a ready pass would take now; empty while `batch_apply` is
+off). It reads the journal and the registry file, without opening the store or
+calling the model.
+
+The daemon reads `[editor]` when it starts. After changing `batch_apply`,
+`batch_max_sources` or `batch_ready_sources`, run `kelmo daemon stop` and
+`kelmo daemon start`; until then its scheduled passes use the old values, while
+`dream status` already shows the new `ready_at`.
 
 Pause affects subsequent passes. It does not interrupt a running provider call.
-Overlapping CLI runs use one process lock. A quota deferral persists its reset
+Overlapping runs use one process lock, the daemon's own Dreaming job included: a
+run that finds the lock held answers `busy`. Through the installed daemon
+service, `dream apply` and `dream run` wait up to 15 minutes for the result. A
+pass that takes longer keeps running in the service and the command answers
+`running`; `kelmo daemon status` shows the job while it runs. Without the
+service the command starts a daemon for the call and waits until the pass ends,
+because that daemon stops when its caller leaves. A quota deferral persists its reset
 time and later invocations wait without calling the provider again. Failed passes
 return a nonzero exit status. The evidence cursor and findings remain durable.
 
