@@ -21,7 +21,7 @@ small wiki in Git, and your agent gets the pages that matter when a session star
 
 ## Install
 
-You need macOS or Linux, Python 3.12 or 3.13, Git with an author name and email, and Claude Code or
+You need macOS on Apple Silicon or Linux (x86_64 or aarch64), Python 3.12 or 3.13, Git with an author name and email, and Claude Code or
 Codex logged in. You can also put your own program, including a local model, behind the
 [executor protocol](https://github.com/dazaronak/kelmo/blob/main/docs/EXECUTORS.md).
 

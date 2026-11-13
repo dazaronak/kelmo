@@ -7,7 +7,11 @@ linker = "/usr/bin/cc"
 linker = "/usr/bin/cc"
 
 # The same for C code built by dependencies (the tokenizer's regex library): build scripts call the `cc` crate,
-# which runs `cc` from PATH unless CC names a compiler. An environment that sets CC keeps its own.
+# which runs `cc` from PATH unless a CC variable names a compiler. Cargo has no per-target [env], so the
+# compiler is named through the target-specific variables the `cc` crate reads first. Other targets keep
+# their own default: Linux build images such as manylinux have `cc` on PATH but no /usr/bin/cc.
 [env]
-CC = { value = "/usr/bin/cc", force = false }
-CXX = { value = "/usr/bin/c++", force = false }
+CC_aarch64_apple_darwin = { value = "/usr/bin/cc", force = false }
+CXX_aarch64_apple_darwin = { value = "/usr/bin/c++", force = false }
+CC_x86_64_apple_darwin = { value = "/usr/bin/cc", force = false }
+CXX_x86_64_apple_darwin = { value = "/usr/bin/c++", force = false }

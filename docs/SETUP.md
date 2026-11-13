@@ -7,7 +7,7 @@
   </picture>
 </p>
 
-Use Python 3.12 or 3.13 on macOS or Linux. Configure Git author name and email,
+Use Python 3.12 or 3.13 on macOS (Apple Silicon) or Linux (x86_64 or aarch64). Configure Git author name and email,
 install the chosen agent CLI and authenticate it using that client's login flow.
 The installer does not copy credentials. Run from this repository:
 

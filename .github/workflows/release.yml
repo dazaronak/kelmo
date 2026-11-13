@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag vX.Y.Z whose version matches pyproject.toml. The full CI runs first; the exact four platform wheels
+# Push a tag vX.Y.Z whose version matches pyproject.toml. The full CI runs first; the exact three platform wheels
 # and the sdist it built and tested are then published to PyPI through Trusted Publishing (no API token is stored
 # anywhere).
 
@@ -41,7 +41,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -- dist/kelmo-*.whl
-          test "$#" -eq 4
+          test "$#" -eq 3
           set -- dist/kelmo-*.tar.gz
           test "$#" -eq 1
           version=$(basename "$1" .tar.gz | cut -d- -f2)

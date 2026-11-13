@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from archive_core_support import PROJECT
 from daemon_harness import KELMOD, SRC, Daemon, kill_group, wait_for
+from platform_support import UNSUPPORTED
 
 from kelmo.core.spec import build
 
@@ -86,7 +87,7 @@ def test_confined_archive_core_serves_the_same_calls(vault, tmp_path):
         reason = None if Path('/usr/bin/sandbox-exec').is_file() else (
             '/usr/bin/sandbox-exec is absent')
     elif sys.platform.startswith('linux'):
-        reason = None if shutil.which('bwrap') else 'bubblewrap (bwrap) is missing'
+        reason = UNSUPPORTED or (None if shutil.which('bwrap') else 'bubblewrap (bwrap) is missing')
     else:
         reason = f'native confinement is not available on {sys.platform}'
     if reason is not None:

@@ -14,7 +14,7 @@ git config user.email      # must print a value
 claude --version           # or: codex --version
 ```
 
-macOS or Linux only. The agent CLI must already be logged in; Kelmo never copies credentials.
+macOS on Apple Silicon or Linux (x86_64 or aarch64) only; Intel Macs are not supported. The agent CLI must already be logged in; Kelmo never copies credentials.
 
 ## 2. Ask the user four things
 

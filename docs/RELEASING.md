@@ -28,10 +28,13 @@ repository, so no API token is stored in the repository or in GitHub secrets.
    ```
 
 `release.yml` runs the full CI (source tests on Linux and macOS, Rust checks, a wheel for each of
-Linux x86_64 and aarch64 and macOS arm64 and x86_64, each carrying the `kelmod` binary, the sdist,
-artifact inspection, fresh installed-launcher tests), checks that the tag matches the built version,
-and publishes the exact four wheels and the sdist CI tested. A failed check publishes nothing. PyPI never accepts the same
-version twice, so a broken release is fixed by a new version, not by a re-upload.
+Linux x86_64, Linux aarch64 and macOS arm64, each carrying the `kelmod` binary, the sdist, artifact
+inspection, fresh installed-launcher tests), checks that the tag matches the built version, and
+publishes the exact three wheels and the sdist CI tested. A failed check publishes nothing. PyPI never
+accepts the same version twice, so a broken release is fixed by a new version, not by a re-upload.
+
+There is no Intel Mac wheel: onnxruntime, which the embedding library needs, has published no macOS
+x86_64 wheel since version 1.24, so Kelmo cannot be installed there.
 
 CI does not download the embedding model, so a green run does not exercise real model search. After a
 release, install the package in a clean environment and run one real search.

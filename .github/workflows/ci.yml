@@ -91,11 +91,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux wheels build in a pinned manylinux image (tag and digest), the same one a local build uses;
+        # maturin-action's default would be the moving :latest. macOS is Apple Silicon only: onnxruntime, which
+        # fastembed needs, has published no macOS x86_64 wheel since 1.24.
         include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, manylinux: "2014", sdist: true }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, manylinux: "2014", sdist: false }
-          - { os: macos-26, target: aarch64-apple-darwin, manylinux: "", sdist: false }
-          - { os: macos-15-intel, target: x86_64-apple-darwin, manylinux: "", sdist: false }
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2014"
+            container: quay.io/pypa/manylinux2014_x86_64:2026.10.26-1@sha256:296069bc05d85275248f168f6e3b34ba8aa06181b67e40cd7447c64d56d3a851
+            sdist: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2014"
+            container: quay.io/pypa/manylinux2014_aarch64:2026.10.26-1@sha256:ec445e2688785976c727d304f421ae8af5489715c19508526a749716e240541a
+            sdist: false
+          - os: macos-26
+            target: aarch64-apple-darwin
+            manylinux: ""
+            container: ""
+            sdist: false
     steps:
       - name: Prepare synthetic environment
         run: |
@@ -130,6 +144,7 @@ jobs:
           command: build
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          container: ${{ matrix.container }}
           args: --release --locked --out dist
       - name: Build source distribution
         if: matrix.sdist

@@ -4,7 +4,7 @@ Implementation reference for contributors: the flows, invariants and refusal cod
 
 ## Runtime in one screen
 
-Python 3.12/3.13; macOS and Linux. Default single-user local writer. One `kelmod` daemon (Rust) per machine serves
+Python 3.12/3.13; macOS on Apple Silicon and Linux (x86_64, aarch64). Default single-user local writer. One `kelmod` daemon (Rust) per machine serves
 MCP over Streamable HTTP on 127.0.0.1 with a bearer token, hooks and the CLI, and supervises the cores it routes
 calls to over the `kelmo/2` framing ([PROTOCOLS.md](PROTOCOLS.md)). SQLite journal, SQLite/FTS5/sqlite-vec archive, local pinned MiniLM embeddings (or an explicitly configured `[embedding]` chunk index, below), Git-backed Markdown/registry. Native Claude/Codex subprocesses are optional executors. No cloud account is required for local storage/search; configured model executors have their own authentication/network requirements.
 
