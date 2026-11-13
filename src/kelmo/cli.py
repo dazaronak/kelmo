@@ -190,12 +190,23 @@ def through_daemon(args, argv, launcher):
         options = {'action': args.action}
         if getattr(args, 'ready', False):
             options['ready'] = True
+        # A service daemon outlives this call, so the wait is only for the answer. A daemon started for the
+        # call ends once nobody is connected and stops the pass with it: there the call waits for the pass.
+        service = daemon_client.service_owned(root)
         try:
-            result = daemon_client.call(root, 'state.job_run', {'job': 'dream', 'options': options},
-                                        path=path, seconds=WAIT_CALL_SECONDS)
+            result = daemon_client.call(root, 'state.job_run', {'job': 'dream', 'options': options}, path=path,
+                                        seconds=WAIT_CALL_SECONDS if service
+                                        else daemon_client.LONGEST_CALL_SECONDS)
         except KelmoError as error:
             if error.code == 'E_BUSY':
                 return {'state': 'busy'}  # what the local run answers while another holds dreaming.lock
+            if error.code == 'E_DEADLINE' and service:
+                # The wait for the answer ended, the pass did not: the service's dream job runs to its end
+                # whoever still listens, and a second call meets it as `busy`.
+                return {'state': 'running',
+                        'reason': 'The pass is still running in the daemon after '
+                                  + str(int(WAIT_CALL_SECONDS // 60)) + ' minutes; `kelmo daemon status` '
+                                  'shows it under jobs while it runs.'}
             raise
         if result.get('state') == 'unconfigured':
             raise KelmoError('E_CONFIG', 'Configure Dreaming before running it.')

@@ -3,7 +3,8 @@
 Without the flag the early apply starts once DREAM_WAITING_NOTES notes wait anywhere and takes them all. With it,
 a project is ready once `batch_ready_sources` of its notes wait for their first pass, the scheduled apply starts
 only then, and it carries `ready` so the pass publishes the ready projects and leaves the small ones for the
-night. The journal here is a real SQLite file with the columns the scheduler and the readiness count read."""
+night. The journal here is a real in-memory SQLite database with the columns the scheduler and the readiness
+count read."""
 import json
 import sqlite3
 from contextlib import nullcontext
@@ -119,6 +120,17 @@ def test_a_redirect_that_joins_two_captured_names_makes_their_project_ready(tmp_
     assert {project: len(ids) for project, ids in jobs._ready_projects().items()} == {'new': 3}
 
 
+def test_an_unreadable_note_reads_as_no_ready_project_and_the_tick_goes_on(tmp_path, monkeypatch):
+    journal = Journal()
+    for _ in range(3):
+        journal.note('big')
+    journal.conn.execute("UPDATE operation_sources SET metadata='not json'")
+    jobs = scheduler(tmp_path, journal, batch_apply=True)
+    assert jobs._ready_projects() == {}
+    assert jobs._dream_due() is None
+    assert scheduled(jobs, monkeypatch) == []
+
+
 def test_too_few_notes_never_read_the_registry(tmp_path, monkeypatch):
     from kelmo.wiki import engine
     journal = Journal()
@@ -147,8 +159,26 @@ def test_a_ready_pass_is_given_only_the_notes_of_its_ready_projects(tmp_path):
     assert jobs._dream_due() is None
 
 
-def test_a_cut_ready_pass_is_taken_up_again_as_a_ready_pass(tmp_path, monkeypatch):
+def test_a_cut_ready_pass_whose_project_is_still_ready_comes_back_after_the_resume_wait(tmp_path, monkeypatch):
     from kelmo.core.jobs import APPLY_RESUME_SECONDS
+    journal = Journal()
+    big = [journal.note('big') for _ in range(7)]
+    now = [100]
+    jobs = scheduler(tmp_path, journal, batch_apply=True, now=now)
+    jobs._record_apply_start(ready=True)
+    for identifier in big[:3]:
+        journal.finish(identifier)
+    now[0] = 130
+    jobs._record_apply_end(stopped=True)
+    assert jobs._dream_due() is None, 'the cut pass waits its resume interval first'
+    now[0] = 130 + APPLY_RESUME_SECONDS
+    # Four notes still wait at ready 3: the uncut pass would have taken another batch, and so does this one.
+    assert jobs._dream_due() == 'apply'
+    assert scheduled(jobs, monkeypatch) == [('dream', {'action': 'apply', 'scheduled': True, 'ready': True})]
+
+
+def test_a_cut_ready_pass_starts_no_pass_for_what_it_left_below_the_number(tmp_path, monkeypatch):
+    from kelmo.core.jobs import APPLY_MIN_INTERVAL_SECONDS
     journal = Journal()
     big = [journal.note('big') for _ in range(4)]
     now = [100]
@@ -158,10 +188,11 @@ def test_a_cut_ready_pass_is_taken_up_again_as_a_ready_pass(tmp_path, monkeypatc
     journal.finish(big[1])
     now[0] = 130
     jobs._record_apply_end(stopped=True)
-    now[0] = 130 + APPLY_RESUME_SECONDS
-    # Two notes of the cut pass still wait though the project is below its number: the pass is taken up again.
-    assert jobs._dream_due() == 'apply'
-    assert scheduled(jobs, monkeypatch) == [('dream', {'action': 'apply', 'scheduled': True, 'ready': True})]
+    now[0] = 130 + APPLY_MIN_INTERVAL_SECONDS
+    # Two notes wait below the number of 3. A ready pass would take neither, so none starts: an uncut pass
+    # would have left them for the night too.
+    assert jobs._dream_due() is None
+    assert scheduled(jobs, monkeypatch) == []
 
 
 @pytest.mark.parametrize('options,code', [({'action': 'run', 'ready': True}, 'E_INPUT'),
@@ -207,3 +238,62 @@ def test_dream_apply_through_the_daemon_carries_ready(tmp_path, monkeypatch, fla
                         or {'state': 'finished'})
     assert cli.through_daemon(args, [], str(tmp_path / 'kelmo')) == {'state': 'finished'}
     assert calls == [('state.job_run', {'job': 'dream', 'options': expected})]
+
+
+def test_the_dream_job_answers_busy_while_a_run_outside_the_daemon_holds_the_dreaming_lock(tmp_path, monkeypatch):
+    """A `--server-profile` Dreaming call runs in its own process: the daemon's job waits its turn behind it."""
+    import fcntl
+
+    from kelmo import dreaming_cli
+    jobs = scheduler(tmp_path, Journal(), batch_apply=True)
+    monkeypatch.setattr(jobs, 'step', nullcontext)
+    monkeypatch.setattr(dreaming_cli, 'run_dream', lambda *args, **kwargs: pytest.fail('the run started'))
+    with (tmp_path / '.state' / 'dreaming.lock').open('a') as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert jobs._dream({'action': 'apply', 'scheduled': True}) == {'state': 'busy'}
+        assert 'apply' not in jobs._read_state(), 'a pass that never started records no start'
+    monkeypatch.setattr(dreaming_cli, 'run_dream', lambda *args, **kwargs: {'state': 'finished', 'apply': {}})
+    assert jobs._dream({'action': 'apply'}) == {'state': 'finished', 'apply': {}}, 'the lock is free again'
+
+
+def test_a_dream_call_the_service_outlasts_is_answered_as_still_running(tmp_path, monkeypatch):
+    """The pass goes on in the service after the call's wait ends: the answer says so instead of E_DEADLINE."""
+    from kelmo import cli
+    from kelmo.core import daemon_client
+    from kelmo.interface import build_parser
+    parser, _commands = build_parser('0')
+    args = parser.parse_args(['dream', 'apply', '--vault', str(tmp_path)])
+    waits = []
+
+    def outlasted(root, op, body, **kwargs):
+        waits.append(kwargs['seconds'])
+        raise KelmoError('E_DEADLINE', 'The core did not answer before the deadline.')
+
+    monkeypatch.setattr(daemon_client, 'ensure', lambda root, **kwargs: tmp_path / 'kelmod.sock')
+    monkeypatch.setattr(daemon_client, 'service_owned', lambda root: True)
+    monkeypatch.setattr(daemon_client, 'call', outlasted)
+    result = cli.through_daemon(args, [], str(tmp_path / 'kelmo'))
+    assert result['state'] == 'running' and 'kelmo daemon status' in result['reason'], result
+    assert waits == [cli.WAIT_CALL_SECONDS]
+
+
+def test_a_dream_call_to_a_daemon_started_for_it_waits_for_the_pass(tmp_path, monkeypatch):
+    """That daemon ends when its caller leaves and stops the pass with it, so the call never answers `running`."""
+    from kelmo import cli
+    from kelmo.core import daemon_client
+    from kelmo.interface import build_parser
+    parser, _commands = build_parser('0')
+    args = parser.parse_args(['dream', 'apply', '--vault', str(tmp_path)])
+    waits = []
+
+    def outlasted(root, op, body, **kwargs):
+        waits.append(kwargs['seconds'])
+        raise KelmoError('E_DEADLINE', 'The core did not answer before the deadline.')
+
+    monkeypatch.setattr(daemon_client, 'ensure', lambda root, **kwargs: tmp_path / 'kelmod.sock')
+    monkeypatch.setattr(daemon_client, 'call', outlasted)
+    assert not daemon_client.service_owned(tmp_path), 'no kelmod service is installed for this root'
+    with pytest.raises(KelmoError) as refused:
+        cli.through_daemon(args, [], str(tmp_path / 'kelmo'))
+    assert refused.value.code == 'E_DEADLINE'
+    assert waits == [daemon_client.LONGEST_CALL_SECONDS]

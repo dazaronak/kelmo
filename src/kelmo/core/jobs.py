@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import threading
+import fcntl
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -229,7 +230,6 @@ class Jobs:
         return acting
 
     def _dream(self, options):
-        from ..dreaming_cli import run_dream
         scheduled = options.get('scheduled')
         action = options.get('action', 'run')
         ready = options.get('ready', False)
@@ -239,7 +239,30 @@ class Jobs:
             raise KelmoError('E_INPUT', 'Only a Dreaming apply runs over ready projects; a run drains every project.')
         if scheduled and self._fenced():
             return {'state': 'fenced'}
+        with self._dreaming_lock() as free:
+            if not free:
+                # What the local run answers too; a scheduled job that meets it starts nothing and records
+                # no start, so the next tick asks again.
+                return {'state': 'busy'}
+            return self._dream_run(action, scheduled, ready)
 
+    @contextmanager
+    def _dreaming_lock(self):
+        """The process lock every Dreaming run takes, yielding whether this job now holds it.
+
+        Inside the daemon one dream job runs at a time anyway. The lock is for a run outside it: a
+        `--server-profile` Dreaming call runs in its own process with its own writer (`dreaming_cli.dispatch`
+        takes the same file), and two passes over one vault would only meet each other's claims."""
+        with self._state_path.with_name('dreaming.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+
+    def _dream_run(self, action, scheduled, ready):
+        from ..dreaming_cli import run_dream
         # The daily run counts once it really started: a paused or deferred Dreaming takes no day and no try.
         daily = []
 
@@ -460,49 +483,61 @@ class Jobs:
         Without `[editor] batch_apply` the early apply starts when DREAM_WAITING_NOTES notes wait across all
         projects and takes them all. With it, the early apply is the ready pass (see `_ready_apply`): it starts
         once one project has `batch_ready_sources` notes waiting for their first pass and publishes only the
-        projects that have, so a small project waits for the night instead of paying a conversation per note."""
+        projects that have, so a small project waits for the night instead of paying a conversation per note.
+
+        A pass the core's stop cut comes back after APPLY_RESUME_SECONDS, or after the usual interval once it
+        was cut more than APPLY_QUICK_RESUMES times in a row (see `_apply_hold`). The plain apply
+        is then taken up again whatever the count (`_cut_apply_waits`). The ready pass needs no such rule: it
+        re-counts a project after every batch and leaves it once fewer than `batch_ready_sources` notes remain,
+        so what a cut pass still owed is exactly a project that is still ready, and the same readiness brings
+        it back. What it left below the number waits for the night, as it would have after an uncut pass."""
         if self._dream_hold()[0] is not None:
             return None
         if self._daily_due():
             return 'run'
         if self._apply_hold()[0] is not None:
             return None
-        if self._cut_apply_waits():
-            return 'apply'
         if self._ready_apply():
             return 'apply' if self._ready_projects() else None
+        if self._cut_apply_waits():
+            return 'apply'
         return 'apply' if self._waiting_notes() >= DREAM_WAITING_NOTES else None
 
     def _ready_apply(self):
         """True when a scheduled apply is the ready pass: `[editor] batch_apply` is on. A ready project is
-        published in batches, so with the flag off the ready pass would take nothing and is refused."""
+        published in batches, so with the flag off the scheduler never asks for a ready pass."""
         return self.storage.writer.config.batch_apply is True
 
     def _ready_projects(self):
         """{project: [operation_id]} of the projects a ready pass would take now, counted as `kelmo dream status`
         and the pass count them: first-pass notes only, published project redirects followed. The registry is
         read only once the notes waiting under their captured project names could make one project ready, so
-        the scheduler's tick stays one journal query while too few notes wait."""
+        the scheduler's tick stays one journal query while too few notes wait. Like `_waiting_notes` it is a
+        schedule probe: a failure reads as no ready project (the daily run still drains every note), never
+        as an error raised on every tick."""
         from ..creation import waiting_by_project
         from ..wiki import engine
-        ready_at = self.storage.writer.config.batch_ready_sources
-        waiting = self.storage.read(lambda reader: waiting_by_project(reader.journal.conn))
-        if sum(len(ids) for ids in waiting.values()) < ready_at:
+        try:
+            ready_at = self.storage.writer.config.batch_ready_sources
+            waiting = self.storage.read(lambda reader: waiting_by_project(reader.journal.conn))
+            if sum(len(ids) for ids in waiting.values()) < ready_at:
+                return {}
+            if any(len(ids) < ready_at for ids in waiting.values()):
+                # A redirect can join two captured names into one project: only the registry says whether
+                # the small ones add up.
+                try:
+                    registry = engine.load_registry_view(self.core.root)
+                except KelmoError:
+                    registry = None
+                if registry is not None:
+                    waiting = self.storage.read(lambda reader: waiting_by_project(reader.journal.conn, registry))
+            return {project: ids for project, ids in waiting.items() if len(ids) >= ready_at}
+        except Exception:  # noqa: BLE001 - a schedule probe never stops the scheduler
             return {}
-        if any(len(ids) < ready_at for ids in waiting.values()):
-            # A redirect can join two captured names into one project: only the registry says whether the
-            # small ones add up.
-            try:
-                registry = engine.load_registry_view(self.core.root)
-            except KelmoError:
-                registry = None
-            if registry is not None:
-                waiting = self.storage.read(lambda reader: waiting_by_project(reader.journal.conn, registry))
-        return {project: ids for project, ids in waiting.items() if len(ids) >= ready_at}
 
     def _cut_apply_waits(self):
-        """A scheduled apply the core's stop cut is taken up again whatever the count, while a note it was given
-        still waits for its first pass."""
+        """A scheduled plain apply the core's stop cut is taken up again whatever the count, while a note it was
+        given still waits for its first pass. The ready pass comes back through readiness (see `_dream_due`)."""
         last = self._read_state().get('apply') or {}
         if last.get('stopped') is not True or not isinstance(last.get('ids'), list):
             return False

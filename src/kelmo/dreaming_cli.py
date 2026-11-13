@@ -15,15 +15,22 @@ from .migration_cli import read_spec
 from .service import Service
 
 
-def status(root):
-    """What Dreaming is configured to do, and what the apply pass would find if it ran now.
+def _journal(config):
+    """The vault's journal, read-only: a status question opens no Service, no store, no broker and no model."""
+    connection = sqlite3.connect((config.state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return closing(connection)
 
-    `waiting` and `ready` are counted from the journal alone: no Service, no store, no broker and no model,
-    so a scheduler can ask them on every tick and only pay a pass when a project is ready.
+
+def status(root):
+    """What Dreaming is configured to do, whether it is paused or deferred, and how its last run ended.
+
+    A few small reads of Dreaming's own tables and nothing of the registry: the state core's scheduler asks
+    this on every tick (`Jobs._dream_hold`). What waits for the apply pass is a separate question with its
+    own cost, see `waiting_status`.
     """
     config = Config.load(root)
-    with closing(sqlite3.connect((config.state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)) as connection:
-        connection.row_factory = sqlite3.Row
+    with _journal(config) as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         values = {row["key"]: json.loads(row["value"]) for row in connection.execute(
             "SELECT key,value FROM dream_state")} if "dream_state" in tables else {}
@@ -32,25 +39,35 @@ def status(root):
         recent = connection.execute(
             "SELECT run_id,state,started_at,finished_at FROM dream_runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone() if "dream_runs" in tables else None
-        # The same readiness `dream apply --ready` counts, over the same stored requests. A vault whose
-        # registry cannot be read still answers the count under the captured project names, because the
-        # question here is how much work waits, not which page it lands on.
-        waiting = {}
+    return {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
+            "next_attempt": values.get("next_attempt", 0), "findings": counts,
+            "last_run": dict(recent) if recent else None}
+
+
+def waiting_status(root):
+    """What the apply pass would find if it ran now: the first-pass notes of each project, and the ready ones.
+
+    The same readiness `dream apply --ready` counts, over the same stored requests, read from the journal
+    and the registry file, so asking costs no pass. A vault whose registry cannot be read still answers the
+    count under the captured project names, because the question here is how much work waits, not which
+    page it lands on. `ready` is empty while `[editor] batch_apply` is off: no ready pass runs then.
+    """
+    from .creation import waiting_by_project
+    from .wiki import engine
+    config = Config.load(root)
+    waiting = {}
+    with _journal(config) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if {"operations", "operation_sources"} <= tables:
-            from .creation import waiting_by_project
-            from .errors import KelmoError
-            from .wiki import engine
             try:
-                registry = engine.load_registry(root)
+                registry = engine.load_registry_view(root)
             except KelmoError:
                 registry = None
             waiting = waiting_by_project(connection, registry)
     ready_at = config.batch_ready_sources
-    return {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
-            "next_attempt": values.get("next_attempt", 0), "findings": counts,
-            "last_run": dict(recent) if recent else None,
-            "waiting": {project: len(ids) for project, ids in waiting.items()},
-            "ready": [project for project, ids in waiting.items() if len(ids) >= ready_at],
+    return {"waiting": {project: len(ids) for project, ids in waiting.items()},
+            "ready": [project for project, ids in waiting.items()
+                      if config.batch_apply and len(ids) >= ready_at],
             "ready_at": ready_at}
 
 
@@ -115,7 +132,7 @@ def dispatch(root, args):
     elif args.client_id:
         raise KelmoError("E_INPUT", "--client-id requires --server-profile.")
     if args.action == "status":
-        return status(root)
+        return {**status(root), **waiting_status(root)}
     if args.action == "schedule":
         return prepare_schedule(root, args)
     if args.action == "configure" and not args.apply:

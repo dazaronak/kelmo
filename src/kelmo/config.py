@@ -30,9 +30,6 @@ EDITOR_MODES = ('immediate', 'nightly')
 # [editor] batch_apply is on. The budget decides the batch's real size; this only bounds how many
 # sources one model answer has to cover.
 DEFAULT_BATCH_MAX_SOURCES = 8
-# How many first-pass notes of one project make that project ready for `kelmo dream apply --ready`.
-# Its own setting, not the batch ceiling: a vault can wait for ten notes of a project and still ask the
-# model about eight at a time. Its default is the value of batch_max_sources, so no constant stands here.
 
 
 def validate_embedding(data, root):
@@ -320,7 +317,7 @@ class Config:
 
     @property
     def batch_apply(self):
-        """True when one `kelmo dream apply` pass consults the model once per batch of waiting sources
+        """True when one `kelmo dream apply` pass holds one conversation with the model per batch of waiting sources
         of a project. Off unless the vault names `[editor] batch_apply = true`."""
         return bool((self.editor or {}).get('batch_apply', False))
 
@@ -333,7 +330,8 @@ class Config:
     def batch_ready_sources(self):
         """How many first-pass notes of one project make it ready for `kelmo dream apply --ready`.
 
-        Its own setting; when the vault names none it is the value of `batch_max_sources`."""
+        Its own setting, not the batch ceiling: a vault can wait for ten notes of a project and still ask
+        the model about eight at a time. When the vault names none it is the value of `batch_max_sources`."""
         editor = self.editor or {}
         return editor.get('batch_ready_sources', editor.get('batch_max_sources', DEFAULT_BATCH_MAX_SOURCES))
 
