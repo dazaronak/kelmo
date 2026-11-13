@@ -270,22 +270,22 @@ def current_request(registry, request):
 
 
 def opened_work_page(registry, project, new_work):
-    """The registered page a stored `new_work` already opened, or None when it names another page or none.
+    """The registered page a stored `new_work` already opened, or None when its target holds no work page.
 
-    A work page is the same page when its target, parent, title and summary are the ones `new_work_page`
-    would have given it. The page ID and the priority are left aside: the page is used as the registry
-    holds it and never re-created under the request's identity, so a note naming no priority or another
-    one still belongs on it. The target must sit in this project's own directory, so a request never
-    resolves onto a page of another project."""
+    A work page registered at the request's target, in this project's own directory, is the page the request
+    opened, whatever its title, summary or parent say now: the slug was checked against the live registry
+    when the note was captured, so a page at that target was opened after it, by a note about the same work
+    or by the request's own earlier attempt, and the editor may have retitled it since. The page is used as
+    the registry holds it and never re-created under the request's identity. A page of another kind at the
+    target is no work page, and a target outside the project's directory belongs to another project: both
+    stay unresolved, and the editor refuses the request."""
     if not isinstance(new_work, dict):
         return None
     target = new_work.get('target')
     entry = registry['pages'].get(target)
-    if entry is None or pages.project_of(target) != project:
+    if entry is None or pages.project_of(target) != project or entry.get('kind') != 'work':
         return None
-    if all(new_work.get(name, '') == entry[name] for name in ('parent', 'title', 'summary')):
-        return target
-    return None
+    return target
 
 
 def _editor_request(service, request):
@@ -299,7 +299,7 @@ def _editor_request(service, request):
     single-source and the batched path read a stored request: the request keeps `new_work` and selects
     that page, which is how the editor tells an opening request from one whose page is already there.
     A request never rewrites its captured metadata, exactly as `current_request` never does; a target
-    registered as a different page is left unresolved and stays the editor's refusal."""
+    registered as a page of another kind is left unresolved and stays the editor's refusal."""
     registry = engine.load_registry_view(service.root)
     request = current_request(registry, request)
     result = {name: value for name, value in request.items() if name not in ('pending',)}
@@ -452,12 +452,14 @@ BATCH_SHAPE = ('E_STATE', 'E_ORIGIN', 'E_PERMISSION', 'E_RECEIPT')
 def _batchable(service, operation, request):
     """The origin this source may be edited under in a batch, or None when it stays single-source.
 
-    A source is left out of the batch when its own stored request opens a work page (`new_work` belongs
-    to one request and `edit_batch` refuses it), when its quota deferral has not reset, or when its
-    owning origin cannot be read. A batch carries one origin, because a rule change is attributable only
-    to the origin that archived its source.
+    A source is left out of the batch when its quota deferral has not reset, or when its owning origin
+    cannot be read. A source whose own stored request opens a work page joins the batch: the page is
+    opened with the batch's commit, named in the payload with the source whose request opened it, so the
+    note that needs a page is not left on the path where a lost conversation leaves it with nothing.
+    A batch carries one origin, because a rule change is attributable only to the origin that archived
+    its source.
     """
-    if request.get('new_work') is not None or service.editor.deferred_until(operation['id']) is not None:
+    if service.editor.deferred_until(operation['id']) is not None:
         return None
     try:
         return service._operation_origin(operation['id'])
@@ -465,20 +467,28 @@ def _batchable(service, operation, request):
         return None
 
 
-def batch_members(service, waiting, ceiling):
+def batch_members(service, waiting, ceiling, alone=frozenset()):
     """The batch one apply pass takes from the head of its waiting list, in capture order.
 
     The oldest waiting source names the batch — its project and its owning origin — and later waiting
     sources of that project and origin join it up to the ceiling. When the head cannot join a batch the
     pass publishes it alone and the next batch starts with the next pass: a batch never passes an older
     note, and a source left out keeps its place in the pass's order. A later source of the same project
-    that cannot join (it opens a work page, is deferred, or belongs to another origin) ends the batch
+    that cannot join (its quota deferral has not reset, or it belongs to another origin) ends the batch
     there, because the notes after it would overtake it; a source of another project is skipped, since
     it waits for its own batch anyway.
+
+    `alone` names the sources this pass already sent through a batch whose answer never accounted for
+    them (see `apply_pending`): each of them runs the single-source path in this same pass, so none of
+    them joins a batch again. As the head it ends the batch, because the pass publishes it alone first;
+    later in the batch's own project it ends the batch there, exactly as a source that cannot join does,
+    because the notes after it would overtake a note that is about to be published alone.
     """
     if not waiting or ceiling < 1:
         return []
     first, first_request = waiting[0]
+    if first['id'] in alone:
+        return []
     origin = _batchable(service, first, first_request)
     if origin is None:
         return []
@@ -488,6 +498,8 @@ def batch_members(service, waiting, ceiling):
             break
         if request.get('project') != first_request['project']:
             continue
+        if operation['id'] in alone:
+            break
         if _batchable(service, operation, request) != origin:
             break
         batch.append((operation, request, origin))
@@ -508,7 +520,9 @@ def publish_batch(service, batch, executor):
 
     Returns {operation_id: {'state': 'applied' | 'parked' | 'failed' | 'deferred' | 'waiting',
     'code': the refusal or contention code, or None}} for every source of the batch. A `waiting` source
-    spent no attempt: it is still in the waiting list and may join the next batch of the same pass.
+    spent no attempt: it is still in the waiting list and may join the next batch of the same pass, except
+    the one the answer named `alone`, which carries `'alone': True` and is sent through the single-source
+    path by this same pass (see `apply_pending`).
     """
     claimed, attempts, items, origins = {}, {}, [], {}
     try:
@@ -570,6 +584,11 @@ def publish_batch(service, batch, executor):
                 row = park(service, operation_id, refusal, claimed[operation_id], attempts[operation_id])
                 outcome[operation_id] = {'state': 'failed' if row['state'] == 'failed' else 'parked',
                                          'code': disposition['code']}
+            elif kind == 'alone':
+                # The batch answer left this source unaccounted for and ended its attempt without a refusal:
+                # it spent no attempt and stays waiting, and the pass names it here so the same pass
+                # consults it alone instead of sending it into a later batch of the same pass.
+                outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code'), 'alone': True}
             else:
                 outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code')}
         return outcome
@@ -680,7 +699,50 @@ class _Turns:
         return False
 
 
-def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.time, should_stop=None, step=None):
+def first_pass_by_project(pairs):
+    """{project: [operation_id]} of the (operation, request) pairs that wait for their first pass.
+
+    Only state `archived` counts: a parked note is a retry, not a first pass, so it never makes a project
+    ready and never stands in the way of the number a scheduler reads. Pairs keep the order they came in,
+    which is capture order for the pending list.
+    """
+    waiting = {}
+    for operation, request in pairs:
+        project = request.get('project')
+        if project is not None and operation['state'] == 'archived':
+            waiting.setdefault(project, []).append(operation['id'])
+    return waiting
+
+
+def waiting_by_project(connection, registry=None):
+    """{project: [operation_id]} of the notes waiting for their first pass, read from a journal connection.
+
+    The same count `first_pass_by_project` makes from the pairs a pass already holds, answered straight
+    from the journal so the caller opens no Service, no store and no model: `kelmo dream status` uses it to
+    name how many first-pass notes each project has and which projects `dream apply --ready` would take
+    now, so a scheduler can skip a tick it would publish nothing in. Rows come in capture order, so each
+    project's first entry is its oldest waiting note and the mapping's own order is the order a ready pass
+    would run its projects in. The stored request is read in Python rather than with SQLite's JSON
+    functions, because a vault whose SQLite has no JSON1 still has to answer. `registry` (optional) follows
+    published project redirects exactly as the pass does, so the number a scheduler reads is the number the
+    pass counts. The connection must read rows as mapping rows (`sqlite3.Row`).
+    """
+    rows = connection.execute(
+        "SELECT o.id, o.state, s.metadata FROM operations o "
+        "JOIN operation_sources s ON s.operation_id = o.id "
+        "WHERE o.intent='create' AND o.terminal=0 AND o.state='archived' ORDER BY o.created_at").fetchall()
+    pairs = []
+    for row in rows:
+        request = (json.loads(row['metadata']) or {}).get('editor_request')
+        if request is None:
+            continue
+        pairs.append(({'id': row['id'], 'state': row['state']},
+                      current_request(registry, request) if registry is not None else request))
+    return first_pass_by_project(pairs)
+
+
+def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.time, ready=False,
+                  should_stop=None, step=None):
     """One `kelmo dream apply` pass: publish every note captured before the pass began through the
     editor, oldest first.
 
@@ -689,16 +751,50 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     note that meets a held lock or a busy database is retried in its place (see ORDER_WAIT_SECONDS).
     With `[editor] batch_apply` on, the head of the waiting list and the later sources of its project
     are published as one batch (see `publish_batch`), never more of them than this pass may still
-    handle; with the flag off every source goes through `publish` alone, exactly as before. The result
-    counts what happened, by operation id.
+    handle; with the flag off every source goes through `publish` alone, exactly as before. A batch
+    never passes an older note of its own project, and that rule holds across the batches of one pass:
+    when the head of a project is left waiting — a batch could not claim it, its quota deferral is still
+    ahead, or the pass spent its waiting budget on it — the rest of that project is held back for the rest
+    of the pass and named in `skipped`, so no newer note of it is published ahead of the older one in a
+    batch or alone. A source of another project keeps its own turn. A note whose turn fails with a fault
+    holds nothing back: it is named `E_INTERNAL` and the pass goes on (see below).
+    A source a batch answer left unaccounted for (see `publish_batch` and `Editor._settle_batch`) is kept
+    in this pass's own `alone` set for the rest of it: `batch_members` never takes it into a batch again,
+    and the same pass runs it through the single-source path with a real model call, so a note never
+    spends a second batch conversation in the pass that already sent it alone. The result counts what
+    happened, by operation id, and names in `waiting` what it left: {project: notes of this pass's own
+    snapshot it did not settle}, so a scheduler can read how much work remains without a second pass.
 
-    In the state core `step` is the job step: each note is one step, so an interactive write waits for one
-    note at most, and the pass lets the baton go while it waits for an older note. `should_stop` is read
-    before every note and after every wait; once it is true the pass raises Stopping, with no note held.
+    With `ready` (the CLI's `--ready`) the pass runs over ready projects only: a project is ready when at
+    least `[editor] batch_ready_sources` of its notes wait for their first pass (state `archived`; a parked
+    note is a retry and counts towards no readiness number). Readiness is counted once, from the notes
+    captured before the pass began, so a note that arrives during the pass counts towards no pass that is
+    already running and a project that was not ready at the start stays out of it. Ready projects run in
+    the order of their oldest waiting note, because the pass still takes the head of the waiting list.
+    Inside a ready project the pass still works oldest first, in batches of at most `batch_max_sources`,
+    and leaves that project once fewer than `batch_ready_sources` of its first-pass notes remain, so what
+    is left waits for the next pass: 17 notes at 8 and 8 give two batches and one note left, 10 notes at
+    ready 10 and 8 per batch give one batch of 8 and two left. A ready project whose oldest waiting note
+    is left waiting is skipped for the rest of the pass (see the held-back rule above) while the other
+    ready projects still run. A note a batch of the pass sent alone runs its single-source turn even when
+    its project has dropped below the number since: the pass took it, so it does not leave it behind.
+
+    In the state core `step` is the job step: each note, or each batch, is one step, so an interactive
+    write waits for one unit at most, and the pass lets the baton go while it waits for an older note.
+    `should_stop` is read before every unit and after every wait; once it is true the pass raises
+    Stopping, with no note held.
     """
     if type(limit) is not int or limit < 1:
         raise KelmoError('E_INPUT', 'The apply limit is a positive integer.')
-    report = {'applied': [], 'parked': [], 'failed': [], 'deferred': [], 'skipped': [], 'stalled': []}
+    if ready and not service.config.batch_apply:
+        # Refused in the engine, not only in the CLI, so every caller of the ready pass meets the same
+        # error: a ready project is published in batches, and with the flag off it would take no note.
+        raise KelmoError('E_CONFIG', 'The ready apply pass needs [editor] batch_apply: it publishes a ready '
+                                     'project in batches of batch_max_sources, and with batch_apply off it '
+                                     'would take no note of that project.')
+    ready_at = service.config.batch_ready_sources if ready else 0
+    report = {'applied': [], 'parked': [], 'failed': [], 'deferred': [], 'skipped': [], 'stalled': [],
+              'waiting': {}}
     step = step or nullcontext
 
     def rest(seconds):
@@ -711,14 +807,50 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
 
     turns = _Turns(report, rest, clock)
     started = journal_now()
-    seen = set()
+    seen, held_back = set(), {}
+    # The sources this pass already sent through a batch whose answer never accounted for them: each of
+    # them runs the single-source path in this same pass, so `batch_members` never takes one of them into
+    # a batch again and no later batch of the pass spends a second conversation on a note that is about
+    # to be published alone.
+    alone = set()
+    # The notes this pass began with, by project: `waiting` is read over them, so a note captured during
+    # the pass belongs to the next one and is not counted as left behind. With --ready, the projects that
+    # reached the number in that same first read (readiness is counted once, not re-counted per round).
+    snapshot, ready_projects = None, None
     while len(seen) < limit:
         if should_stop is not None and should_stop():
             raise Stopping()
         with step():
             try:
-                waiting = [(operation, request) for operation, request in pending_operations(service)
-                           if operation['created_at'] <= started and operation['id'] not in seen]
+                pending = [(operation, request) for operation, request in pending_operations(service)
+                           if operation['created_at'] <= started]
+                if snapshot is None:
+                    snapshot = {operation['id']: request.get('project') for operation, request in pending}
+                waiting = [(operation, request) for operation, request in pending if operation['id'] not in seen]
+                # The later sources of a project this pass could not get past: they stay waiting, named here
+                # before anything else narrows the list, so one blocked note never lets the notes behind it
+                # overtake it inside the same pass and is never silently dropped from the pass's own report.
+                for project, (blocker, code) in held_back.items():
+                    for operation, request in waiting:
+                        if request.get('project') != project or operation['id'] in seen:
+                            continue
+                        seen.add(operation['id'])
+                        reason = ('held by another attempt' if operation['id'] == blocker
+                                  else 'held back by the older note ' + blocker)
+                        report['skipped'].append({'operation_id': operation['id'], 'error_code': code,
+                                                  'reason': reason})
+                waiting = [(operation, request) for operation, request in waiting if operation['id'] not in seen]
+                if ready:
+                    if ready_projects is None:
+                        ready_projects = {project for project, ids in first_pass_by_project(waiting).items()
+                                          if len(ids) >= ready_at}
+                    remaining = first_pass_by_project(waiting)
+                    active = {project for project in ready_projects
+                              if len(remaining.get(project, ())) >= ready_at}
+                    # A note a batch of this pass sent alone stays in the pass whatever its project's count
+                    # has dropped to: the pass took it into that batch, so it owes it the single-source turn.
+                    waiting = [(operation, request) for operation, request in waiting
+                               if request.get('project') in active or operation['id'] in alone]
                 if not waiting:
                     break
                 operation, request = waiting[0]
@@ -742,29 +874,51 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
             if moved:
                 continue
             try:
-                batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)))
-                         if service.config.batch_apply else [])
+                batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)),
+                                       alone=alone) if service.config.batch_apply else [])
                 if len(batch) > 1:
                     # One conversation and one commit for the head of the waiting list and the later sources
                     # of its project; each member still settles on its own row and in its own bucket.
                     outcome = publish_batch(service, batch, executor)
-                    moved = False
+                    moved, sent_alone = False, False
                     for operation_id, item in outcome.items():
                         if item['state'] == 'waiting':
+                            if item.get('alone'):
+                                alone.add(operation_id)
+                                sent_alone = True
                             continue
                         seen.add(operation_id)
                         report[item['state']].append(operation_id)
                         moved = True
-                    if not moved:
+                    # The earliest member this batch could not claim, or one its quota deferral left
+                    # unconsulted, holds the rest of its project back for the rest of the pass: a batch never
+                    # passes an older note, and the pass must not start a later batch of that project that
+                    # does. A source the batch dropped for its own budget (no code) keeps its place in the
+                    # next batch.
+                    for member, _request, _origin in batch:
+                        item = outcome.get(member['id']) or {}
+                        if item.get('state') == 'deferred' or (item.get('state') == 'waiting'
+                                                               and item.get('code') in UNCHARGED):
+                            held_back[batch[0][1]['project']] = (member['id'], item.get('code') or 'E_CLAIM')
+                            break
+                    if not moved and not sent_alone:
                         # Nothing this batch touched left the waiting list: name the head and move on, so a
-                        # source another attempt holds never spins the pass.
+                        # source another attempt holds never spins the pass. A member the answer sent alone
+                        # did leave it — the same pass publishes it on the single-source path — so the head
+                        # of an exhausted batch is never named here: it would spend the pass's waiting budget
+                        # on a note the batch charged nothing for, and the notes behind it would never be
+                        # consulted.
                         seen.add(operation['id'])
                         report['skipped'].append({'operation_id': operation['id'],
                                                   'error_code': outcome[operation['id']]['code'] or 'E_BUSY'})
                     continue
                 if service.editor.deferred_until(operation['id']) is not None:
+                    # The head waits for its quota reset. Its project is held back for the rest of the pass,
+                    # because the next note of that project would otherwise become the head and be published
+                    # ahead of the older one.
                     seen.add(operation['id'])
                     report['deferred'].append(operation['id'])
+                    held_back.setdefault(request['project'], (operation['id'], 'E_QUOTA'))
                     continue
                 result = publish(service, operation['id'], request, executor, now=True)
             except (KelmoError, sqlite3.Error) as error:
@@ -775,14 +929,19 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                 if turns.held(operation['id']):
                     continue
                 seen.add(operation['id'])
-                report['skipped'].append({'operation_id': operation['id'], 'error_code': 'E_BUSY'
-                                          if isinstance(error, sqlite3.Error) else error.code})
+                code = 'E_BUSY' if isinstance(error, sqlite3.Error) else error.code
+                report['skipped'].append({'operation_id': operation['id'], 'error_code': code})
+                # The pass spent its waiting budget on this note and left it waiting: its project is held
+                # back for the rest of the pass, so the notes behind it wait for it instead of overtaking it.
+                held_back.setdefault(request['project'], (operation['id'], code))
                 continue
             except AssertionError:
                 raise  # a broken invariant (the baton's, a shared registry changed in place) ends the pass
             except Exception as error:  # noqa: BLE001 - one note's fault must not end the pass for every note
                 # The note keeps its journal state: a publication it already committed is finished by recovery
-                # on its next turn, as after a crash. It is named here, and the pass goes on with the next note.
+                # on its next turn, as after a crash. It is named here, and the pass goes on with the next note,
+                # of its own project too: unlike a held claim or a quota wait, a fault does not clear by
+                # itself, so holding the project back behind it would stall that project on every pass.
                 print(f'kelmo: note {operation["id"]} failed in the apply pass ({type(error).__name__}: {error}); '
                       'it is tried again on the next pass', file=sys.stderr, flush=True)
                 seen.add(operation['id'])
@@ -793,6 +952,19 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
             bucket = ('applied' if state == 'applied' else 'parked' if state == 'parked'
                       else 'failed' if state == 'failed' else 'deferred')
             report[bucket].append(operation['id'])
+            if bucket == 'deferred':
+                # The consultation met a quota signal and the note is still archived: its project waits for
+                # its reset instead of letting the notes behind it publish ahead of it.
+                held_back.setdefault(request['project'], (operation['id'], 'E_QUOTA'))
+    if snapshot is not None:
+        # What this pass left, by project: the notes it began with that it did not settle. A note that was
+        # deferred, held or stopped short of the pass's own limit still waits, so it is named here.
+        settled = set(report['applied']) | set(report['parked']) | set(report['failed'])
+        left = {}
+        for operation_id, project in snapshot.items():
+            if operation_id not in settled:
+                left[project] = left.get(project, 0) + 1
+        report['waiting'] = left
     return report
 
 

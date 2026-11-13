@@ -9,7 +9,8 @@ process group, recorded under `<state>/executors/state/` so kelmod can kill what
 
 Kinds:
   worker     one pass of the queue: operations, one resolution request, session jobs (daemon.tick)
-  dream      waiting notes first, then the findings pass (dreaming `run`); `apply` runs only the notes
+  dream      waiting notes first, then the findings pass (dreaming `run`); `apply` runs only the notes, and
+             `apply` with `ready` only the projects with `[editor] batch_ready_sources` notes waiting
   backfill   vectors for chunks that have none
   reembed    vectors again for the configured model
   graph      rebuild the wiki graph index
@@ -231,6 +232,11 @@ class Jobs:
         from ..dreaming_cli import run_dream
         scheduled = options.get('scheduled')
         action = options.get('action', 'run')
+        ready = options.get('ready', False)
+        if type(ready) is not bool:
+            raise KelmoError('E_PROTOCOL', 'The dream job option ready is a boolean.')
+        if ready and action != 'apply':
+            raise KelmoError('E_INPUT', 'Only a Dreaming apply runs over ready projects; a run drains every project.')
         if scheduled and self._fenced():
             return {'state': 'fenced'}
 
@@ -242,7 +248,7 @@ class Jobs:
                 daily.append(True)
                 self._record_dream_try()
             elif scheduled and action == 'apply':
-                self._record_apply_start()
+                self._record_apply_start(ready=ready)
 
         stopped = False
         try:
@@ -250,7 +256,8 @@ class Jobs:
             # only for journal transactions; model calls and the publication run without it, so an interactive write
             # waits for the transaction in progress, not for the unit.
             result = run_dream(self.storage.writer, action, contexts=getattr(self.core.profile, 'contexts', None),
-                               clock=self.clock, on_start=started, should_stop=self.should_stop, step=self.step)
+                               clock=self.clock, on_start=started, should_stop=self.should_stop, step=self.step,
+                               ready=ready)
         except Stopping:
             stopped = True
             if daily:
@@ -395,13 +402,17 @@ class Jobs:
             return 'deferred', reset
         return None, None
 
-    def _record_apply_start(self):
-        notes = self._queue_notes()
+    def _record_apply_start(self, ready=False):
+        # The notes this pass is given: every first-pass note, or for a ready pass the first-pass notes of the
+        # projects it takes. A note of a project the ready pass leaves for the night was never given to it, so it
+        # neither marks the pass as stuck nor brings a cut pass back.
+        given = ({operation_id for ids in self._ready_projects().values() for operation_id in ids} if ready
+                 else self._queue_notes()['archived'])
         previous = self._read_state().get('apply') or {}
         # Cuts in a row: carried while every pass since the last complete one was ended by the core's stop.
         stops = _count(previous.get('stops')) if previous.get('stopped') is True else 0
-        self._write_state(apply={'started': self.clock(), 'ids': sorted(notes['archived']), 'finished': None,
-                                 'stops': stops})
+        self._write_state(apply={'started': self.clock(), 'ids': sorted(given), 'finished': None,
+                                 'stops': stops, 'ready': ready})
         self._apply_started = True
 
     def _record_apply_end(self, stopped=False):
@@ -442,16 +453,52 @@ class Jobs:
         return None, None
 
     def _dream_due(self):
-        """Dreaming runs once a day from DREAM_HOUR, and at once when DREAM_WAITING_NOTES notes wait. The day is
-        kept in .state/jobs.json once a run completes, so a restart does not run it twice; a run that did not
-        complete is tried again (see DREAM_TRIES)."""
+        """Dreaming runs once a day from DREAM_HOUR and drains every project; between the daily runs an apply
+        starts early. The day is kept in .state/jobs.json once a run completes, so a restart does not run it
+        twice; a run that did not complete is tried again (see DREAM_TRIES).
+
+        Without `[editor] batch_apply` the early apply starts when DREAM_WAITING_NOTES notes wait across all
+        projects and takes them all. With it, the early apply is the ready pass (see `_ready_apply`): it starts
+        once one project has `batch_ready_sources` notes waiting for their first pass and publishes only the
+        projects that have, so a small project waits for the night instead of paying a conversation per note."""
         if self._dream_hold()[0] is not None:
             return None
         if self._daily_due():
             return 'run'
         if self._apply_hold()[0] is not None:
             return None
-        return 'apply' if self._waiting_notes() >= DREAM_WAITING_NOTES or self._cut_apply_waits() else None
+        if self._cut_apply_waits():
+            return 'apply'
+        if self._ready_apply():
+            return 'apply' if self._ready_projects() else None
+        return 'apply' if self._waiting_notes() >= DREAM_WAITING_NOTES else None
+
+    def _ready_apply(self):
+        """True when a scheduled apply is the ready pass: `[editor] batch_apply` is on. A ready project is
+        published in batches, so with the flag off the ready pass would take nothing and is refused."""
+        return self.storage.writer.config.batch_apply is True
+
+    def _ready_projects(self):
+        """{project: [operation_id]} of the projects a ready pass would take now, counted as `kelmo dream status`
+        and the pass count them: first-pass notes only, published project redirects followed. The registry is
+        read only once the notes waiting under their captured project names could make one project ready, so
+        the scheduler's tick stays one journal query while too few notes wait."""
+        from ..creation import waiting_by_project
+        from ..wiki import engine
+        ready_at = self.storage.writer.config.batch_ready_sources
+        waiting = self.storage.read(lambda reader: waiting_by_project(reader.journal.conn))
+        if sum(len(ids) for ids in waiting.values()) < ready_at:
+            return {}
+        if any(len(ids) < ready_at for ids in waiting.values()):
+            # A redirect can join two captured names into one project: only the registry says whether the
+            # small ones add up.
+            try:
+                registry = engine.load_registry_view(self.core.root)
+            except KelmoError:
+                registry = None
+            if registry is not None:
+                waiting = self.storage.read(lambda reader: waiting_by_project(reader.journal.conn, registry))
+        return {project: ids for project, ids in waiting.items() if len(ids) >= ready_at}
 
     def _cut_apply_waits(self):
         """A scheduled apply the core's stop cut is taken up again whatever the count, while a note it was given
@@ -481,7 +528,10 @@ class Jobs:
             print(f'kelmo: Dreaming schedule probe failed: {type(error).__name__}', file=sys.stderr, flush=True)
             action = None
         if action is not None:
-            self._background('dream', {'action': action, 'scheduled': True})
+            options = {'action': action, 'scheduled': True}
+            if action == 'apply' and self._ready_apply():
+                options['ready'] = True
+            self._background('dream', options)
         if (self.storage.writer.config.embedding is not None and not self._backfill_scheduled
                 and self.clock() >= self._backfill_due):
             self._backfill_scheduled = True

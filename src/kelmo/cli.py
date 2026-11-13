@@ -187,8 +187,11 @@ def through_daemon(args, argv, launcher):
     root = selected_root(args)
     if args.command == 'dream':
         path = daemon_client.ensure(root, kelmod=Path(launcher).parent / 'kelmod', launcher=launcher)
+        options = {'action': args.action}
+        if getattr(args, 'ready', False):
+            options['ready'] = True
         try:
-            result = daemon_client.call(root, 'state.job_run', {'job': 'dream', 'options': {'action': args.action}},
+            result = daemon_client.call(root, 'state.job_run', {'job': 'dream', 'options': options},
                                         path=path, seconds=WAIT_CALL_SECONDS)
         except KelmoError as error:
             if error.code == 'E_BUSY':

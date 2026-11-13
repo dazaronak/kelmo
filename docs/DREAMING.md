@@ -42,6 +42,34 @@ on a cause the worker retries) and retries a note that met another writer's lock
 in place before moving to newer ones. One wait budget of an hour covers the whole
 pass; a note older than that is listed under `stalled` and the pass moves on.
 
+## Batched apply
+
+With `[editor] batch_apply = true`, an `apply` pass asks the model once per batch
+of waiting notes from one project instead of once per note. It is off by
+default. `batch_max_sources` (default 8) caps how many notes go into one batch;
+the editor budget usually decides the real size.
+
+Each note in a batch still ends on its own: published with its own facts,
+recorded as already stated (its reason names the fact keys that say so), refused
+with its own error code, or handed back to the same pass to run alone. A note the
+model's answer never mentions is not settled on the batch's word. The same goes
+for a batch the model answers `unresolved` or that runs out of rounds: each note
+gets its own consultation in the same pass and spends none of its attempts.
+
+```sh
+kelmo --vault /srv/memory dream apply --ready --json
+kelmo --vault /srv/memory dream status --json
+```
+
+`apply --ready` publishes only ready projects. A project is ready once
+`[editor] batch_ready_sources` of its notes wait for their first pass; the
+default is the value of `batch_max_sources`, and parked notes do not count. The
+pass leaves a project once fewer notes than that remain, so a small project
+waits for the next full pass. Without `batch_apply`, `--ready` is refused with
+`E_CONFIG`. `dream status` reports `waiting` (first-pass notes per project) and
+`ready` (the projects ready now) from the journal alone, without opening the
+store or calling the model.
+
 Pause affects subsequent passes. It does not interrupt a running provider call.
 Overlapping CLI runs use one process lock. A quota deferral persists its reset
 time and later invocations wait without calling the provider again. Failed passes

@@ -458,6 +458,20 @@ class Journal:
             operation_id, lambda current: current is not None and current.get('consulting') == token,
             observation)
 
+    def action_end_attempt(self, operation_id, token):
+        """End the attempt of an open request whose recorded answer is a batch's, leaving the `action_release` form.
+
+        `action_release` can only end a lease the caller still holds, and a batch member's row no longer
+        holds one: the recorded answer replaced its lease. This is the other half — the row keeps its open
+        state and gets back the released-lease observation, so the same request key is retryable at once
+        and `action_lease` takes it again. It accepts only a row whose observation carries a batch answer
+        with no live lease, so it never releases an attempt another caller holds and never ends a row
+        carrying an answer of its own, which its own settle path owns.
+        """
+        return self._lease_update(
+            operation_id, lambda current: current is not None and 'consulting' not in current
+            and current.get('batch'), {'consulting': token, 'expires_at': 0})
+
     def action_history(self, action_id):
         """Accepted events of one action in accepted order; proposals and open intents are absent."""
         return tuple(json.loads(row['accepted_event']) for row in self.conn.execute(

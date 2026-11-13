@@ -139,7 +139,8 @@ def test_create_without_a_budget_uses_the_vault_editor_setting(world):
     toml.write_text(original + '\n[editor]\nbudget_tokens = 180000\n', encoding='utf-8')
     world.service.config = Config.load(world.root)
     assert world.service.config.as_dict()['editor'] == {'budget_tokens': 180000, 'mode': 'immediate',
-                                                         'batch_apply': False, 'batch_max_sources': 8}
+                                                         'batch_apply': False, 'batch_max_sources': 8,
+                                                         'batch_ready_sources': 8}
     assert budget_of(world.service.create('Configured budget.', project='app', idempotency_key='budget-vault')) \
         == 180000
     assert budget_of(world.service.create('Explicit budget.', project='app', idempotency_key='budget-explicit',
@@ -498,6 +499,50 @@ def test_a_work_page_that_appears_while_an_attempt_is_open_does_not_meet_the_ide
     assert world.fact('app.export-rework')['text'] == 'Rework the export queue.'
 
 
+def test_a_retried_note_whose_work_page_another_note_opened_loses_no_attempt(world, monkeypatch):
+    """A note retried under its own key after another note opened its page spends no attempt on that page.
+
+    The crashed attempt recorded its answer with the work page the request opened. A second note opened
+    that page in between, so the retry must not inject the creation again: `normalize` refuses a target
+    the registry already holds, and a note that met that refusal would pay a charged attempt of its own
+    budget for a page the vault itself opened. What the retry meets instead is the generation moving,
+    which is one of the refusals the vault causes and costs nothing."""
+    from kelmo import creation
+    from kelmo.editor import Editor
+
+    def crash(self, *args, **kwargs):
+        raise RuntimeError('the process died after the answer')
+
+    work = {'slug': 'export-rework', 'title': 'Rework the export'}
+    queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export queue.',
+                 status='backlog', expected_revision=None)
+    first = world.service.create('First: rework the export queue.', project='app', new_work=dict(work),
+                                 idempotency_key='late-page-first')
+    real = Editor._settle
+    monkeypatch.setattr(Editor, '_settle', crash)
+    with pytest.raises(RuntimeError):
+        world.service.run(first['id'], executor=Scripted(lambda job: world.propose(facts=[queue])))
+    monkeypatch.setattr(Editor, '_settle', real)
+    assert not world.service.journal.get(first['id'])['terminal']
+
+    cap = dict(fact_key='app.export-rework-cap', target=WORK, text='The queue caps retries at three.',
+               status='backlog', expected_revision=None)
+    second = world.service.create('Second: the queue needs a retry cap.', project='app', new_work=dict(work),
+                                  idempotency_key='late-page-second')
+    assert world.service.run(second['id'], executor=Scripted(
+        lambda job: world.propose(facts=[cap])))['state'] == 'applied'
+    assert WORK in world.registry()['pages'], 'the second note opened the page'
+
+    retried = world.service.run(first['id'], executor=Scripted(lambda job: world.propose(facts=[queue])))
+    reason = (world.outcome(first['id']) or {}).get('reason', '')
+    assert 'already registered' not in reason, reason
+    assert retried['state'] == 'parked', retried
+    assert creation._parked(world.service.trace(first['id']))[1] == 0, reason
+    applied = world.service.run(first['id'], executor=Scripted(lambda job: world.propose(facts=[queue])))
+    assert applied['state'] == 'applied', world.outcome(first['id'])
+    assert world.fact('app.export-rework')['text'] == 'Rework the export queue.'
+
+
 def test_a_note_without_a_priority_edits_the_page_a_note_with_one_opened(world):
     """A priority is an attribute of the page, not part of which page it is."""
     first = world.service.create('First: rework the export queue.', project='app',
@@ -552,25 +597,55 @@ def test_a_request_row_written_under_the_earlier_fingerprint_still_answers_itsel
     assert len(executor.jobs) == 1, 'the finished row answered without another model call'
 
 
-def test_a_new_work_target_registered_as_another_page_stays_refused(world):
-    """Resolution needs the same page: a request whose target names another page is still refused."""
+def test_a_new_work_whose_page_is_registered_under_another_title_publishes_onto_it(world):
+    """One slug is one page: a request whose work page appeared under another title edits that page.
+
+    Both notes were captured before either published, so both passed the capture's check that the slug is
+    free. The first opened the page; the second names the same target with its own title, the shape a page
+    the editor retitled since leaves too. It is the page the request opened, so the note publishes its fact
+    there and the page keeps the identity it was opened with, instead of parking on a refusal forever."""
     first = world.service.create('First: rework the export.', project='app',
                                  new_work={'slug': 'export-rework', 'title': 'Rework the export'},
                                  idempotency_key='other-page-first')
-    second = world.service.create('Second: something else entirely.', project='app',
-                                  new_work={'slug': 'export-rework', 'title': 'A different page'},
+    second = world.service.create('Second: the export rework caps retries.', project='app',
+                                  new_work={'slug': 'export-rework', 'title': 'A different title'},
                                   idempotency_key='other-page-second')
     queue = dict(fact_key='app.export-rework', target=WORK, text='Rework the export pipeline.',
                  status='backlog', expected_revision=None)
     assert world.service.run(first['id'], executor=Scripted(
         lambda job: world.propose(facts=[queue])))['state'] == 'applied'
-    other = dict(fact_key='app.export-rework-other', target=WORK, text='Something else.',
+    other = dict(fact_key='app.export-rework-retries', target=WORK, text='The export rework caps retries.',
                  status='backlog', expected_revision=None)
-    result = world.service.run(second['id'], executor=Scripted(
-        lambda job: world.propose(facts=[other])))
-    assert (result['state'], result['error_code']) == ('parked', 'E_PROPOSAL')
-    assert world.registry()['pages'][WORK]['title'] == 'Rework the export'
-    assert 'app.export-rework-other' not in world.registry()['facts']
+    executor = Scripted(lambda job: world.propose(facts=[other]))
+    result = world.service.run(second['id'], executor=executor)
+    assert result['state'] == 'applied', result.get('outcome')
+    assert WORK in [page['target'] for page in executor.jobs[0].payload['pages']], \
+        'the registered page is sent to the model'
+    assert 'new_work' not in executor.jobs[0].payload, 'no page creation is asked for a page that exists'
+    registry = world.registry()
+    assert registry['pages'][WORK]['title'] == 'Rework the export', 'the page keeps the identity it was opened with'
+    assert registry['facts']['app.export-rework-retries']['target'] == WORK
+
+
+def test_a_registered_target_counts_as_opened_only_for_a_work_page_of_its_own_project():
+    """`opened_work_page` resolves a stored request onto a work page of its own project, and nothing else."""
+    from kelmo.creation import opened_work_page
+    target = 'projects/app/export-rework.md'
+    work = {'target': target, 'title': 'Rework the export', 'summary': 'Rework the export',
+            'parent': 'projects/app/app.md'}
+
+    def registry(entry):
+        return {'pages': {target: entry}}
+
+    renamed = dict(work, kind='work', title='Export rework, phase two', summary='Retitled by the editor')
+    assert opened_work_page(registry(renamed), 'app', work) == target
+    assert opened_work_page(registry(dict(work, kind='work')), 'app', work) == target
+    assert opened_work_page(registry(dict(work, kind='feature')), 'app', work) is None, \
+        'a page of another kind at the target is no work page'
+    assert opened_work_page(registry(dict(work, kind='work')), 'ops', work) is None, \
+        'a target outside the project directory belongs to another project'
+    assert opened_work_page({'pages': {}}, 'app', work) is None
+    assert opened_work_page(registry(dict(work, kind='work')), 'app', None) is None
 
 
 def test_a_note_declaring_an_unknown_domain_is_refused_before_the_capture(world):

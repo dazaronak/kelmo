@@ -23,12 +23,24 @@ from .daemon import defer_termination, execute, validate_argv, validate_timeout
 from .errors import KelmoError
 from . import quota
 
-OUTCOME_KINDS = ('proposal', 'expand', 'reconcile', 'open_work', 'failure', 'deferred')
+OUTCOME_KINDS = ('proposal', 'expand', 'reconcile', 'open_work', 'open_works', 'failure', 'deferred')
 # Answer fields that request something, in the order they are served: pages, then a work page to
-# open, then reconciliation.
-REQUESTS = (('expand', 'expand', 'pages'), ('open_work', 'open_work', 'work'), ('reconcile', 'reconcile', 'facts'))
+# open (one source's own, then a batch's list of them), then reconciliation.
+REQUESTS = (('expand', 'expand', 'pages'), ('open_work', 'open_work', 'work'),
+            ('open_works', 'open_works', 'works'), ('reconcile', 'reconcile', 'facts'))
 RESULT_LIMIT = 1048576
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+# What one opened work page may name: the single-source request names its slug, title and the optional
+# summary and priority; a batch's page names the operation id of the note it is opened for as well.
+WORK_FIELDS = frozenset({'slug', 'title', 'summary', 'priority'})
+BATCH_WORK_FIELDS = WORK_FIELDS | {'source'}
+
+
+def _works_shape(works):
+    """True when every page of a batch's open-work answer names its slug, its title and the note it is for."""
+    return (isinstance(works, list)
+            and all(isinstance(page, dict) and {'slug', 'title', 'source'} <= set(page) <= BATCH_WORK_FIELDS
+                    and all(isinstance(value, str) for value in page.values()) for page in works))
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,9 @@ class ModelOutcome:
     """A normalized answer: proposal, expansion or reconciliation request, typed failure or quota deferral.
 
     `deferred` is an adapter-level provider signal; model answer content never produces it.
+
+    `open_works` is the batch-only request: one answer asking the publisher to open one work page per note of
+    the batch, each page naming the note it is opened for. The single-source `open_work` keeps its own shape.
     """
     kind: str
     result: dict | None = None
@@ -85,11 +100,16 @@ class ModelOutcome:
         if self.kind == 'open_work' and (
                 not isinstance(self.result, dict) or set(self.result) != {'work'}
                 or not isinstance(self.result['work'], dict)
-                or not {'slug', 'title'} <= set(self.result['work']) <= {'slug', 'title', 'summary', 'priority'}
+                or not {'slug', 'title'} <= set(self.result['work']) <= WORK_FIELDS
                 or not all(isinstance(value, str) for value in self.result['work'].values())):
             raise ValueError('A work page request names its slug and title, and optionally a summary '
                              'and a priority.')
-        if self.kind in ('proposal', 'expand', 'reconcile', 'open_work'):
+        if self.kind == 'open_works' and (
+                not isinstance(self.result, dict) or set(self.result) != {'works'}
+                or not _works_shape(self.result['works'])):
+            raise ValueError('A batch work page request names, for each page it wants opened, its slug, '
+                             'its title and the operation id of the note it is opened for.')
+        if self.kind in ('proposal', 'expand', 'reconcile', 'open_work', 'open_works'):
             if not isinstance(self.result, dict):
                 raise ValueError('A proposal or expansion carries a JSON object result.')
             try:
@@ -122,6 +142,12 @@ def normalize_answer(answer):
     A structured answer may carry every field of its schema with the unused ones empty, and an empty
     request asks for nothing. A request is served before anything proposed beside it, which was
     written without the pages or receipts it asks for.
+
+    A batch's open-work request is the exception to that serving: a page list the model shaped badly
+    (a page naming no note, a page naming a field it may not name) is answered as a proposal carrying
+    the field, so the editor refuses it as its own shape check and the model repairs it in the next
+    round of the same conversation. A typed `E_PROPOSAL` failure here would park every note of the batch
+    for one malformed page.
     """
     if not isinstance(answer, dict):
         return ModelOutcome('failure', error_code='E_EXECUTOR', reason='The executor returned no answer object.')
@@ -136,12 +162,21 @@ def normalize_answer(answer):
                                       else '.'))
     try:
         for name, kind, key in REQUESTS:
-            if answer.get(name) not in (None, [], {}):
-                return ModelOutcome(kind, {key: answer[name]})
+            value = answer.get(name)
+            if value in (None, [], {}):
+                continue
+            if kind == 'open_works' and not _works_shape(value):
+                # A page list the model shaped badly is no request at all: it stays inside the answer, so
+                # the editor's own shape check refuses it and the model repairs it in the next round of the
+                # same conversation. A typed failure here would park every note of the batch for one page
+                # the model can fix, and the answer's other requests are served as they always were.
+                continue
+            return ModelOutcome(kind, {key: value})
     except ValueError as error:
         return ModelOutcome('failure', error_code='E_PROPOSAL', reason=str(error))
     return ModelOutcome('proposal', {name: value for name, value in answer.items()
-                                     if name not in ('expand', 'reconcile', 'open_work', 'unresolved', 'reason')})
+                                     if name not in ('expand', 'reconcile', 'open_work', 'unresolved', 'reason')
+                                     and not (name == 'open_works' and not value)})
 
 
 class CliModelExecutor:
@@ -199,8 +234,8 @@ def decode_proposal(value):
 def decode_custom_outcome(envelope):
     """Decode the custom adapter's trusted transport envelope, not model answer content."""
     fields = {'proposal': {'kind', 'result'}, 'expand': {'kind', 'result'}, 'open_work': {'kind', 'result'},
-              'reconcile': {'kind', 'result'}, 'failure': {'kind', 'error_code', 'reason'},
-              'deferred': {'kind', 'reset_at'}}
+              'open_works': {'kind', 'result'}, 'reconcile': {'kind', 'result'},
+              'failure': {'kind', 'error_code', 'reason'}, 'deferred': {'kind', 'reset_at'}}
     if (not isinstance(envelope, dict) or not isinstance(envelope.get('kind'), str)
             or envelope['kind'] not in fields or set(envelope) - fields[envelope['kind']]
             or 'reason' in envelope and not isinstance(envelope['reason'], str)):
@@ -219,6 +254,8 @@ def decode_custom_outcome(envelope):
         return {'reconcile': outcome.result['facts']}
     if kind == 'open_work':
         return {'open_work': outcome.result['work']}
+    if kind == 'open_works':
+        return {'open_works': outcome.result['works']}
     if kind == 'deferred':
         if not quota.within_bounds(outcome.reset_at):
             raise KelmoError('E_EXECUTOR', 'The custom adapter quota reset must fall within the next 24 hours.')

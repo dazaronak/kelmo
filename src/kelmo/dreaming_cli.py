@@ -16,6 +16,11 @@ from .service import Service
 
 
 def status(root):
+    """What Dreaming is configured to do, and what the apply pass would find if it ran now.
+
+    `waiting` and `ready` are counted from the journal alone: no Service, no store, no broker and no model,
+    so a scheduler can ask them on every tick and only pay a pass when a project is ready.
+    """
     config = Config.load(root)
     with closing(sqlite3.connect((config.state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)) as connection:
         connection.row_factory = sqlite3.Row
@@ -27,9 +32,26 @@ def status(root):
         recent = connection.execute(
             "SELECT run_id,state,started_at,finished_at FROM dream_runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone() if "dream_runs" in tables else None
+        # The same readiness `dream apply --ready` counts, over the same stored requests. A vault whose
+        # registry cannot be read still answers the count under the captured project names, because the
+        # question here is how much work waits, not which page it lands on.
+        waiting = {}
+        if {"operations", "operation_sources"} <= tables:
+            from .creation import waiting_by_project
+            from .errors import KelmoError
+            from .wiki import engine
+            try:
+                registry = engine.load_registry(root)
+            except KelmoError:
+                registry = None
+            waiting = waiting_by_project(connection, registry)
+    ready_at = config.batch_ready_sources
     return {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
             "next_attempt": values.get("next_attempt", 0), "findings": counts,
-            "last_run": dict(recent) if recent else None}
+            "last_run": dict(recent) if recent else None,
+            "waiting": {project: len(ids) for project, ids in waiting.items()},
+            "ready": [project for project, ids in waiting.items() if len(ids) >= ready_at],
+            "ready_at": ready_at}
 
 
 def prepare_schedule(root, args):
@@ -133,16 +155,21 @@ def dispatch(root, args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            return run_dream(service, args.action, contexts=contexts)
+            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
 
 
-def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None):
+def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None,
+              ready=False):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
     The caller makes sure no other Dreaming run is in progress.
 
     In the state core `step` is the job step, entered once per unit of work (the settings, each note, the
     findings pass), and `should_stop` ends the run between units and cuts a model call in flight: the run then
-    raises Stopping, holds nothing and charges no note."""
+    raises Stopping, holds nothing and charges no note.
+
+    `ready` belongs to `apply` alone: the owner's "run the editor now" over ready projects only (see
+    `apply_pending`). `run` keeps draining everything, because the night pass is what publishes small
+    projects."""
     step = step or nullcontext
     with step():
         # Built inside the step: its first use creates the Dreaming tables on the shared journal connection.
@@ -163,7 +190,8 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
     # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
     # is the owner's "run the editor now".
     from .creation import apply_pending
-    applied = apply_pending(service, executor, should_stop=should_stop, step=step)
+    applied = apply_pending(service, executor, should_stop=should_stop, step=step,
+                            ready=ready and action == "apply")
     if action == "apply":
         return {"state": "finished", "apply": applied}
     if should_stop is not None and should_stop():

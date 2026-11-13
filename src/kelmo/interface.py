@@ -128,14 +128,18 @@ def build_parser(version):
     sync.add_argument('--apply', action='store_true')
     sync.add_argument('--push', action='store_true', help='Also push the synchronized branch; never force')
     dream = command('dream', 'Configure, inspect or run a bounded Dreaming pass; no scheduler is started. '
-                             '`apply` publishes every waiting note through the editor now; `run` does that '
-                             'first, then the findings pass.')
+                             '`apply` publishes every waiting note through the editor now, or only the '
+                             'ready projects with `--ready`; `run` does that first, then the findings pass.')
     dream_actions = dream.add_subparsers(dest='action', required=True)
     for name in ('configure', 'status', 'pause', 'resume', 'apply', 'run', 'findings', 'schedule'):
         action = dream_actions.add_parser(name)
         common(action)
         server_profile(action)
         action.add_argument('--client-id', help='Enrolled origin for a shared Dreaming run')
+        if name == 'apply':
+            action.add_argument('--ready', action='store_true',
+                                help='Publish only the projects with at least [editor] batch_ready_sources '
+                                     'notes waiting for their first pass')
         if name == 'configure':
             action.add_argument('--executor-config', type=Path, required=True)
             action.add_argument('--max-sources', type=int, default=10)

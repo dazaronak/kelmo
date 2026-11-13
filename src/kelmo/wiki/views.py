@@ -173,8 +173,9 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
         cost = _cost(block)
         if used + cost > budget_tokens:
             omitted.append(target)
-            # What the page needed and what was left after the source, the rules, the receipts and the
-            # index: without these numbers a refusal cannot be read from outside the vault.
+            # What the page needed and what the budget still left after the fixed parts of the payload
+            # and the pages already sent in this same call: without these numbers a refusal cannot be read
+            # from outside the vault.
             unmet.append({'target': target, 'needs_tokens': cost, 'left_tokens': budget_tokens - used})
             continue
         sent.append(block)
