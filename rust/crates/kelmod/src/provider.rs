@@ -386,11 +386,16 @@ impl Provider {
             let _ = tx.send((input, result));
         });
         let mut early = None;
+        // Whether the call ended for a reason that says nothing against the provider (a stop or the deadline);
+        // a closed pipe or an invalid answer means the provider is gone or broken.
+        let mut harmless = false;
         let result = loop {
             if self.stopping.load(Ordering::Acquire) {
+                harmless = true;
                 break Err(unavailable("provider is stopping", true));
             }
             if Instant::now() >= deadline {
+                harmless = true;
                 break Err(timeout());
             }
             match rx.try_recv() {
@@ -423,7 +428,9 @@ impl Provider {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         };
+        // Only a harmless end can leave the provider in place, and only when the writer never touched the pipe.
         let cancelled = result.is_err()
+            && harmless
             && write_state
                 .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
@@ -670,20 +677,23 @@ mod tests {
             "-e",
             "if (fork() == 0) { POSIX::setsid(); sleep 5; exit 0 } sleep 30",
         ])));
-        let body = json!({"purpose": "query", "texts": ["x".repeat(1024 * 1024)], "timeout": 0.1});
+        // A deadline long enough to start the provider and begin the write on a loaded machine: one spent before
+        // the request is sent leaves the fresh provider running, which is not what this test is about.
+        let body = json!({"purpose": "query", "texts": ["x".repeat(1024 * 1024)], "timeout": 1.0});
         let start = Instant::now();
         assert!(reason(&provider.call(&body).unwrap_err()).starts_with("timeout:"));
         assert_eq!(provider.status()["running"], false);
         provider.stop();
-        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(start.elapsed() < Duration::from_secs(4));
     }
 
     #[test]
     fn timeout_kills_and_reaps_unresponsive_provider() {
         let provider = Provider::new(Some(config(&["/bin/sh", "-c", "/bin/sleep 30"])));
         let start = Instant::now();
-        assert!(reason(&provider.call(&body(0.05)).unwrap_err()).starts_with("timeout:"));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        // Long enough that the request is written before the deadline, as above.
+        assert!(reason(&provider.call(&body(1.0)).unwrap_err()).starts_with("timeout:"));
+        assert!(start.elapsed() < Duration::from_secs(3));
         assert_eq!(provider.status()["running"], false);
         assert_eq!(provider.status()["failures"], 1);
     }
@@ -691,10 +701,11 @@ mod tests {
     #[test]
     fn timeout_during_large_write_kills_provider() {
         let provider = Provider::new(Some(config(&["/bin/sh", "-c", "/bin/sleep 30"])));
-        let body = json!({"purpose": "query", "texts": ["x".repeat(1024 * 1024)], "timeout": 0.1});
+        // Long enough that the write has begun and blocks on the full pipe when the deadline passes.
+        let body = json!({"purpose": "query", "texts": ["x".repeat(1024 * 1024)], "timeout": 1.0});
         let start = Instant::now();
         assert!(reason(&provider.call(&body).unwrap_err()).starts_with("timeout:"));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(3));
         assert_eq!(provider.status()["running"], false);
     }
 
