@@ -577,8 +577,9 @@ def test_a_second_pass_replays_nothing_because_the_batch_settled_every_member(wo
     assert commits(world) == before + 1
 
 
-def test_a_pass_that_died_after_the_answer_settles_each_member_from_its_own_row(world, monkeypatch):
-    """The window the design note names: the answer is recorded, the pass dies before the settle."""
+def test_a_pass_that_died_after_the_answer_asks_its_notes_again_and_publishes_them_once(world, monkeypatch):
+    """The answer is recorded and the pass dies before the settle: nothing was committed, so the next pass
+    does not finish that answer. It asks the batch again, and no note pays for the pass that died."""
     from kelmo.creation import apply_pending
     from kelmo.editor import Editor
     editor_mode(world)
@@ -592,8 +593,11 @@ def test_a_pass_that_died_after_the_answer_settles_each_member_from_its_own_row(
     settled = counted(BatchModel(world))
     report = apply_pending(world.service, settled)
     assert sorted(report['applied']) == sorted(ids)
-    assert settled.calls == 0, 'the recorded batch answer is settled, never re-consulted'
-    assert commits(world) == before + 1, 'the resumed pass publishes the batch once'
+    assert [len(job.payload['sources']) for job in settled.inner.jobs] == [2], 'one conversation, as a batch'
+    assert commits(world) == before + 1, 'the batch is published once'
+    assert len(facts_of(world)) == 2
+    for operation_id in ids:
+        assert charged_parkings(world, operation_id) == ([], 0)
 
 
 def test_the_batch_shares_its_commit_yet_every_member_keeps_its_own_receipt(world):
@@ -890,8 +894,6 @@ def test_a_member_of_a_batch_the_precheck_refused_before_splitting_still_reports
     assert report['applied'] == [ids[0], ids[1]] and report['parked'] == [ids[2]], report
     assert [world.outcome(operation_id)['disposition'] for operation_id in ids] == \
         ['applied', 'applied', 'unresolved']
-    assert json.loads(member_rows(world, ids)[1]['observation'])['slice'] is None, \
-        'the precheck stopped before recording any slice, so that row holds no answer of its own'
 
 
 def test_a_crash_after_the_commit_does_not_park_published_notes(world, monkeypatch):
@@ -1275,12 +1277,11 @@ def test_a_batch_refused_during_recovery_reports_no_member_applied(world, monkey
 
 
 def test_a_new_source_after_a_died_pass_keeps_its_proposal(world, monkeypatch):
-    """A source that joins the pass after the one that died is settled from its own answer.
+    """A note captured after a pass died joins the notes that pass left, and each publishes its own fact.
 
-    The first pass recorded the batch answer and died before settling. The next pass takes a newer note
-    of the same project into a batch of its own: it is consulted as the lead of its own answer, and must
-    not be settled `archive-only` for being absent from the older batch. Its proposal reaches the wiki in
-    this pass or the next one."""
+    The first pass recorded the batch answer and died before settling. Nothing was committed, so the next
+    pass asks those notes again, with the newer note of the same project in the same batch. It must not be
+    settled `archive-only` for being absent from the answer that died."""
     from kelmo.editor import Editor
     editor_mode(world)
     first = capture(world, notes(2))
@@ -1318,26 +1319,26 @@ def test_a_crash_after_the_commit_when_the_publisher_is_not_the_lead(world, monk
     The lead's own fact check fails, so the two members publish and the process dies while the second one
     settles. The next pass must see that the batch committed even though the lead's row is still open, and
     end every member whose items were committed `applied` without consulting the model again. The lead's
-    refusal died with the pass before it was recorded, so the lead spends no attempt and is consulted again."""
+    refusal died with the pass before it was recorded, so the lead spends no attempt and is asked again."""
     from kelmo.editor import Editor
     editor_mode(world)
     ids = capture(world, notes(3))
-    model = BogusLead(world)
     real = Editor._member_disposition
     monkeypatch.setattr(Editor, '_member_disposition', crash_with('the process died after the commit'))
     with pytest.raises(Died):
-        pending_pass(world, model)
+        pending_pass(world, BogusLead(world))
     assert len(facts_of(world)) == 2, 'the two accepted members were committed before the crash'
-    calls = len(model.jobs)
     monkeypatch.setattr(Editor, '_member_disposition', real)
+    model = counted(BatchModel(world))
     report = pending_pass(world, model)
     assert world.outcome(ids[1])['disposition'] == 'applied'
     assert world.outcome(ids[2])['disposition'] == 'applied', world.outcome(ids[2])
     assert report['parked'] == [], report
     assert charged_parkings(world, ids[0]) == ([], 0), 'the commit left the lead out: that is no refusal of its own'
-    assert ['sources' in job.payload for job in model.jobs[calls:]] == [False], \
-        'the published members paid no model call; the lead got its own consultation'
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [1], \
+        'the published members paid no model call; the lead was asked again, by itself'
     assert sorted(report['applied']) == sorted(ids), report
+    assert len(facts_of(world)) == 3
 
 
 def test_a_crash_after_a_precheck_that_wrote_no_slice_keeps_the_published_member(world, monkeypatch):
@@ -2366,8 +2367,8 @@ def test_a_crash_after_the_commit_with_repairs_exhausted_settles_the_published_m
     with pytest.raises(Died):
         pending_pass(world, model)
     assert len(facts_of(world)) == 2, 'the two notes the answer accounted for were committed before the crash'
-    calls = len(model.inner.jobs)
     monkeypatch.setattr(Editor, '_member_disposition', real)
+    model = counted(BatchModel(world))
     report = pending_pass(world, model)
     assert world.outcome(ids[0])['disposition'] == 'applied', world.outcome(ids[0])
     assert world.outcome(ids[1])['disposition'] == 'applied', world.outcome(ids[1])
@@ -2377,7 +2378,8 @@ def test_a_crash_after_the_commit_with_repairs_exhausted_settles_the_published_m
     assert 'adds no new fact' not in world.outcome(ids[2])['reason'], world.outcome(ids[2])
     assert [event for event in world.service.trace(ids[2])['events']
             if event['stage'] == 'parked'] == [], 'the note nobody answered spends none of its attempts'
-    assert len(model.inner.jobs) == calls + 1, 'the published members paid no model call; the alone note got its own'
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [1], \
+        'the published members paid no model call; the note the commit does not carry was asked again'
     assert len(facts_of(world)) == 3, 'every note of the pass ended with a fact of its own'
 
 
@@ -3160,7 +3162,8 @@ class PartlyAnswered(BatchModel):
     reconciliation returned (the replay reconciles its text first); `silent` the notes it never answers;
     `collide` an (earlier, later) pair where the later note proposes the earlier one's fact key, which the
     split settles in capture order. Every other note gets a fact of its own, and a note consulted alone is
-    answered the way the replay answers a single source.
+    answered the way the replay answers a single source. A batch that no longer holds the `recorded` note
+    is answered without it.
     """
 
     def __init__(self, world, recorded=None, silent=(), collide=None):
@@ -3171,6 +3174,8 @@ class PartlyAnswered(BatchModel):
     def execute(self, job):
         from kelmo.executor import ModelOutcome
         payload = job.payload
+        if 'sources' in payload and self.recorded not in {block['operation_id'] for block in payload['sources']}:
+            self.recorded, self.asked = None, True
         if 'sources' in payload and not self.asked:
             self.asked = True
             self.jobs.append(job)
@@ -3683,14 +3688,11 @@ def test_a_batch_answer_the_editor_cannot_read_charges_no_note_and_each_runs_alo
         assert charged_parkings(world, operation_id) == ([], 0)
 
 
-@pytest.mark.parametrize('dies_at, conversations', [(1, [1, 1, 1]), (2, [3, 1, 1, 1]), (3, [3, 1, 1, 1])])
-def test_a_pass_that_died_while_sending_its_batch_alone_still_consults_every_note(world, monkeypatch, dies_at,
-                                                                                  conversations):
-    """A member's recorded answer settles only with the lead row that still holds that answer.
-
-    The death leaves some attempts ended and the other rows still naming the lead. Once the lead's attempt is
-    over those rows are ended attempts too: every note is consulted again, none settles on an answer that
-    never named it, and none is charged."""
+@pytest.mark.parametrize('dies_at', [1, 2, 3])
+def test_a_pass_that_died_while_sending_its_batch_alone_still_consults_every_note(world, monkeypatch, dies_at):
+    """The death leaves some attempts ended and the other rows still holding the answer. None of them was
+    committed, so every note is asked again: the batch, which answers `unresolved` once more, then each note
+    alone. None settles on an answer that never named it, and none is charged."""
     from kelmo.journal import Journal
     editor_mode(world)
     ids = capture(world, notes(3))
@@ -3709,7 +3711,7 @@ def test_a_pass_that_died_while_sending_its_batch_alone_still_consults_every_not
     model = counted(DeclinedBatchAnswer(world))
     report = pending_pass(world, model)
     assert [len(job.payload['sources']) if 'sources' in job.payload else 1
-            for job in model.inner.jobs] == conversations
+            for job in model.inner.jobs] == [3, 1, 1, 1]
     assert sorted(report['applied']) == sorted(ids), report
     assert (report['parked'], report['failed'], report['skipped']) == ([], [], []), report
     assert len(facts_of(world)) == 3, 'every note was consulted and published its own fact'
@@ -3832,39 +3834,13 @@ def test_a_head_refusal_charges_the_note_the_editor_led_with_not_one_already_pub
     assert charged_parkings(world, first[0]) == ([], 0), 'the published note is charged nothing'
 
 
-def test_an_answer_a_died_pass_recorded_is_settled_before_anything_is_consulted(world, monkeypatch):
-    """The pass died between ending the note its batch left out and settling the note it recorded.
-
-    The next pass settles the recorded answer first and consults nothing in that call: a new conversation
-    for the note left out would be ended by that settle and its row refused for a conflict of the editor's
-    own making."""
-    from kelmo.editor import Editor
-    editor_mode(world)
-    ids = capture(world, notes(2))
-    real = Editor._finish_batch
-    monkeypatch.setattr(Editor, '_finish_batch', crash_with('the process died before the batch was settled'))
-    with pytest.raises(Died):
-        pending_pass(world, counted(PartlyAnswered(world, recorded=ids[0], silent={ids[1]})))
-    assert facts_of(world) == {}, 'the batch proposed no fact of its own'
-    monkeypatch.setattr(Editor, '_finish_batch', real)
-    model = counted(PartlyAnswered(world, recorded=ids[0], silent={ids[1]}))
-    report = pending_pass(world, model)
-    assert sorted(report['applied']) == sorted(ids), report
-    assert (report['parked'], report['failed'], report['skipped']) == ([], [], []), report
-    assert world.outcome(ids[0])['disposition'] == 'archive-only', world.outcome(ids[0])
-    assert 'app.replay-' + evidence_of(world, ids[1]) in facts_of(world), 'the note left out published alone'
-    assert [job for job in model.inner.jobs if 'sources' in job.payload] == [], 'no batch conversation was paid'
-    for operation_id in ids:
-        assert charged_parkings(world, operation_id) == ([], 0)
-
-
 # ---------------------------------------------------------------------------
 # A note that comes alone after a pass died on its batch
 #
 # The rows of a batch a pass died on hold that batch's answer. A later pass can meet them one note at a
-# time: the flag was turned off, or the pass takes a single note. The single-source path cannot settle a
-# batch answer, so it takes the note out of the batch: settled from the commit when the batch committed it,
-# consulted alone when nothing of it was published.
+# time: the flag was turned off, or the pass takes a single note. Either way the note leaves the batch by
+# the one rule (`Editor._leave_batch`, tests/test_dreaming_batch_recovery.py): settled from the commit when
+# the batch committed it, consulted again when nothing of it was published.
 # ---------------------------------------------------------------------------
 
 
@@ -3916,11 +3892,10 @@ def test_a_note_that_comes_alone_after_its_batch_committed_settles_from_that_com
 
 
 # ---------------------------------------------------------------------------
-# What can still settle a recorded batch answer
+# What can still settle a batch answer after its pass died
 #
-# A member's answer is settled from the commit that carries its source, or with the lead's row while that
-# row is open and still holds the answer. A lead that was refused, dismissed or finished without the member
-# settles nothing for it: the member's attempt is ended without a refusal and it is consulted again.
+# Only its commit. A note the commit carries is finished from it. A note it does not carry, and every note
+# of a batch that committed nothing, has its attempt ended without a refusal and is asked again.
 # ---------------------------------------------------------------------------
 
 
@@ -4007,3 +3982,351 @@ def test_a_refused_commit_the_pass_did_not_live_to_settle_charges_only_the_row_t
     assert report['applied'] == ids[1:], report
     for operation_id in ids[1:]:
         assert charged_parkings(world, operation_id) == ([], 0), 'no member pays for the refused commit'
+
+
+# ---------------------------------------------------------------------------
+# A parked note leaves no open request behind
+#
+# A parked note takes a new request key on its next attempt, so nothing returns to the request it was
+# refused under. The pass closes that request when it parks the note, with the note's own refusal: left
+# open, it would read as an unfinished request for ever, and `requeue` refuses a note that has one.
+# ---------------------------------------------------------------------------
+
+
+def test_a_note_refused_in_a_batch_is_closed_under_its_own_code_and_can_be_requeued(world):
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    report = pending_pass(world, CollidingFirst(world))
+    assert report['parked'] == [ids[2]], report
+    assert [(row['state'], row['error_code']) for row in world.service.editor.status(ids[2])['requests']] == \
+        [('refused', 'E_PROPOSAL')], 'the refusal is on the row of the note it belongs to'
+    receipt = world.service.editor.requeue(ids[2], origin=world.service._operation_origin(ids[2]),
+                                           idempotency_key='requeued', project='app', selected=[FEATURE],
+                                           executor=BatchModel(world), budget_tokens=60000)
+    assert receipt.outcome == 'published'
+
+
+def test_a_batch_parked_whole_leaves_no_open_request_of_any_member(world, monkeypatch):
+    """The working tree is dirty when the batch settles: every member is parked for it, as each would be alone."""
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import engine
+    editor_mode(world)
+    ids = capture(world, notes(3))
+
+    def dirty(*args, **kwargs):
+        raise KelmoError('E_CONFLICT', 'Knowledge paths have uncommitted local changes: feature.md')
+
+    monkeypatch.setattr(engine, 'require_clean_baseline', dirty)
+    report = pending_pass(world, counted(BatchModel(world)))
+    assert sorted(report['parked']) == sorted(ids), report
+    for operation_id in ids:
+        assert [(row['state'], row['error_code']) for row in world.service.editor.status(operation_id)['requests']] \
+            == [('refused', 'E_CONFLICT')]
+
+
+# ---------------------------------------------------------------------------
+# A fault of the editor on a batch is no note's fault
+# ---------------------------------------------------------------------------
+
+
+def test_a_fault_of_the_editor_on_a_batch_sends_each_note_alone_in_the_same_pass(world, monkeypatch):
+    """A fault that is no Kelmo refusal names no note of the batch. Asking the rest as a batch again would
+    spend a conversation per note still waiting; each note takes the single-source path instead."""
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = capture(world, notes(3))
+
+    def faulty(self, *args, **kwargs):
+        raise RuntimeError('a defect in the split')
+
+    monkeypatch.setattr(Editor, '_settle_batch', faulty)
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert [len(job.payload['sources']) if 'sources' in job.payload else 1
+            for job in model.inner.jobs] == [3, 1, 1, 1], 'the batch once, then each note alone'
+    assert report['applied'] == ids, report
+    assert (report['parked'], report['failed'], report['skipped']) == ([], [], []), report
+    for operation_id in ids:
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+def test_a_batch_that_meets_a_row_another_request_began_is_busy_and_holds_no_lease(world, monkeypatch):
+    """Another request began one member's row while this batch was opening: the batch consults nothing, ends
+    the leases it had taken, and its next turn runs as if it were the first."""
+    from kelmo.errors import KelmoError
+    from kelmo.journal import Journal
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    real, begun = Journal.action_begin, []
+
+    def raced_once(self, *args, **kwargs):
+        begun.append(1)
+        if len(begun) == 2:
+            raise KelmoError('E_IDEMPOTENCY', 'This action request was recorded concurrently.')
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Journal, 'action_begin', raced_once)
+    model = counted(BatchModel(world))
+    clock = [1000.0]
+    from kelmo.creation import apply_pending
+    report = apply_pending(world.service, model, sleep=lambda seconds: clock.__setitem__(0, clock[0] + 600),
+                           clock=lambda: clock[0])
+    assert sorted(report['applied']) == sorted(ids), report
+    assert (report['parked'], report['failed'], report['skipped']) == ([], [], []), report
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [3], 'one conversation, on the second turn'
+
+
+# ---------------------------------------------------------------------------
+# A note's own problem ends the batch before it
+#
+# A stored request that can no longer be used is that note's refusal, as on the single path. In a batch it
+# must not reach the notes around it: the batch ends before the note, the note is refused at the head of
+# the next batch, and the notes behind it publish after it.
+# ---------------------------------------------------------------------------
+
+
+def three_notes_one_marked(world, marked=1):
+    """Three notes; the request of the `marked` one can be told apart (see `changes_the_marked_request`)."""
+    ids = []
+    for index, text in enumerate(notes(3)):
+        operation = world.service.create(text, project='app', selected=[FEATURE],
+                                         **({'budget_tokens': 77777} if index == marked else {}))
+        world.service.run(operation['id'])
+        ids.append(operation['id'])
+    return ids
+
+
+def changes_the_marked_request(monkeypatch, change):
+    from kelmo import creation
+    real = creation._editor_request
+
+    def changed(service, request):
+        built = real(service, request)
+        if request.get('budget_tokens') == 77777:
+            change(built)
+        return built
+
+    monkeypatch.setattr(creation, '_editor_request', changed)
+
+
+def test_a_note_whose_selection_names_a_page_that_is_gone_parks_alone_and_no_note_passes_it(world, monkeypatch):
+    editor_mode(world)
+    ids = three_notes_one_marked(world)
+    changes_the_marked_request(monkeypatch, lambda request: request.update(
+        selected=[*request['selected'], 'projects/app/gone.md']))
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert [len(job.payload['sources']) if 'sources' in job.payload else 1
+            for job in model.inner.jobs] == [1, 1], 'the batch ended before the note: no batch carried the third'
+    assert (report['applied'], report['parked']) == ([ids[0], ids[2]], [ids[1]]), report
+    assert world.service.journal.get(ids[1])['error_code'] == 'E_INPUT'
+    for operation_id in (ids[0], ids[2]):
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+def test_a_note_whose_request_changed_under_an_open_row_parks_alone_and_no_note_passes_it(world, monkeypatch):
+    """A pass died while the model answered, so each note has an open row. Then one note's budget changes:
+    its key names a different request now, which is that note's refusal and nobody else's."""
+    from kelmo.creation import apply_pending
+    editor_mode(world)
+    ids = three_notes_one_marked(world)
+
+    class DiesAnswering(BatchModel):
+        def execute(self, job):
+            raise Died('the pass died while the model answered')
+
+    with pytest.raises(Died):
+        apply_pending(world.service, DiesAnswering(world))
+    changes_the_marked_request(monkeypatch, lambda request: request.update(budget_tokens=77778))
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert [len(job.payload['sources']) if 'sources' in job.payload else 1
+            for job in model.inner.jobs] == [1, 1], 'the batch ended before the note: no batch carried the third'
+    assert (report['applied'], report['parked']) == ([ids[0], ids[2]], [ids[1]]), report
+    assert [(row['state'], row['error_code']) for row in world.service.editor.status(ids[1])['requests']] == \
+        [('refused', 'E_IDEMPOTENCY')], 'the row the dead pass opened is closed with the refusal'
+    for operation_id in (ids[0], ids[2]):
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+def wiki_budget_refuses(monkeypatch, times):
+    """`check_budget` refuses its first `times` calls; None refuses every call."""
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import engine
+    real, calls = engine.check_budget, []
+
+    def over(root, registry):
+        calls.append(1)
+        if times is None or len(calls) <= times:
+            raise KelmoError('E_BUDGET', 'Wiki budget exceeded: the hub page is over its limit')
+        return real(root, registry)
+
+    monkeypatch.setattr(engine, 'check_budget', over)
+
+
+def test_notes_that_together_exceed_the_wiki_budget_run_alone_and_none_is_charged(world, monkeypatch):
+    """The wiki holds what it has, and not what the three notes add together: that names none of them."""
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    wiki_budget_refuses(monkeypatch, times=1)
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert [len(job.payload['sources']) if 'sources' in job.payload else 1
+            for job in model.inner.jobs] == [3, 1, 1, 1], 'one batch conversation, then each note alone'
+    assert report['applied'] == ids, report
+    for operation_id in ids:
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+def test_a_wiki_already_over_its_budget_parks_the_batch_without_asking_each_note_alone(world, monkeypatch):
+    """No note can be published into a wiki that is over its budget as it stands: asking each one alone
+    would spend a conversation per note to learn it."""
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    wiki_budget_refuses(monkeypatch, times=None)
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [3], 'the batch, and no note alone'
+    assert sorted(report['parked']) == sorted(ids), report
+    assert {world.service.journal.get(operation_id)['error_code'] for operation_id in ids} == {'E_BUDGET'}
+
+
+# ---------------------------------------------------------------------------
+# No turn of the pass lets a newer note pass an older one of its project
+# ---------------------------------------------------------------------------
+
+
+def test_a_ready_pass_leaves_a_note_sent_alone_behind_the_older_notes_that_wait(world):
+    """Eight notes at ready 8; the answer leaves out the third and the sixth. The third runs alone. The
+    project is below the number then, so the pass takes no more batches of it, and the sixth must not run
+    alone ahead of the fourth and the fifth."""
+    editor_mode(world)
+    app = capture(world, notes(8))
+    model = counted(NeverAccounted(world, {app[2], app[5]}))
+    report = ready_pass(world, model)
+    assert sorted(report['applied']) == sorted(app[:3]), report
+    assert len([job for job in model.inner.jobs if 'sources' not in job.payload]) == 1, 'only the third ran alone'
+    assert report['waiting'] == {'app': 5}, report
+    assert waiting_ids(world) == app[3:]
+    assert charged_parkings(world, app[5]) == ([], 0)
+
+
+def test_a_note_that_waits_for_its_quota_holds_back_the_notes_between_it_and_a_newer_hold(world):
+    """The fourth note is held by another attempt. The batch leaves the first out, and on its own turn the
+    first meets a quota signal. The second and the third are newer than it and must wait with it."""
+    import time
+    from kelmo import quota
+    editor_mode(world)
+    ids = capture(world, notes(4))
+
+    class QuotaAlone(NeverAccounted):
+        def execute(self, job):
+            if 'sources' not in job.payload:
+                raise quota.QuotaWait(time.time() + 600, 'login')
+            return super().execute(job)
+
+    held = world.service.journal.claim(ids[3], lease_seconds=600)
+    try:
+        report = pending_pass(world, counted(QuotaAlone(world, {ids[0]})))
+    finally:
+        world.service.journal.release(ids[3], held)
+    assert (report['applied'], report['deferred']) == ([], [ids[0]]), report
+    assert {item['operation_id']: item.get('reason') for item in report['skipped']} == {
+        ids[3]: 'held by another attempt',
+        ids[1]: 'held back by the older note ' + ids[0],
+        ids[2]: 'held back by the older note ' + ids[0]}, report
+
+
+@pytest.mark.parametrize('marked', [0, 1], ids=['the note whose row carried the commit', 'another note of the commit'])
+def test_a_note_the_commit_published_is_not_refused_for_a_request_that_changed_since(world, monkeypatch, marked):
+    """The batch committed and the pass died before it recorded that. Then the note's budget changes. Its
+    facts are in the wiki, so it settles from the commit: refusing it would send it to the model again."""
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    editor_mode(world)
+    ids = three_notes_one_marked(world, marked)
+    with monkeypatch.context() as dying:
+        dying.setattr(Editor, '_member_disposition', crash_with('the pass died after the commit'))
+        with pytest.raises(Died):
+            apply_pending(world.service, BatchModel(world))
+    assert len(facts_of(world)) == 3, 'the commit landed before the death'
+    changes_the_marked_request(monkeypatch, lambda request: request.update(budget_tokens=77778))
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert sorted(report['applied']) == sorted(ids), report
+    assert (report['parked'], model.calls, len(facts_of(world))) == ([], 0, 3), report
+
+
+def test_an_environment_failure_at_the_commit_parks_no_note_the_prepared_commit_carries(world, monkeypatch):
+    """The wiki cannot be written, so the commit stays prepared. Its notes wait for the recovery. Parking
+    them would ask the model about each again while the recovery publishes their facts."""
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import engine
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    real, failed = engine.publish_semantic, []
+
+    def unwritable_once(root, operation_id):
+        if not failed:
+            failed.append(operation_id)
+            raise KelmoError('E_IO', 'the wiki repository could not be written')
+        return real(root, operation_id)
+
+    monkeypatch.setattr(engine, 'publish_semantic', unwritable_once)
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert (report['applied'], report['parked'], report['failed']) == ([], [], []), report
+    assert sorted(item['operation_id'] for item in report['skipped']) == sorted(ids), report
+    assert {item['error_code'] for item in report['skipped']} == {'E_BUSY'}, report
+    report = pending_pass(world, model)
+    assert sorted(report['applied']) == sorted(ids), report
+    assert (model.calls, len(facts_of(world))) == (1, 3), 'the recovery published the batch with no model call'
+    for operation_id in ids:
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+def test_a_conversation_that_loses_its_lead_frees_the_rows_it_holds(world, monkeypatch):
+    """The lead's lease is lost in the middle of the conversation. The rows the batch still holds are freed,
+    so its next turn consults at once and no note waits out a lease nothing will use."""
+    from kelmo.creation import apply_pending
+    from kelmo.editor import Editor
+    from kelmo.errors import KelmoError
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    real, renewed = Editor._renew, []
+
+    def lost_once(self, *args, **kwargs):
+        renewed.append(1)
+        if len(renewed) == 1:
+            raise KelmoError('E_BUSY', 'This attempt no longer holds the consulting lease.')
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Editor, '_renew', lost_once)
+    model = counted(BatchModel(world))
+    clock = [1000.0]
+    report = apply_pending(world.service, model, sleep=lambda seconds: clock.__setitem__(0, clock[0] + 600),
+                           clock=lambda: clock[0])
+    assert sorted(report['applied']) == sorted(ids), report
+    assert report['skipped'] == [], report
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [3], 'one conversation, on the second turn'
+
+
+def test_a_head_whose_evidence_cannot_be_read_parks_alone_whatever_the_failure_is(world, monkeypatch):
+    from kelmo.editor import Editor
+    from kelmo.errors import KelmoError
+    editor_mode(world)
+    ids = capture(world, notes(3))
+    real = Editor._source
+
+    def unreadable(self, operation_id, *args, **kwargs):
+        if operation_id == ids[0]:
+            raise KelmoError('E_IO', 'the archived evidence could not be read')
+        return real(self, operation_id, *args, **kwargs)
+
+    monkeypatch.setattr(Editor, '_source', unreadable)
+    model = counted(BatchModel(world))
+    report = pending_pass(world, model)
+    assert (report['parked'], sorted(report['applied'])) == ([ids[0]], sorted(ids[1:])), report
+    assert [len(job.payload['sources']) for job in model.inner.jobs] == [2], 'the two notes behind it, as a batch'
+    for operation_id in ids[1:]:
+        assert charged_parkings(world, operation_id) == ([], 0)

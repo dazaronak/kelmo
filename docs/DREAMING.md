@@ -58,23 +58,36 @@ model's answer never mentions is not settled on the batch's word. The same goes
 for a batch whose conversation ends without a proposal the editor can read: the
 model answers `unresolved`, the rounds run out, the executor fails, the answer
 stays malformed after its repairs, the model keeps asking for something the
-editor cannot serve, or what the batch proposed is refused as a whole. Each note
-then gets its own consultation in the same pass and spends none of its attempts
-for the batch. A note that cannot be placed alone either is refused there, under
-its own attempt count.
+editor cannot serve, what the batch proposed is refused as a whole (the notes
+together exceed the wiki budget, for example), or the editor itself fails on the
+batch. Each note then gets its own consultation in the
+same pass and spends none of its attempts for the batch. A note that cannot be
+placed alone either is refused there, under its own attempt count. One refusal
+stays with a note of the batch: when the commit itself is refused, the note whose
+request carried the commit spends an attempt for it, and the others are asked
+alone.
 
 A batch never takes a note past an older note of the same project that it could
 not consult. When another process holds a note, a note waits for a quota reset,
 or its source cannot be read, the batch ends there and the notes captured after
-it wait; older notes still take their turn. The same holds inside a batch: when
+it wait; older notes still take their turn. A note whose own stored request can
+no longer be used (a page it selected is gone, or its settings changed after an
+earlier attempt opened it) ends the batch before it too. That note is refused on
+its own turn and spends one of its attempts; the notes after it follow in the
+same pass. The same holds inside a batch: when
 the model's answer leaves a note out, the batch publishes only the notes captured
 before it, that note is consulted alone next, and the notes after it are
 consulted again in the same pass.
 
 A pass that dies in the middle of a batch loses no note and publishes none
 twice. On the next pass a note the batch had committed is settled from that
-commit, and any other note is settled from the answer the batch recorded or
-asked again. This also holds when `batch_apply` was turned off in between.
+commit, with no model call. Every other note of the batch is asked again and
+spends none of its attempts for the pass that died. This also holds when
+`batch_apply` was turned off in between.
+
+When a batch cannot write its commit to the wiki, its notes are not refused. The
+commit stays prepared, the notes are listed under `skipped` with `E_BUSY`, and
+the next pass publishes the commit with no model call.
 
 ```sh
 kelmo --vault /srv/memory dream apply --ready --json
@@ -85,7 +98,8 @@ kelmo --vault /srv/memory dream status --json
 `[editor] batch_ready_sources` of its notes wait for their first pass; the
 default is the value of `batch_max_sources`, and parked notes do not count. The
 pass leaves a project once fewer notes than that remain, so a small project
-waits for the next full pass. Without `batch_apply`, `--ready` is refused with
+waits for the next full pass. A note its batch sent to run alone still gets that
+turn in the same pass, unless an older note of the project waits ahead of it. Without `batch_apply`, `--ready` is refused with
 `E_CONFIG`. `dream status` reports `waiting` (first-pass notes per project) and
 `ready` (the projects a ready pass would take now; empty while `batch_apply` is
 off). It reads the journal and the registry file, without opening the store or

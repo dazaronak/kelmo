@@ -647,6 +647,21 @@ class Journal:
             self._source_effects(self._request_row(operation_id), outcome, result)
             return True
 
+    def refuse_open_semantic(self, source_operation_id, code, message):
+        """Refuse every open editor request of a source with the refusal its note is parked for.
+
+        A parked note takes a new request key on its next attempt, so no call returns to these rows: left
+        open, each would stand for an unfinished request nothing ever finishes. A prepared request is not
+        touched: its publication is the recovery's to finish or refuse.
+        """
+        if self.conn.in_transaction:
+            raise KelmoError('E_STATE', 'Journal action refusal requires an idle connection.')
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            self.conn.execute('''UPDATE action_requests SET state='refused', error_code=?, error_message=?
+                                 WHERE kind='semantic' AND source_operation_id=? AND state='open' ''',
+                              (code, message, source_operation_id))
+
     def dismiss_semantic(self, source_operation_id, *, by, reason, outcome):
         """Refuse every open editor request of a source, record the dismissal and its outcome at once."""
         outcome = self._settled_outcome(outcome)

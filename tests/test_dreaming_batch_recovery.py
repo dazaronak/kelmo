@@ -1,0 +1,199 @@
+"""What a later call does with a batch a pass died on.
+
+A batch answer is settled by the call that recorded it. When that call dies, a later one does not finish
+its work. It asks one question of every row the dead pass left answered: did the batch commit this note?
+A note the commit carries is finished from the stored intent, with no model call. Any other note has its
+attempt ended, spends none of its attempts and is asked again. That rule is `Editor._leave_batch`.
+
+These tests write by hand the rows a dead pass leaves and call the rule itself: no model, no commit.
+What a real pass leaves when it dies, and what the next pass does with it, is in
+`test_dreaming_batched_apply.py`.
+"""
+import json
+import time
+import uuid
+
+import pytest
+
+from test_dreaming_batched_apply import capture, charged_parkings, editor_mode, notes
+from test_editor_scoping import build_world
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    built = build_world(tmp_path, monkeypatch, other_project=True)
+    try:
+        yield next(built)
+    finally:
+        built.close()
+
+
+class DeadBatch:
+    """The request rows of one batch as a pass that died left them: the lead's row holds the answer, every
+    other row says which batch it belongs to. `commit`, `refused_commit` and `prepare` put the batch's
+    intent on one of those rows."""
+
+    def __init__(self, world, ids):
+        from kelmo.editor import StateCoordinator
+        self.world, self.ids, self.journal = world, ids, world.service.journal
+        self.idem = {operation_id: 'create:' + operation_id + ':1' for operation_id in ids}
+        self.keys = {operation_id: StateCoordinator._request_key('semantic', world.origins['editor'],
+                                                                self.idem[operation_id]) for operation_id in ids}
+        self.answer(ids)
+
+    def answer(self, batch):
+        """Record one answer over `batch`, oldest first; a row that is there already is consulted again."""
+        mark = {'batch': list(batch), 'generation': self.world.service.knowledge.generation().to_dict()}
+        for operation_id in batch:
+            observation = dict(mark, result={}) if operation_id == batch[0] else mark
+            row = self.row(operation_id)
+            if row is None:
+                self.journal.action_begin(self.keys[operation_id], 'semantic', 'fingerprint',
+                                          self.world.origins['editor'], operation_id, observation=observation)
+            else:
+                token = uuid.uuid4().hex
+                assert self.journal.action_lease(row['operation_id'], token, time.time() + 900)
+                assert self.journal.action_observe(row['operation_id'], token, observation)
+
+    def row(self, operation_id):
+        return self.journal.action_request(self.keys[operation_id])
+
+    def prepare(self, carrier, carried, recorded=None):
+        """Store the batch's intent on `carrier`'s row. It carries `carried`; a note named in `recorded`
+        has no item of its own in it, only the fact keys the answer said already state it."""
+        recorded = recorded or {}
+        delta = {'facts': [{'fact_key': 'app.note-' + source[:8], 'source_operation_id': source}
+                           for source in carried if source not in recorded], 'narratives': [], 'pages': []}
+        self.journal.action_prepare(self.row(carrier)['operation_id'], {
+            'batch': list(carried), 'delta': delta,
+            'sources': {source: {'applied_reason': None, 'recorded': recorded.get(source, [])}
+                        for source in carried}})
+
+    def commit(self, carrier, carried, recorded=None):
+        self.prepare(carrier, carried, recorded)
+        self.journal.action_finish(self.row(carrier)['operation_id'], {'published': list(carried)})
+
+    def refused_commit(self, carrier, carried):
+        self.prepare(carrier, carried)
+        self.journal.action_refuse(self.row(carrier)['operation_id'], 'E_FACT_CHECK',
+                                   'a receipt no longer matches the registry')
+
+    def published_alone(self, operation_id):
+        """The note left its batch, was consulted on the single-source path and published there."""
+        self.journal.action_prepare(self.row(operation_id)['operation_id'],
+                                    {'delta': {'facts': [{'fact_key': 'app.alone'}], 'narratives': [], 'pages': []}})
+        self.journal.action_finish(self.row(operation_id)['operation_id'], {'published': [operation_id]})
+
+    def leave(self, operation_id):
+        return self.world.service.editor._leave_batch(self.keys[operation_id], self.idem)
+
+    def asked_again(self, operation_id):
+        """The row is back in the form a released lease leaves, and its note was charged nothing."""
+        row = self.row(operation_id)
+        observation = json.loads(row['observation'])
+        return (row['state'] == 'open' and set(observation) == {'consulting', 'expires_at'}
+                and observation['expires_at'] == 0 and charged_parkings(self.world, operation_id) == ([], 0))
+
+
+@pytest.fixture
+def archived(world):
+    editor_mode(world)
+    return capture(world, notes(3))
+
+
+def test_a_note_the_commit_carries_is_finished_from_it_with_its_own_facts(world, archived):
+    batch = DeadBatch(world, archived)
+    batch.commit(archived[0], archived)
+    assert batch.leave(archived[1])['disposition'] == 'applied'
+    assert batch.row(archived[1])['state'] == 'finished'
+    outcome = world.outcome(archived[1])
+    assert (outcome['disposition'], outcome['reason']) == ('applied', 'fact applied: app.note-' + archived[1][:8])
+    assert batch.row(archived[2])['state'] == 'open', 'only the row that was asked about is settled'
+
+
+def test_a_note_the_commit_carries_with_no_item_of_its_own_ends_recorded(world, archived):
+    batch = DeadBatch(world, archived)
+    batch.commit(archived[0], archived, recorded={archived[2]: ['app.known']})
+    assert batch.leave(archived[2])['disposition'] == 'archive-only'
+    outcome = world.outcome(archived[2])
+    assert outcome['disposition'] == 'archive-only'
+    assert 'app.known' in outcome['reason'], 'it names the facts the answer said already state it'
+
+
+def test_the_lead_settles_from_a_commit_another_row_carried(world, archived):
+    """The lead proposed nothing of its own, so the batch committed on the second note's row."""
+    batch = DeadBatch(world, archived)
+    batch.commit(archived[1], archived, recorded={archived[0]: ['app.known']})
+    assert batch.leave(archived[0])['disposition'] == 'archive-only'
+    assert batch.leave(archived[2])['disposition'] == 'applied'
+
+
+def test_a_note_the_commit_does_not_carry_is_asked_again(world, archived):
+    batch = DeadBatch(world, archived)
+    batch.commit(archived[0], archived[:2])
+    assert batch.leave(archived[2]) is None
+    assert batch.asked_again(archived[2])
+    assert world.service.journal.get(archived[2])['state'] == 'archived', 'it still waits for its turn'
+
+
+def test_a_batch_that_committed_nothing_leaves_every_note_to_be_asked_again(world, archived):
+    batch = DeadBatch(world, archived)
+    assert [batch.leave(operation_id) for operation_id in archived] == [None, None, None]
+    assert all(batch.asked_again(operation_id) for operation_id in archived)
+
+
+def test_a_refused_commit_settles_no_other_note_and_charges_none(world, archived):
+    batch = DeadBatch(world, archived)
+    batch.refused_commit(archived[1], archived)
+    assert [batch.leave(operation_id) for operation_id in (archived[0], archived[2])] == [None, None]
+    assert batch.asked_again(archived[0]) and batch.asked_again(archived[2])
+    assert batch.row(archived[1])['state'] == 'refused', 'the refusal stays on the row that carried the commit'
+
+
+def test_a_commit_still_to_be_recovered_is_busy_and_moves_no_row(world, archived):
+    from kelmo.errors import KelmoError
+    batch = DeadBatch(world, archived)
+    batch.prepare(archived[0], archived)
+    before = batch.row(archived[1])
+    with pytest.raises(KelmoError) as refusal:
+        batch.leave(archived[1])
+    assert refusal.value.code == 'E_BUSY'
+    assert batch.row(archived[1]) == before
+
+
+def test_a_note_settles_from_the_commit_that_carries_it_whatever_its_lead_published_since(world, archived):
+    """The batch committed on the second note's row and carries the third. The lead was left out, asked
+    again and published in a later batch of its own; that later commit is not the third note's."""
+    batch = DeadBatch(world, archived)
+    batch.commit(archived[1], archived[1:])
+    assert batch.leave(archived[0]) is None
+    batch.answer(archived[:1])
+    batch.commit(archived[0], archived[:1])
+    assert batch.leave(archived[2])['disposition'] == 'applied'
+    assert world.outcome(archived[2])['reason'] == 'fact applied: app.note-' + archived[2][:8]
+
+
+@pytest.mark.parametrize('how', ['in a later batch', 'on the single-source path'])
+def test_what_another_note_published_since_is_not_this_notes_commit(world, archived, how):
+    """Nothing of the batch was committed. Its lead was asked again and published without the third note."""
+    batch = DeadBatch(world, archived)
+    assert batch.leave(archived[0]) is None
+    if how == 'in a later batch':
+        batch.answer(archived[:1])
+        batch.commit(archived[0], archived[:1])
+    else:
+        batch.published_alone(archived[0])
+    assert batch.leave(archived[2]) is None
+    assert batch.asked_again(archived[2])
+
+
+def test_a_row_that_holds_no_batch_answer_is_left_as_it_is(world, archived):
+    batch = DeadBatch(world, archived)
+    batch.commit(archived[0], archived)
+    assert batch.leave(archived[0]) is None, 'a finished row'
+    assert batch.leave(archived[1])['disposition'] == 'applied'
+    assert batch.leave(archived[1]) is None, 'the row it has just finished'
+    assert batch.leave(archived[2])['disposition'] == 'applied'
+    ended = DeadBatch(world, capture(world, notes(1, start=3)))
+    assert ended.leave(ended.ids[0]) is None and ended.leave(ended.ids[0]) is None, 'an ended attempt'
+    assert ended.asked_again(ended.ids[0])

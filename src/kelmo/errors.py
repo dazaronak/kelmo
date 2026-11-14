@@ -26,8 +26,9 @@ class Stopping(BaseException):
 
 
 class HeadRefusal(KelmoError):
-    """A batch shrank to its oldest source and the budget cannot carry even that one.
+    """A refusal that belongs to the source a batch led with, and to no other source of it.
 
-    The refusal is that source's alone, exactly as on the single-source path: every other source of the
-    batch was dropped before the model read it, spends no attempt and keeps its place in the pass.
+    The batch shrank to that source and the budget cannot carry even it, its key already names a different
+    request, or its selection names a page that is gone. The source is refused exactly as on the
+    single-source path; every other source of the batch spends no attempt and keeps its place in the pass.
     """
