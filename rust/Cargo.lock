@@ -669,11 +669,11 @@ dependencies = [
 
 [[package]]
 name = "kelmo-archive"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "kelmo-embed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sha2 0.10.9",
  "tokenizers",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "kelmo-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kelmo-wire",
  "libc",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "kelmo-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "kelmod"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "http",

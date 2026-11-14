@@ -6,6 +6,8 @@ entry here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-14
+
 ### Added
 
 - `kelmo dream apply --ready` publishes only the projects that have at least `[editor] batch_ready_sources`
