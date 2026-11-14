@@ -56,6 +56,61 @@ def test_unconfigured_executor_keeps_source_durable_and_scope_bound(world, monke
     assert world.service.journal.get(later['id'])['terminal']
 
 
+def test_a_worker_tick_stops_at_a_vault_that_takes_no_publication_and_tells_the_owner(world, monkeypatch):
+    """In immediate mode the worker publishes each note as it comes. A failure under which no note can be
+    published refuses none of them: the tick tries no further note, names the one it met, and alerts once."""
+    from kelmo.alerts import VaultWatch
+    from kelmo.daemon import tick
+    from kelmo.errors import VaultFailure
+    ids = [world.service.create(f'Exports move to 0{index}:00.', project='app', selected=[FEATURE])['id']
+           for index in range(2)]
+    tried, sent = [], []
+
+    def blocked(operation_id, executor=None):
+        tried.append(operation_id)
+        raise VaultFailure('E_CONFLICT', 'Knowledge paths have uncommitted local changes: feature.md')
+
+    monkeypatch.setattr(world.service, 'run', blocked)
+    monkeypatch.setattr(VaultWatch, 'send', lambda self, text: sent.append(text) or True)
+    result = tick(world.service)
+    assert tried == ids[:1], 'the tick tried no note after the failure'
+    assert result['skipped'] == [{'operation_id': ids[0], 'error_code': 'E_CONFLICT'}], result
+    assert len(sent) == 1 and 'no note can be published' in sent[0], sent
+    for operation_id in ids:
+        assert not world.service.journal.get(operation_id)['terminal']
+
+
+@pytest.mark.parametrize('stops', [True, False], ids=['then-a-vault-failure', 'and-nothing-stops'])
+def test_a_worker_tick_closes_an_outage_only_when_nothing_stopped_it(world, monkeypatch, stops):
+    """An outage is on record. The tick's first note is refused for its own reason after the vault was read
+    taking a publication. If the next note then meets a vault failure, the outage is not announced over;
+    if nothing stops the tick, it is."""
+    from kelmo.alerts import VaultWatch
+    from kelmo.daemon import tick
+    from kelmo.errors import VaultFailure
+    ids = [world.service.create(f'Exports move to 0{index}:00.', project='app', selected=[FEATURE])['id']
+           for index in range(2)]
+    sent = []
+    monkeypatch.setattr(VaultWatch, 'send', lambda self, text: sent.append(text) or True)
+    VaultWatch.for_service(world.service).blocked('an-older-note', 'E_IO', 'the old outage')
+
+    def run(operation_id, executor=None):
+        if operation_id == ids[0]:
+            world.service.editor.vault_passed = True
+            return {'state': 'parked'}
+        if stops:
+            raise VaultFailure('E_IO', 'the wiki repository could not be written')
+        return {'state': 'parked'}
+
+    monkeypatch.setattr(world.service, 'run', run)
+    tick(world.service)
+    if stops:
+        assert not [text for text in sent if 'takes publications again' in text], sent
+        assert VaultWatch.for_service(world.service).marker.exists()
+    else:
+        assert len(sent) == 2 and 'takes publications again' in sent[1], sent
+
+
 def test_a_stop_between_model_rounds_lets_go_and_the_next_start_publishes(world):
     from kelmo.errors import Stopping
     from kelmo.executor import ModelOutcome

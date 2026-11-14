@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sqlite3
 import time
 import uuid
+from pathlib import Path
 
 from . import conversation, fact_checks, outcomes, quota
 from .contracts import EvidenceRef, Generation, KnowledgeChange, KnowledgeProposal, OperationReceipt, Origin
 from .core.baton import outside_journal
-from .errors import HeadRefusal, KelmoError
+from .errors import VAULT_REFUSALS, HeadRefusal, KelmoError, VaultFailure, sqlite_busy
 from .executor import WORK_FIELDS, ModelExecutor, ModelJob, ModelOutcome
 from .publication import KnowledgeService, StateCoordinator, coordinator_lock, recover_publications
 from .quota import QuotaWait
@@ -42,6 +45,11 @@ MAX_REPAIRS = 2
 # or its repair.
 NAMED_OMITTED = 4
 BUDGET_CODE = 'E_BUDGET'
+# The refusal of a batch commit as a whole: it names no note of the batch, so no note is charged for it.
+UNION_CODE = 'E_UNION'
+# Another writer holds what this call needs (a Git lock, the wiki lock, a claim): it passes by itself, so it
+# is neither a vault that takes no publication nor any note's refusal, and every check passes it on as it is.
+CONTENTION = ('E_BUSY', 'E_CLAIM')
 LEFT_AFTER = ' left after the source, the rules, the receipts, the index and the pages sent before it'
 REPAIR_TAIL = '. Requeue with a larger budget or fewer selected pages.'
 # The reconciliation receipts and the candidates they name may cost at most this part of the request's
@@ -609,9 +617,12 @@ def normalize(result, scope, registry, *, rule_change, project, enrollment=None,
             continue
         if named not in batch:
             raise ProposalError('a fact check names a source this batch did not send: ' + str(named)[:120])
-    # A check keeps today's exact shape (fact_checks.check refuses any other key); it is matched to its
-    # fact by fact_key, which the split already made unique per source.
-    checks = [{key: value for key, value in check.items() if key != 'source'} for check in checks]
+    # A check keeps today's exact shape (fact_checks.check refuses any other key). In a batch it also keeps the
+    # source it names, as `source_operation_id`, so the split hands a fact two sources claim the check of the
+    # source that keeps it; the split strips it again.
+    checks = [{**{key: value for key, value in check.items() if key != 'source'},
+               **({'source_operation_id': check['source']} if batch is not None and check.get('source') else {})}
+              for check in checks]
     # Checks of dropped restatements go with them; checks naming any other fact stay and are refused.
     checks = [check for check in checks if check.get('fact_key') in proposed
               or check.get('fact_key') not in counts.get('facts', {})]
@@ -646,13 +657,20 @@ def split_delta(delta, checks, order):
     `normalize` already attributed every item, so the cut reads each item's `source_operation_id` and
     carries the `fact_checks` of the facts in that slice. A cross-source collision — the same fact key,
     the same page target, the same narrative identity or the same created page ID — goes to the earlier
-    source and the later one is refused alone with an `E_PROPOSAL` hint naming it, which is the same
-    capture order the editor reads notes in today. A slice with no item is no change: the source lands
-    as archive-only, exactly as a single-source proposal that proposed nothing.
+    source, which is the capture order the editor reads notes in, and is named for the later one: the
+    settle leaves that note out of the commit, uncharged, and the same pass consults it alone. A slice
+    with no item is no change: the source lands as archive-only, exactly as a single-source proposal
+    that proposed nothing.
     """
     slices = {operation_id: {name: [] for name in (*LIMITS, 'fact_checks')} for operation_id in order}
     first = {}
     refusals = {}
+    # Items are read in capture order of their sources, whatever order the answer lists them in, so the
+    # earlier source keeps a collided identity; each source's own items keep their order.
+    rank = {operation_id: index for index, operation_id in enumerate(order)}
+
+    def in_capture_order(items):
+        return sorted(items, key=lambda item: rank.get(item['source_operation_id'], len(order)))
 
     def collide(kind, name, owner, what):
         held = first.get((kind, name))
@@ -663,7 +681,7 @@ def split_delta(delta, checks, order):
         return False
 
     for name in ('pages', 'facts', 'narratives'):
-        for item in delta[name]:
+        for item in in_capture_order(delta[name]):
             owner = item['source_operation_id']
             identity = (item.get('fact_key') if name == 'facts'
                         else item.get('narrative_id') if name == 'narratives' else item['target'])
@@ -675,35 +693,41 @@ def split_delta(delta, checks, order):
             slices[owner][name].append({key: value for key, value in item.items()
                                         if key != 'source_operation_id'})
     checks_by_key = {}
-    for item in delta['facts']:
+    for item in in_capture_order(delta['facts']):
         checks_by_key.setdefault(item['fact_key'], item['source_operation_id'])
     held_checks = set()
     for check in checks:
         owner = checks_by_key.get(check['fact_key'])
-        if owner is None or check['fact_key'] in held_checks:
+        named = check.get('source_operation_id')
+        if owner is None or check['fact_key'] in held_checks or named not in (None, owner):
             continue
         # The reconciliation gate allows one check per fact, so a fact two sources claimed carries the
-        # check of the one that keeps it, never both.
+        # check of the one that keeps it, never both, and never the other source's.
         held_checks.add(check['fact_key'])
-        slices[owner]['fact_checks'].append(check)
+        slices[owner]['fact_checks'].append({key: value for key, value in check.items()
+                                             if key != 'source_operation_id'})
     return {operation_id: {'delta': {name: part[name] for name in LIMITS}, 'fact_checks': part['fact_checks']}
             for operation_id, part in slices.items()}, refusals
 
 
-def _reattribute_created_pages(slices, delta, accepted):
+def _reattribute_created_pages(slices, accepted):
     """Put every created page of a batch in the slice of the earliest accepted note that puts a fact on it.
 
     `split_delta` attributes a created page to the source the answer named — the note whose request opened
-    it — and that is the source a cross-source collision refuses most often: the note that opens a work
-    page is the one whose open-work fact overlaps a neighbour's. A page whose owner is refused leaves the
+    it — and that is the source a cross-source collision leaves out most often: the note that opens a work
+    page is the one whose open-work fact overlaps a neighbour's. A page whose owner is left out leaves the
     commit with its owner, so the batch would publish the facts the other notes put on it onto a page it
     never creates. The owner is therefore read back from the slices
     the split returns: the earliest accepted source, in capture order, whose own slice keeps a fact on that
     target — the next accepted note with a fact on the page when the opener is refused. A page no accepted
     source keeps a fact on is dropped, with the narratives that target it: a created page is published only
     together with a fact on it, and the note that opened it keeps its own turn.
+
+    Only the pages the split kept are moved. A page a later note proposed for a target an earlier note's page
+    already holds lost that collision, and its body never reaches the commit under another note's name.
     """
-    for page in [item for item in delta['pages'] if item.get('expected_revision') is None]:
+    for page in [item for part in slices.values() for item in part['delta']['pages']
+                 if item.get('expected_revision') is None]:
         target = page['target']
         owner = next((operation_id for operation_id in accepted
                       if any(fact['target'] == target
@@ -1182,10 +1206,27 @@ def _expansion_refusal(wanted, payload, expanded):
 
 
 _BEHIND = 'an older source of this batch was left out by the answer and this one waits behind it'
+_OWN_BEHIND = ('its own recorded answer settles at the head of a later batch, once the older sources ahead of it '
+               'are settled')
 
 
 def _union_refused(code, error):
     return 'what the batch proposed was refused as a whole (' + code + ': ' + str(error) + ')'
+
+
+def _vault_refused(disposition):
+    """A source refused for a reason the vault caused (`VAULT_REFUSALS`): it is asked again later, so its claim
+    is still to come and no newer source of its project publishes ahead of it."""
+    return disposition.get('disposition') == 'refused' and disposition.get('code') in VAULT_REFUSALS
+
+
+def _own_check_refusal(error):
+    """The code and message a failed check refuses a proposal with once the failure is its own: a typed
+    refusal keeps its code (over the budget, a claimed or locally edited path), and a page the proposal leaves
+    unrenderable or unreadable is `E_PROPOSAL`, as at the projection."""
+    if isinstance(error, KelmoError):
+        return error.code, str(error)
+    return 'E_PROPOSAL', 'The proposal leaves a page that cannot be rendered: ' + str(error)
 
 
 def _batch_answered(row):
@@ -1217,6 +1258,10 @@ class Editor:
 
     def __init__(self, service):
         self.service = service
+        # Set when the vault as it stands is seen to take a publication: the batch's whole check passed, or
+        # `_publishable` read a clean tree that renders within its budget. The apply pass and the worker tick
+        # reset it and read it to close an outage on record.
+        self.vault_passed = False
 
     @property
     def journal(self):
@@ -1272,7 +1317,65 @@ class Editor:
         return bool(recorded and recorded['metadata'].get('packet', {}).get('source_kind') == 'git_event')
 
     def _source(self, operation_id, origin, rule_change, *, resolution=False):
-        """The exact archived evidence of one source; archiving precedes and differs from publication."""
+        """The exact archived evidence of one source; archiving precedes and differs from publication.
+
+        It is read as `_read_archive` reads: a storage that cannot read the archive is the vault's, and what
+        the archive says about the source, or a record of it that alone cannot be read, is the source's own."""
+        return self._read_archive(lambda: self._archived_source(operation_id, origin, rule_change,
+                                                                resolution=resolution))
+
+    def _read_archive(self, read, stop=None):
+        """`read()` of a source's archived evidence (its journal rows, its archive receipt, its captured
+        file), read again while the storage cannot read it, as `_read` reads the wiki.
+
+        A failure of the storage (an `OSError`, or an SQLite error other than a busy database) is read again at
+        once. A second or a third one is the vault's unless the archive as a whole reads (`_archive_readable`):
+        `stop(code, message)` records it and raises its `VaultFailure`, and without `stop` it is raised as
+        one. While the archive reads, the evidence is read a third time, and a failure that persists while the
+        archive still reads is that source's own damaged record, refused as `E_SOURCE` like a captured source
+        whose bytes no longer match.
+        What the archive says about the source (a receipt or a hash that no longer matches, a workflow that
+        owns it) is the source's own and is raised as it is, and so is contention."""
+        for attempt in range(3):
+            try:
+                return read()
+            except sqlite3.Error as error:
+                if sqlite_busy(error):
+                    raise
+                failure = error
+            except OSError as error:
+                failure = error
+            if attempt > 0 and not self._archive_readable():
+                message = ('The archive could not be read: ' + str(failure)
+                           + '. Repair the storage, then retry the same request.')
+                if stop is not None:
+                    stop('E_IO', message)
+                raise VaultFailure('E_IO', message) from failure
+        raise KelmoError('E_SOURCE', 'The archived evidence of this source cannot be read while the rest of the '
+                                     'archive reads: ' + str(failure) + '. Restore its captured source, or dismiss '
+                                     'the note.') from failure
+
+    def _archive_readable(self):
+        """Whether the storage reads the archive as a whole: the journal and the archive database answer, and
+        the directory of captured sources lists. Contention answers neither way and is raised as it is."""
+        try:
+            self.journal.conn.execute('SELECT id FROM operations LIMIT 1').fetchall()
+            self.service.archive_api.assert_writer()
+            with os.scandir(self.service.config.internal(Path('.state/sources'))) as entries:
+                next(entries, None)
+        except sqlite3.Error as error:
+            if sqlite_busy(error):
+                raise
+            return False
+        except KelmoError as error:
+            if error.code in CONTENTION:
+                raise
+            return False
+        except OSError:
+            return False
+        return True
+
+    def _archived_source(self, operation_id, origin, rule_change, *, resolution=False):
         operation = self.journal.get(operation_id)
         if operation['durable_stage'] not in ('archived', 'applied'):
             raise KelmoError('E_PERMISSION', 'Archive the source before editing: wiki changes need its archive '
@@ -1284,10 +1387,16 @@ class Editor:
         if self._intake_owned(operation):
             raise KelmoError('E_STATE', 'This source is a Git intake whose outcome StateAPI settles; it is not '
                                        'edited from the source.')
-        exact = self.journal.evidence_record(operation_id)
-        if exact is None:
+        try:
+            exact = self.journal.evidence_record(operation_id)
+            reference = None if exact is None else EvidenceRef.from_dict(exact)
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            # A record that reads but does not parse is that source's own damaged record, exactly as one the
+            # storage cannot read while the rest of the archive reads (`_read_archive`).
+            raise KelmoError('E_SOURCE', 'The archived evidence record of this source is damaged: ' + str(error)
+                             + '. Restore its captured source, or dismiss the note.') from error
+        if reference is None:
             raise KelmoError('E_RECEIPT', 'The source has no exact archived evidence reference.')
-        reference = EvidenceRef.from_dict(exact)
         owner = self.service._operation_origin(operation_id)
         self.service.archive_api.verify_receipt(reference, operation_id, owner)
         packet = self.service.source_packet(operation_id)
@@ -1321,8 +1430,16 @@ class Editor:
 
     def edit(self, source_operation_id, *, origin, idempotency_key, project, selected, executor,
              budget_tokens, rule_change=False, contexts=None, link_pages=False, resolution_claim=None,
-             proposal_digest=None, new_work=None, hint=None):
+             proposal_digest=None, new_work=None, hint=None, own_key=False):
         """Edit the selected pages from one archived source; replays by origin-scoped idempotency key.
+
+        `own_key` is the apply pass's: the key is one the pass derived for this source's attempt, never one a
+        person chose, so a row under it that already published replays whatever the stored request has become
+        since (its budget raised in the config, its project renamed): its source must not be consulted again
+        for facts it has published. A row refused under the old request does not replay: the change may be
+        the very repair of that refusal, so it meets `E_IDEMPOTENCY`, which parks the note free under a new
+        key. Every other caller keeps the rule that one key names one request. (The pass itself settles a
+        finished row before it calls this, `settle_published`; the replay keeps `edit` safe on its own.)
 
         `rule_change` is a controller-only seam: it is honoured only for a requester-capable issued
         origin that also owns the archived source. `contexts` is the controller's ContextBindings;
@@ -1385,20 +1502,27 @@ class Editor:
                 {'request': request, 'origin': origin.to_dict(), 'key': idempotency_key}):
             # A row an earlier release wrote names the whole `new_work`; it still answers its own request.
             fingerprint = row['fingerprint']
-        receipt = StateCoordinator._replay(row, fingerprint)
-        if receipt is not None:
-            return receipt
+        if row is not None and row['state'] == 'prepared':
+            # Its publication is decided: the recovery finishes or refuses it before anything else is read of
+            # the row, so a request that changed since replays what the publication became instead of being
+            # refused while it waits for a recovery nothing else would start.
+            with coordinator_lock(self.service.config):
+                self._recover()
+            row = self.journal.action_request(request_key)
         if row is not None and row['state'] == 'open' and _batch_answered(row):
             # A pass died on a batch and this source now comes alone (the flag was turned off, or the pass
             # takes one note at a time). The row holds that batch's answer, which is not a single-source
-            # answer and cannot be settled as one.
+            # answer and cannot be settled as one. It leaves that batch before anything else is read of it:
+            # finished from the batch's commit when one carries it, its attempt ended otherwise.
             with coordinator_lock(self.service.config):
                 self._recover()
                 self._leave_batch(request_key, {source_operation_id: idempotency_key})
             row = self.journal.action_request(request_key)
-            receipt = StateCoordinator._replay(row, fingerprint)
-            if receipt is not None:
-                return receipt
+        if own_key and row is not None and row['state'] == 'finished':
+            fingerprint = row['fingerprint']
+        receipt = StateCoordinator._replay(row, fingerprint)
+        if receipt is not None:
+            return receipt
         if resolution_claim is not None:
             from .resolution import validate_editor_claim
             validate_editor_claim(self.service, source_operation_id, resolution_claim, executor, idempotency_key)
@@ -1428,9 +1552,10 @@ class Editor:
         optional `hint`, `link_pages`, `proposal_digest`). Every member keeps its own request row under
         its own key and fingerprint — membership lives in the recorded answers, never in a key — and the
         lead row carries the consulting lease for the one conversation. The answer is split in capture
-        order: a refused slice parks alone, a cross-source collision parks the later source, and the
-        accepted slices become one batch intent and one commit, prepared on the row of the earliest
-        accepted source whose own slice carries an item.
+        order: a refused slice parks alone, a cross-source collision sends the later source alone in the same
+        pass, uncharged, and the accepted slices become one batch intent and one commit, prepared on the row
+        of the earliest published source (an accepted one that no unheard note precedes) whose own slice
+        carries an item.
 
         The batch's budget is read before any row opens (`_preflight_batch`), so a source the budget cannot
         carry spends no part of the conversation, has no row of this attempt, and the same pass publishes it
@@ -1445,7 +1570,11 @@ class Editor:
         request, also uncharged).
         """
         self._idle()
-        self._issued(origin)
+        try:
+            self._issued(origin)
+        except KelmoError as error:
+            # The batch is edited under its head's origin: an origin that is not issued is the head's refusal.
+            raise HeadRefusal(error.code, str(error)) from error
         if not isinstance(executor, ModelExecutor):
             raise KelmoError('E_EXECUTOR', 'The editor needs a ModelExecutor returning normalized outcomes.')
         if not isinstance(sources, (list, tuple)) or not sources:
@@ -1493,23 +1622,44 @@ class Editor:
             requests[operation_id].get('new_work')),
             'origin': origin.to_dict(), 'key': idem[operation_id]})
                         for operation_id in order}
-        rows, settled = self._batch_state(order, keys)
+        try:
+            return self._edit_batch(order, requests, idem, keys, fingerprints, origin, enrollment, executor)
+        except KelmoError as error:
+            # Whatever ended the call, a row that has finished, before this call or in it, has published its
+            # note. Those notes are named for the caller, which settles them now instead of leaving a published
+            # note waiting behind a refusal, a quota wait or a vault failure that is not its own.
+            try:
+                finished = self._batch_state(order, keys)[1]
+            except Exception:  # noqa: BLE001 - the error that ended the call is the one the caller must see
+                finished = {}
+            error.settled = [operation_id for operation_id, disposition in finished.items()
+                             if disposition['disposition'] == 'settled']
+            raise
+
+    def _edit_batch(self, order, requests, idem, keys, fingerprints, origin, enrollment, executor):
+        rows, settled = self._batch_state(order, keys, fingerprints)
         # What an earlier attempt left on a row is dealt with before anything is consulted, under the worker
         # lock the publication needs, and after the recovery has finished what was prepared. A row holding
         # the answer of a batch leaves that batch (`_leave_batch`): settled from the batch's commit, or its
         # attempt ended so that this call consults the source again. A row holding its own single-source
         # answer settles from that answer: it is never leased into a batch, which would overwrite an answer
-        # its source already paid for. A row whose request has changed since settles only from what was
-        # published under it; what is left of it afterwards ends the batch (`_up_to_changed_request`).
+        # its source already paid for. A row whose own intent is prepared is finished by that recovery first.
+        # A row whose request has changed since settles only from what was published under it; what is left
+        # of it afterwards ends the batch (`_up_to_changed_request`). A row's own answer publishes only when
+        # every older source of the batch is settled: otherwise the batch ends before it, and it settles at
+        # the head of a later batch, so it never publishes ahead of an older note that may still wait.
         changed = {operation_id for operation_id in order
                    if rows[operation_id] is not None and rows[operation_id]['fingerprint'] != fingerprints[operation_id]}
+        own_behind = {}
         if any(operation_id not in settled and (operation_id in changed or _own_answer(rows[operation_id])
-                                                or _batch_answered(rows[operation_id]))
+                                                or _batch_answered(rows[operation_id])
+                                                or (rows[operation_id] is not None
+                                                    and rows[operation_id]['state'] == 'prepared'))
                for operation_id in order):
             with coordinator_lock(self.service.config):
                 self._recover()
-                rows, settled = self._batch_state(order, keys)
-                for operation_id in order:
+                rows, settled = self._batch_state(order, keys, fingerprints)
+                for index, operation_id in enumerate(order):
                     if operation_id in settled:
                         continue
                     if _batch_answered(rows[operation_id]):
@@ -1517,19 +1667,28 @@ class Editor:
                         if left is not None:
                             settled[operation_id] = left
                     elif _own_answer(rows[operation_id]) and operation_id not in changed:
+                        # An older note refused for a reason the vault caused has its claim still to come,
+                        # exactly like one not settled yet (`_up_to_a_vault_refusal` ends the batch at it).
+                        if any(older not in settled or _vault_refused(settled[older]) for older in order[:index]):
+                            own_behind = {later: {'disposition': 'dropped', 'code': None, 'reason': _OWN_BEHIND}
+                                          for later in order[index:] if later not in settled}
+                            order = order[:index] + [later for later in order[index:] if later in settled]
+                            break
                         settled[operation_id] = self._own_answer_disposition(
                             rows[operation_id], operation_id, origin, requests[operation_id], idem[operation_id],
                             enrollment)
+        order, refused_behind = self._up_to_a_vault_refusal(order, settled)
         order, behind = self._up_to_changed_request(order, keys, fingerprints, settled)
+        behind.update(own_behind)
+        behind.update(refused_behind)
         live = [operation_id for operation_id in order if operation_id not in settled]
         lead, dropped = (live[0] if live else None), {}
         if live:
             try:
                 # The budget is read before any row opens, so a source the batch cannot carry has no request
                 # row of this attempt and the same pass publishes it alone under its own single-source key.
-                sources, live, dropped = self._preflight_batch(live, requests, origin)
-                self._answer_batch(lead, live, origin, requests, keys, idem, fingerprints, enrollment, executor,
-                                   sources, dropped)
+                dropped = self._answer_batch(lead, live, origin, requests, keys, idem, fingerprints, enrollment,
+                                             executor)
             except KelmoError as error:
                 # The source this call led with is not always the first one it was given: an older one may
                 # be settled already. A refusal that belongs to the lead alone names it for the caller.
@@ -1541,6 +1700,23 @@ class Editor:
         result['dispositions'].update(behind)
         return result
 
+    @staticmethod
+    def _up_to_a_vault_refusal(order, settled):
+        """The batch up to the first source already refused, before this call consults, for a reason the vault
+        caused (`VAULT_REFUSALS`: a generation that moved, a request changed under its row, a union refused
+        whole, as the recovery refuses a prepared commit). That source is asked again on a later pass and its
+        claim is still to come, so the sources after it that have not settled wait for it, uncharged and
+        unconsulted, instead of publishing ahead of it in this call; the pass then holds its project. Returns
+        the sources the batch keeps and the dispositions of the ones it leaves."""
+        for index, operation_id in enumerate(order):
+            if _vault_refused(settled.get(operation_id) or {}):
+                behind = {later: {'disposition': 'dropped', 'code': None,
+                                  'reason': 'the batch ended at an older source refused for a reason the vault '
+                                            'caused; this one stays waiting behind it'}
+                          for later in order[index + 1:] if later not in settled}
+                return order[:index + 1] + [later for later in order[index + 1:] if later in settled], behind
+        return order, {}
+
     def _up_to_changed_request(self, order, keys, fingerprints, settled):
         """The batch up to the first source whose key names a different request and settles nothing.
 
@@ -1550,22 +1726,25 @@ class Editor:
         change is that source's own refusal, as on the single-source path, so the notes around it never meet
         it: at the head it is raised for the head alone; later, the batch ends before that source, which is
         refused on its own turn at the head of a later batch. Returns the sources the batch keeps and the
-        dispositions of the ones it leaves: dropped, uncharged, still waiting.
+        dispositions of the ones it leaves: dropped, uncharged, still waiting. A source after the cut that has
+        settled already keeps that settlement: it is published or refused, and is never reported waiting.
         """
+        head = next((operation_id for operation_id in order if operation_id not in settled), None)
         for index, operation_id in enumerate(order):
             row = self.journal.action_request(keys[operation_id])
             if operation_id in settled or row is None or row['fingerprint'] == fingerprints[operation_id]:
                 continue
             message = 'The idempotency key already identifies a different action request.'
-            if index == 0:
+            if operation_id == head:
                 refusal = HeadRefusal('E_IDEMPOTENCY', message)
                 refusal.lead = operation_id
                 raise refusal
             behind = {later: {'disposition': 'dropped', 'code': 'E_IDEMPOTENCY',
                               'reason': 'the batch ended at an older source whose request changed; this one '
-                                        'stays waiting behind it'} for later in order[index + 1:]}
+                                        'stays waiting behind it'}
+                      for later in order[index + 1:] if later not in settled}
             behind[operation_id] = {'disposition': 'dropped', 'code': 'E_IDEMPOTENCY', 'reason': message}
-            return order[:index], behind
+            return order[:index] + [later for later in order[index + 1:] if later in settled], behind
         return order, {}
 
     def awaiting_publication(self):
@@ -1581,6 +1760,64 @@ class Editor:
             carried.update([intent.get('source_operation_id'), *(intent.get('sources') or ())])
         return carried - {None}
 
+    def published_by_batch(self, source_operation_id):
+        """Whether a finished batch intent carries this source while its own row still waits to be settled from it.
+
+        A read only: the source's facts are in the wiki, and `_leave_batch` finishes its row on its next turn
+        with no model call. A caller must not park such a source."""
+        return any(row['state'] == 'open' and _batch_answered(row) and self._carrying_intent(row) is not None
+                   for row in self.journal.semantic_requests(source_operation_id))
+
+    def publication_decided(self, source_operation_id):
+        """Whether a publication settles this source, or is about to: a row of it finished, a prepared intent
+        carries it, or a finished batch commit carries one of its open rows. A read only."""
+        return (any(row['state'] in ('finished', 'prepared')
+                    for row in self.journal.semantic_requests(source_operation_id))
+                or source_operation_id in self.awaiting_publication()
+                or self.published_by_batch(source_operation_id))
+
+    def settle_published(self, source_operation_id):
+        """Settle this source from the publication decided for it; True when a row of it is finished.
+
+        A prepared intent that carries it is finished (or refused) by the recovery, and an open row a finished
+        batch commit carries is finished from that commit's stored intent, its key included. None of it asks
+        the model, and it comes before anything of the source's next turn is checked: a refusal of that turn
+        (an origin revoked since, a stored request that no longer reads) would otherwise park a note whose
+        facts are published, or leave it waiting behind its own publication on every pass, since `park`
+        refuses to park it, and its next attempt would ask the model again under a new key. A finished commit
+        publishes nothing more, so its rows settle without the recovery: another note's publication that cannot
+        be finished does not keep them waiting. A batch of it that is still prepared raises `E_BUSY`.
+        """
+        self._idle()
+        if source_operation_id in self.awaiting_publication():
+            with coordinator_lock(self.service.config):
+                self._recover()
+        if self.published_by_batch(source_operation_id):
+            with coordinator_lock(self.service.config):
+                for row in self.journal.semantic_requests(source_operation_id):
+                    intent = (self._carrying_intent(row) if row['state'] == 'open' and _batch_answered(row)
+                              else None)
+                    if intent is not None:
+                        self._leave_batch(row['request_key'],
+                                          {source_operation_id: intent['sources'][source_operation_id]['idempotency_key']})
+        return any(row['state'] == 'finished' for row in self.journal.semantic_requests(source_operation_id))
+
+    def _carrying_intent(self, row, rows=None):
+        """The finished intent that carries `row` itself, an open row holding a batch answer, or None.
+
+        It is looked for on the rows of every source the batch named (`rows`, read here when not given),
+        since any of them may have carried the commit, whichever answer it came from. An intent carries the
+        row its source entry names (`request`), never just the source: a commit made under an earlier request
+        of the same source settles that request, not a later one whose answer it never held."""
+        if rows is None:
+            rows = self.journal.action_requests_of(json.loads(row['observation'])['batch'])
+        for other in rows:
+            intent = self.journal.action_intent(other['operation_id']) if other['state'] == 'finished' else None
+            entry = (intent.get('sources') or {}).get(row['source_operation_id']) if intent is not None else None
+            if isinstance(entry, dict) and entry.get('request') == row['operation_id']:
+                return intent
+        return None
+
     def _leave_batch(self, request_key, idem):
         """Take a source out of the batch whose recorded answer a pass that died left on its row.
 
@@ -1592,10 +1829,9 @@ class Editor:
         return nothing is inferred about how far that pass got, so no note is settled on a split it never
         finished and none pays for the refusal of another.
 
-        The commit is looked for on the rows of the sources the batch named, since any of them may have
-        carried it. An intent that carries a source still waiting is that source's commit, whichever answer
-        it came from. Runs after recovery, under the worker lock: a commit of the batch that is still
-        prepared then raises `E_BUSY`, and the caller retries.
+        The commit is found by `_carrying_intent`. Runs under the worker lock, after the recovery where the
+        caller goes on to publish: a commit of the batch that is still prepared raises `E_BUSY`, and the
+        caller retries.
         """
         row = self.journal.action_request(request_key)
         if row is None or row['state'] != 'open' or not _batch_answered(row):
@@ -1604,10 +1840,9 @@ class Editor:
         if any(other['state'] == 'prepared' for other in rows):
             raise KelmoError('E_BUSY', 'The batch that answered this source is still publishing; retry it '
                                        'under the same key.')
-        for other in rows:
-            intent = self.journal.action_intent(other['operation_id']) if other['state'] == 'finished' else None
-            if intent is not None and row['source_operation_id'] in (intent.get('sources') or {}):
-                return self._member_disposition(request_key, idem, intent=intent)
+        intent = self._carrying_intent(row, rows)
+        if intent is not None:
+            return self._member_disposition(request_key, idem, intent=intent)
         self._end_attempt(row)
         return None
 
@@ -1630,8 +1865,12 @@ class Editor:
                 {'disposition': 'dropped', 'code': 'E_CLAIM',
                  'reason': 'another attempt holds this source; it stays waiting and spends no attempt'})
 
-    def _batch_state(self, order, keys):
-        """Each member's request row and the dispositions a replay answers without consulting: receipt or refusal."""
+    def _batch_state(self, order, keys, fingerprints=None):
+        """Each member's request row and the dispositions a replay answers without consulting: receipt or refusal.
+
+        A published row replays whatever its request has become since, as in `edit(own_key=True)`. A refused
+        row replays only under the request it refused (`fingerprints`, when given): a request that changed since
+        may be the repair of that refusal, so the row is left to `_up_to_changed_request`, which ends it free."""
         rows, settled = {}, {}
         for operation_id in order:
             row = self.journal.action_request(keys[operation_id])
@@ -1641,7 +1880,8 @@ class Editor:
             if row['state'] == 'finished':
                 settled[operation_id] = {'disposition': 'settled',
                                          'receipt': OperationReceipt.from_dict(json.loads(row['receipt']))}
-            elif row['state'] == 'refused':
+            elif row['state'] == 'refused' and (fingerprints is None
+                                                or row['fingerprint'] == fingerprints[operation_id]):
                 settled[operation_id] = {'disposition': 'refused', 'code': row['error_code'],
                                          'reason': row['error_message']}
         return rows, settled
@@ -1653,9 +1893,9 @@ class Editor:
         refused replays; the rows carrying the answer this call recorded are settled through the batch
         split, with the row of `lead`, the source the call led with; a row carrying a single-source answer
         of its own is settled from that answer; a row another attempt is still consulting raises `E_BUSY`,
-        one with its own prepared intent is busy, and a row that is gone is dropped. A source the preflight left out of the consultation has no
-        row of this attempt by design: it is dropped with the reason the preflight named, and it stays
-        waiting.
+        one with its own prepared intent is busy, and a row that is gone is dropped. A source the preflight
+        left out of the consultation has no row of this attempt by design: it is dropped with the reason
+        the preflight named, and it stays waiting.
 
         An answer is settled here and nowhere else, by the call that recorded it: whatever an earlier call
         left answered was taken out of its batch before this one consulted, so every answered row is this
@@ -1680,7 +1920,8 @@ class Editor:
                                               'reason': 'its own prepared intent publishes before this batch settles it'}
             elif operation_id in dropped and _awaiting(row):
                 # A row an earlier attempt left open for a source this pass reads alone: its lapsed lease
-                # is ended, the source spends no attempt and keeps its place in the waiting list.
+                # is ended, the source spends no attempt and keeps its place in the waiting list. No live
+                # attempt holds that lease: the pass claims every member before the batch is edited.
                 observation = json.loads(row['observation'] or '{}')
                 if 'consulting' in observation:
                     self.journal.action_release(row['operation_id'], observation['consulting'])
@@ -1702,28 +1943,40 @@ class Editor:
         return self._batch_result(order[0], order, dispositions)
 
     def _own_answer_disposition(self, row, source_operation_id, origin, request, idempotency_key, enrollment):
-        """Settle a row whose recorded answer is its own (not this batch's), exactly as `edit` settles it."""
+        """Settle a row whose recorded answer is its own (not this batch's), exactly as `edit` settles it.
+
+        A refusal of the answer is that note's. A vault that takes no publication and contention are no
+        refusal of anything: they end the call, as they end `edit`, and the note keeps its row."""
         try:
             source = self._source(source_operation_id, origin, request.get('rule_change', False))
             receipt = self._settle(row, source, origin, idempotency_key, request.get('rule_change', False),
                                    enrollment, request.get('new_work'))
+        except VaultFailure:
+            raise
         except KelmoError as error:
+            if error.code in CONTENTION:
+                raise
             return {'disposition': 'refused', 'code': error.code, 'reason': str(error)}
         return {'disposition': 'applied' if receipt.outcome == 'published' else 'archive-only', 'receipt': receipt}
 
     def _batch_result(self, lead, batch, dispositions):
         return {'lead': lead, 'batch': list(batch), 'dispositions': dispositions}
 
-    def _answer_batch(self, lead, live, origin, requests, keys, idem, fingerprints, enrollment, executor,
-                      sources, dropped):
-        """Lease every row of the batch, consult the model once, record the answer.
+    def _answer_batch(self, lead, live, origin, requests, keys, idem, fingerprints, enrollment, executor):
+        """Read the batch, lease every row of it, consult the model once, record the answer; returns `dropped`.
+
+        Under the worker lock, after the recovery has finished what was prepared and the vault has shown it can
+        take a publication, the batch is read at one generation (`_preflight_batch`): the sources it can
+        carry, and the ones it drops before any row opens. The conversation reads that same generation, so the
+        selection checked here is the selection the model is sent.
 
         Every row is leased under the one token of the one conversation, so a pass that dies mid-batch
         leaves N open rows and no answer, and the next pass consults them again under the same keys once
         those leases have lapsed. A row this call cannot lease, or one another request began meanwhile, makes
         the whole batch busy: the leases taken so far are ended and nothing is consulted, so every answered
-        row the settle pass finds afterwards was answered by this call. `sources` and `dropped` come from
-        `_preflight_batch`: the rows opened here are exactly the sources the batch kept.
+        row the settle pass finds afterwards was answered by this call. The rows opened here are exactly the
+        sources the batch kept, and every one of their leases is renewed with the lead's for as long as the
+        conversation lasts.
         """
         token = uuid.uuid4().hex
         lease = {'consulting': token, 'expires_at': time.time() + LEASE_SECONDS}
@@ -1732,11 +1985,14 @@ class Editor:
         try:
             with coordinator_lock(self.service.config):
                 self._recover()
+                self._require_publishable(whole=True)
                 if self._dismissed(lead):
-                    raise KelmoError('E_STATE', 'This source was dismissed; it is settled without publication.')
+                    raise HeadRefusal('E_STATE', 'This source was dismissed; it is settled without publication.')
                 reset_at = self.deferred_until(lead)
                 if reset_at is not None:
                     raise QuotaWait(reset_at)
+                generation = self._read_committed(self.service.knowledge.generation)
+                sources, live, dropped = self._preflight_batch(live, requests, origin, generation)
                 for operation_id in live:
                     row = self.journal.action_request(keys[operation_id])
                     if row is None:
@@ -1755,9 +2011,10 @@ class Editor:
             self._release_batch(live, keys, token)
             raise
         action_id = self.journal.action_request(keys[lead])['operation_id']
+        members = [self.journal.action_request(keys[operation_id])['operation_id'] for operation_id in live[1:]]
         try:
             observation = self._consult_batch(live, sources, requests, executor, action_id, token, enrollment,
-                                              dropped)
+                                              dropped, generation, members)
         except QuotaWait as wait:
             self._release_batch(live, keys, token)
             self._record(lead, 'unresolved', str(wait), request=action_id, code=wait.code,
@@ -1768,23 +2025,21 @@ class Editor:
                 # The lead's lease is gone; the rows this conversation still holds are freed with it.
                 self._release_batch(live, keys, token)
                 raise
-            if error.code in SETTLED_CONSULT_CODES:
+            if isinstance(error, HeadRefusal):
+                # The batch shrank to its head and the budget cannot carry even that one: the refusal is the
+                # head's alone, and settles the head's row. The sources the shrink dropped were never asked
+                # about: their leases end and they stay waiting.
                 if not self.journal.action_refuse(action_id, error.code, str(error), token=token,
                                                   outcome=_outcome('unresolved', str(error), error.code),
                                                   result=_result(action_id, 'unresolved', error.code)):
+                    # The lead's row is no longer this conversation's: nothing of it settles here, and the
+                    # rows it still holds are freed.
+                    self._release_batch(live, keys, token)
                     raise busy from error
-                # The refusal is the conversation's, so it settles the sources still in it. One the budget
-                # shrank out along the way was not asked about: its lease is ended and it stays waiting. A
-                # head refusal is raised from inside that shrink, before the dropped sources left `sources`,
-                # and by its own meaning leaves the head alone.
-                asked = [lead] if isinstance(error, HeadRefusal) else [operation_id for operation_id in live
-                                                                       if operation_id in sources]
-                self._refuse_batch_members(asked, keys, error.code, str(error))
-                for operation_id in live[1:]:
-                    member = self.journal.action_request(keys[operation_id])
-                    if operation_id not in asked and member is not None and member['state'] == 'open':
-                        self.journal.action_release(member['operation_id'], token)
+                self._release_batch(live[1:], keys, token)
                 raise
+            # Any other refusal is the conversation's and names no note of it: no row is refused, every lease
+            # ends, and the pass sends each note alone, where each meets whatever is its own.
             self._release_batch(live, keys, token)
             self._record(lead, 'unresolved', str(error), request=action_id, code=error.code)
             raise
@@ -1794,6 +2049,33 @@ class Editor:
         observation['dropped'] = dropped
         self.journal.action_observe(action_id, token, observation)
         self._observe_batch_members(live, keys, token, observation)
+        # A source the budget shrank out during the conversation is no member of the answer: its lease ends now,
+        # so whatever stops this call before it settles, the next pass can lease that row at once.
+        self._release_batch([operation_id for operation_id in live if operation_id not in observation['batch']],
+                            keys, token)
+        return dropped
+
+    def _renew_members(self, members, token):
+        """Extend the leases of the batch's member rows with the lead's, before each executor call.
+
+        A conversation may outlast one lease. A member row whose lease lapsed could be taken by another attempt
+        for the same request, which would then answer and publish it alone while this batch answers it too.
+        A row settled meanwhile (its note was dismissed) is left to the split, which reads it; a lease of this
+        conversation that lapsed with nobody taking it is taken again. A row another attempt now holds makes
+        the batch lose it the way it loses the lead's lease: `E_BUSY`.
+        """
+        expires_at = time.time() + LEASE_SECONDS
+        for member in members:
+            if self.journal.action_renew(member, token, expires_at):
+                continue
+            row = self.journal.action_row(member)
+            if row is None or row['state'] != 'open':
+                continue
+            observation = json.loads(row['observation'] or '{}')
+            if observation.get('consulting') == token and self.journal.action_lease(member, token, expires_at):
+                continue
+            raise KelmoError('E_BUSY', 'This batch lost the consulting lease of one of its rows to another attempt; '
+                                      'retry the same keys.')
 
     def _release_batch(self, live, keys, token):
         """End every lease this conversation holds, so the same keys are retryable at once."""
@@ -1821,15 +2103,18 @@ class Editor:
             self.journal.action_observe(row['operation_id'], token, {
                 'batch': list(observation['batch']), 'generation': observation['generation']})
 
-    def _source_batch(self, live, requests, origin):
+    def _source_batch(self, live, requests, origin, generation):
         """The archived evidence of the batch's members, up to the first one the batch cannot take.
 
-        A member is not taken when its evidence cannot be read or its selection names a page that is no
-        longer registered. It is dropped, never failed, and the batch ends there: the members after it are
-        dropped with it, because a batch never publishes a note ahead of an older one. That member is refused
-        on its own turn, as the head of a later batch, and the notes behind it follow."""
+        A member is not taken when its evidence cannot be read or its selection names a page that is not
+        registered at `generation`, the one the conversation reads. It is dropped, never failed, and the batch
+        ends there: the members after it are dropped with it, because a batch never publishes a note ahead of
+        an older one. That member is refused on its own turn, as the head of a later batch, and the notes
+        behind it follow. A note's own evidence is its own: at the head, what its archive says against it is
+        that note's refusal, as on the single path. A storage that cannot read the archive (`_read_archive`)
+        is the vault's at any member, and ends the call before any row opens."""
         sources, dropped = {}, {}
-        registered = self.service.knowledge.registry(self.service.knowledge.generation())['pages']
+        registered = self._read_committed(lambda: self.service.knowledge.registry(generation))['pages']
         for index, operation_id in enumerate(live):
             try:
                 source = self._source(operation_id, origin, requests[operation_id].get('rule_change', False))
@@ -1838,8 +2123,12 @@ class Editor:
                     raise HeadRefusal('E_INPUT', 'Select registered pages only; unknown: ' + ', '.join(unknown[:5]))
                 sources[operation_id] = source
             except KelmoError as error:
+                if isinstance(error, VaultFailure):
+                    raise
                 if index == 0:
-                    raise error if isinstance(error, HeadRefusal) else HeadRefusal(error.code, str(error)) from error
+                    if isinstance(error, HeadRefusal) or error.code in CONTENTION:
+                        raise
+                    raise HeadRefusal(error.code, str(error)) from error
                 dropped[operation_id] = {'disposition': 'dropped', 'code': error.code, 'reason': str(error)}
                 for later in live[index + 1:]:
                     dropped[later] = {'disposition': 'dropped', 'code': error.code,
@@ -1848,8 +2137,8 @@ class Editor:
                 break
         return sources, dropped
 
-    def _preflight_batch(self, live, requests, origin):
-        """Read the batch's budget before any request row opens, shrinking from the newest source.
+    def _preflight_batch(self, live, requests, origin, generation):
+        """Read the batch's budget at `generation` before any request row opens, shrinking from the newest source.
 
         A source the batch cannot carry must never get a row under this attempt's key: a batch row is
         fingerprinted by the batch request, while the same key published alone carries the single-source
@@ -1857,17 +2146,18 @@ class Editor:
         that source's own attempt instead of letting the pass publish it alone. Returns
         `(sources, kept, dropped)` — the kept sources are the batch this call consults.
         """
-        sources, dropped = self._source_batch(live, requests, origin)
+        sources, dropped = self._source_batch(live, requests, origin, generation)
         taken = [operation_id for operation_id in live if operation_id in sources]
         blocks = [{'operation_id': operation_id,
                    'text': sources[operation_id]['packet'].content.decode('utf-8'),
                    'evidence': sources[operation_id]['reference'],
                    **({'hint': requests[operation_id]['hint']} if requests[operation_id].get('hint') else {})}
                   for operation_id in taken]
-        _view, shrunk = self._batch_view(self.service.knowledge, self.service.knowledge.generation(),
-                                         requests[live[0]]['project'],
+        selections = {operation_id: requests[operation_id]['selected'] for operation_id in taken}
+        _view, shrunk = self._batch_view(self.service.knowledge, generation, requests[live[0]]['project'],
                                          list(dict.fromkeys(target for operation_id in taken
-                                                            for target in requests[operation_id]['selected'])),
+                                                            for target in selections[operation_id])),
+                                         selections,
                                          max(requests[operation_id]['budget_tokens'] for operation_id in taken),
                                          blocks, [], [])
         for operation_id, entry in shrunk.items():
@@ -1875,8 +2165,8 @@ class Editor:
             dropped.setdefault(operation_id, entry)
         return sources, [operation_id for operation_id in live if operation_id in sources], dropped
 
-    def _batch_view(self, reader, generation, project, selected, budget, blocks, expansions, reconciliations,
-                    candidates=()):
+    def _batch_view(self, reader, generation, project, selected, selections, budget, blocks, expansions,
+                    reconciliations, candidates=()):
         """The batch view, shrinking the batch from the newest source while the budget refuses it.
 
         Returns (view, dropped): a dropped source spent no model call and stays waiting, the same greedy
@@ -1885,14 +2175,25 @@ class Editor:
         selected page, which would leave the batch with nothing it may edit. A single source that cannot
         fit alone is not dropped — it is refused exactly as today, because nothing was sent and nothing is
         labelled complete.
+
+        `selected` is the conversation's selection and `selections` each source's own. A page only dropped
+        sources selected leaves the view with them, so the sources still kept are never refused, or read
+        short, for pages none of them asked for; a page the conversation added (an opened work page's
+        parent) stays.
         """
         kept, dropped = list(blocks), {}
+        every = {target for targets in selections.values() for target in targets}
+
+        def kept_selection():
+            own = {target for block in kept for target in selections[block['operation_id']]}
+            return [target for target in selected if target in own or target not in every]
+
         while len(kept) > 1:
             reason = None
             try:
-                view = views.editor_view(reader, generation, project, selected, budget, sources=kept,
-                                         expansions=expansions, reconciliations=reconciliations,
-                                         candidates=candidates)
+                view = self._read_committed(lambda: views.editor_view(
+                    reader, generation, project, kept_selection(), budget, sources=kept, expansions=expansions,
+                    reconciliations=reconciliations, candidates=candidates))
             except KelmoError as error:
                 if error.code != 'E_BUDGET':
                     raise
@@ -1906,23 +2207,24 @@ class Editor:
                                                             'older ones (' + reason + '); it stays waiting.'}
             kept.pop()
         try:
-            return views.editor_view(reader, generation, project, selected, budget, sources=kept,
-                                     expansions=expansions, reconciliations=reconciliations,
-                                     candidates=candidates), dropped
+            return self._read_committed(lambda: views.editor_view(
+                reader, generation, project, kept_selection(), budget, sources=kept, expansions=expansions,
+                reconciliations=reconciliations, candidates=candidates)), dropped
         except KelmoError as error:
             if error.code != 'E_BUDGET':
                 raise
             raise HeadRefusal('E_BUDGET', str(error)) from error
 
-    def _consult_batch(self, live, sources, requests, executor, action_id, token, enrollment, dropped):
+    def _consult_batch(self, live, sources, requests, executor, action_id, token, enrollment, dropped, generation,
+                       members=()):
         """Expand, reconcile and propose for the whole batch within MAX_BATCH_ROUNDS model calls.
 
         The batch is one conversation: MAX_BATCH_ROUNDS, MAX_EXPANSIONS and MAX_REPAIRS are per batch, not
         per source. The proposal first meets the settle checks against the generation the model read; one
         they refuse goes back with `refusal` (code and reason, never fresh receipts) for at most
         MAX_REPAIRS more answers. The answer is returned whole, for the lead's row, and the batch publishes
-        one intent. `dropped` gains a source the budget shrank out. A
-        source the answer never accounted for is named in `alone` when the repair budget runs out with it
+        one intent. `dropped` gains a source the budget shrank out. A source the answer never accounted
+        for is named in `alone` when the repair budget runs out with it
         still silent: `_settle_batch` leaves it out of the commit, ends its attempt and the apply pass
         consults it again, so a note nobody answered is not settled on a reason the editor invented.
         Every work page an answer asks for is opened in the round it is asked for, one per note, each
@@ -1938,9 +2240,11 @@ class Editor:
         answered any of them, which is the loss this step is about. A conversation that ends that way after
         a proposal returns that proposal, as one that ran out of rounds does.
 
-        One refusal is still raised from here: the batch shrank to its oldest source and the budget cannot
-        carry even that one (`HeadRefusal`). It is that source's own refusal, and the sources the shrink
-        dropped on the way are not part of it.
+        One refusal is still raised from here: in the first round, the batch shrank to its oldest source and
+        the budget cannot carry even that one (`HeadRefusal`). It is that source's own refusal, and the sources
+        the shrink dropped on the way are not part of it. In a later round the view also carries the pages and
+        receipts the conversation gathered, some of them for sources dropped since, so the same shortfall ends
+        the conversation instead (`exhausted`), and each note is consulted alone.
 
         An answer of `unresolved` is returned the same way, naming every source in `alone` with
         `unresolved`: that answer names no source, so it says nothing about any note of the batch and
@@ -1948,8 +2252,8 @@ class Editor:
         spends an attempt for it and each one runs the single-source path in the same pass.
         """
         reader = self.service.knowledge
-        generation = reader.generation()
-        registry = reader.registry(generation)
+        # The generation the preflight read and checked the selection against: the model reads the same one.
+        registry = self._read_committed(lambda: reader.registry(generation))
         facts = registry['facts']
         project = requests[live[0]]['project']
         selected = list(dict.fromkeys(target for operation_id in live for target in requests[operation_id]['selected']))
@@ -1968,23 +2272,38 @@ class Editor:
         ended = None
         # An earlier park's refusal is the first thing the model reads; it is not one of this batch's repairs.
         hinted = [requests[operation_id]['hint'] for operation_id in live if requests[operation_id].get('hint')]
-        work = _batch_opened_pages(requests, live, registry)
         # One work page per source of the batch: opened by its own creation request, or opened here from
         # the answer's own page list (a single `open_work` ask names the batch's first source, as a
         # single-source request carries its own `new_work`).
+        work = _batch_opened_pages(requests, live, registry)
         # One model conversation for the whole batch: each round names it, and later rounds carry what changed.
         talk, previous = conversation.key('edit_pages', action_id, token), None
         for round_number in range(MAX_BATCH_ROUNDS):
-            view, shrank = self._batch_view(reader, generation, project, selected, budget,
-                                            [block for block in blocks if block['operation_id'] in sources],
-                                            expansions, reconciliations, candidates)
+            try:
+                fresh_view, shrank = self._batch_view(
+                    reader, generation, project, selected,
+                    {operation_id: requests[operation_id]['selected'] for operation_id in live},
+                    budget, [block for block in blocks if block['operation_id'] in sources],
+                    expansions, reconciliations, candidates)
+                if not fresh_view['scope']:
+                    # The shrink left a batch whose budget sends no page it may edit: the model would only be
+                    # asked to expand a page the budget already omitted.
+                    raise HeadRefusal('E_BUDGET', _budget_refusal(fresh_view['omitted_budget'], budget,
+                                                                  fresh_view['used_tokens']))
+            except HeadRefusal as error:
+                if round_number == 0:
+                    # The oldest source alone, as the preflight read it: its own refusal.
+                    raise
+                # A later round carries what the conversation gathered for the whole batch: the pages expanded
+                # and the receipts searched, some of them for sources the shrink then dropped. The oldest
+                # source cannot carry them, which is the conversation's end, not that source's refusal: it
+                # ends with what it has, and each note is consulted alone, with only what is its own.
+                ended = 'the batch conversation outgrew its budget (' + str(error) + ')'
+                break
+            view = fresh_view
             for operation_id, entry in shrank.items():
                 sources.pop(operation_id, None)
                 dropped.setdefault(operation_id, entry)
-            if not view['scope']:
-                # The shrink left a batch whose budget sends no page it may edit: the model would only be
-                # asked to expand a page the budget already omitted. Refuse it with the numbers instead.
-                raise HeadRefusal('E_BUDGET', _budget_refusal(view['omitted_budget'], budget, view['used_tokens']))
             ceiling = _receipt_ceiling(budget, view['fixed_tokens'])
             view['payload']['budget']['receipt_ceiling'] = ceiling
             view['payload']['expansions_left'] = MAX_EXPANSIONS - expanded
@@ -1995,6 +2314,7 @@ class Editor:
             if hinted or repairs:
                 view['payload']['refusal'] = (repairs or hinted)[-1]
             self._renew(action_id, token)
+            self._renew_members(members, token)
             turn = conversation.turn(talk, round_number, previous, view['payload'])
             previous = view['payload']
             outcome = executor.execute(ModelJob('edit_pages', view['bundle'], view['payload'], conversation=turn))
@@ -2061,7 +2381,11 @@ class Editor:
                 # the refusal the model reads is code and reason only. They are kept for the return below,
                 # because the answer this consultation hands `_settle_batch` is this one.
                 unaccounted = list(problem.pop('alone', ())) if problem is not None else []
-                if problem is None or len(repairs) >= MAX_REPAIRS or not getattr(executor, 'revises', True):
+                # A repair is checked against the generation this conversation read. Once another publication
+                # moved the wiki, no repair can pass and the settle refuses the answer as stale whatever it
+                # says, so the conversation ends here instead of spending its repairs.
+                if (problem is None or len(repairs) >= MAX_REPAIRS or not getattr(executor, 'revises', True)
+                        or self._read_committed(reader.generation) != generation):
                     if unaccounted:
                         refused['alone'] = unaccounted
                     return refused
@@ -2108,10 +2432,9 @@ class Editor:
         # The conversation ended with nothing proposed: it spent every round, its executor produced nothing,
         # or it asked for what no further round can serve. Refusing it whole would charge every member of it
         # for a conversation that answered none of them: the conversation is the batch's, the attempts are
-        # not. The answer is recorded
-        # naming every source of the batch in `alone`, so `_settle_batch` ends each member's attempt the way a
-        # released lease ends and the same pass consults each one alone, where a note the model cannot place
-        # is refused under its own key.
+        # not. The answer is recorded naming every source of the batch in `alone`, so `_settle_batch` ends each
+        # member's attempt the way a released lease ends and the same pass consults each one alone, where a note
+        # the model cannot place is refused under its own key.
         return {'batch': [operation_id for operation_id in live if operation_id in sources],
                 'generation': generation.to_dict(), 'project': project,
                 'scope': view['scope'], 'omitted': view['omitted'], 'readable': view['readable'],
@@ -2134,7 +2457,7 @@ class Editor:
         `normalize` runs once over the whole answer (its duplicate detection is what catches two sources
         claiming the same thing), `split_delta` cuts it in capture order, and each slice then meets the
         reconciliation gate with its own receipts. A cross-source collision is named here so the model
-        gets its repair round; a collision still there at settle parks the later source. `send` names the
+        gets its repair round; a collision still there at settle sends the later source alone. `send` names the
         pages the repair needs in front of the model, which the consult loop sends itself.
 
         A source with no item of its own must be named in `recorded` with keys a reconciliation of this
@@ -2163,7 +2486,7 @@ class Editor:
                                                    observation['receipts']))
             # A created page belongs to the earliest note with a fact on it, as at the settle, so the
             # accounting below reads the slices the settle pass will publish.
-            _reattribute_created_pages(slices, delta, batch)
+            _reattribute_created_pages(slices, batch)
             recorded = {entry['source']: entry['fact_keys']
                         for entry in observation['result'].get('recorded') or []}
             reconciled = _reconciled_keys(self.journal.conn, observation['receipts'])
@@ -2189,15 +2512,6 @@ class Editor:
             return {'code': error.code, 'reason': str(error)}
         return None
 
-    def _refuse_batch_members(self, live, keys, code, message):
-        """Settle every open member row of a batch the consultation itself refused."""
-        for operation_id in live[1:]:
-            row = self.journal.action_request(keys[operation_id])
-            if row is not None and row['state'] == 'open':
-                self.journal.action_refuse(row['operation_id'], code, message,
-                                           outcome=_outcome('unresolved', message, code),
-                                           result=_result(row['operation_id'], 'unresolved', code))
-
     def _member_disposition(self, request_key, idem, delta=None, recorded=(), intent=None):
         """Finish one member row of a batch that published, and return what it ended with.
 
@@ -2217,11 +2531,16 @@ class Editor:
         if not observation or 'consulting' in observation:
             return {'disposition': 'busy', 'code': 'E_CLAIM',
                     'reason': 'its consultation is still held by another attempt'}
-        reference = EvidenceRef.from_dict(self.service.journal.evidence_record(row['source_operation_id']))
+        source = row['source_operation_id']
         generation = Generation.from_dict(observation['generation'])
         stored = None
-        if intent is not None:
-            source = row['source_operation_id']
+        if intent is None:
+            reference = EvidenceRef.from_dict(self.service.journal.evidence_record(source))
+        else:
+            # The commit stored each source's evidence: a member it carries settles from the intent alone, so
+            # nothing it has to read again can keep a published note from settling.
+            reference = EvidenceRef.from_dict(intent['sources'][source].get('evidence_ref')
+                                              or self.service.journal.evidence_record(source))
             delta = {name: [item for item in intent['delta'].get(name) or ()
                             if item.get('source_operation_id') == source] for name in LIMITS}
             recorded = intent['sources'][source].get('recorded') or ()
@@ -2259,6 +2578,9 @@ class Editor:
         batch = [operation_id for operation_id in observation['batch']]
         generation = Generation.from_dict(observation['generation'])
         dispositions = dict(settled)
+        # A dismissal refuses the source's open rows under the worker lock (`dismiss_semantic`), so a member
+        # dismissed while the model answered is already refused in `settled` (`_batch_state`). This keeps the
+        # settle from publishing a dismissed note however it is reached.
         for operation_id in batch:
             if self._dismissed(operation_id):
                 dispositions[operation_id] = {'disposition': 'refused', 'code': 'E_DISMISSED',
@@ -2271,15 +2593,20 @@ class Editor:
             # left unaccounted for is sent. Refusing the batch whole, or settling its members on one answer
             # that named none of them, would lose notes the conversation never answered.
             return self._apart(observation, batch, keys, dispositions)
-        if self.service.knowledge.generation() != generation:
+
+        def stop(code, message):
+            self._retryable_batch(action_id, batch, code, message)
+
+        if self._read_vault(self.service.knowledge.generation, stop) != generation:
             # Every source the split has not decided meets the refusal it would meet alone.
             stale = {'disposition': 'refused', 'code': 'E_STALE',
                      'reason': 'The knowledge generation moved after the editor read it; requeue the sources '
                                'under new requests.'}
             return self._batch_result(batch[0], batch, {**{operation_id: stale for operation_id in batch},
                                                         **dispositions})
-        registry = engine.load_registry_view(self.service.root)
-        if engine.fingerprint(registry) != self.service.knowledge.registry_fingerprint(generation):
+        registry = self._read_vault(lambda: engine.load_registry_view(self.service.root), stop)
+        if engine.fingerprint(registry) != self._read_vault(
+                lambda: self.service.knowledge.registry_fingerprint(generation), stop):
             self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The working registry differs from the '
                                   'generation the editor read; restore the committed registry, then retry the '
                                   'same request.')
@@ -2300,12 +2627,15 @@ class Editor:
             # note whose own proposal is malformed or unauthorized is refused under its own key.
             return self._apart(observation, batch, keys, dispositions,
                                'the batch answer is malformed or unauthorized (' + str(error) + ')')
+        # A cross-source collision is the answer's own: it gave one fact, page or work page to two notes of the
+        # batch, and the later one never had the turn alone that would have shown it the earlier one's claim. It
+        # is no refusal of that note, and it stands whatever then happens to the earlier note: the later note
+        # leaves the commit, spends no attempt and is consulted alone in this same pass, after the earlier one
+        # is published or refused; the notes captured after it wait for it, as behind a note left unanswered.
+        collided = {operation_id: '; '.join(collisions[operation_id]) for operation_id in batch
+                    if collisions.get(operation_id) and operation_id not in dispositions}
         for operation_id in batch:
-            if collisions.get(operation_id):
-                dispositions[operation_id] = {'disposition': 'refused', 'code': 'E_PROPOSAL',
-                                              'reason': '; '.join(collisions[operation_id])}
-        for operation_id in batch:
-            if operation_id in dispositions:
+            if operation_id in dispositions or operation_id in collided:
                 continue
             part = slices[operation_id]
             part['fact_checks'] = rebind_receipts(part['fact_checks'], part['delta']['facts'],
@@ -2314,11 +2644,12 @@ class Editor:
                 verify_fact_checks(self.journal.conn, registry, part['delta']['facts'], part['fact_checks'])
             except KelmoError as error:
                 dispositions[operation_id] = {'disposition': 'refused', 'code': error.code, 'reason': str(error)}
-        accepted = [operation_id for operation_id in batch if operation_id not in dispositions]
+        accepted = [operation_id for operation_id in batch
+                    if operation_id not in dispositions and operation_id not in collided]
         # A created page belongs to the earliest accepted note that puts a fact on it, not to the note whose
-        # request opened it: the opener is the source a cross-source collision refuses most often, and a page
+        # request opened it: the opener is the source a cross-source collision leaves out most often, and a page
         # that leaves the commit with its owner publishes the other notes' facts onto a page nothing creates.
-        _reattribute_created_pages(slices, delta, accepted)
+        _reattribute_created_pages(slices, accepted)
         # A source the answer left unaccounted for — no item of its own and no `recorded` entry whose keys a
         # reconciliation of this conversation returned — takes no part in the commit, whatever the consult
         # loop's last refusal named: the precheck stops at the first problem it meets, so a collision or a
@@ -2335,8 +2666,10 @@ class Editor:
         # this batch: a newer note may correct an older one, and the other order would leave the older claim
         # standing. Those notes go back to the waiting list unconsulted for the pass's next batch, which the
         # pass starts once the note ahead of them has been consulted alone.
-        behind = ([operation_id for operation_id in accepted[accepted.index(silent[0]):]
-                   if operation_id not in silent] if silent else [])
+        unheard = [operation_id for operation_id in batch if operation_id in silent or operation_id in collided]
+        behind = ([operation_id for operation_id in accepted
+                   if batch.index(operation_id) > batch.index(unheard[0]) and operation_id not in silent]
+                  if unheard else [])
         publish = [operation_id for operation_id in accepted
                    if operation_id not in silent and operation_id not in behind]
         union = {name: [] for name in LIMITS}
@@ -2350,14 +2683,16 @@ class Editor:
             union_checks.extend(slices[operation_id]['fact_checks'])
         if not accepted:
             # Every source of the batch was refused for a reason of its own, or dismissed: nothing is left
-            # to publish, and each one keeps the refusal it met.
+            # to publish, and each one keeps the refusal it met. A collided one is consulted alone.
+            self._end_collided(observation, collided, keys, dispositions)
             return self._batch_result(batch[0], batch, dispositions)
         if not any(union.values()):
             # A batch that publishes nothing cannot resolve a legacy note, and the single-source path can:
             # such a note takes that path in this same pass, its attempt ended without a refusal. Refusing
             # the batch for it would charge every member for a note none of them is.
             legacy = [operation_id for operation_id in accepted if engine.resolvable_note(
-                registry, EvidenceRef.from_dict(self.service.journal.evidence_record(operation_id)).to_dict())]
+                registry, EvidenceRef.from_dict(self._read_archive(
+                    lambda: self.service.journal.evidence_record(operation_id), stop)).to_dict())]
             self._end_alone_attempts(observation, legacy, keys, dispositions,
                                      reason='a batch that publishes nothing does not resolve a legacy note')
             silent = [operation_id for operation_id in silent if operation_id not in legacy]
@@ -2373,6 +2708,7 @@ class Editor:
             # an answer that says nothing about a note is no answer for it, exactly as `unresolved` is not,
             # and settling those notes `archive-only` on the batch's text is the loss this path exists to stop.
             self._end_alone_attempts(observation, silent, keys, dispositions)
+            self._end_collided(observation, collided, keys, dispositions)
             self._end_alone_attempts(observation, behind, keys, dispositions, rejoin=_BEHIND)
             return self._finish_batch(batch, dispositions, keys, idem, generation,
                                       _settle_reasons(observation, batch))
@@ -2390,16 +2726,23 @@ class Editor:
                               for operation_id in publishers}
         except KelmoError as error:
             return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
-        sources = {operation_id: {'evidence_ref': EvidenceRef.from_dict(
-            self.service.journal.evidence_record(operation_id)).to_dict(),
-            'filename': self.service.source_packet(operation_id).filename,
+        # The members' evidence is read before anything is prepared: a storage that cannot read the archive is
+        # the vault's, so every member waits uncharged and the pass stops (`_retryable_batch`). A member whose
+        # record alone stopped reading since the batch read it names no note here: the call ends, and each
+        # note goes alone, where that one meets the refusal (`E_SOURCE`) under its own key.
+        archived = self._read_archive(lambda: {operation_id: (
+            EvidenceRef.from_dict(self.service.journal.evidence_record(operation_id)),
+            self.service.source_packet(operation_id).filename) for operation_id in publish}, stop)
+        sources = {operation_id: {'evidence_ref': archived[operation_id][0].to_dict(),
+            'filename': archived[operation_id][1],
             'idempotency_key': idem[operation_id],
+            'request': self.journal.action_request(keys[operation_id])['operation_id'],
             'applied_reason': member_reasons.get(operation_id),
             'recorded': recorded.get(operation_id) or [],
             'rule_change': ({'origin': origin.to_dict(), 'source_operation_id': operation_id}
                             if authorities[operation_id]['rule_change'] else None)}
             for operation_id in publish}
-        lead_reference = EvidenceRef.from_dict(self.service.journal.evidence_record(publisher))
+        lead_reference = archived[publisher][0]
         intent = {'request_kind': 'semantic', 'delta': union, 'fact_checks': union_checks,
                   'applied_reason': applied_reason,
                   'evidence_ref': lead_reference.to_dict(), 'filename': sources[publisher]['filename'],
@@ -2424,24 +2767,33 @@ class Editor:
                 'E_PROPOSAL', 'the proposal cannot enter the registry: ' + str(error)))
         try:
             # As in the single path: renders and audits read files only, so interactive writes go first meanwhile.
-            with outside_journal():
-                result, changes = engine.semantic_projection(self.service.root, registry, intent)
+            result, changes = self._project(registry, intent)
         except (engine.OwnershipConflict, engine.SemanticRefusal) as error:
             return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
-        except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
-            self._retryable_batch(action_id, batch, 'E_CONFLICT', 'The pages could not be rendered: '
-                                  + str(error) + '. Repair the page, then retry the same request.')
+        except (KelmoError, engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
+            failure = self._render_failure(registry, error)
+            if failure is not None:
+                self._retryable_batch(action_id, batch, failure.code, str(failure))
+            # The vault takes a publication without what the batch proposed and not with it: the union broke a
+            # page, and the note whose own proposal does it meets that refusal alone.
+            return self._apart(observation, batch, keys, dispositions, _union_refused(
+                'E_PROPOSAL', 'the proposal leaves a page that cannot be rendered: ' + str(error)))
         try:
-            with outside_journal():
-                engine.require_clean_baseline(self.service.root, result, previous=registry)
-                engine.check_budget(self.service.root, result)
-        except KelmoError as error:
-            if error.code == 'E_OWNERSHIP' or (error.code == BUDGET_CODE and self._fits_budget(registry)):
-                # The wiki holds what it has and not what these notes add together: that names no note, and
-                # each may still fit alone. A wiki already over its budget is the vault's to repair.
-                return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
-            self._retryable_batch(action_id, batch, error.code, str(error))
-        baselines = self._baselines(action_id, publisher, generation, changes)
+            self._check_result(result, registry)
+        except (KelmoError, engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
+            failure = self._check_failure(registry, error)
+            if failure is not None:
+                self._retryable_batch(action_id, batch, failure.code, str(failure))
+            # The wiki takes what it has and not what these notes add together (over its budget, a page it
+            # leaves unrenderable, or a page it creates whose path holds a file): that names no note, and each
+            # may still pass alone. A vault that takes no publication as it stands is the vault's to repair.
+            code, message = _own_check_refusal(error)
+            return self._apart(observation, batch, keys, dispositions, _union_refused(code, message))
+        try:
+            baselines = self._baselines(action_id, publisher, generation, changes)
+        except VaultFailure as failure:
+            # A page the commit rewrites has local edits: every member waits, recorded as each one does.
+            self._retryable_batch(action_id, batch, failure.code, str(failure))
         references = tuple(EvidenceRef.from_dict(entry['evidence_ref']) for entry in sources.values())
         proposal = KnowledgeProposal(self.journal.action_request(keys[publisher])['operation_id'], generation,
                                      tuple(KnowledgeChange(path, hashlib.sha256(baselines.get(path, b'')).hexdigest(),
@@ -2463,8 +2815,9 @@ class Editor:
                 # recovery publishes the whole union on its turn. Each member then settles from that commit.
                 # Refusing a member here would leave a refused row whose fact the recovery then commits.
                 raise
-            # The commit was refused whole and the refusal settled the row that carried it. Nothing of the
-            # other notes was published and none of them is refused with it: each is consulted alone.
+            # The commit was refused whole and the refusal settled the row that carried it, as the union's
+            # (`UNION_CODE`, uncharged). Nothing of the other notes was published and none of them is refused
+            # with it: each is consulted alone.
             dispositions[publisher] = {'disposition': 'refused', 'code': error.code, 'reason': str(error)}
             return self._apart(observation, batch, keys, dispositions, _union_refused(error.code, error))
         dispositions[publisher] = {'disposition': 'applied', 'receipt': receipt}
@@ -2474,19 +2827,95 @@ class Editor:
             dispositions[operation_id] = self._member_disposition(keys[operation_id], idem,
                                                                   slices[operation_id]['delta'],
                                                                   recorded.get(operation_id, ()))
-        # The batch committed its part; the sources it left unaccounted for keep their turn, and the ones
-        # captured after the first of them wait for it.
+        # The batch committed its part; the sources it left unaccounted for or collided keep their turn, and
+        # the ones captured after the first of them wait for it.
         self._end_alone_attempts(observation, silent, keys, dispositions)
+        self._end_collided(observation, collided, keys, dispositions)
         self._end_alone_attempts(observation, behind, keys, dispositions, rejoin=_BEHIND)
         return self._batch_result(publisher, batch, dispositions)
 
-    def _fits_budget(self, registry):
-        """Whether the wiki budget holds the registry as it stands, before a batch adds to it."""
+    def _read(self, registry, read):
+        """`read()`, which reads the wiki with a proposal's change (its projection, or the checks of the
+        registry it would commit), read again while it cannot read.
+
+        A failure to read (the storage's `OSError`, a reader's `E_IO`, a Git command that fails, `E_GIT`) is
+        read again at once. A second one is the vault's (`VaultFailure`) unless the wiki as it stands reads,
+        renders and fits its budget (`_publishable`); then it is read a third time, and a storage moment that
+        has passed leaves the result standing. Only a failure that persists once the vault was read whole is
+        what the proposal adds: it is raised as it is, for the caller to refuse. Every other failure is raised
+        as it is."""
+        for attempt in range(3):
+            try:
+                with outside_journal():
+                    return read()
+            except (OSError, KelmoError) as error:
+                if (isinstance(error, KelmoError) and (isinstance(error, VaultFailure)
+                                                       or error.code not in ('E_IO', 'E_GIT'))
+                        or attempt == 2):
+                    raise
+                if attempt == 1 and not self._publishable(registry):
+                    raise VaultFailure(error.code if isinstance(error, KelmoError) else 'E_IO',
+                                       'The wiki could not be read: ' + str(error)
+                                       + '. Repair the storage, then retry the same request.') from error
+
+    def _project(self, registry, intent, **kwargs):
+        """The semantic projection of `intent`, read as `_read` reads."""
+        return self._read(registry, lambda: engine.semantic_projection(self.service.root, registry, intent,
+                                                                       **kwargs))
+
+    def _check_result(self, result, registry):
+        """Clean publication paths and the wiki budget of the registry a publication would commit, read as
+        `_read` reads."""
+        def check():
+            engine.require_clean_baseline(self.service.root, result, previous=registry)
+            engine.check_budget(self.service.root, result)
+        self._read(registry, check)
+
+    def _check_failure(self, registry, error):
+        """The VaultFailure a failed check of the registry a proposal would commit is, or None when it is the
+        proposal's own.
+
+        A path the commit would claim from its owner (`E_OWNERSHIP`) is the proposal's whatever the vault is.
+        Uncommitted edits on the paths it rewrites (`DirtyKnowledge`) are a person's, never the proposal's,
+        also when they are restored before the vault is looked at: a created page's path is claimed first,
+        so every other path the check finds dirty is one the wiki as it stands publishes too. Any other
+        failure the vault as it stands does not share (`_publishable`) appears only with what the proposal
+        adds. One it shares, or one `_read` already found the vault's, stops every publication. Contention is
+        neither: it is raised as it is."""
+        if isinstance(error, VaultFailure):
+            return error
+        if isinstance(error, KelmoError) and error.code in CONTENTION:
+            raise error
+        if isinstance(error, engine.DirtyKnowledge):
+            return VaultFailure(error.code, str(error))
+        if isinstance(error, KelmoError) and error.code == 'E_OWNERSHIP' or self._publishable(registry):
+            return None
+        if isinstance(error, KelmoError):
+            return VaultFailure(error.code, str(error))
+        return VaultFailure('E_IO' if isinstance(error, OSError) else 'E_CONFLICT',
+                            'The pages could not be checked as they stand: ' + str(error)
+                            + '. Repair the vault, then retry the same request.')
+
+    def _publishable(self, registry):
+        """Whether the vault as it stands takes a publication: its publication paths are clean, and every page
+        renders within the wiki budget (`check_budget` renders them all).
+
+        This is how a failed check of a proposal is classified. While it holds, the failure appears only with
+        what the proposal adds, so it is that proposal's own refusal; once it does not, no publication can
+        succeed and the failure is the vault's (`VaultFailure`). It is read after the failure, so a person's
+        edit that lands meanwhile leaves the tree dirty and still counts as the vault's. Contention answers
+        neither way: it is raised as it is, and the caller's request waits for its turn."""
         try:
             with outside_journal():
+                engine.require_clean_baseline(self.service.root, registry)
                 engine.check_budget(self.service.root, registry)
-        except KelmoError:
+        except KelmoError as error:
+            if error.code in CONTENTION:
+                raise
             return False
+        except (engine.WikiProblem, ValueError, RuntimeError, OSError):
+            return False
+        self.vault_passed = True
         return True
 
     def _apart(self, observation, batch, keys, dispositions, reason=None):
@@ -2499,6 +2928,13 @@ class Editor:
                                                if operation_id not in dispositions], keys, dispositions,
                                  reason=reason)
         return self._batch_result(batch[0], batch, dispositions)
+
+    def _end_collided(self, observation, collided, keys, dispositions):
+        """Send every source the answer collided with an earlier one alone, each with its own collision named."""
+        for operation_id, why in collided.items():
+            self._end_alone_attempts(observation, [operation_id], keys, dispositions,
+                                     reason='the batch answer gave it what an earlier note of the batch also '
+                                            'claims (' + why + ')')
 
     def _end_alone_attempts(self, observation, silent, keys, dispositions, reason=None, rejoin=None):
         """End the attempt of every source the batch answer left unaccounted for, spending none of its attempts.
@@ -2523,6 +2959,8 @@ class Editor:
         unresolved = observation.get('unresolved')
         ending = '; its attempt was ended without a refusal, so it spends none of them and is consulted again'
         for operation_id in silent:
+            if operation_id in dispositions:
+                continue  # already sent on its way by this call (a legacy note that also waits behind one)
             ended = self._end_attempt(self.journal.action_request(keys[operation_id]))
             if ended and rejoin:
                 dispositions[operation_id] = {'disposition': 'dropped', 'code': None,
@@ -2539,12 +2977,14 @@ class Editor:
                  'reason': 'another attempt holds this source; it stays waiting and spends no attempt'})
 
     def _retryable_batch(self, action_id, batch, code, message):
-        """An environment failure before preparation: no member row is refused, and the failure is raised.
+        """A failure of the vault before preparation: no member row is refused, and the failure is raised.
 
-        The apply pass then parks every member for it, as it parks a single source for the same failure."""
+        It names no note (`VaultFailure`): the apply pass leaves every member waiting under its own key and
+        stops. The rows keep the batch's answer, which only the call that recorded it may settle; the next
+        call ends each attempt uncharged and consults again (`_leave_batch`)."""
         for operation_id in batch:
             self._record(operation_id, 'unresolved', message, request=action_id, code=code)
-        raise KelmoError(code, message)
+        raise VaultFailure(code, message)
 
     def _finish_batch(self, batch, dispositions, keys, idem, generation, reasons):
         """Finish every member row of a batch the model declined or that proposed nothing: archive-only.
@@ -2583,8 +3023,10 @@ class Editor:
         """
         source_id = source['operation_id']
         with coordinator_lock(self.service.config):
-            # Pending publications finish first, so the model reads the generation they produce.
+            # Pending publications finish first, so the model reads the generation they produce, and no
+            # model is asked while the vault cannot take a publication.
             self._recover()
+            self._require_publishable()
             if self._dismissed(source_id):
                 raise KelmoError('E_STATE', 'This source was dismissed; it is settled without publication.')
             reset_at = self.deferred_until(source_id)
@@ -2622,7 +3064,10 @@ class Editor:
             raise
         except KelmoError as error:
             if error.code == 'E_BUSY':
-                # This attempt lost its lease: the attempt that holds it settles the request.
+                # Contention met while consulting, or this attempt lost its lease. A lease it still holds is
+                # ended, so the same key is retried at once instead of waiting out a lease nothing uses; one
+                # another attempt took stays with it (the release checks the token), and that attempt settles.
+                self.journal.action_release(operation_id, token)
                 raise
             if error.code in SETTLED_CONSULT_CODES:
                 # Fixed by the request or the model answer: settled under this attempt's token, so the
@@ -2663,8 +3108,8 @@ class Editor:
         refuse under its own code.
         """
         reader = self.service.knowledge
-        generation = reader.generation()
-        registry = reader.registry(generation)
+        generation = self._read_committed(reader.generation)
+        registry = self._read_committed(lambda: reader.registry(generation))
         facts = registry['facts']
         text = source['packet'].content.decode('utf-8')
         expansions, reconciliations, candidates, expanded, repairs, refused = [], [], [], 0, [], None
@@ -2680,10 +3125,10 @@ class Editor:
         # One model conversation per attempt: each round names it, and later rounds carry what changed.
         talk, previous = conversation.key('edit_pages', operation_id, token), None
         for round_number in range(MAX_ROUNDS):
-            view = views.editor_view(reader, generation, request['project'], request['selected'],
-                                     request['budget_tokens'], source_text=text,
-                                     evidence=source['reference'], expansions=expansions,
-                                     reconciliations=reconciliations, candidates=candidates)
+            view = self._read_committed(lambda: views.editor_view(
+                reader, generation, request['project'], request['selected'], request['budget_tokens'],
+                source_text=text, evidence=source['reference'], expansions=expansions,
+                reconciliations=reconciliations, candidates=candidates))
             if not view['scope']:
                 # Nothing this note may edit fits the budget: the model would be asked to expand a page
                 # the budget already omitted. The refusal is the request's, not the model's, and it is
@@ -2776,7 +3221,9 @@ class Editor:
                     refused['repairs'] = [item['code'] for item in repairs]
                 problem = None if len(repairs) >= MAX_REPAIRS or not getattr(executor, 'revises', True) else (
                     self._precheck(refused, registry, request, _enrolled(enrollment, work)))
-                if problem is None:
+                # As in the batch loop: once the wiki moved past the generation read here, no repair can pass,
+                # and the settle refuses the answer as stale.
+                if problem is None or self._read_committed(reader.generation) != generation:
                     return refused
                 # The editor's own repair: a refusal that names a registered page of this project gets that
                 # page sent with the next round, spending none of the model's expansions. The budget still
@@ -2912,6 +3359,19 @@ class Editor:
             return {'code': error.code, 'reason': str(error)}
         return None
 
+    def _refuse_intent(self, operation_id, source_operation_id, intent, code, message):
+        """Refuse a prepared intent at its commit.
+
+        The refusal of an intent that carries several notes is its union's and names none of them, whether it
+        comes right after the settle or at a recovery passes later (a budget lowered meanwhile, an authority
+        withdrawn). It settles as `UNION_CODE`, an uncharged refusal: the note whose row carried the commit is
+        parked without spending an attempt and asked again alone, as the notes the commit carried are once
+        their attempts end. `E_STALE` is uncharged already and keeps its code."""
+        if len(intent.get('sources') or ()) > 1 and code != 'E_STALE':
+            message = 'The batch commit was refused as a whole (' + code + '): ' + message
+            code = UNION_CODE
+        self._refuse(operation_id, source_operation_id, code, message)
+
     def _refuse(self, operation_id, source_operation_id, code, message):
         """Settle the request refused with its result and source outcome in one journal transaction."""
         self.journal.action_refuse(operation_id, code, message, outcome=_outcome('unresolved', message, code),
@@ -2919,21 +3379,68 @@ class Editor:
         raise KelmoError(code, message)
 
     def _retryable(self, operation_id, source_operation_id, code, message):
-        """An environment failure before preparation: the request stays open, and a caller that retries
-        under the same key resumes it. The apply pass parks the note instead and closes this request."""
+        """A failure of the vault before preparation: the request stays open with its recorded answer, and a
+        retry under the same key settles that answer with no model call. It refuses no note (`VaultFailure`):
+        the apply pass leaves the note waiting under the same key and stops."""
         self._record(source_operation_id, 'unresolved', message, request=operation_id, code=code)
-        raise KelmoError(code, message)
+        raise VaultFailure(code, message)
+
+    @staticmethod
+    def _read_committed(read):
+        """`read()` of committed knowledge for a consultation (its generation, its registry, the editor view),
+        read once more when it cannot read (`E_GIT`, `E_IO`, the storage's `OSError`).
+
+        A second failure to read is the vault's (`VaultFailure`): the view reads only pages the registry says
+        are committed (a selection is checked against the registry first), so no note wrote what cannot be
+        read. Every other failure (a selection, a budget) is the request's and is raised as it is."""
+        for _attempt in range(2):
+            try:
+                return read()
+            except OSError as error:
+                failure = error
+            except KelmoError as error:
+                if isinstance(error, VaultFailure) or error.code not in ('E_GIT', 'E_IO'):
+                    raise
+                failure = error
+        raise VaultFailure(failure.code if isinstance(failure, KelmoError) else 'E_IO',
+                           'The committed knowledge could not be read: ' + str(failure)
+                           + '. Repair the knowledge repository, then retry the same request.') from failure
+
+    @staticmethod
+    def _read_vault(read, stop):
+        """`read()` of the vault's own state (its generation, the working registry, committed page bytes).
+
+        No note wrote what cannot be read there, so a failure is the vault's: `stop(code, message)` records it
+        and raises its `VaultFailure`. Contention is raised as it is."""
+        try:
+            return read()
+        except VaultFailure:
+            raise
+        except KelmoError as error:
+            if error.code in CONTENTION:
+                raise
+            stop(error.code, 'The vault could not be read: ' + str(error))
+        except (engine.WikiProblem, ValueError, OSError) as error:
+            stop('E_IO' if isinstance(error, OSError) else 'E_CONFLICT',
+                 'The vault could not be read: ' + str(error) + '. Repair it, then retry the same request.')
+        raise AssertionError('stop() raises the vault failure')
 
     def _baselines(self, operation_id, source_id, generation, changes):
-        """Baselines are the pinned generation bytes the model read; a dirty page is retryable.
+        """Baselines are the pinned generation bytes the model read; a dirty page is retryable, and so is a
+        committed page that cannot be read.
 
         Created pages have an empty baseline: semantic_projection already refused any file there.
         """
         reader = self.service.knowledge
-        pinned = reader.registry(generation)['pages']
+
+        def stop(code, message):
+            self._retryable(operation_id, source_id, code, message)
+
+        pinned = self._read_vault(lambda: reader.registry(generation)['pages'], stop)
         baselines = {}
         for target, (current, _) in sorted(changes.items()):
-            committed = reader.page(target, generation).content if target in pinned else b''
+            committed = (self._read_vault(lambda: reader.page(target, generation).content, stop)
+                         if target in pinned else b'')
             if current != committed:
                 self._retryable(operation_id, source_id, 'E_CONFLICT', 'Page ' + target + ' differs from the '
                                 'committed bytes the editor read; restore them, then retry the same request.')
@@ -2958,11 +3465,15 @@ class Editor:
                                  outcomes.clipped('the editor applied nothing: ' + observation['declined'])),
                 result=_result(operation_id, 'archive-only'))
             return receipt
-        if self.service.knowledge.generation() != generation:
+        def stop(code, message):
+            self._retryable(operation_id, source_id, code, message)
+
+        if self._read_vault(self.service.knowledge.generation, stop) != generation:
             self._refuse(operation_id, source_id, 'E_STALE', 'The knowledge generation moved after the editor '
                                                              'read it; requeue the source under a new request.')
-        registry = engine.load_registry_view(self.service.root)
-        if engine.fingerprint(registry) != self.service.knowledge.registry_fingerprint(generation):
+        registry = self._read_vault(lambda: engine.load_registry_view(self.service.root), stop)
+        if engine.fingerprint(registry) != self._read_vault(
+                lambda: self.service.knowledge.registry_fingerprint(generation), stop):
             self._retryable(operation_id, source_id, 'E_CONFLICT', 'The working registry differs from the '
                             'generation the editor read; restore the committed registry, then retry the same '
                             'request.')
@@ -3028,25 +3539,28 @@ class Editor:
             # Includes the commit's managed-link audit on this projection, before anything is prepared. Renders
             # and audits read files only, so interactive writes go first meanwhile; publishers wait on the worker
             # lock this request holds.
-            with outside_journal():
-                result, changes = engine.semantic_projection(self.service.root, registry, intent, result=result)
+            result, changes = self._project(registry, intent, result=result)
         except (engine.OwnershipConflict, engine.SemanticRefusal) as error:
             self._refuse(operation_id, source_id, error.code, str(error))
-        except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
-            # Render failures come from page bytes or the environment, not the proposal: retryable.
-            self._retryable(operation_id, source_id, 'E_CONFLICT', 'The pages could not be rendered: '
-                            + str(error) + '. Repair the page, then retry the same request.')
+        except (KelmoError, engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
+            # Unreadable or unrenderable pages stop every publication: retryable, and the note is not refused.
+            # A vault that takes a publication without this proposal and not with it was broken by the proposal.
+            failure = self._render_failure(registry, error)
+            if failure is not None:
+                self._retryable(operation_id, source_id, failure.code, str(failure))
+            self._refuse(operation_id, source_id, 'E_PROPOSAL', 'The proposal leaves a page that cannot be '
+                         'rendered: ' + str(error))
         try:
             # Every file the real publication writes (all registered pages, the registry and the
-            # manifest) must be clean, and the next generation must fit the wiki budget; both stay
-            # retryable here, before any intent exists.
-            with outside_journal():
-                engine.require_clean_baseline(self.service.root, result, previous=registry)
-                engine.check_budget(self.service.root, result)
-        except KelmoError as error:
-            if error.code == 'E_OWNERSHIP':
-                self._refuse(operation_id, source_id, error.code, str(error))
-            self._retryable(operation_id, source_id, error.code, str(error))
+            # manifest) must be clean, and the next generation must fit the wiki budget, before any
+            # intent exists. A dirty path, unreadable pages or a wiki over its budget as it stands stop
+            # every publication and stay retryable; a failure only this note's addition causes is its own.
+            self._check_result(result, registry)
+        except (KelmoError, engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
+            failure = self._check_failure(registry, error)
+            if failure is not None:
+                self._retryable(operation_id, source_id, failure.code, str(failure))
+            self._refuse(operation_id, source_id, *_own_check_refusal(error))
         baselines = self._baselines(operation_id, source_id, generation, changes)
         proposal = KnowledgeProposal(operation_id, generation, tuple(
             KnowledgeChange(path, hashlib.sha256(baselines.get(path, b'')).hexdigest(), after, (reference,))
@@ -3086,8 +3600,9 @@ class Editor:
                 if self.service._operation_origin(source_id) is not trusted:
                     raise ValueError('The source owner differs from the rule-change origin.')
             except (ValueError, KeyError, TypeError, KelmoError) as error:
-                self._refuse(operation_id, source_id, 'E_ORIGIN', 'The prepared rule change lost its requester '
-                             'authority before publication: ' + str(error))
+                self._refuse_intent(operation_id, intent['source_operation_id'], intent, 'E_ORIGIN',
+                                    'The prepared rule change of note ' + source_id + ' lost its requester '
+                                    'authority before publication: ' + str(error))
 
     def _complete(self, operation_id):
         """Publish one prepared intent, or recognize its committed generation, then store the receipt."""
@@ -3115,20 +3630,35 @@ class Editor:
                     engine.publish_semantic(self.service.root, operation_id)
             except KelmoError as error:
                 # Typed refusals are final for this intent; environment failures keep it prepared so a
-                # retry or the next recovery publishes it without another model call.
-                if error.code not in REFUSAL_CODES:
+                # retry or the next recovery publishes it without another model call. A budget refusal is the
+                # intent's only while the wiki fits its budget as it stands: a budget lowered after the prepare
+                # stops every publication, and the intent waits for the repair like any failure of the vault.
+                if error.code not in REFUSAL_CODES or (error.code == BUDGET_CODE
+                                                       and not self._publishable(registry)):
                     # Contention settles nothing: the intent stays prepared and publishes on its turn.
-                    if error.code not in ('E_BUSY', 'E_CLAIM'):
-                        self._record(source_id, 'unresolved', 'prepared publication not committed: ' + str(error),
-                                     request=operation_id, code=error.code)
-                    raise
-                self._refuse(operation_id, source_id, error.code, str(error))
+                    if error.code in CONTENTION:
+                        raise
+                    self._record(source_id, 'unresolved', 'prepared publication not committed: ' + str(error),
+                                 request=operation_id, code=error.code)
+                    # Every later publication now waits behind this intent (`recover_publications`).
+                    if isinstance(error, VaultFailure):
+                        raise
+                    raise VaultFailure(error.code, 'The prepared publication of note ' + source_id
+                                       + ' could not be committed: ' + str(error)) from error
+                self._refuse_intent(operation_id, source_id, intent, error.code, str(error))
             except engine.Conflict as error:
                 # The baseline moved between the check above and the publication lock: stale, final.
-                self._refuse(operation_id, source_id, 'E_STALE', str(error))
+                self._refuse_intent(operation_id, source_id, intent, 'E_STALE', str(error))
+            except OSError as error:
+                # The wiki's files could not be written or read: the intent stays prepared, as for any other
+                # failure of the vault, and every later publication waits behind it.
+                self._record(source_id, 'unresolved', 'prepared publication not committed: ' + str(error),
+                             request=operation_id, code='E_IO')
+                raise VaultFailure('E_IO', 'The prepared publication of note ' + source_id
+                                   + ' could not be committed: ' + str(error)) from error
         generation = self.service.knowledge.generation()
         if self.service.knowledge.registry_fingerprint(generation) != intent['result_digest']:
-            raise KelmoError('E_PUBLICATION', 'The committed generation lacks the prepared editor registry.')
+            raise VaultFailure('E_PUBLICATION', 'The committed generation lacks the prepared editor registry.')
         reference = EvidenceRef.from_dict(intent['evidence_ref'])
         receipt = OperationReceipt(operation_id, intent['idempotency_key'], intent['source_id'], 'published',
                                    (reference,), generation=generation)
@@ -3144,8 +3674,109 @@ class Editor:
         return receipt
 
     def _recover(self):
-        """The shared recovery: the common transaction, then every prepared intent in preparation order."""
-        recover_publications(self.service)
+        """The shared recovery: the common transaction, every prepared intent in preparation order, then an
+        interrupted project rename or addition (`recover_publications`).
+
+        Recovery raises while one of them stays unfinished, and every later publication waits behind it: no
+        note can be published until a person repairs it, so the failure is the vault's (`VaultFailure`).
+        Contention passes by itself and stays what it is.
+        """
+        try:
+            recover_publications(self.service)
+        except VaultFailure:
+            raise
+        except KelmoError as error:
+            if error.code in CONTENTION:
+                raise
+            raise VaultFailure(error.code, self._stuck() + ': ' + str(error)) from error
+        except sqlite3.Error as error:
+            if sqlite_busy(error):
+                raise
+            raise VaultFailure('E_IO', self._stuck() + ': ' + str(error)) from error
+        except AssertionError:
+            raise  # a broken invariant (the baton's among them) is a defect, not the vault's state
+        except Exception as error:  # noqa: BLE001 - whatever stops the recovery stops every later publication
+            # `E_PROCESSING` is the code an operation run records for the same fault (`Service.run`), which the
+            # worker retries as transient; a code it does not retry would leave that operation failed for good.
+            raise VaultFailure('E_IO' if isinstance(error, OSError) else 'E_PROCESSING',
+                               self._stuck() + ' (' + type(error).__name__ + '): ' + str(error)) from error
+
+    def _stuck(self):
+        """What a failed recovery stops at, so the owner repairs, dismisses or requeues the right note: the
+        prepared publication of a note when one is prepared, else the wiki's own unfinished operation (its
+        common transaction, or a project rename or addition), which names no note."""
+        try:
+            for action_id in self.journal.prepared_semantic():
+                source = (self.journal.action_intent(action_id) or {}).get('source_operation_id')
+                if source:
+                    return ('A prepared publication of note ' + source + ' cannot be finished, and every '
+                            'later one waits behind it')
+        except Exception:  # noqa: BLE001 - the message names what it can; the failure itself is raised either way
+            pass
+        return ('An unfinished wiki operation (its transaction, or a project rename or addition) cannot be '
+                'finished, and every publication waits behind it')
+
+    def _require_publishable(self, *, whole=False):
+        """Refuse to start a consultation while no publication can succeed (`VaultFailure`): nothing is charged
+        and the request stays as it is.
+
+        Every path a publication rewrites must be clean: a dirty path stops every commit, and the check is one
+        `git status`. With `whole`, the wiki must also render and fit its budget as it stands, which renders
+        every page. The batch asks for that: a batch answer the vault refuses is never resumed (only the call
+        that recorded it may settle it), so without the check a vault that stays broken would cost one batch
+        conversation on every pass. A single note's answer is resumed with no model call, so the single path
+        does not pay the render. A check that cannot read (the storage's `OSError`, a reader's `E_IO`, a Git
+        command's `E_GIT`) is run once more before it stops the pass, as `_read_committed` reads."""
+        reader = self.service.knowledge
+        if not reader.adopted():
+            return
+        for attempt in range(2):
+            try:
+                with outside_journal():
+                    engine.require_clean_baseline(self.service.root, reader.registry(reader.generation()))
+                    if whole:
+                        engine.check_budget(self.service.root, engine.load_registry_view(self.service.root))
+                # Only the whole check says the vault takes a publication: a clean tree alone leaves the budget
+                # and the render unread (`_publishable` sets it too, once it has read them).
+                if whole:
+                    self.vault_passed = True
+                return
+            except KelmoError as error:
+                if error.code in CONTENTION:
+                    raise
+                if attempt == 0 and error.code in ('E_IO', 'E_GIT') and not isinstance(error, VaultFailure):
+                    continue
+                raise VaultFailure(error.code, str(error)) from error
+            except (engine.WikiProblem, ValueError, RuntimeError, OSError) as error:
+                if attempt == 0 and isinstance(error, OSError):
+                    continue
+                raise VaultFailure('E_IO' if isinstance(error, OSError) else 'E_CONFLICT',
+                                   'The pages could not be rendered as they stand: ' + str(error)
+                                   + '. Repair the page, then retry the same request.') from error
+
+    def _render_failure(self, registry, error):
+        """The VaultFailure a failed projection is, or None when it is the proposal's own.
+
+        A projection renders every registered page before and after the change. Uncommitted edits, or a wiki
+        that does not render, cannot be read or does not fit its budget as it stands, stop every publication;
+        a vault that takes a publication without the proposal and not with it was broken by what the proposal
+        says, an unreadable file included (`_publishable`). A failure `_read` already classified as the vault's
+        stays so. Contention is neither: it is raised as it is.
+        """
+        if isinstance(error, VaultFailure):
+            return error
+        if isinstance(error, KelmoError) and error.code in CONTENTION:
+            raise error
+        if not isinstance(error, engine.DirtyKnowledge) and self._publishable(registry):
+            return None
+        if isinstance(error, KelmoError):
+            return VaultFailure(error.code, 'The pages could not be projected as they stand: ' + str(error)
+                                + '. Repair the vault, then retry the same request.')
+        if isinstance(error, OSError):
+            return VaultFailure('E_IO', 'The pages could not be read: ' + str(error)
+                                + '. Repair the storage, then retry the same request.')
+        return VaultFailure('E_CONFLICT', 'The pages could not be rendered: ' + str(error)
+                            + '. Repair the page, then retry the same request.')
 
     def deferred_until(self, source_operation_id):
         """The provider quota reset recorded for this source that is still ahead, or None."""

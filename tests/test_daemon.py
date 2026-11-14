@@ -115,9 +115,12 @@ def test_exhausted_source_retries_are_settled_as_unresolved(service, monkeypatch
     with service.journal.conn:
         service.journal.conn.execute('UPDATE worker_retries SET eligible=0')
     tick(service, max_attempts=2)
-    # Each failed attempt records why it stopped; exhaustion replaces that with the final reason.
-    assert service.journal.get(operation['id'])['outcome'] == {'disposition': 'unresolved',
-                                                               'reason': 'E_PROCESSING: dirty wiki'}
+    # Each failed attempt records why it stopped; exhaustion replaces that with the final reason. A prepared
+    # publication the recovery cannot finish stops every later one, so the reason names that note.
+    outcome = service.journal.get(operation['id'])['outcome']
+    assert outcome['disposition'] == 'unresolved', outcome
+    assert outcome['reason'].startswith('E_PROCESSING: A prepared publication of note ' + operation['id']), outcome
+    assert outcome['reason'].endswith('(RuntimeError): dirty wiki'), outcome
     settled = tick(service, max_attempts=2)
     assert settled['failed_attempts'] == [{'operation_id': operation['id'], 'error_code': 'E_ATTEMPTS',
                                            'attempts': 2, 'exhausted': True}]

@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 
-from .errors import KelmoError, Stopping, sqlite_busy
+from .errors import KelmoError, Stopping, VaultFailure, sqlite_busy
 from . import outcomes, quota
 from .journal import when_free
 
@@ -435,10 +435,11 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         if state == 'exhausted':
             failed_attempts.append({'operation_id': operation['id'], 'error_code': 'E_ATTEMPTS',
                                     'attempts': attempts, 'exhausted': True})
-    processed = 0
+    processed, vault_failed = 0, False
     with step():
         # A list, not the generator: its body reads the journal and must run inside the step.
         runnable = list(runnable_operations(service, argv))
+    service.editor.vault_passed = False
     for operation_id in runnable:
         if processed >= 20 or stopping():
             break
@@ -446,13 +447,25 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
             with step():
                 if service.journal.get(operation_id)['intent'] == 'create':
                     from .creation import CommandExecutor
-                    service.run(operation_id, executor=CommandExecutor(argv, timeout, stopping) if argv else None)
+                    ran = service.run(operation_id,
+                                      executor=CommandExecutor(argv, timeout, stopping) if argv else None)
                 else:
-                    service.run(operation_id)
+                    ran = service.run(operation_id)
             processed += 1
+            if (ran or {}).get('state') == 'applied':
+                from .alerts import VaultWatch
+                VaultWatch.for_service(service).published()
         except KelmoError as error:
             if stopping():
                 break  # a failure the stop caused (a call no core answers any more) is not the operation's
+            if isinstance(error, VaultFailure):
+                # No note can be published until the vault is repaired: this one keeps its key and its row, the
+                # owner is told, and the tick tries no further note, since each would meet the same failure.
+                from .alerts import VaultWatch
+                skipped.append({'operation_id': operation_id, 'error_code': error.code})
+                VaultWatch.for_service(service).blocked(operation_id, error.code, str(error))
+                vault_failed = True
+                break
             if error.code not in ('E_BUSY', 'E_CLAIM'):
                 raise
             skipped.append({'operation_id': operation_id, 'error_code': error.code})
@@ -462,6 +475,11 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
             skipped.append({'operation_id': operation_id, 'error_code': 'E_BUSY'})
         except Stopping:
             break
+    if not vault_failed and service.editor.vault_passed:
+        # As in the apply pass: the vault took a publication check and nothing stopped the tick, so an outage
+        # on record is over even when no note was applied (one that was has closed it already).
+        from .alerts import VaultWatch
+        VaultWatch.for_service(service).published(applied=False)
     if stopping():
         result = {'operations': processed, 'resolutions': 0, 'stopped': True}
         for name, items in (('skipped', skipped), ('failed_attempts', failed_attempts)):

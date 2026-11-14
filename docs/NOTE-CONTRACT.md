@@ -58,10 +58,16 @@ A refused editor attempt (a malformed proposal, a wrong receipt, a stale
 generation, an executor that returned no usable answer) is never final by
 itself: the source parks (state `parked`, outcome `unresolved` with the
 refusal), and the next `kelmo dream apply` pass consults the model again with
-that refusal as its first hint. The third charged refusal fails the source (a stale-generation `E_STALE` refusal is retried uncharged up to five times) and
+that refusal as its first hint. The third charged refusal fails the source and
 alerts the vault owner through `[alerts]`, since a note the model could not
-place three times needs a person. Infrastructure waits (quota, a lost login, a
-busy claim) are never charged as attempts.
+place three times needs a person. Refusals the vault causes rather than the note
+(among them a moved generation `E_STALE`, a request changed by a raised budget
+or a renamed project `E_IDEMPOTENCY`, a batch commit refused as a whole
+`E_UNION`) are retried uncharged, up to five times in all, and the newer notes of
+the same project wait for that note until the next pass. Infrastructure waits
+(quota, a lost login, a busy claim) are never charged as attempts, and a vault
+that takes no publication at all (a commit that cannot be written, uncommitted
+edits, a wiki over its budget) stops the pass without charging any note.
 
 `[editor] mode = "nightly"` holds every archived note for the Dreaming pass:
 the worker archives it and records `awaiting_dreaming`; `kelmo dream apply`

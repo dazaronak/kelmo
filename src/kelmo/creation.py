@@ -11,7 +11,7 @@ import time
 
 from . import outcomes, quota, stopping
 from .daemon import execute, validate_config
-from .errors import HeadRefusal, KelmoError, Stopping, sqlite_busy
+from .errors import VAULT_REFUSALS, HeadRefusal, KelmoError, Stopping, VaultFailure, sqlite_busy
 from .journal import now as journal_now
 from .executor import ModelOutcome, normalize_answer
 from .wiki import engine, pages
@@ -299,8 +299,18 @@ def _editor_request(service, request):
     single-source and the batched path read a stored request: the request keeps `new_work` and selects
     that page, which is how the editor tells an opening request from one whose page is already there.
     A request never rewrites its captured metadata, exactly as `current_request` never does; a target
-    registered as a page of another kind is left unresolved and stays the editor's refusal."""
-    registry = engine.load_registry_view(service.root)
+    registered as a page of another kind is left unresolved and stays the editor's refusal.
+
+    The working registry is the vault's: a registry that cannot be read names no note (`VaultFailure`)."""
+    try:
+        registry = engine.load_registry_view(service.root)
+    except KelmoError as error:
+        if error.code in UNCHARGED or isinstance(error, VaultFailure):
+            raise
+        raise VaultFailure(error.code, 'The working registry could not be read: ' + str(error)) from error
+    except (engine.WikiProblem, ValueError, OSError) as error:
+        raise VaultFailure('E_IO' if isinstance(error, OSError) else 'E_CONFLICT',
+                           'The working registry could not be read: ' + str(error)) from error
     request = current_request(registry, request)
     result = {name: value for name, value in request.items() if name not in ('pending',)}
     result['budget_tokens'] = max(request['budget_tokens'], service.config.editor_budget)
@@ -310,13 +320,18 @@ def _editor_request(service, request):
     return result
 
 
-# Refusals the vault itself causes: the generation moved while the model was consulted (E_STALE), the
-# outcome store refused the reason of a publication (E_OUTCOME), the controller enrollment did not match
-# the pages a proposal would change (E_BINDING). None of them is the note's own content, so the note is
-# parked and retried with a fresh baseline like any refusal; the first FREE_STALE_REFUSALS of them are not
-# charged, so a busy wiki or a broken vault delays a note without failing it, and a note that meets the
-# same refusal forever still ends in the owner's alert instead of consulting the model endlessly.
-UNCHARGED_REFUSALS = ('E_STALE', 'E_OUTCOME', 'E_BINDING')
+# Refusals the vault itself causes (`errors.VAULT_REFUSALS`): the generation moved while the model was
+# consulted (E_STALE), the outcome store refused the reason of a publication (E_OUTCOME), the controller
+# enrollment did not match the pages a proposal would change (E_BINDING), the note's stored request changed
+# under the request its attempt had opened, because the vault's budget was raised or its project renamed
+# since (E_IDEMPOTENCY), the commit of a batch was refused as a whole, which names none of its notes (E_UNION).
+# None of them is the note's own content, so the note is parked and retried with a fresh baseline under a
+# new key like any refusal; the first FREE_STALE_REFUSALS of them are not charged, so a busy wiki or a
+# changed configuration delays a note without failing it, and a note that meets the same refusal forever
+# still ends in the owner's alert instead of consulting the model endlessly. Its claim is still to come, so
+# its project waits for it for the rest of the pass (`apply_pending`). A failure under which no note can be
+# published at all (`VaultFailure`) parks nothing: the pass leaves every note waiting and stops.
+UNCHARGED_REFUSALS = VAULT_REFUSALS
 FREE_STALE_REFUSALS = 5
 
 
@@ -375,7 +390,17 @@ def park(service, operation_id, error, token, attempts):
     The source's next attempt runs under a new request key, so the open requests of this one are closed
     here with the refusal that parked it, before the source changes state: a pass that dies in between
     finds a refused request and parks the source for it on its next turn.
+
+    A source whose publication is decided is never parked, whatever the refusal: a prepared intent carries
+    it (the recovery finishes or refuses it under the key it has now), or a finished batch intent carries it
+    while its own row still waits to be settled from that commit (its next turn settles it with no model
+    call). Parking it would consult the model again under a new key while its facts are published under this
+    one. It raises `E_BUSY` instead, which every caller treats as a wait that charges nothing.
     """
+    if (operation_id in service.editor.awaiting_publication()
+            or service.editor.published_by_batch(operation_id)):
+        raise KelmoError('E_BUSY', 'The publication of this note is decided; it settles from that publication '
+                                   'before the note is consulted again.')
     service.journal.refuse_open_semantic(operation_id, error.code, str(error))
     reason = outcomes.repair_reason(error.code, error)
     if not _free_refusal(service.trace(operation_id), error) and attempts + 1 >= PARK_ATTEMPTS:
@@ -429,29 +454,29 @@ def publish(service, operation_id, request, executor=None, *, now=False):
     if token is None:
         raise KelmoError('E_BUSY', 'This source is already being edited.')
     try:
+        if service.editor.settle_published(operation_id):
+            # A publication settled this note and the pass that made it died before staging it: it is staged
+            # from that publication before its origin or its stored request is read, so neither can refuse it.
+            service.journal.stage(operation_id, 'applied', terminal=True, claim_token=token)
+            return service.journal.get(operation_id)
         key, hint, attempts = _attempt(service, operation_id)
         try:
             service.editor.edit(operation_id, origin=service._operation_origin(operation_id),
                                 idempotency_key=key, executor=executor, contexts=service.context_bindings,
-                                hint=hint, **_editor_request(service, request))
+                                hint=hint, own_key=True, **_editor_request(service, request))
         except quota.QuotaWait:
             return service.journal.get(operation_id)
         except KelmoError as error:
             if stopping.requested():
                 raise Stopping() from error  # the core's stop caused it; the note waits, uncharged
-            if error.code in UNCHARGED:
+            if error.code in UNCHARGED or isinstance(error, VaultFailure):
+                # Contention, or a vault that takes no publication: the note keeps its key and its row.
                 raise
             return park(service, operation_id, error, token, attempts)
         service.journal.stage(operation_id, 'applied', terminal=True, claim_token=token)
         return service.journal.get(operation_id)
     finally:
         service.journal.release(operation_id, token)
-
-
-# A batch failure that names the batch's shape rather than a member's content: only the batch's head is
-# charged for it, because that is the source the editor could not consult. The rest of the batch spent no
-# model call of its own and stays waiting, exactly as a source dropped by the budget shrink does.
-BATCH_SHAPE = ('E_STATE', 'E_ORIGIN', 'E_PERMISSION', 'E_RECEIPT')
 
 
 def _batchable(service, operation, request):
@@ -525,18 +550,26 @@ def publish_batch(service, batch, executor):
     attempt. A dropped source stays waiting for the next batch of the same pass; one another attempt holds
     waits for the next pass, with the notes of its project behind it.
 
-    A refusal that is the head's alone (`BATCH_SHAPE`, `HeadRefusal`, or the head's own unreadable request)
-    charges the head and leaves the rest waiting. The head is the source the editor led with, which is a
+    A refusal that is the head's alone (`HeadRefusal`, raised where the head's own evidence, selection,
+    origin, dismissal or budget is what fails, or the head's own unreadable request) charges the head and
+    leaves the rest waiting. Ownership decides, never the code: the same code raised by the conversation
+    names no note. The head is the source the editor led with, which is a
     later one when the oldest is settled already. A later source with such a problem of its own (its key
     names a different request, its selection names a page that is gone, its evidence cannot be read) ends
-    the batch before it and meets that refusal at the head of a later batch. Any other refusal raised for
-    the batch as a whole is the vault's or the environment's, and every claimed member is parked for it, as
-    each would be alone. One kind of member is never parked: a source a prepared intent carries. Its
-    publication is the recovery's to finish or refuse, so it waits (`E_BUSY`), uncharged, with the notes of
-    its project behind it.
+    the batch before it and meets that refusal at the head of a later batch. A failure under which no note
+    can be published (`VaultFailure`: a prepared publication the recovery cannot finish, a commit that
+    cannot be written, a dirty working tree, a wiki over its budget or unrenderable as it stands) refuses no
+    member: each keeps its key and its row and waits, named with the failure (`blocked`), and the pass stops.
+    Any other refusal raised for the batch as a whole names no member either: each one is handed back to run
+    alone in the same pass (`alone`), uncharged, where it meets whatever is its own. A member whose
+    publication is decided is never parked (`park`): it waits (`E_BUSY`), uncharged, with the notes of its
+    project behind it. Whatever refusal ends the call, a member whose row finished in it, or before it, has
+    published and is staged `applied` here; after a fault that is no refusal, such a member is staged on its
+    own turn in the same pass, from the commit, with no model call (`settle_published`).
 
     Returns {operation_id: {'state': 'applied' | 'parked' | 'failed' | 'deferred' | 'waiting',
-    'code': the refusal or contention code, or None}} for every source of the batch. A `waiting` source
+    'code': the refusal or contention code, or None}} for every source of the batch, and `'blocked'` (the
+    failure's text) on every member a vault failure left waiting. A `waiting` source
     spent no attempt: it is still in the waiting list and may join the next batch of the same pass, except
     the one the answer named `alone`, which carries `'alone': True` and is sent through the single-source
     path by this same pass (see `apply_pending`).
@@ -545,11 +578,24 @@ def publish_batch(service, batch, executor):
 
     def parked(operation_id, error):
         """Park a claimed source for `error` and name where that left it. A source whose publication is
-        prepared is not parked: the recovery finishes or refuses it, so it waits, uncharged."""
-        if operation_id in service.editor.awaiting_publication():
-            return {'state': 'waiting', 'code': 'E_BUSY'}
-        row = park(service, operation_id, error, claimed[operation_id], attempts[operation_id])
+        decided is not parked (`park` raises `E_BUSY`): a prepared one is finished or refused by the recovery,
+        a committed one settles from its commit, so it waits, uncharged."""
+        try:
+            row = park(service, operation_id, error, claimed[operation_id], attempts[operation_id])
+        except KelmoError as busy:
+            if busy.code not in UNCHARGED:
+                raise
+            return {'state': 'waiting', 'code': busy.code}
         return {'state': 'failed' if row['state'] == 'failed' else 'parked', 'code': error.code}
+
+    def applied(operation_id):
+        service.journal.stage(operation_id, 'applied', terminal=True, claim_token=claimed[operation_id])
+        return {'state': 'applied', 'code': None}
+
+    def published(error):
+        """The members whose rows finished before `error` ended the call: published, so they settle now."""
+        return {operation_id: applied(operation_id) for operation_id in getattr(error, 'settled', ())
+                if operation_id in claimed}
 
     # What ended the batch early: 'E_CLAIM' when another attempt holds the next source, which holds the
     # sources behind it back; None when the next source's own request could not be read, which only ends
@@ -571,7 +617,7 @@ def publish_batch(service, batch, executor):
             except KelmoError as error:
                 if stopping.requested():
                     raise Stopping() from error
-                if error.code in UNCHARGED:
+                if error.code in UNCHARGED or isinstance(error, VaultFailure):
                     raise
                 if items:
                     # A later source whose stored request cannot be read ends the batch before it. It is
@@ -592,24 +638,40 @@ def publish_batch(service, batch, executor):
         try:
             result = service.editor.edit_batch(items, origin=origins[head], executor=executor,
                                                contexts=service.context_bindings)
-        except quota.QuotaWait:
+        except quota.QuotaWait as wait:
+            done = published(wait)
             return dict(waiting, **{operation_id: {'state': 'deferred', 'code': 'E_QUOTA'}
-                                    for operation_id in claimed})
+                                    for operation_id in claimed if operation_id not in done}, **done)
         except KelmoError as error:
             if stopping.requested():
                 raise Stopping() from error  # the core's stop caused it; every member waits, uncharged
+            done = published(error)
             if error.code in UNCHARGED:
+                if done:
+                    # Contention ends the call, and the notes it published settle anyway; the rest wait.
+                    return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code}
+                                            for operation_id in claimed if operation_id not in done}, **done)
                 raise
-            if error.code in BATCH_SHAPE or isinstance(error, HeadRefusal):
+            if isinstance(error, VaultFailure):
+                # No note can be published until the vault is repaired. None of them is refused for that: each
+                # keeps its key and its row, and the pass stops at it (`blocked` names the failure).
+                return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code,
+                                                       'blocked': str(error)}
+                                        for operation_id in claimed if operation_id not in done}, **done)
+            if isinstance(error, HeadRefusal):
                 # The batch itself could not be opened (its head is dismissed, unarchivable, unowned), or it
                 # shrank to a head the budget cannot carry: only the head is charged for it, exactly as a
                 # single source would be. The head is the source the editor led with, which is a later one
                 # when the oldest was settled by a pass that died before it recorded that.
                 head = getattr(error, 'lead', head)
                 return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code}
-                                        for operation_id in claimed if operation_id != head},
-                            **{head: parked(head, error)})
-            return dict(waiting, **{operation_id: parked(operation_id, error) for operation_id in claimed})
+                                        for operation_id in claimed if operation_id not in done and operation_id != head},
+                            **done, **({head: parked(head, error)} if head not in done else {}))
+            # Any other refusal raised for the batch as a whole names no note of it, like a fault that is no
+            # Kelmo refusal: each note not settled takes the single-source path in this same pass, uncharged, and
+            # meets there whatever is its own. A note a commit of this batch carried settles from it there.
+            return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code, 'alone': True}
+                                    for operation_id in claimed if operation_id not in done}, **done)
         outcome = dict(waiting)
         for operation, _request, _origin in batch:
             operation_id = operation['id']
@@ -618,8 +680,7 @@ def publish_batch(service, batch, executor):
             disposition = result['dispositions'].get(operation_id) or {}
             kind = disposition.get('disposition')
             if kind in ('applied', 'settled', 'archive-only'):
-                service.journal.stage(operation_id, 'applied', terminal=True, claim_token=claimed[operation_id])
-                outcome[operation_id] = {'state': 'applied', 'code': None}
+                outcome[operation_id] = applied(operation_id)
             elif kind == 'refused':
                 outcome[operation_id] = parked(operation_id, KelmoError(disposition['code'], disposition['reason']))
             elif kind == 'alone':
@@ -779,6 +840,11 @@ def waiting_by_project(connection, registry=None):
     return first_pass_by_project(pairs)
 
 
+# Why the pass left the note it could not get past, by the code it stopped at.
+HELD_REASONS = {'E_CLAIM': 'held by another attempt',
+                'E_BUSY': 'busy: another attempt, or its own prepared publication, holds it'}
+
+
 def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.time, ready=False,
                   should_stop=None, step=None):
     """One `kelmo dream apply` pass: publish every note captured before the pass began through the
@@ -804,6 +870,15 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     spends a second batch conversation in the pass that already sent it alone. The result counts what
     happened, by operation id, and names in `waiting` what it left: {project: notes of this pass's own
     snapshot it did not settle}, so a scheduler can read how much work remains without a second pass.
+
+    A failure under which no note can be published (`VaultFailure`) ends the pass where it is met: every note
+    still waiting keeps its key, its row and its place, and none is charged, because none caused it. The
+    result names it in `blocked` ({operation_id, error_code, reason}), and the vault owner is told once when
+    such an outage starts, once a day while it lasts and once when a pass applies a note again, or gets past
+    the vault's checks and stops at nothing (`alerts.VaultWatch`). The failure is checked before any model
+    is asked, where it can be (the recovery, a dirty working tree and, for a batch, the whole wiki's render
+    and budget); a single note keeps the answer it paid for, so a vault that stays broken costs no
+    conversation on later passes.
 
     With `ready` (the CLI's `--ready`) the pass runs over ready projects only: a project is ready when at
     least `[editor] batch_ready_sources` of its notes wait for their first pass (state `archived`; a parked
@@ -852,6 +927,10 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     # `held_back` names, per project, the note the pass could not get past. Every note captured after it has
     # left the pass, so a note that is held later is older than the one named: the newest hold replaces it.
     seen, held_back = set(), {}
+    # The vault failure the pass stopped at, as (note, code, reason): no note can be published past it.
+    stopped = None
+    # Whether a consultation of this pass got past the vault's checks (`Editor.vault_passed`).
+    service.editor.vault_passed = False
     # The sources this pass already sent through a batch whose answer never accounted for them: each of
     # them runs the single-source path in this same pass, so `batch_members` never takes one of them into
     # a batch again and no later batch of the pass spends a second conversation on a note that is about
@@ -886,8 +965,8 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                                 or place[operation['id']] < first_held):
                             continue
                         seen.add(operation['id'])
-                        reason = ('held by another attempt' if operation['id'] == blocker
-                                  else 'held back by the older note ' + blocker)
+                        reason = (HELD_REASONS.get(code, 'left waiting (' + str(code) + ')')
+                                  if operation['id'] == blocker else 'held back by the older note ' + blocker)
                         report['skipped'].append({'operation_id': operation['id'], 'error_code': code,
                                                   'reason': reason})
                 waiting = [(operation, request) for operation, request in waiting if operation['id'] not in seen]
@@ -934,8 +1013,12 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                 continue
             batch = []
             try:
+                # A head whose publication is decided takes the single-source turn, which settles it from that
+                # publication before anything else of the turn can refuse it (`publish`).
                 batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)),
-                                       alone=alone) if service.config.batch_apply else [])
+                                       alone=alone)
+                         if service.config.batch_apply and not service.editor.publication_decided(operation['id'])
+                         else [])
                 if len(batch) > 1:
                     # One conversation and one commit for the head of the waiting list and the later sources
                     # of its project; each member still settles on its own row and in its own bucket.
@@ -950,15 +1033,24 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                         seen.add(operation_id)
                         report[item['state']].append(operation_id)
                         moved = True
-                    # The earliest member this batch could not claim, or one its quota deferral left
-                    # unconsulted, holds the rest of its project back for the rest of the pass: a batch never
-                    # passes an older note, and the pass must not start a later batch of that project that
-                    # does. A source the batch dropped for its own budget (`E_BUDGET`, which no other attempt
-                    # stands behind) or left behind an older note (no code) keeps its place in the next batch.
+                    blocked = [member['id'] for member, _request, _origin in batch
+                               if (outcome.get(member['id']) or {}).get('blocked')]
+                    if blocked:
+                        # No note can be published until the vault is repaired: every note keeps its turn.
+                        stopped = (blocked[0], outcome[blocked[0]]['code'], outcome[blocked[0]]['blocked'])
+                        break
+                    # The earliest member this batch could not claim, one its quota deferral left unconsulted,
+                    # or one parked for a refusal the vault caused (its claim is still to come, as on the
+                    # single-source path below) holds the rest of its project back for the rest of the pass: a
+                    # batch never passes an older note, and the pass must not start a later batch of that
+                    # project that does. A source the batch dropped for its own budget (`E_BUDGET`, which no
+                    # other attempt stands behind) or left behind an older note (no code) keeps its place in
+                    # the next batch.
                     for member, _request, _origin in batch:
                         item = outcome.get(member['id']) or {}
-                        if item.get('state') == 'deferred' or (item.get('state') == 'waiting'
-                                                               and item.get('code') in UNCHARGED):
+                        if (item.get('state') == 'deferred'
+                                or item.get('state') == 'waiting' and item.get('code') in UNCHARGED
+                                or item.get('state') == 'parked' and item.get('code') in UNCHARGED_REFUSALS):
                             held_back[batch[0][1]['project']] = (member['id'], item.get('code') or 'E_CLAIM')
                             break
                     if not moved and not sent_alone:
@@ -981,6 +1073,11 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                     held_back[request['project']] = (operation['id'], 'E_QUOTA')
                     continue
                 result = publish(service, operation['id'], request, executor, now=True)
+            except VaultFailure as error:
+                # No note can be published until the vault is repaired, so no further note is tried: each one
+                # would meet the same failure. This note keeps its key, its row and its turn.
+                stopped = (operation['id'], error.code, str(error))
+                break
             except (KelmoError, sqlite3.Error) as error:
                 contention = (sqlite_busy(error) if isinstance(error, sqlite3.Error)
                               else error.code in UNCHARGED)
@@ -1027,6 +1124,27 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                 # The consultation met a quota signal and the note is still archived: its project waits for
                 # its reset instead of letting the notes behind it publish ahead of it.
                 held_back[request['project']] = (operation['id'], 'E_QUOTA')
+            elif bucket == 'parked' and result.get('error_code') in UNCHARGED_REFUSALS:
+                # Refused for a reason the vault caused (a generation that moved, a request that changed under
+                # its open row, a union refused whole): the note is asked again on the next pass and its claim
+                # is still to come, so its project waits for it. A newer note may correct an older one, and the
+                # other order would leave the older claim standing.
+                held_back[request['project']] = (operation['id'], result['error_code'])
+    from .alerts import VaultWatch
+    if report['applied']:
+        # A note published in this pass ends any outage on record, also when a new one stops the pass later:
+        # the owner hears that the old one is over and then, at once, of the new one.
+        VaultWatch.for_service(service).published()
+    elif stopped is None and service.editor.vault_passed:
+        # Nothing was published, but the vault took a publication check and nothing stopped the pass: the
+        # outage on record is over, so a new one is told when it starts, not at the old one's reminder.
+        VaultWatch.for_service(service).published(applied=False)
+    if stopped is not None:
+        operation_id, code, reason = stopped
+        report['blocked'] = {'operation_id': operation_id, 'error_code': code, 'reason': reason}
+        print(f'kelmo: the apply pass stopped at note {operation_id}: no note can be published ({code}: {reason}); '
+              'every waiting note keeps its turn and is not charged', file=sys.stderr, flush=True)
+        VaultWatch.for_service(service).blocked(operation_id, code, reason)
     if snapshot is not None:
         # What this pass left, by project: the notes it began with that it did not settle. A note that was
         # deferred, held or stopped short of the pass's own limit still waits, so it is named here.

@@ -10,6 +10,7 @@ NAMED_FACTS = 8
 CAUSES = {
     'E_UNRESOLVED': 'the executor declared these facts unresolvable',
     'E_STALE': 'the registry moved after this request was created',
+    'E_UNION': 'the commit of a batch was refused as a whole; the note is asked again alone',
     'E_PROPOSAL': 'the proposal did not fit the requested facts',
     'E_EXECUTOR': 'the executor did not return a usable answer',
     'E_CONFLICT': 'the wiki state conflicts with this request',
