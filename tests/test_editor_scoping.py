@@ -436,23 +436,25 @@ def test_publication_receipt_replays_and_differs_from_archive_receipt(world):
     assert world.registry() == registry
 
 
+class ProcessDeath(BaseException):
+    """The process ending: no handler of the editor catches it, as none runs when a process is killed."""
+
+
 @pytest.mark.parametrize('stage', ['semantic_projection', 'publish_semantic'])
 def test_crash_resumes_the_recorded_answer_without_another_model_call(world, monkeypatch, stage):
-    from kelmo.errors import KelmoError
     from kelmo.wiki import engine
     source, _ = world.archive('Exports run hourly.', key='hourly')
     executor = Scripted(world.propose(facts=[world.change('app.export', 'Exports run hourly.')]))
     original = getattr(engine, stage)
 
     def crash(*args, **kwargs):
-        raise RuntimeError('synthetic process death')
+        raise ProcessDeath('synthetic process death')
 
     monkeypatch.setattr(engine, stage, crash)
-    # A render failure before preparation is a retryable conflict; after it, the intent stays prepared.
-    with pytest.raises(KelmoError if stage == 'semantic_projection' else RuntimeError) as error:
+    # A death before preparation leaves the recorded answer on its open row; after it, the intent stays prepared.
+    with pytest.raises(ProcessDeath):
         world.edit(source, executor, key='crash')
     if stage == 'semantic_projection':
-        assert error.value.code == 'E_CONFLICT'
         assert [row['state'] for row in world.service.editor.status(source)['requests']] == ['open']
     assert len(executor.jobs) == 1 and world.fact('app.export')['text'] == 'Exports run nightly.'
     prepared = world.service.journal.prepared_semantic()
@@ -711,8 +713,11 @@ def test_duplicate_page_updates_are_refused_before_publication(world):
     (detail_page(page_id='app-notes'), 'E_PROPOSAL'),
     (detail_page(layout='person'), 'E_PROPOSAL'),
     (detail_page(links=['app-archive']), 'E_PROPOSAL'),
+    # A name no file system can hold is the proposal's refusal before anything is prepared, never a commit
+    # that cannot be written and would hold every later publication.
+    (detail_page(target='projects/app/' + 'retries-' * 40 + '.md', page_id='long-name'), 'E_PROPOSAL'),
 ], ids=['other-project', 'unregistered-file', 'registered-unselected', 'unsent-parent', 'person-parent',
-        'page-id-collision', 'person-layout', 'unsent-link'])
+        'page-id-collision', 'person-layout', 'unsent-link', 'name-too-long'])
 def test_page_creation_cannot_claim_an_unauthorized_destination(world, page, code):
     from kelmo.errors import KelmoError
     source, _ = world.archive('Create a detail page.', key='claim')
@@ -1329,7 +1334,19 @@ def test_dirty_page_is_retryable_and_the_recorded_answer_publishes_after_restore
     path = world.service.config.wiki / FEATURE
     committed = path.read_bytes()
     path.write_bytes(committed + b'Uncommitted hand edit.\n')
-    executor = Scripted(world.propose(facts=[world.change('app.export', 'Exports run hourly.')]))
+    unasked = Scripted()
+    with pytest.raises(KelmoError) as error:
+        world.edit(source, unasked, key='dirty')
+    assert error.value.code == 'E_CONFLICT' and unasked.jobs == [], 'a dirty tree is found before the model is asked'
+    assert world.service.editor.status(source)['requests'] == []
+    path.write_bytes(committed)
+
+    def dirties(job):
+        # The hand edit lands while the model answers: only the settle can see it.
+        path.write_bytes(committed + b'Uncommitted hand edit.\n')
+        return world.propose(facts=[world.change('app.export', 'Exports run hourly.')])
+
+    executor = Scripted(dirties)
     before = world.registry()
     with pytest.raises(KelmoError) as error:
         world.edit(source, executor, key='dirty')
@@ -1662,13 +1679,41 @@ def test_journal_outcome_keeps_the_reference_signatures(world):
     assert error.value.code == 'E_OUTCOME' and journal.action_row(other['operation_id'])['state'] == 'open'
 
 
+def test_a_projection_that_fails_while_a_registered_page_is_dirty_is_the_vault_s(world, monkeypatch):
+    """The projection fails for a reason of its own kind (a page it cannot render) while a page the proposal
+    does not touch has uncommitted edits. A vault with a dirty page takes no publication as it stands, so the
+    failure is the vault's: the request stays open with its answer and nothing is refused."""
+    from kelmo.errors import VaultFailure
+    from kelmo.wiki import engine
+    source, _ = world.archive('Exports now run hourly.', key='dirty-and-broken')
+    path = world.service.config.wiki / OTHER
+    original = path.read_bytes()
+
+    def broken(*args, **kwargs):
+        path.write_bytes(original + b'Uncommitted independent context.\n')
+        raise ValueError('a page cannot be rendered')
+
+    monkeypatch.setattr(engine, 'semantic_projection', broken)
+    executor = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run hourly.')]))
+    with pytest.raises(VaultFailure) as error:
+        world.edit(source, executor, key='dirty-and-broken')
+    assert error.value.code == 'E_CONFLICT', error.value
+    assert [row['state'] for row in world.service.editor.status(source)['requests']] == ['open']
+    path.write_bytes(original)
+
+
 def test_unrelated_dirty_registered_page_stays_retryable_before_preparation(world):
     from kelmo.errors import KelmoError
     source, _ = world.archive('Exports now run hourly.', key='unrelated-dirty')
     path = world.service.config.wiki / OTHER
     original = path.read_bytes()
-    path.write_bytes(original + b'Uncommitted independent context.\n')
-    executor = Scripted(world.propose(facts=[world.change('app.export', 'Exports run hourly.')]))
+
+    def dirties(job):
+        # The edit lands while the model answers; a tree dirty before the call is refused before it.
+        path.write_bytes(original + b'Uncommitted independent context.\n')
+        return world.propose(facts=[world.change('app.export', 'Exports run hourly.')])
+
+    executor = Scripted(dirties)
     with pytest.raises(KelmoError) as error:
         world.edit(source, executor, key='unrelated-dirty')
     assert error.value.code == 'E_CONFLICT' and OTHER in str(error.value)

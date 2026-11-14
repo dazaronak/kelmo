@@ -86,14 +86,20 @@ NARRATIVE_FIELDS = {'narrative_id', 'page_id', 'text', 'evidence_refs', 'depends
                     'previous_revision', 'compatibility'}
 
 
+NAME_MAX = 255
+
+
 def valid_wiki_target(target):
     if not isinstance(target, str) or not re.fullmatch(
         r'(?:projects/[a-z0-9_-]+/|life/)?[a-z0-9_/-]+\.md', target
     ):
         return False
     path = Path(target)
+    # A name the file system cannot hold (NAME_MAX, 255 bytes) is refused here, as a proposal's own problem,
+    # not at the commit, where an intent that can never be written would hold every later publication.
     return (not path.is_absolute() and '..' not in path.parts and str(path) == target
-            and not any(part.startswith('.') for part in path.parts))
+            and not any(part.startswith('.') for part in path.parts)
+            and all(len(part.encode('utf-8')) <= NAME_MAX for part in path.parts))
 
 
 def digest(value):

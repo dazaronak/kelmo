@@ -42,8 +42,129 @@ on a cause the worker retries) and retries a note that met another writer's lock
 in place before moving to newer ones. One wait budget of an hour covers the whole
 pass; a note older than that is listed under `stalled` and the pass moves on.
 
+## Batched apply
+
+With `[editor] batch_apply = true`, the pass over waiting notes (`dream apply`,
+and the first part of `dream run`) holds one conversation with the model per
+batch of waiting notes from one project instead of one per note. A batch
+conversation takes up to 8 model calls. It is off by default.
+`batch_max_sources` (default 8) caps how many notes go into one batch; the editor
+budget usually decides the real size.
+
+Each note in a batch still ends on its own: published with its own facts,
+recorded as already stated (its reason names the fact keys that say so), refused
+with its own error code, or handed back to the same pass to run alone. The
+batch's word settles neither a note the model's answer never mentions nor a note
+the answer gives something an earlier note of the batch also claims (the same
+fact, page or work page). The second kind is asked alone after that earlier
+note, and the notes captured after it wait for it.
+
+A batch whose conversation ends without a proposal the editor can read is
+handled the same way. That happens when the model answers `unresolved`, the
+rounds run out, the executor fails, the answer stays malformed after its
+repairs, the model keeps asking for something the editor cannot serve, the pages
+and receipts it gathered no longer fit beside even the oldest note, the editor
+refuses what the batch proposed as a whole (the notes together exceed the wiki
+budget, for example), or the editor itself fails on the batch. Each note then
+gets its own consultation in the same pass and spends none of its attempts for
+the batch. A note that cannot be placed alone either is refused there, under its
+own attempt count.
+
+A batch commit that is refused, right away or by a later recovery, is handled
+the same way too: that refusal (`E_UNION`) names no note, so no note spends an
+attempt. The note whose row carried the commit is asked again alone on the next
+pass, and the notes captured after it wait for it.
+
+A batch never takes a note past an older note of the same project that it could
+not consult. When another process holds a note, a note waits for a quota reset,
+or its archived source cannot be used (it no longer matches its receipt, for
+example), the batch ends there and the notes captured after it wait; older
+notes still take their turn. A note whose own stored request can no longer be
+used also ends the batch before it, and the notes after it follow in the same
+pass. If a page it selected is gone, the note is refused on its own turn and
+spends one of its attempts. If its settings changed after an earlier attempt
+opened it (a raised budget, a renamed project), it spends no attempt and is
+asked again under the new settings on the next pass.
+
+A note refused for a reason the vault caused (its settings changed, the wiki
+moved on while the model answered, its batch's commit was refused whole) holds
+the notes of its project captured after it for the rest of the pass, on both
+paths, because its claim is still to come. Inside a batch the rule is the same:
+when the model's answer leaves a note out, the batch publishes only the notes
+captured before it, that note is consulted alone next, and the notes after it
+are consulted again in the same pass.
+
+A pass that dies in the middle of a batch loses no note and publishes none
+twice. On the next pass a note the batch had committed is settled from that
+commit, with no model call. Every other note of the batch is asked again and
+spends none of its attempts for the pass that died. This also holds when
+`batch_apply` was turned off in between. A committed note is settled before
+anything else about it is checked, so a change made since (its origin revoked,
+its stored request no longer readable) cannot refuse it or leave it waiting.
+The same holds for a note published alone whose pass died before recording it.
+
+Some failures stop every publication, not one note: a commit that cannot be
+written, a prepared publication the recovery cannot finish, uncommitted edits
+in the wiki's files, a working registry or committed page that cannot be read,
+an archive the storage cannot read, a working registry that differs from the
+last commit, or a wiki that is over its budget or does not render as it stands.
+A note never pays for one of them, batched or not.
+
+A read of the wiki or of the archive that fails is tried again. It counts
+against the note only when the wiki or the archive as a whole reads and that
+note's read still fails. A note whose captured source or archived record alone
+cannot be read, or reads but is damaged (a record that does not parse, a file
+that is no longer text), is refused for it and spends one attempt, and the other
+notes go on.
+
+The pass stops at the first failure that stops every publication and names it
+under `blocked` (the note, the code, the reason). Every note keeps its place and
+its attempts, a note that published before the failure stays applied, and the
+next pass publishes a commit that stayed prepared with no model call. The
+recovery and the working tree are checked before the model is asked, and a batch
+also checks first that the wiki renders and fits its budget. A note asked alone
+learns whether the wiki renders and fits only after the model answers. It keeps
+the answer, and the first pass after the repair publishes it without asking
+again. Either way, a vault that stays broken costs no conversation on later
+passes.
+
+With `[alerts]` set, the owner hears of it once when it starts, once a day while
+it lasts, and once when it is over: when a note is published again, or when a
+pass reads the vault taking a publication and stops at nothing. A kind of
+failure not yet told that day is told when it is met. Each kind keeps its own
+daily reminder, so failures that alternate are not told on every pass. The alert
+goes out even when its record cannot be written. The worker in `immediate` mode
+stops its tick the same way.
+
+```sh
+kelmo --vault /srv/memory dream apply --ready --json
+kelmo --vault /srv/memory dream status --json
+```
+
+`apply --ready` publishes only ready projects. A project is ready once
+`[editor] batch_ready_sources` of its notes wait for their first pass; the
+default is the value of `batch_max_sources`, and parked notes do not count. The
+pass leaves a project once fewer notes than that remain, so a small project
+waits for the next full pass. A note its batch sent to run alone still gets that
+turn in the same pass, unless an older note of the project waits ahead of it. Without `batch_apply`, `--ready` is refused with
+`E_CONFIG`. `dream status` reports `waiting` (first-pass notes per project) and
+`ready` (the projects a ready pass would take now; empty while `batch_apply` is
+off). It reads the journal and the registry file, without opening the store or
+calling the model.
+
+The daemon reads `[editor]` when it starts. After changing `batch_apply`,
+`batch_max_sources` or `batch_ready_sources`, run `kelmo daemon stop` and
+`kelmo daemon start`; until then its scheduled passes use the old values, while
+`dream status` already shows the new `ready_at`.
+
 Pause affects subsequent passes. It does not interrupt a running provider call.
-Overlapping CLI runs use one process lock. A quota deferral persists its reset
+Overlapping runs use one process lock, the daemon's own Dreaming job included: a
+run that finds the lock held answers `busy`. Through the installed daemon
+service, `dream apply` and `dream run` wait up to 15 minutes for the result. A
+pass that takes longer keeps running in the service and the command answers
+`running`; `kelmo daemon status` shows the job while it runs. Without the
+service the command starts a daemon for the call and waits until the pass ends,
+because that daemon stops when its caller leaves. A quota deferral persists its reset
 time and later invocations wait without calling the provider again. Failed passes
 return a nonzero exit status. The evidence cursor and findings remain durable.
 

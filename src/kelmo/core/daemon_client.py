@@ -120,6 +120,17 @@ def _check_profile(root, path, server_profile):
                                       'stop it (kelmo daemon stop) and connect again.')
 
 
+# The longest wait a call may ask for: the wire refuses a deadline past a day.
+LONGEST_CALL_SECONDS = 86400.0
+
+
+def service_owned(root):
+    """Whether an installed kelmod service owns `root`. Its daemon outlives its callers; a daemon `ensure`
+    starts ends once none is connected, and the work it was doing is stopped with it."""
+    from .instance import state_dir
+    return (state_dir(Path(root).expanduser().resolve()) / 'kelmod.spec.json').exists()
+
+
 def ensure(root, *, kelmod=None, launcher=None, server_profile=None):
     """The socket of the daemon that owns `root`, starting an ephemeral one when none answers. `launcher`
     is the installed `kelmo` script, whose runtime then starts the cores; `server_profile` lets the started

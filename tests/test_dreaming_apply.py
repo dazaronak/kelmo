@@ -780,7 +780,7 @@ def test_dream_apply_cli_publishes_waiting_notes_and_run_applies_first(world, tm
     assert world.fact('app.export')['text'] == 'Exports run at 12:00.'
     assert receipt
     assert invoke('run')['apply'] == {'applied': [], 'parked': [], 'failed': [], 'deferred': [], 'skipped': [],
-                                      'stalled': []}
+                                      'stalled': [], 'waiting': {}}
 
 
 def test_mcp_wait_stops_at_parked_and_awaiting_states(world):

@@ -754,12 +754,16 @@ class Service:
         """Recover the packet owned by this operation, including its original metadata."""
         operation = self.journal.get(operation_id)
         content = self.source_path(operation).read_bytes()
-        if engine.digest(content.decode('utf-8')) != operation['source_hash']:
+        try:
+            text = content.decode('utf-8')
+        except UnicodeDecodeError as error:
+            raise KelmoError('E_SOURCE', 'Captured source is no longer UTF-8 text.') from error
+        if engine.digest(text) != operation['source_hash']:
             raise KelmoError('E_SOURCE', 'Captured source hash no longer matches.')
         stored = self.journal.source_metadata(operation_id)
         if stored is None:
             try:
-                return self._legacy_source_packet(operation, content.decode('utf-8'))
+                return self._legacy_source_packet(operation, text)
             except (ArchiveValidationError, ValueError) as error:
                 # A journal from before typed metadata: its source is kept, never re-described.
                 raise KelmoError('E_CAPABILITY', 'Legacy operation ' + operation_id + ' has no recorded source '

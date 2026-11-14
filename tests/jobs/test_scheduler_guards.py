@@ -20,7 +20,7 @@ def scheduler(tmp_path, now, operations):
         return SimpleNamespace(fetchall=lambda: rows)
 
     reader = SimpleNamespace(journal=SimpleNamespace(conn=SimpleNamespace(execute=execute)))
-    writer = SimpleNamespace(config=SimpleNamespace(embedding={}))
+    writer = SimpleNamespace(config=SimpleNamespace(embedding={}, batch_apply=False, batch_ready_sources=8))
     storage = SimpleNamespace(writer=writer, read=lambda fn: fn(reader))
     core = SimpleNamespace(root=tmp_path, storage=storage, profile=None, profile_path=None)
     return Jobs(core, clock=lambda: now[0])

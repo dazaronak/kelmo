@@ -223,19 +223,23 @@ def validate_editor(data):
     as soon as it is archived) or `nightly` (archived notes wait for `kelmo dream apply`).
     batch_apply (a boolean, default false) lets one `kelmo dream apply` pass consult the model once
     per batch of waiting sources of one project instead of once per source; batch_max_sources (a
-    positive integer) caps the sources in one batch. Nothing else is accepted."""
+    positive integer) caps the sources in one batch; batch_ready_sources (a positive integer, default
+    the value of batch_max_sources) is how many first-pass notes of one project make it ready for
+    `kelmo dream apply --ready`. Nothing else is accepted."""
     if data is None:
         return None
     try:
         if not isinstance(data, dict):
             raise TypeError('[editor] must be a table')
-        unknown = set(data) - {'budget_tokens', 'mode', 'batch_apply', 'batch_max_sources'}
+        unknown = set(data) - {'budget_tokens', 'mode', 'batch_apply', 'batch_max_sources',
+                               'batch_ready_sources'}
         if unknown:
             raise ValueError('keys not accepted: ' + ', '.join(sorted(unknown)))
         settings = {'budget_tokens': data.get('budget_tokens', DEFAULT_EDITOR_BUDGET),
                     'mode': data.get('mode', 'immediate'),
                     'batch_apply': data.get('batch_apply', False),
                     'batch_max_sources': data.get('batch_max_sources', DEFAULT_BATCH_MAX_SOURCES)}
+        settings['batch_ready_sources'] = data.get('batch_ready_sources', settings['batch_max_sources'])
         if type(settings['budget_tokens']) is not int or settings['budget_tokens'] <= 0:
             raise ValueError('budget_tokens must be a positive integer')
         if settings['mode'] not in EDITOR_MODES:
@@ -244,6 +248,8 @@ def validate_editor(data):
             raise ValueError('batch_apply must be a boolean')
         if type(settings['batch_max_sources']) is not int or settings['batch_max_sources'] <= 0:
             raise ValueError('batch_max_sources must be a positive integer')
+        if type(settings['batch_ready_sources']) is not int or settings['batch_ready_sources'] <= 0:
+            raise ValueError('batch_ready_sources must be a positive integer')
         return settings
     except (ValueError, TypeError) as error:
         raise KelmoError('E_CONFIG', f'Invalid [editor] configuration: {error}') from error
@@ -311,7 +317,7 @@ class Config:
 
     @property
     def batch_apply(self):
-        """True when one `kelmo dream apply` pass consults the model once per batch of waiting sources
+        """True when one `kelmo dream apply` pass holds one conversation with the model per batch of waiting sources
         of a project. Off unless the vault names `[editor] batch_apply = true`."""
         return bool((self.editor or {}).get('batch_apply', False))
 
@@ -319,6 +325,15 @@ class Config:
     def batch_max_sources(self):
         """The ceiling on the sources one apply batch may carry; the budget usually decides the real size."""
         return (self.editor or {}).get('batch_max_sources', DEFAULT_BATCH_MAX_SOURCES)
+
+    @property
+    def batch_ready_sources(self):
+        """How many first-pass notes of one project make it ready for `kelmo dream apply --ready`.
+
+        Its own setting, not the batch ceiling: a vault can wait for ten notes of a project and still ask
+        the model about eight at a time. When the vault names none it is the value of `batch_max_sources`."""
+        editor = self.editor or {}
+        return editor.get('batch_ready_sources', editor.get('batch_max_sources', DEFAULT_BATCH_MAX_SOURCES))
 
     @property
     def state(self):

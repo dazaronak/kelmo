@@ -15,10 +15,22 @@ from .migration_cli import read_spec
 from .service import Service
 
 
+def _journal(config):
+    """The vault's journal, read-only: a status question opens no Service, no store, no broker and no model."""
+    connection = sqlite3.connect((config.state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return closing(connection)
+
+
 def status(root):
+    """What Dreaming is configured to do, whether it is paused or deferred, and how its last run ended.
+
+    A few small reads of Dreaming's own tables and nothing of the registry: the state core's scheduler asks
+    this on every tick (`Jobs._dream_hold`). What waits for the apply pass is a separate question with its
+    own cost, see `waiting_status`.
+    """
     config = Config.load(root)
-    with closing(sqlite3.connect((config.state / "journal.sqlite3").as_uri() + "?mode=ro", uri=True)) as connection:
-        connection.row_factory = sqlite3.Row
+    with _journal(config) as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         values = {row["key"]: json.loads(row["value"]) for row in connection.execute(
             "SELECT key,value FROM dream_state")} if "dream_state" in tables else {}
@@ -30,6 +42,33 @@ def status(root):
     return {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
             "next_attempt": values.get("next_attempt", 0), "findings": counts,
             "last_run": dict(recent) if recent else None}
+
+
+def waiting_status(root):
+    """What the apply pass would find if it ran now: the first-pass notes of each project, and the ready ones.
+
+    The same readiness `dream apply --ready` counts, over the same stored requests, read from the journal
+    and the registry file, so asking costs no pass. A vault whose registry cannot be read still answers the
+    count under the captured project names, because the question here is how much work waits, not which
+    page it lands on. `ready` is empty while `[editor] batch_apply` is off: no ready pass runs then.
+    """
+    from .creation import waiting_by_project
+    from .wiki import engine
+    config = Config.load(root)
+    waiting = {}
+    with _journal(config) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if {"operations", "operation_sources"} <= tables:
+            try:
+                registry = engine.load_registry_view(root)
+            except KelmoError:
+                registry = None
+            waiting = waiting_by_project(connection, registry)
+    ready_at = config.batch_ready_sources
+    return {"waiting": {project: len(ids) for project, ids in waiting.items()},
+            "ready": [project for project, ids in waiting.items()
+                      if config.batch_apply and len(ids) >= ready_at],
+            "ready_at": ready_at}
 
 
 def prepare_schedule(root, args):
@@ -93,7 +132,7 @@ def dispatch(root, args):
     elif args.client_id:
         raise KelmoError("E_INPUT", "--client-id requires --server-profile.")
     if args.action == "status":
-        return status(root)
+        return {**status(root), **waiting_status(root)}
     if args.action == "schedule":
         return prepare_schedule(root, args)
     if args.action == "configure" and not args.apply:
@@ -133,16 +172,21 @@ def dispatch(root, args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            return run_dream(service, args.action, contexts=contexts)
+            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
 
 
-def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None):
+def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None,
+              ready=False):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
     The caller makes sure no other Dreaming run is in progress.
 
     In the state core `step` is the job step, entered once per unit of work (the settings, each note, the
     findings pass), and `should_stop` ends the run between units and cuts a model call in flight: the run then
-    raises Stopping, holds nothing and charges no note."""
+    raises Stopping, holds nothing and charges no note.
+
+    `ready` belongs to `apply` alone: the owner's "run the editor now" over ready projects only (see
+    `apply_pending`). `run` keeps draining everything, because the night pass is what publishes small
+    projects."""
     step = step or nullcontext
     with step():
         # Built inside the step: its first use creates the Dreaming tables on the shared journal connection.
@@ -163,7 +207,8 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
     # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
     # is the owner's "run the editor now".
     from .creation import apply_pending
-    applied = apply_pending(service, executor, should_stop=should_stop, step=step)
+    applied = apply_pending(service, executor, should_stop=should_stop, step=step,
+                            ready=ready and action == "apply")
     if action == "apply":
         return {"state": "finished", "apply": applied}
     if should_stop is not None and should_stop():

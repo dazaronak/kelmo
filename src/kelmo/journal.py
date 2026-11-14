@@ -395,6 +395,14 @@ class Journal:
         row = self.conn.execute('SELECT * FROM action_requests WHERE operation_id=?', (operation_id,)).fetchone()
         return dict(row) if row else None
 
+    def action_requests_of(self, source_operation_ids):
+        """Every request row of these sources, under whatever key and in whatever state; a read only."""
+        ids = list(source_operation_ids)
+        if not ids:
+            return []
+        return [dict(row) for row in self.conn.execute(
+            'SELECT * FROM action_requests WHERE source_operation_id IN (' + ','.join('?' for _ in ids) + ')', ids)]
+
     def action_begin(self, request_key, kind, fingerprint, origin, source_operation_id, *,
                      operation_id=None, observation=None, error=None, outcome=None):
         """Record a request once; its creation time is the action's single ingestion time.
@@ -457,6 +465,20 @@ class Journal:
         return self._lease_update(
             operation_id, lambda current: current is not None and current.get('consulting') == token,
             observation)
+
+    def action_end_attempt(self, operation_id, token):
+        """End the attempt of an open request whose recorded answer is a batch's, leaving the `action_release` form.
+
+        `action_release` can only end a lease the caller still holds, and a batch member's row no longer
+        holds one: the recorded answer replaced its lease. This is the other half — the row keeps its open
+        state and gets back the released-lease observation, so the same request key is retryable at once
+        and `action_lease` takes it again. It accepts only a row whose observation carries a batch answer
+        with no live lease, so it never releases an attempt another caller holds and never ends a row
+        carrying an answer of its own, which its own settle path owns.
+        """
+        return self._lease_update(
+            operation_id, lambda current: current is not None and 'consulting' not in current
+            and current.get('batch'), {'consulting': token, 'expires_at': 0})
 
     def action_history(self, action_id):
         """Accepted events of one action in accepted order; proposals and open intents are absent."""
@@ -624,6 +646,21 @@ class Journal:
                                  WHERE operation_id=?''', (code, message, operation_id))
             self._source_effects(self._request_row(operation_id), outcome, result)
             return True
+
+    def refuse_open_semantic(self, source_operation_id, code, message):
+        """Refuse every open editor request of a source with the refusal its note is parked for.
+
+        A parked note takes a new request key on its next attempt, so no call returns to these rows: left
+        open, each would stand for an unfinished request nothing ever finishes. A prepared request is not
+        touched: its publication is the recovery's to finish or refuse.
+        """
+        if self.conn.in_transaction:
+            raise KelmoError('E_STATE', 'Journal action refusal requires an idle connection.')
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            self.conn.execute('''UPDATE action_requests SET state='refused', error_code=?, error_message=?
+                                 WHERE kind='semantic' AND source_operation_id=? AND state='open' ''',
+                              (code, message, source_operation_id))
 
     def dismiss_semantic(self, source_operation_id, *, by, reason, outcome):
         """Refuse every open editor request of a source, record the dismissal and its outcome at once."""
