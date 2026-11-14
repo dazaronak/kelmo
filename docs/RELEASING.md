@@ -12,13 +12,22 @@ repository, so no API token is stored in the repository or in GitHub secrets.
 2. In the GitHub repository, Settings, Environments: create `pypi`. Adding yourself as a required
    reviewer makes every release wait for one approval click before anything is uploaded.
 
+## Between releases
+
+Every change a user can see gets an entry under `## [Unreleased]` in [`CHANGELOG.md`](../CHANGELOG.md),
+in the same branch as the change. A feature branch reaches `main` through a merge commit
+(`git merge --no-ff`) whose message body carries the same notes: what a user sees, new options and
+config keys with their defaults, and what behaves differently. A fix no user can see may reach `main`
+by fast-forward with no entry.
+
 ## Each release
 
 1. Set the version in three places and commit them to `main`: `version` in `pyproject.toml` (for
    example `0.2.0`), `__version__` in `src/kelmo/__init__.py`, and `workspace.package.version` in
    `rust/Cargo.toml` (`0.2.0`; a development version is spelled `0.2.0-dev.0` there and
    `0.2.0.dev0` in Python). `tests/test_distribution.py::test_versions_agree` fails when they
-   differ. Refresh `uv.lock` with `uv lock`.
+   differ. Refresh `uv.lock` with `uv lock`. In the same commit, move the `Unreleased` entries of
+   `CHANGELOG.md` under `## [0.2.0] - YYYY-MM-DD`; that section is the release text on GitHub.
 2. Run `ci.yml` by hand once (Actions, CI, "Run workflow"): a manual run builds the full matrix.
 3. Tag that commit `v` plus the same version and push the tag:
 
