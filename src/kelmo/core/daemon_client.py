@@ -71,8 +71,18 @@ class _Cut(Exception):
         self.sent = sent
 
 
-def _frames(sock, reader):
+def _budget(sock, until):
+    """Bounds the next blocking socket operation by the absolute `until`, so all of an exchange's waits
+    together stay inside it."""
+    left = until - time.monotonic()
+    if left <= 0:
+        raise TimeoutError('timed out')
+    sock.settimeout(left)
+
+
+def _frames(sock, reader, until):
     while True:
+        _budget(sock, until)
         data = sock.recv(1048576)
         if not data:
             raise ConnectionResetError('The daemon closed the connection.')
@@ -105,24 +115,25 @@ def _connect(target, limit=None):
             time.sleep(RECONNECT_PAUSE)
 
 
-def _attempt(sock, op, body, key, timeout, deadline_ms):
-    """One exchange on a connected socket: hello, the call, its reply."""
+def _attempt(sock, op, body, key, until, deadline_ms):
+    """One exchange on a connected socket: hello, the call, its reply, all of it by the absolute `until`."""
     sent = False
     with sock:
-        sock.settimeout(timeout)
         try:
             reader = wire.FrameReader()
+            _budget(sock, until)
             sock.sendall(wire.encode({'v': wire.VERSION, 'kind': 'hello', 'id': uuid.uuid4().hex,
                                       'body_type': 'json', 'protocols': ['kelmo/2'], 'operations': []}))
-            _frames(sock, reader)
+            _frames(sock, reader, until)
             header = {'v': wire.VERSION, 'kind': 'call', 'id': uuid.uuid4().hex, 'op': op, 'body_type': 'json',
                       'deadline_ms': deadline_ms}
             if key is not None:
                 header['key'] = key
             frame = wire.encode(header, body if body is not None else {})
+            _budget(sock, until)
             sent = True
             sock.sendall(frame)
-            return _frames(sock, reader)[0]
+            return _frames(sock, reader, until)[0]
         except TimeoutError as error:
             if not sent:
                 # Nothing reached kelmod, so no pass or write can be running for this call.
@@ -145,7 +156,7 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
         raise KelmoError('E_TRANSPORT', f'The daemon directory of {target} is not private to this user.')
     limit = time.monotonic() + seconds
     try:
-        reply, result = _attempt(_connect(target), op, body, key, seconds + GRACE_SECONDS, int(seconds * 1000))
+        reply, result = _attempt(_connect(target), op, body, key, limit + GRACE_SECONDS, int(seconds * 1000))
     except _Cut as cut:
         if cut.sent and not _resendable(op, key):
             error = KelmoError('E_TRANSPORT', 'The daemon closed the connection after the call was sent; '
@@ -160,7 +171,7 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
             sock.close()
             raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
         try:
-            reply, result = _attempt(sock, op, body, key, left, int(left * 1000))
+            reply, result = _attempt(sock, op, body, key, limit, int(left * 1000))
         except _Cut as again:
             raise KelmoError('E_TRANSPORT', 'The daemon closed the connection again.') from again
     if reply.get('ok'):

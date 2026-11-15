@@ -28,11 +28,12 @@ def hold(seconds, then):
 
 
 class Connection:
-    """`hello=False` reads the client's hello and closes without answering it. `gone` keeps the socket path
-    unbound that many seconds after this connection ends, as a daemon between two lives."""
+    """`hello=False` reads the client's hello and closes without answering it. `hello_delay` answers it
+    that many seconds late. `gone` keeps the socket path unbound that many seconds after this connection
+    ends, as a daemon between two lives."""
 
-    def __init__(self, *calls, hello=True, gone=0.0):
-        self.calls, self.hello, self.gone = list(calls), hello, gone
+    def __init__(self, *calls, hello=True, gone=0.0, hello_delay=0.0):
+        self.calls, self.hello, self.gone, self.hello_delay = list(calls), hello, gone, hello_delay
 
 
 def default_answer(header, body, number):
@@ -79,7 +80,8 @@ class ScriptedDaemon:
             if connection.gone:
                 self.server.close()
                 self.path.unlink()
-                time.sleep(connection.gone)
+                if self.closing.wait(connection.gone):  # the test ended meanwhile: never rebind
+                    return
                 self.server = self._listen()
 
     def _one(self, conn, connection):
@@ -88,6 +90,8 @@ class ScriptedDaemon:
             hello = self._frame(conn, reader)
             if hello is None or not connection.hello:
                 return
+            if connection.hello_delay:
+                time.sleep(connection.hello_delay)
             conn.sendall(wire.encode({'v': wire.VERSION, 'kind': 'hello', 'id': hello[0]['id'],
                                       'body_type': 'json', 'protocols': ['kelmo/2'], 'operations': []}))
             for action in connection.calls:

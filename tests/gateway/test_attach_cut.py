@@ -39,7 +39,7 @@ def v1_answer(header, body, number):
     request = body['request']
     if request['op'] == 'hello':
         result = {'authority_id': AUTHORITY, 'client_id': CLIENT_ID,
-                  'operations': ['hello', 'search', 'create', 'status']}
+                  'operations': ['hello', 'search', 'create', 'status', 'reconcile']}
     else:
         result = {'op': request['op'], 'key': request.get('idempotency_key'), 'call': number}
     return {'protocol': PROTOCOL, 'request_id': request['request_id'], 'ok': True, 'result': result}
@@ -98,6 +98,40 @@ def test_a_read_cut_twice_gives_a_typed_error_inside_the_deadline(bridge):
     assert error.value.code == 'E_TRANSPORT', error.value
     assert time.monotonic() - started < 6.5
     assert requests(daemon) == [('search', None, None), ('search', None, None)]
+
+
+def test_a_reconcile_cut_after_it_was_sent_is_not_sent_again(bridge):
+    # reconcile goes through `call` but writes a receipt on the server (replay class `never`): a cut leaves
+    # its effect unknown, so it is not sent a second time.
+    daemon, client = bridge(Connection(ANSWER, CLOSE), Connection(ANSWER, ANSWER))
+    try:
+        with client.deadline(10):
+            result = client.call('reconcile', {'text': 'A fact.', 'targets': []})
+    except KelmoError as error:
+        result = {'refused': error.code}
+    assert result == {'refused': 'E_TRANSPORT'}, result
+    assert requests(daemon) == [('reconcile', None, None)]
+
+
+def test_a_reconnect_that_reaches_another_authority_fails_at_once(bridge, monkeypatch):
+    from kelmo import client as module
+    monkeypatch.setattr(module, 'RECONNECT_SECONDS', 10.0)
+
+    def other_authority_on_reconnect(header, body, number):
+        answer = v1_answer(header, body, number)
+        if body['request']['op'] == 'hello' and number > 1:
+            answer['result']['authority_id'] = '9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f'
+        return answer
+    daemon, client = bridge(Connection(ANSWER, CLOSE), Connection(ANSWER, ANSWER))
+    daemon.answer = other_authority_on_reconnect
+    started = time.monotonic()
+    try:
+        with client.deadline(10):
+            result = client.call('search', {'query': 'q'})
+    except KelmoError as error:
+        result = {'refused': error.code}
+    assert result == {'refused': 'E_AUTHORITY'}, result
+    assert time.monotonic() - started < 3, time.monotonic() - started
 
 
 def test_a_keyed_write_cut_after_it_was_sent_stays_pending_and_goes_again_under_its_key(bridge):

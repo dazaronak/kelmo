@@ -123,6 +123,16 @@ def test_a_silent_second_attempt_ends_at_the_deadline(daemon):
     assert len(peer.calls) == 2
 
 
+def test_a_late_hello_on_the_second_attempt_still_ends_at_the_deadline(daemon):
+    # The second connection answers its hello late and then never replies: the time left bounds the whole
+    # second exchange, not each wait on its socket.
+    peer = daemon(Connection(CLOSE), Connection(SILENT, hello_delay=1.2))
+    got = outcome(peer, 'state.scheduler_status', {}, seconds=2.0)
+    assert got[0] == 'error', got
+    assert got[1] == 'E_DEADLINE', got
+    assert got[-1] < 2.5, got
+
+
 def test_a_daemon_that_never_comes_back_fails_inside_the_reconnect_window(daemon, monkeypatch):
     monkeypatch.setattr(daemon_client, 'RECONNECT_SECONDS', 0.5)
     peer = daemon(Connection(CLOSE, gone=30))

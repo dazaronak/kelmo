@@ -891,6 +891,14 @@ RECONNECT_FIRST_PAUSE = 0.25
 RECONNECT_LAST_PAUSE = 2.0
 
 
+def _replayable_read(op):
+    """Whether a request that went through `call` may be sent again after a cut: only an operation the
+    server's table marks as a read (some, such as `reconcile`, go through `call` and still write)."""
+    from .core.operations import REPLAY_READ, by_name
+    found = by_name().get('state.' + op)
+    return found is not None and found.replay == REPLAY_READ
+
+
 class SharedClient:
     """One client root: its outbox, its cache and at most one open channel.
 
@@ -1103,7 +1111,8 @@ class SharedClient:
         try:
             return self._read_once(op, args)
         except KelmoError as error:
-            if isinstance(error, Unsent) or error.code != 'E_TRANSPORT' or time.monotonic() >= limit:
+            if (isinstance(error, Unsent) or error.code != 'E_TRANSPORT' or time.monotonic() >= limit
+                    or not _replayable_read(op)):
                 raise
             failed = error
         self._drop(self._channel)
@@ -1114,6 +1123,8 @@ class SharedClient:
                     self._connect()
                 break
             except Unbound as error:
+                if error.code != 'E_TRANSPORT':  # a refusal (another authority, a bad profile) stays one
+                    raise
                 failed = error
                 if time.monotonic() + pause >= window:
                     raise failed from None
