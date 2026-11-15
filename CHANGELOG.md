@@ -16,6 +16,18 @@ entry here.
   deadline for the call ends first (it gives a `--wait` command 900 seconds, so this takes a longer
   `--wait-timeout`), the command fails with `E_BUSY` and names the operation the server already accepted.
   Running the same command again reuses its idempotency key, so the note is not captured twice.
+- A note delivered while the server's kelmod restarts is no longer lost. `kelmod attach` refused a request
+  that was sent and then cut as final, even when it carried an idempotency key, so the client's outbox
+  settled the note as refused for good. A keyed request is now refused as retryable: the note stays pending
+  and the next flush sends it again under the same key. A request without a key is still refused, with its
+  effect reported as unknown.
+- A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
+  server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
+  doubling the pause up to 2 seconds.
+- A CLI call to the local daemon follows the same rule when kelmod drops the socket: a call cut before it
+  was sent, a read, or a write under a key goes once more within the deadline, and any other write fails at
+  once with `E_TRANSPORT` and its effect reported as unknown. The resend tries to reconnect for at most 15
+  seconds. A hello the daemon never answers is now `E_TRANSPORT` with nothing sent, not `E_DEADLINE`.
 
 ## [0.3.1] - 2026-11-15
 
