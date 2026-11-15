@@ -6,6 +6,8 @@ entry here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-15
+
 ### Added
 
 - The worker checks that the executor gives the model this build's instructions. `kelmo executor` builds
