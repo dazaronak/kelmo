@@ -200,6 +200,9 @@ class Outbox:
             self.conn.execute('''CREATE TABLE IF NOT EXISTS skips (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, event TEXT NOT NULL,
                 native_id TEXT, reason TEXT NOT NULL, at TEXT NOT NULL)''')
+            # `state` sits after `args` in a row: without this index, counting or finding the pending head
+            # reads every queued body's pages.
+            self.conn.execute('CREATE INDEX IF NOT EXISTS entries_state ON entries (state, seq)')
             self._shed_transcript_bytes()
 
     def _shed_transcript_bytes(self, seq=None):
@@ -267,6 +270,25 @@ class Outbox:
     @_serial
     def pending(self):
         return [dict(row) for row in self.conn.execute("SELECT * FROM entries WHERE state='pending' ORDER BY seq")]
+
+    @_serial
+    def pending_count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM entries WHERE state='pending'").fetchone()[0]
+
+    @_serial
+    def last_seq(self):
+        return self.conn.execute('SELECT COALESCE(MAX(seq), 0) FROM entries').fetchone()[0]
+
+    @_serial
+    def next_pending(self, after, through):
+        """The pending entry with the lowest seq in (after, through]: its seq, key and op, not its body."""
+        row = self.conn.execute("SELECT seq, idempotency_key, op FROM entries WHERE state='pending' "
+                                'AND seq>? AND seq<=? ORDER BY seq LIMIT 1', (after, through)).fetchone()
+        return dict(row) if row else None
+
+    @_serial
+    def body(self, seq):
+        return self.conn.execute('SELECT args FROM entries WHERE seq=?', (seq,)).fetchone()['args']
 
     @_serial
     def attempt(self, key):
@@ -341,8 +363,9 @@ class Outbox:
             'SELECT state, COUNT(*) AS n FROM entries GROUP BY state')}
         refused = [{'idempotency_key': row['idempotency_key'], 'op': row['op'], 'at': row['settled_at'],
                     **json.loads(row['outcome'])}
-                   for row in self.conn.execute("SELECT * FROM entries WHERE state='refused' ORDER BY seq DESC "
-                                                'LIMIT ?', (REFUSED_SHOWN,))][::-1]
+                   for row in self.conn.execute("SELECT idempotency_key, op, settled_at, outcome FROM entries "
+                                                "WHERE state='refused' ORDER BY seq DESC LIMIT ?",
+                                                (REFUSED_SHOWN,))][::-1]
         skipped = {row['reason']: row['n'] for row in self.conn.execute(
             'SELECT reason, COUNT(*) AS n FROM skips GROUP BY reason')}
         result = {'pending': counts.get('pending', 0), 'delivered': counts.get('delivered', 0),
@@ -1140,7 +1163,7 @@ class SharedClient:
         """Deliver pending entries in order. A bound refusal the server calls final settles its entry; a
         retryable one, or no verdict at all (launcher, channel, hello, a reply bound to no request), leaves
         it and everything after it pending and stops. `reached` says whether a channel was open."""
-        if self._multiplex and not self.outbox.pending():
+        if self._multiplex and not self.outbox.pending_count():
             # Nothing to deliver: a read that only wants its own writes sent first does not wait for the
             # owner of the outbox. Whoever is delivering holds entries that are still pending.
             return {'delivered': 0, 'refused': [], 'pending': 0, 'stopped': None, 'reached': None}
@@ -1155,19 +1178,24 @@ class SharedClient:
                     stopped = error.code
         except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
             stopped = 'E_BUSY'
-        return {'delivered': 0, 'refused': [], 'pending': len(self.outbox.pending()),
+        return {'delivered': 0, 'refused': [], 'pending': self.outbox.pending_count(),
                 'stopped': stopped, 'reached': None}
 
     def _deliver(self):
+        """One pass over what was queued when it began, one entry in memory at a time: an entry queued
+        meanwhile waits for the next pass, so a pass never chases a steady writer."""
         delivered, refused, stopped, reached = 0, [], None, None
-        for entry in self.outbox.pending():
-            key = entry['idempotency_key']
+        high, after = self.outbox.last_seq(), 0
+        while (entry := self.outbox.next_pending(after, high)) is not None:
+            after, key, args = entry['seq'], entry['idempotency_key'], None
             channel = None
             try:
                 channel = self._connect()
                 reached = True
                 self.outbox.attempt(key)
-                ok, value = self._send(channel, entry['op'], json.loads(entry['args']), key)
+                # The body is read only once a channel is open: a pass that reaches no server reads none.
+                args = json.loads(self.outbox.body(after))
+                ok, value = self._send(channel, entry['op'], args, key)
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
@@ -1186,10 +1214,9 @@ class SharedClient:
             self.outbox.settle(key, 'refused', outcome)
             if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
                 # The server does not hold the bytes this piece followed: the next capture starts over.
-                args = json.loads(entry['args'])
                 self.outbox.reset_transcript(args['provider'], args['native_id'])
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
-        return {'delivered': delivered, 'refused': refused, 'pending': len(self.outbox.pending()),
+        return {'delivered': delivered, 'refused': refused, 'pending': self.outbox.pending_count(),
                 'stopped': stopped, 'reached': reached}
 
     def _entry_result(self, entry):
