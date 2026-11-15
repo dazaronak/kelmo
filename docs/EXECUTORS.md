@@ -73,6 +73,37 @@ the field is always correct. The built-in `claude` and `codex` adapters ignore
 it. The worker passes the field beside the payload, and `kelmo executor` takes
 it back out before anything reaches the model.
 
+### Naming the instructions
+
+Before work that would use the executor, the worker sends the configured command
+one request whose `task` is `identify` (see `docs/DREAMING.md`, "The executor
+must run this build"). `kelmo executor` answers it itself, without calling the
+provider or the custom command behind it:
+
+```json
+{
+  "kelmo": {
+    "version": "0.3.1",
+    "instructions": { "edit_pages": "5c1e...", "dream": "a07b..." }
+  }
+}
+```
+
+A command behind `--provider custom` never sees this request. A command that
+the worker runs directly, without `kelmo executor`, builds its own instructions,
+and says so with:
+
+```json
+{ "kelmo": { "instructions": "own" } }
+```
+
+The worker then compares nothing for that command and sends no reminders about
+it. A command that answers `identify` any other way is treated as a
+`kelmo executor` older than 0.3.1: the work goes on, and the owner is reminded
+once a day.
+
+### Deferrals, limits and a probe
+
 A quota deferral must come from the adapter's provider status, never from a
 model's answer. The CLI translates it to the worker's `quota_wait` result so
 waiting does not consume the failure budget; a built-in provider adds `reason`

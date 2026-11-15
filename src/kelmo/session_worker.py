@@ -357,6 +357,15 @@ def tick(root, argv=None, *, execute=None, timeout=120, max_attempts=3,
                 ORDER BY j.rowid LIMIT 1''',(time.time(),)).fetchone()
             if job is None:
                 return {'jobs':[]}
+            if execute is default_execute:
+                # Before the job is charged an attempt: an executor command that gives the model another
+                # build's instructions for sessions extracts none. The job waits, and the check tells the owner.
+                from .creation import SESSION_TASKS, instructions_standing
+                from .errors import VaultFailure
+                try:
+                    instructions_standing(argv, timeout, config, SESSION_TASKS, 'session jobs')
+                except VaultFailure as error:
+                    return {'jobs':[],'executor_ready':False,'error_code':error.code}
             job = dict(job)
             with db:
                 db.execute('INSERT OR IGNORE INTO session_processing(job_id) VALUES (?)',(job['id'],))

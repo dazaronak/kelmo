@@ -435,7 +435,7 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         if state == 'exhausted':
             failed_attempts.append({'operation_id': operation['id'], 'error_code': 'E_ATTEMPTS',
                                     'attempts': attempts, 'exhausted': True})
-    processed, vault_failed = 0, False
+    processed, vault_failed, executor_refused = 0, False, False
     with step():
         # A list, not the generator: its body reads the journal and must run inside the step.
         runnable = list(runnable_operations(service, argv))
@@ -445,7 +445,15 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
             break
         try:
             with step():
-                if service.journal.get(operation_id)['intent'] == 'create':
+                row = service.journal.get(operation_id)
+                if row['intent'] == 'create':
+                    if (executor_refused and row['state'] == 'archived'
+                            and not service.editor.publication_decided(operation_id)):
+                        # All that is left for an archived note is its editing, and the executor was just
+                        # refused for it: the note is not started, so a long queue costs this tick little. A
+                        # note whose publication is already decided needs no model and still takes its turn.
+                        skipped.append({'operation_id': operation_id, 'error_code': 'E_EXECUTOR'})
+                        continue
                     from .creation import CommandExecutor
                     ran = service.run(operation_id,
                                       executor=CommandExecutor(argv, timeout, stopping) if argv else None)
@@ -458,6 +466,14 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         except KelmoError as error:
             if stopping():
                 break  # a failure the stop caused (a call no core answers any more) is not the operation's
+            if isinstance(error, VaultFailure) and error.code == 'E_EXECUTOR':
+                # The executor gives the model another build's instructions (`creation.instructions_standing`,
+                # which has told the owner): no note is edited, this one keeps its key and its row, and what
+                # needs no model (a store, the archive of a new note) still runs. The vault itself takes
+                # publications, so its outage record is neither opened nor closed for this.
+                skipped.append({'operation_id': operation_id, 'error_code': error.code})
+                executor_refused = True
+                continue
             if isinstance(error, VaultFailure):
                 # No note can be published until the vault is repaired: this one keeps its key and its row, the
                 # owner is told, and the tick tries no further note, since each would meet the same failure.
@@ -495,8 +511,20 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
                           failed_attempts):
     from .resolution import Resolution
     queue = Resolution(service)
-    request = queue.claim(lease_seconds=int(timeout) + 60) if argv else None
+    # The lease covers the question that may be put before the model call as well as the call itself.
+    from .creation import IDENTIFY_TIMEOUT, RESOLVE_TASKS, instructions_standing
+    request = queue.claim(lease_seconds=int(timeout) + IDENTIFY_TIMEOUT + 60) if argv else None
     quota_waits = []
+    if request and request['response'] is None:
+        # Before the model is asked: an executor that gives it another build's instructions for resolving
+        # answers no request, and this one goes back unanswered with its attempts. The owner is told by
+        # the check itself.
+        try:
+            instructions_standing(argv, timeout, service.config, RESOLVE_TASKS, 'resolution requests')
+        except VaultFailure as error:
+            queue.release_busy(request['id'], request['token'])
+            skipped.append({'resolution_id': request['id'], 'error_code': error.code})
+            request = None
     if request:
         try:
             reply = request['response'] if request['response'] is not None else quota.checked(

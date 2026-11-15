@@ -120,6 +120,15 @@ whose mandatory pages alone approach that figure sets the table once:
 budget_tokens = 200000
 ```
 
+A batch of the batched apply carries several notes in one conversation.
+`batch_budget_tokens` raises its budget above the largest budget among its notes
+when the table names it ([Dreaming](DREAMING.md#batched-apply)).
+
+Reconciliation receipts may take up to half of a request's budget. With
+`[editor] coverage = true` the editor's answer also says what became of every
+part of the note, and the note's trace records it
+([Dreaming](DREAMING.md#coverage)).
+
 An explicit `--budget-tokens` still wins for that call. A budget that cannot hold
 the source, receipts and mandatory pages fails the operation with `E_BUDGET`
 before anything is sent to the model; nothing is labelled complete. A request

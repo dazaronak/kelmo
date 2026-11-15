@@ -301,13 +301,16 @@ def run_borrowed_client(client, argv, sources=None, stdin=None, *, root=None):
 
 def dispatch(args, commands):
     if args.command == 'executor':
-        from .executor import resolve
+        from .executor import IDENTIFY, identity, resolve
         from .quota import QuotaWait
         # A complete one-MiB source can expand sixfold when JSON-escaped.
         raw = sys.stdin.read(EXECUTOR_INPUT_LIMIT + 1)
         if len(raw.encode()) > EXECUTOR_INPUT_LIMIT:
             raise KelmoError('E_INPUT', 'Executor input exceeds size limit.')
         payload = json.loads(raw)
+        if isinstance(payload, dict) and payload.get('task') == IDENTIFY:
+            # The worker asks which instructions this install gives a model. No provider is called.
+            return {'kelmo': identity()}
         # The worker sends a job's conversation beside its payload; it is never model input.
         conversation = payload.pop('conversation', None) if isinstance(payload, dict) else None
         if args.provider_home is not None:

@@ -1,6 +1,7 @@
 """Plain-text intake through the existing archive, editor and operation journal."""
 from contextlib import nullcontext
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,187 @@ class CommandExecutor:
             return ModelOutcome('deferred', reset_at=wait.reset_at)
         except KelmoError as error:
             return ModelOutcome('failure', error_code=error.code, reason=str(error))
+
+
+# What each executor command last said of its instructions, for this process:
+# {(command, ours): (monotonic time, what it named, its version)}; what it named is a dict of digests, 'own',
+# or None when it named nothing. An answer that names this build's instructions is believed for ten minutes,
+# so a worker that looks for work every few seconds starts one more process in ten minutes and not one per
+# look. One that names other instructions is believed for a minute: the repair is a person's, and the pass
+# after it should not wait long to see it. One that names none, or says its instructions are its own, is
+# believed for an hour, here and across processes (`UNIDENTIFIED_SECONDS`): on a Kelmo older than 0.3.1 the
+# question is answered as a job, which costs one small model call, and a repaired executor is seen within
+# the hour.
+_STANDINGS = {}
+_BELIEVED = {'same': 600, 'differs': 60, 'unidentified': 3600, 'own': 3600}
+UNIDENTIFIED_SECONDS = 3600
+IDENTIFY_TIMEOUT = 120
+# A question that failed is put again after a minute, then two, four, up to an hour: {key: (monotonic time,
+# failures in a row)}. A worker that looks for work every few seconds does not start a failing command on
+# every look. After `FAILURES_TOLD` failures in a row the command counts as one that names no instructions.
+_UNASKED = {}
+UNASKED_SECONDS = 60
+FAILURES_TOLD = 3
+# The instructions each kind of work has the model read (`executor.identity` names them the same way).
+EDITOR_TASKS = ('edit_pages', 'edit_pages_covered')
+DREAM_TASKS = ('dream',)
+SESSION_TASKS = ('extract', 'reconcile_session')
+RESOLVE_TASKS = ('resolve',)
+
+
+def require_same_instructions(executor, config=None, tasks=None, work='notes'):
+    """`instructions_standing` for an executor object. Only a configured command is asked: an object handed
+    in by a caller (a test double, an embedding application) owns its instructions. Without `tasks` the
+    editor's are meant: the plain instructions, and the accounting ones only where `[editor] coverage`
+    has the editor send them."""
+    if not isinstance(executor, CommandExecutor):
+        return None
+    if tasks is None:
+        tasks = EDITOR_TASKS if config is None or config.coverage else EDITOR_TASKS[:1]
+    return instructions_standing(executor.argv, executor.timeout, config, tasks, work)
+
+
+def instructions_standing(argv, timeout=IDENTIFY_TIMEOUT, config=None, tasks=None, work='notes'):
+    """Whether the executor command gives the model this Kelmo's instructions for `tasks` (all of them when
+    None): `same`, `own`, `unidentified` or `unasked`. A known difference raises `VaultFailure` with
+    `E_EXECUTOR`; `work` names what is then kept from the command, for the owner's message.
+
+    `kelmo executor` builds the model's instructions and answer schema from the Kelmo it is installed in;
+    this process checks the answers against its own. A command that runs from another install (another
+    account, a runtime of its own) and was left on another build makes the model answer under rules this
+    worker never wrote, and nothing in an answer shows it. So the command is asked what it gives the model
+    (`executor.identity`) before work that would use it:
+
+    - the digests asked about are this build's: `same`. The version alone is no difference, and neither is
+      a digest of a task this caller does not use.
+    - one of them differs: `VaultFailure`. Nothing can be done well with that executor until a person
+      updates it, and no note caused it, so the caller stops and charges nothing. The owner is told here
+      (`alerts.ExecutorWatch.refused`), once a day for each kind of work.
+    - the command says its instructions are its own (`{"kelmo": {"instructions": "own"}}`, for a command
+      that is not `kelmo executor`): `own`, and nothing is checked.
+    - the command answers without naming its instructions: `unidentified`. A `kelmo executor` older than
+      0.3.1 answers the question as a job. The work goes on, since a patch release must not stop a vault
+      whose executor nobody has touched, and the owner is told at once and reminded daily
+      (`alerts.ExecutorWatch.unidentified`).
+    - the question itself fails: with a difference already known for this command and this build (in this
+      process or on record) the refusal stands, since a command that stops answering has not been repaired.
+      Otherwise `unasked`, with one line on stderr, and the work goes on: only a known difference stops
+      it. The question is put again after a minute, then less and less often; after three failures in a
+      row the command counts as `unidentified` and the owner is told.
+
+    With `config` the answers are recorded in the state directory, where `kelmo dream status` reads them."""
+    from .alerts import ExecutorWatch
+    from .executor import IDENTIFY, identity
+    ours = identity()
+    mine = hashlib.sha256(json.dumps(ours['instructions'], sort_keys=True).encode()).hexdigest()
+    command = hashlib.sha256(json.dumps(list(argv)).encode()).hexdigest()
+    name = Path(str(argv[0])).name if argv else '?'
+    key, clock = (command, mine), time.monotonic()
+    watch = ExecutorWatch.for_config(config) if config is not None else None
+
+    def differing(told, among):
+        return sorted(task for task, digest in ours['instructions'].items()
+                      if (among is None or task in among) and told.get(task) != digest)
+
+    def judged(told, version, wrong=None):
+        wrong = differing(told, tasks) if wrong is None else wrong
+        if not wrong:
+            return 'same'
+        refusal = ('The executor command runs Kelmo ' + version + ' and gives the model other instructions '
+                   'than this Kelmo (' + ours['version'] + ') for ' + ', '.join(wrong) + '. Its answers would be '
+                   'checked against rules the model never read. Install this build where the executor command '
+                   "runs from, or bring this worker to the executor's build; nothing was sent to the model and "
+                   'nothing was charged.')
+        if watch is not None:
+            watch.refused(command, name, work, refusal)
+        raise VaultFailure('E_EXECUTOR', refusal)
+
+    def standing_of(told):
+        return ('unidentified' if told is None else 'own' if told == 'own'
+                else 'differs' if differing(told, None) else 'same')
+
+    held = _STANDINGS.get(key)
+    if held is not None:
+        asked, told, version = held
+        if clock - asked < _BELIEVED[standing_of(told)]:
+            return judged(told, version) if isinstance(told, dict) else standing_of(told)
+    entry = watch.entry(command) if watch is not None else None
+
+    def unanswered(failures):
+        """What stands while the command cannot be asked. A difference already known for this command and
+        this build, in this process or on record, stands until an answer lifts it: a command that stops
+        answering was not repaired. With none known the work goes on, and after three failures in a row the
+        command counts as one that names no instructions."""
+        if held is not None and isinstance(held[1], dict) and differing(held[1], tasks):
+            return judged(held[1], held[2])
+        known = entry is not None and entry['standing'] == 'differs' and entry.get('ours') == mine
+        still = sorted(task for task in (entry.get('differing') or []) if tasks is None or task in tasks) \
+            if known else []
+        if still:
+            return judged({}, str(entry.get('executor_version')), still)
+        return 'unidentified' if failures >= FAILURES_TOLD and not known else 'unasked'
+
+    failed = _UNASKED.get(key)
+    if failed is not None:
+        # While a difference is known the question is put again every minute, however often it failed:
+        # the refusal stands until an answer lifts it, and a repaired command should be seen soon.
+        refusing = ((held is not None and isinstance(held[1], dict) and differing(held[1], None))
+                    or (entry is not None and entry['standing'] == 'differs' and entry.get('ours') == mine))
+        wait = UNASKED_SECONDS if refusing else min(UNASKED_SECONDS * 2 ** (failed[1] - 1), 3600)
+        if clock - failed[0] < wait:
+            return unanswered(failed[1])
+    if (entry is not None and entry['standing'] in ('unidentified', 'own') and entry.get('ours') == mine
+            and isinstance(entry.get('asked_at'), (int, float))
+            and 0 <= time.time() - entry['asked_at'] < UNIDENTIFIED_SECONDS):
+        if entry['standing'] == 'unidentified':
+            watch.unidentified(command, name, mine, str(entry.get('reason')), asked=False)
+        _STANDINGS[key] = (clock, None if entry['standing'] == 'unidentified' else 'own', None)
+        return entry['standing']
+    try:
+        answer = execute(argv, {'task': IDENTIFY}, timeout=min(timeout, IDENTIFY_TIMEOUT))
+    except Stopping:
+        raise
+    except (KelmoError, OSError) as error:
+        reason = ('the question failed (' + (error.code if isinstance(error, KelmoError)
+                                            else type(error).__name__) + ': '
+                  + ' '.join(str(error).split())[:200] + ')')
+        failures = watch.failed(command, name, mine) if watch is not None else (failed[1] + 1 if failed else 1)
+        _UNASKED[key] = (clock, failures)
+        print('kelmo: the executor command ' + name + ' could not be asked which instructions it gives the '
+              'model: ' + reason + '; they are not checked this time', file=sys.stderr)
+        standing = unanswered(failures)
+        if standing == 'unidentified' and watch is not None:
+            watch.unidentified(command, name, mine, reason + ', ' + str(failures) + ' times in a row',
+                               failures=failures)
+        return standing
+    _UNASKED.pop(key, None)
+    theirs = answer.get('kelmo') if isinstance(answer, dict) else None
+    told = theirs.get('instructions') if isinstance(theirs, dict) else None
+    if told == 'own':
+        if watch is not None:
+            watch.own(command, name, mine)
+        _STANDINGS[key] = (clock, 'own', None)
+        return 'own'
+    if isinstance(told, dict):
+        told = {task: digest for task, digest in told.items() if isinstance(digest, str)}
+    if not isinstance(told, dict) or not any(task in told for task in ours['instructions']):
+        reason = 'it answered the question as a job'
+        print('kelmo: the executor command ' + name + ' does not name the instructions it gives the model: '
+              + reason + ' (a `kelmo executor` older than 0.3.1 does); they are not checked against this build',
+              file=sys.stderr)
+        if watch is not None:
+            watch.unidentified(command, name, mine, reason)
+        _STANDINGS[key] = (clock, None, None)
+        return 'unidentified'
+    version = str(theirs.get('version'))[:40]
+    _STANDINGS[key] = (clock, dict(told), version)
+    wrong = differing(told, None)
+    if watch is not None:
+        if wrong:
+            watch.differs(command, name, mine, version, 'other instructions for ' + ', '.join(wrong), wrong)
+        else:
+            watch.same(command, name, mine, version)
+    return judged(told, version)
 
 
 def configured_executor(service):
@@ -459,6 +641,10 @@ def publish(service, operation_id, request, executor=None, *, now=False):
             # from that publication before its origin or its stored request is read, so neither can refuse it.
             service.journal.stage(operation_id, 'applied', terminal=True, claim_token=token)
             return service.journal.get(operation_id)
+        # Before an attempt is opened and before any model call: an executor that gives the model another
+        # build's instructions edits no note. The failure is the vault's, so the note keeps its place and
+        # its attempts, and the claim is released on the way out.
+        require_same_instructions(executor, service.config)
         key, hint, attempts = _attempt(service, operation_id)
         try:
             service.editor.edit(operation_id, origin=service._operation_origin(operation_id),
@@ -625,13 +811,19 @@ def publish_batch(service, batch, executor):
                     break
                 # The head's own request is the refusal: it is charged for it alone, as `publish` charges it.
                 return {member['id']: (parked(operation['id'], error) if member['id'] == operation['id']
-                                       else {'state': 'waiting', 'code': None})
+                                       else {'state': 'waiting', 'code': None,
+                                             'reason': 'the head of its batch was refused for its own request '
+                                                       'before the batch opened; it was not consulted'})
                         for member, _request, _origin in batch}
             if hint is not None:
                 entry['request']['hint'] = hint
             items.append(entry)
         head = items[0]['source_operation_id'] if items else batch[0][0]['id']
-        waiting = {operation['id']: {'state': 'waiting', 'code': cut}
+        waiting = {operation['id']: {'state': 'waiting', 'code': cut,
+                                     'reason': ('another attempt holds a source of the batch; this one was not '
+                                                'consulted and waits behind it' if cut else
+                                                'the batch ended before a source whose stored request could not '
+                                                'be read; this one was not consulted')}
                    for operation, _request, _origin in batch if operation['id'] not in claimed}
         if not items:
             return waiting
@@ -649,7 +841,8 @@ def publish_batch(service, batch, executor):
             if error.code in UNCHARGED:
                 if done:
                     # Contention ends the call, and the notes it published settle anyway; the rest wait.
-                    return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code}
+                    return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code,
+                                                           'reason': str(error)}
                                             for operation_id in claimed if operation_id not in done}, **done)
                 raise
             if isinstance(error, VaultFailure):
@@ -664,13 +857,16 @@ def publish_batch(service, batch, executor):
                 # single source would be. The head is the source the editor led with, which is a later one
                 # when the oldest was settled by a pass that died before it recorded that.
                 head = getattr(error, 'lead', head)
-                return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code}
+                return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code,
+                                                       'reason': 'the head of its batch was refused (' + str(error)
+                                                                 + '); it was not consulted'}
                                         for operation_id in claimed if operation_id not in done and operation_id != head},
                             **done, **({head: parked(head, error)} if head not in done else {}))
             # Any other refusal raised for the batch as a whole names no note of it, like a fault that is no
             # Kelmo refusal: each note not settled takes the single-source path in this same pass, uncharged, and
             # meets there whatever is its own. A note a commit of this batch carried settles from it there.
-            return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code, 'alone': True}
+            return dict(waiting, **{operation_id: {'state': 'waiting', 'code': error.code, 'alone': True,
+                                                   'reason': str(error)}
                                     for operation_id in claimed if operation_id not in done}, **done)
         outcome = dict(waiting)
         for operation, _request, _origin in batch:
@@ -687,13 +883,47 @@ def publish_batch(service, batch, executor):
                 # The batch answer left this source unaccounted for and ended its attempt without a refusal:
                 # it spent no attempt and stays waiting, and the pass names it here so the same pass
                 # consults it alone instead of sending it into a later batch of the same pass.
-                outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code'), 'alone': True}
+                outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code'), 'alone': True,
+                                         'reason': disposition.get('reason')}
             else:
-                outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code')}
+                # `reason` says why the batch left it waiting (dropped for the budget, behind an older note,
+                # held by another attempt); the pass reports it, since nothing else of this call outlives it.
+                # The source the batch ended before was claimed and never sent: its own request is why.
+                reason = disposition.get('reason') or (
+                    None if any(entry['source_operation_id'] == operation_id for entry in items) else
+                    'its stored request could not be read, so the batch ended before it; it takes its own turn')
+                outcome[operation_id] = {'state': 'waiting', 'code': disposition.get('code'),
+                                         **({'reason': reason} if reason else {})}
         return outcome
     finally:
         for operation_id, token in claimed.items():
             service.journal.release(operation_id, token)
+
+
+def _report_unsettled(report, batch, outcome):
+    """Name, in the pass report and the worker log, the notes a batch consulted and did not settle, with why.
+
+    Such a note stays waiting and is consulted again, alone or in the next batch, so no bucket of the report
+    holds it; without this the conversation the batch paid for leaves no word of how it ended. `unsettled`
+    appears in the report only when a batch left a note: `{'operation_id', 'lead', 'error_code', 'reason'}`.
+    """
+    lead = batch[0][0]['id']
+    # Every note the call left waiting is named, on one line each: a reason it did not carry is said to be
+    # missing, never left out of the count.
+    left = [{'operation_id': operation_id, 'lead': lead, 'error_code': item.get('code'),
+             'reason': ' '.join(str(item.get('reason') or item.get('blocked')
+                                    or 'no reason was recorded for it').split())}
+            for operation_id, item in outcome.items() if item['state'] == 'waiting']
+    if not left:
+        return
+    report.setdefault('unsettled', []).extend(left)
+    reasons = list(dict.fromkeys(item['reason'] for item in left))
+    try:
+        print(f'kelmo: the batch of {len(batch)} notes led by {lead} left {len(left)} of them waiting '
+              f'({len(outcome) - len(left)} settled, deferred or parked): ' + ' | '.join(reasons[:3])
+              + (f' (+{len(reasons) - 3} more reasons)' if len(reasons) > 3 else ''), file=sys.stderr, flush=True)
+    except OSError:
+        pass  # the report carries the same notes; a log that cannot be written ends no pass
 
 
 def pending_operations(service, project=None, *, include_unarchived=False, registry=None):
@@ -931,6 +1161,9 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     stopped = None
     # Whether a consultation of this pass got past the vault's checks (`Editor.vault_passed`).
     service.editor.vault_passed = False
+    # What the answers of this pass accounted for, note by note (`[editor] coverage`).
+    service.editor.accounted = {}
+    # Whether the executor command was asked which instructions it gives the model (once a pass).
     # The sources this pass already sent through a batch whose answer never accounted for them: each of
     # them runs the single-source path in this same pass, so `batch_members` never takes one of them into
     # a batch again and no later batch of the pass spends a second conversation on a note that is about
@@ -1013,6 +1246,10 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                 continue
             batch = []
             try:
+                # Before each note or batch is consulted, and only when there is one: the executor must give
+                # the model this build's instructions (`instructions_standing`, which remembers its answer, so
+                # the command is started once in ten minutes and not once a note).
+                require_same_instructions(executor or configured_executor(service), service.config)
                 # A head whose publication is decided takes the single-source turn, which settles it from that
                 # publication before anything else of the turn can refuse it (`publish`).
                 batch = (batch_members(service, waiting, min(service.config.batch_max_sources, limit - len(seen)),
@@ -1024,6 +1261,7 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                     # of its project; each member still settles on its own row and in its own bucket.
                     outcome = publish_batch(service, batch, executor)
                     moved, sent_alone = False, False
+                    _report_unsettled(report, batch, outcome)
                     for operation_id, item in outcome.items():
                         if item['state'] == 'waiting':
                             if item.get('alone'):
@@ -1139,12 +1377,30 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
         # Nothing was published, but the vault took a publication check and nothing stopped the pass: the
         # outage on record is over, so a new one is told when it starts, not at the old one's reminder.
         VaultWatch.for_service(service).published(applied=False)
+    published = [service.editor.accounted[operation_id] for operation_id in report['applied']
+                 if operation_id in service.editor.accounted]
+    if published:
+        # What became of the units of the notes this pass published: how many reached an item, how many
+        # were left under each reason, and how many are in neither. The last is the loss nobody decided on,
+        # so it is said aloud; each note's trace names its own units.
+        from . import coverage
+        report['coverage'] = coverage.totals(published)
+        if report['coverage']['open']:
+            try:
+                print(f"kelmo: the answers of this pass left {report['coverage']['open']} of "
+                      f"{report['coverage']['units']} units of {report['coverage']['notes']} notes in no item and "
+                      "under no reason; `kelmo trace` of a note names its own", file=sys.stderr, flush=True)
+            except OSError:
+                pass
     if stopped is not None:
         operation_id, code, reason = stopped
         report['blocked'] = {'operation_id': operation_id, 'error_code': code, 'reason': reason}
         print(f'kelmo: the apply pass stopped at note {operation_id}: no note can be published ({code}: {reason}); '
               'every waiting note keeps its turn and is not charged', file=sys.stderr, flush=True)
-        VaultWatch.for_service(service).blocked(operation_id, code, reason)
+        if code != 'E_EXECUTOR':
+            # An executor that gives the model other instructions has its own record and its own daily
+            # message (`instructions_standing`); the vault's outage record is not opened or closed for it.
+            VaultWatch.for_service(service).blocked(operation_id, code, reason)
     if snapshot is not None:
         # What this pass left, by project: the notes it began with that it did not settle. A note that was
         # deferred, held or stopped short of the pass's own limit still waits, so it is named here.
