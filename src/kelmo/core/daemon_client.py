@@ -20,6 +20,8 @@ from ..errors import KelmoError
 from . import wire
 
 START_SECONDS = 15.0
+# How long a resend after a cut keeps trying to connect while kelmod rebinds its socket.
+RECONNECT_SECONDS = START_SECONDS
 
 
 def runtime_dir(root):
@@ -55,40 +57,112 @@ def kelmod_executable(preferred=None):
     return found
 
 
+# The first attempt's socket waits this long past the deadline, so kelmod's own E_DEADLINE reply can arrive.
+GRACE_SECONDS = 5.0
+RECONNECT_PAUSE = 0.05
+
+
+class _Cut(Exception):
+    """kelmod's channel ended under a call: closed, reset, or broken on a write. `sent` says whether the
+    call frame's write had been attempted."""
+
+    def __init__(self, sent):
+        super().__init__('The daemon closed the connection.')
+        self.sent = sent
+
+
 def _frames(sock, reader):
     while True:
         data = sock.recv(1048576)
         if not data:
-            raise KelmoError('E_TRANSPORT', 'The daemon closed the connection.')
+            raise ConnectionResetError('The daemon closed the connection.')
         frames = reader.feed(data)
         if frames:
             return frames
 
 
+def _resendable(op, key):
+    """Whether a call cut after it was sent may go once more: kelmod's own replay rule (operations.py)."""
+    from .operations import REPLAY_KEYED, REPLAY_READ, by_name
+    if op == 'daemon.status':  # served by kelmod itself, outside the cores' operation table
+        return True
+    found = by_name().get(op)
+    replay = found.replay if found is not None else None
+    return replay == REPLAY_READ or (replay == REPLAY_KEYED and key is not None)
+
+
+def _connect(target, limit=None):
+    """A connected socket. Without `limit` one try; with it, a try every RECONNECT_PAUSE until `limit`."""
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(target)
+            return sock
+        except OSError as error:
+            sock.close()
+            if limit is None or time.monotonic() + RECONNECT_PAUSE >= limit:
+                raise KelmoError('E_TRANSPORT', f'No daemon answers at {target}.') from error
+            time.sleep(RECONNECT_PAUSE)
+
+
+def _attempt(sock, op, body, key, timeout, deadline_ms):
+    """One exchange on a connected socket: hello, the call, its reply."""
+    sent = False
+    with sock:
+        sock.settimeout(timeout)
+        try:
+            reader = wire.FrameReader()
+            sock.sendall(wire.encode({'v': wire.VERSION, 'kind': 'hello', 'id': uuid.uuid4().hex,
+                                      'body_type': 'json', 'protocols': ['kelmo/2'], 'operations': []}))
+            _frames(sock, reader)
+            header = {'v': wire.VERSION, 'kind': 'call', 'id': uuid.uuid4().hex, 'op': op, 'body_type': 'json',
+                      'deadline_ms': deadline_ms}
+            if key is not None:
+                header['key'] = key
+            frame = wire.encode(header, body if body is not None else {})
+            sent = True
+            sock.sendall(frame)
+            return _frames(sock, reader)[0]
+        except TimeoutError as error:
+            if not sent:
+                # Nothing reached kelmod, so no pass or write can be running for this call.
+                failure = KelmoError('E_TRANSPORT', 'The daemon did not answer the hello in time; nothing was sent.')
+                failure.retryable = True
+                raise failure from error
+            raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from error
+        except (ConnectionResetError, BrokenPipeError) as error:
+            raise _Cut(sent) from error
+
+
 def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
-    """One call to the daemon of `root`; returns the reply body or raises KelmoError with its verdict."""
+    """One call to the daemon of `root`; returns the reply body or raises KelmoError with its verdict.
+
+    A channel cut under the call (kelmod stopping, restarting or crashing) is met by kelmod's own replay
+    rule: a call cut before it was sent, a read, or a write under a key goes once more inside the deadline;
+    any other write is not sent again and is reported with its effect unknown."""
     target = str(path or socket_path(root))
     if not _trusted(target):
         raise KelmoError('E_TRANSPORT', f'The daemon directory of {target} is not private to this user.')
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(seconds + 5)
+    limit = time.monotonic() + seconds
+    try:
+        reply, result = _attempt(_connect(target), op, body, key, seconds + GRACE_SECONDS, int(seconds * 1000))
+    except _Cut as cut:
+        if cut.sent and not _resendable(op, key):
+            error = KelmoError('E_TRANSPORT', 'The daemon closed the connection after the call was sent; '
+                                              'its effect is unknown.')
+            error.retryable = False
+            raise error from cut
+        if limit - time.monotonic() <= 0:
+            raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
+        sock = _connect(target, min(limit, time.monotonic() + RECONNECT_SECONDS))
+        left = limit - time.monotonic()
+        if left <= 0:
+            sock.close()
+            raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
         try:
-            sock.connect(target)
-        except OSError as error:
-            raise KelmoError('E_TRANSPORT', f'No daemon answers at {target}.') from error
-        reader = wire.FrameReader()
-        sock.sendall(wire.encode({'v': wire.VERSION, 'kind': 'hello', 'id': uuid.uuid4().hex, 'body_type': 'json',
-                                  'protocols': ['kelmo/2'], 'operations': []}))
-        _frames(sock, reader)
-        header = {'v': wire.VERSION, 'kind': 'call', 'id': uuid.uuid4().hex, 'op': op, 'body_type': 'json',
-                  'deadline_ms': int(seconds * 1000)}
-        if key is not None:
-            header['key'] = key
-        sock.sendall(wire.encode(header, body if body is not None else {}))
-        try:
-            reply, result = _frames(sock, reader)[0]
-        except TimeoutError as error:
-            raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from error
+            reply, result = _attempt(sock, op, body, key, left, int(left * 1000))
+        except _Cut as again:
+            raise KelmoError('E_TRANSPORT', 'The daemon closed the connection again.') from again
     if reply.get('ok'):
         return result
     error = KelmoError(reply['error']['code'], reply['error']['message'])
