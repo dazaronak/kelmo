@@ -875,7 +875,8 @@ def _sealed(record, key, authority_id):
 
 
 class Busy(KelmoError):
-    """The owner of the outbox did not free it within the caller's deadline; nothing was done."""
+    """The owner of the outbox did not free it within the caller's deadline. Nothing was done, unless the
+    message names what was."""
 
     def __init__(self, message):
         super().__init__('E_BUSY', message)
@@ -1510,7 +1511,12 @@ class ClientService:
                 if ((not following['terminal'] or (following['state'] == 'failed'
                                                    and following.get('error_code') == 'E_BUSY'))
                         and following['state'] != 'captured'):
-                    self.client.pause(max(0, min(0.25, limit - time.monotonic())))
+                    try:
+                        self.client.pause(max(0, min(0.25, limit - time.monotonic())))
+                    except Busy as error:
+                        raise Busy(f'{error} Operation {operation["id"]} was accepted; kelmo trace '
+                                   f'{operation["id"]} shows it, and the same command again reuses its '
+                                   'idempotency key.') from error
 
     def _capture(self, content, filename, role, intent, idempotency_key, supersedes):
         if intent not in ('archive', 'promote'):

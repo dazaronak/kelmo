@@ -76,6 +76,11 @@ class OwnerLock:
                 # A caller that gave up may have been the one whose turn it was.
                 self._condition.notify_all()
 
+    def held(self):
+        """How many times the calling thread holds the lock: 0 when another thread or nobody does."""
+        with self._condition:
+            return self._count if self._holder == threading.get_ident() else 0
+
     def release(self):
         with self._condition:
             if self._holder != threading.get_ident():
@@ -120,7 +125,7 @@ class EdgeCore:
         self._owner = OwnerLock()
         self._urgent = threading.local()
         self.client._lock = _OwnerGate(self)
-        self._depth = threading.local()
+        self._request = threading.local()  # the deadline of the call each handler thread serves
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.client.pause = self._pause
@@ -137,12 +142,12 @@ class EdgeCore:
         from ..client import Busy
         if not self._owner.acquire(timeout=max(0.0, seconds), urgent=urgent):
             raise Busy('The edge core is busy with another write; retry.')
-        self._depth.count = getattr(self._depth, 'count', 0) + 1
         try:
             yield self.client
         finally:
-            self._depth.count -= 1
-            self._owner.release()
+            # A pause that could not take the outbox back left this thread holding nothing.
+            if self._owner.held():
+                self._owner.release()
 
     @contextmanager
     def serving(self, context, cap=None, urgent=False):
@@ -152,12 +157,15 @@ class EdgeCore:
         context.check()
         left = context.remaining() if cap is None else min(cap, context.remaining())
         previous = getattr(self._urgent, 'value', False)
+        until = getattr(self._request, 'until', None)
         self._urgent.value = urgent
+        self._request.until = time.monotonic() + max(0.001, left)
         try:
             with self.client.deadline(max(0.001, left)):
                 yield self.client
         finally:
             self._urgent.value = previous
+            self._request.until = until
 
     # Acknowledgements of HOT deliveries, run when `kelmod hook` reports that the session printed the context.
     ACK_SECONDS = 60.0
@@ -187,15 +195,33 @@ class EdgeCore:
         return {'acknowledged': True}
 
     def _pause(self, seconds):
-        """A wait between polls (`memory_create --wait`) gives the client to other callers meanwhile."""
-        depth = getattr(self._depth, 'count', 0)
+        """A wait between polls (`kelmo create --wait`) gives the outbox to other callers meanwhile and takes it
+        back before the call's deadline, or fails as busy. A tool call holds nothing across its wait, so it lends
+        nothing and takes nothing back."""
+        from ..client import Busy
+        depth = self._owner.held()
+        if not depth:
+            time.sleep(seconds)
+            return
         for _ in range(depth):
             self._owner.release()
         try:
-            time.sleep(seconds)
+            time.sleep(max(0.0, min(seconds, self._left())))
         finally:
-            for _ in range(depth):
+            if not self._owner.acquire(timeout=self._left(), urgent=getattr(self._urgent, 'value', False)):
+                raise Busy('The edge core stayed busy past this call\'s deadline while it waited between polls.')
+            for _ in range(depth - 1):
                 self._owner.acquire()
+
+    def _left(self):
+        """Seconds left before the deadline of the call this thread serves."""
+        until = getattr(self._request, 'until', None)
+        if until is not None:
+            return max(0.0, until - time.monotonic())
+        try:
+            return self.client.remaining()
+        except KelmoError:
+            return 0.0
 
     # --- delivery --------------------------------------------------------------------------------------
 
