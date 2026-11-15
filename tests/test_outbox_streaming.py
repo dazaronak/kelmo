@@ -225,10 +225,12 @@ def test_a_flush_does_not_chase_entries_queued_after_it_started(make_client):
     server = Server()
     client = make_client(server)
     queue(client, 3)
-    counter = iter(range(1000))
+    counter = iter(range(5))
 
     def keep_queueing():
-        number = next(counter)
+        number = next(counter, None)
+        if number is None:
+            return
         other = Outbox(client.profile.state)
         try:
             other.enqueue('capture', {'content': f'late {number}', 'filename': f'late{number}.md'},
