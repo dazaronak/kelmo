@@ -885,6 +885,10 @@ class Busy(KelmoError):
 
 # How long a client that found a kelmo-client/1 server waits before it offers kelmo/2 again.
 LEGACY_RETRY_SECONDS = 300
+# A read cut under it reconnects for at most this long, pausing 0.25 s, then doubling up to 2 s between tries.
+RECONNECT_SECONDS = 15.0
+RECONNECT_FIRST_PAUSE = 0.25
+RECONNECT_LAST_PAUSE = 2.0
 
 
 class SharedClient:
@@ -1090,7 +1094,35 @@ class SharedClient:
 
     def call(self, op, args=None):
         """A read: no outbox, and a transport failure is reported, never answered from the cache. Over a
-        channel that carries several requests it does not wait for the owner of the outbox."""
+        channel that carries several requests it does not wait for the owner of the outbox.
+
+        A read whose channel fails under it (the server's kelmod restarting, the bridge to it cut) is sent
+        once more within the active deadline: a read has no effect to repeat. Reconnecting starts the
+        profile's command again, so it is tried with a growing pause for at most RECONNECT_SECONDS."""
+        limit = time.monotonic() + self.remaining()
+        try:
+            return self._read_once(op, args)
+        except KelmoError as error:
+            if isinstance(error, Unsent) or error.code != 'E_TRANSPORT' or time.monotonic() >= limit:
+                raise
+            failed = error
+        self._drop(self._channel)
+        window, pause = min(limit, time.monotonic() + RECONNECT_SECONDS), RECONNECT_FIRST_PAUSE
+        while True:
+            try:
+                with self.deadline(window - time.monotonic()):
+                    self._connect()
+                break
+            except Unbound as error:
+                failed = error
+                if time.monotonic() + pause >= window:
+                    raise failed from None
+                self.pause(pause)
+                pause = min(pause * 2, RECONNECT_LAST_PAUSE)
+        with self.deadline(limit - time.monotonic()):
+            return self._read_once(op, args)
+
+    def _read_once(self, op, args):
         if self._multiplex:
             channel = self._connect()
             if getattr(channel, 'concurrent', False):
@@ -1184,6 +1216,9 @@ class SharedClient:
                 delivered += 1
                 continue
             if value['retryable']:
+                if value['code'] == 'E_TRANSPORT':
+                    # The bridge answered for a server it lost and has ended: the next pass opens a new one.
+                    self._drop(channel)
                 self.outbox.note(key, value['code'])
                 stopped = value['code']
                 break
