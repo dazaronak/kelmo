@@ -8,7 +8,9 @@ named in `[alerts]`; that command owns the channel and its secrets, so none of t
 the state directory holds the outage start and the last delivered alert, so a restart neither repeats an
 alert nor drops one; an undelivered alert is tried again on the next answer that shows the same outage.
 """
+import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
@@ -16,6 +18,9 @@ import time
 REMINDER_SECONDS = 86400
 MARKER = 'login-outage.json'
 VAULT_MARKER = 'vault-outage.json'
+EXECUTOR_MARKER = 'executor-identity.json'
+# Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
+_REFUSALS_TOLD = {}
 
 
 def _when(epoch):
@@ -164,3 +169,212 @@ class VaultWatch(LoginWatch):
         except Exception as failure:  # noqa: BLE001 - Alerting must not turn a publication into a failure.
             print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
                   flush=True)
+
+
+class ExecutorWatch(LoginWatch):
+    """What each executor command said when it was asked which instructions it gives the model
+    (`creation.instructions_standing`), kept in the state directory for `kelmo dream status` and for the
+    next process, and what the owner is told about it.
+
+    One file holds an entry for every command, by the digest of its argv: the worker's, the one sessions
+    use and Dreaming's may be three different commands, and none of them answers for another.
+
+    - `same`: the command names this build's instructions. Nothing is told, except that an earlier
+      trouble with this command is over.
+    - `differs`: it names other instructions. The work that would use them does not start (`refused`), and
+      the owner is told once when that starts and once a day while it lasts, for each kind of work.
+    - `unidentified`: it names none, or the question keeps failing. A `kelmo executor` older than 0.3.1
+      answers the question as a job, so this is what an executor left behind by an upgrade looks like.
+      Nothing is refused; the owner is told at once and reminded once a day until the command names its
+      instructions, since one worker log line was all there was the time an executor stayed six days on
+      another build.
+    - `own`: a command that is not `kelmo executor` says its instructions are its own. Nothing is checked
+      and no reminder is sent; one message ends an earlier trouble with the command.
+    - `unasked`: every question to it has failed so far (`failed` counts them).
+    """
+
+    @classmethod
+    def for_config(cls, config):
+        settings = config.alerts or {}
+        return cls(config.state / EXECUTOR_MARKER, settings.get('command'), settings.get('label', 'Kelmo'))
+
+    @classmethod
+    def for_service(cls, service):
+        return cls.for_config(service.config)
+
+    def saw(self, wait, now=None):
+        raise TypeError('ExecutorWatch reads what an executor said of its instructions: use same, own, '
+                        'differs, unidentified, failed or refused.')
+
+    def entries(self):
+        """Every command on record: {command digest: entry}. A file that cannot be read as one is none."""
+        try:
+            held = json.loads(self.marker.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+        commands = held.get('commands') if isinstance(held, dict) else None
+        if not isinstance(commands, dict):
+            return {}
+        return {command: entry for command, entry in commands.items()
+                if isinstance(command, str) and isinstance(entry, dict)
+                and entry.get('standing') in ('same', 'own', 'differs', 'unidentified', 'unasked')}
+
+    def entry(self, command):
+        return self.entries().get(command)
+
+    def _keep(self, command, entry, read=None):
+        """Write one command's entry and leave the others as they are. A state directory that cannot be
+        written loses the record, never the alert or the refusal: both were decided before this. `read` is
+        the entry the caller started from, when it only adds to it (a reminder time, a failure count): if
+        another process recorded a newer answer meanwhile, that answer stays."""
+        try:
+            self.marker.parent.mkdir(parents=True, exist_ok=True)
+            # Read, change and replace under one lock: two processes that write the entries of different
+            # commands at once lose neither. The partial file is this process's own.
+            with open(self.marker.with_name(self.marker.name + '.lock'), 'w') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                commands = self.entries()
+                current = commands.get(command)
+                if (read is not None and current is not None
+                        and (current.get('asked_at') or 0) > (read.get('asked_at') or 0)):
+                    return
+                commands[command] = entry
+                partial = self.marker.with_name(f'{self.marker.name}.{os.getpid()}.partial')
+                partial.write_text(json.dumps({'commands': commands}), encoding='utf-8')
+                partial.replace(self.marker)
+        except OSError as failure:
+            print(json.dumps({'executor_record': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    @staticmethod
+    def _due(last, now):
+        """Whether a reminder is due: never told, a day ago or more, or told at a time still ahead of the
+        clock (a clock that was set back must not silence a reminder)."""
+        return not isinstance(last, (int, float)) or not 0 <= now - last < REMINDER_SECONDS
+
+    def _over(self, before, name):
+        """The message that ends an earlier trouble with this command, when the owner was told of one."""
+        if before is None:
+            return
+        if before.get('standing') == 'unidentified' and before.get('alerted_at'):
+            self.send(f'{self.label}: the executor command {name} now names the instructions it gives the '
+                      'model.')
+        elif before.get('standing') == 'differs' and before.get('refused'):
+            self.send(f'{self.label}: the executor command {name} gives the model this build\'s instructions '
+                      'again; the work that waited for it resumes.')
+
+    def same(self, command, name, ours, version, now=None):
+        now = time.time() if now is None else now
+        try:
+            before = self.entry(command)
+            self._keep(command, {'standing': 'same', 'name': name, 'ours': ours, 'asked_at': now,
+                                 'executor_version': version})
+            self._over(before, name)
+        except Exception as failure:  # noqa: BLE001 - A record must not turn a check into a failed pass.
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    def own(self, command, name, ours, now=None):
+        now = time.time() if now is None else now
+        try:
+            before = self.entry(command)
+            self._keep(command, {'standing': 'own', 'name': name, 'ours': ours, 'asked_at': now})
+            if before is None:
+                return
+            if before.get('standing') == 'unidentified' and before.get('alerted_at'):
+                self.send(f'{self.label}: the executor command {name} now says its instructions are its own; '
+                          'they are not checked.')
+            elif before.get('standing') == 'differs' and before.get('refused'):
+                self.send(f'{self.label}: the executor command {name} now says its instructions are its own; '
+                          'the work that waited for it resumes.')
+        except Exception as failure:  # noqa: BLE001
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    def differs(self, command, name, ours, version, reason, differing=(), now=None):
+        now = time.time() if now is None else now
+        try:
+            before = self.entry(command)
+            lasting = (before is not None and before.get('standing') == 'differs'
+                       and before.get('ours') == ours)
+            self._keep(command, {'standing': 'differs', 'name': name, 'ours': ours, 'asked_at': now,
+                                 'executor_version': version, 'reason': reason,
+                                 'differing': sorted(differing),
+                                 'refused': before.get('refused') if lasting
+                                 and isinstance(before.get('refused'), dict) else {}})
+        except Exception as failure:  # noqa: BLE001
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    def refused(self, command, name, work, reason, now=None):
+        """`work` ('notes', 'the findings pass', 'session jobs', 'resolution requests') was kept from a
+        command that gives the model other instructions for it. Told once when it starts and once a day
+        while it lasts, for each kind of work. The decision is the caller's and was made before this: a
+        record that cannot be read or written costs a repeated message, never a silent refusal."""
+        now = time.time() if now is None else now
+        try:
+            entry = self.entry(command)
+            if entry is not None and entry.get('standing') != 'differs':
+                # A newer answer of this command is on record (another process asked after a repair): the
+                # caller's memory of a difference is about to expire, and nothing is said over the record.
+                return
+            told = entry.get('refused') if entry is not None and isinstance(entry.get('refused'), dict) else {}
+            # With no record to read (the state directory cannot be written) this process remembers what
+            # it told, so a worker that looks for work every few seconds does not send on every look.
+            mine = (str(self.marker), command, work)
+            if not self._due(told.get(work, _REFUSALS_TOLD.get(mine) if entry is None else None), now):
+                return
+            text = (f'{self.label}: {work} wait for the executor command {name} and are not charged. '
+                    + ' '.join(str(reason).split())[:400])
+            if self.send(text) or not self.argv:
+                _REFUSALS_TOLD[mine] = now
+                if entry is not None:
+                    self._keep(command, {**entry, 'refused': {**told, work: now}}, read=entry)
+        except Exception as failure:  # noqa: BLE001 - Alerting must not turn a refusal into a failed tick.
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    def unidentified(self, command, name, ours, reason, now=None, asked=True, failures=0):
+        """The command named no instructions. `asked=False` keeps the time of the last question: the answer
+        on record was reused instead of asking again."""
+        now = time.time() if now is None else now
+        try:
+            before = self.entry(command)
+            lasting = (before is not None and before.get('standing') == 'unidentified'
+                       and before.get('ours') == ours)
+            entry = {'standing': 'unidentified', 'name': name, 'ours': ours, 'reason': reason,
+                     'since': before['since'] if lasting and isinstance(before.get('since'), (int, float))
+                     else now,
+                     'asked_at': now if asked or not lasting else before.get('asked_at', now),
+                     'alerted_at': before.get('alerted_at') if lasting else None,
+                     'failures': failures if asked else (before or {}).get('failures', 0)}
+            if self._due(entry['alerted_at'], now):
+                text = (f'{self.label}: the executor command {name} does not name the instructions it gives '
+                        f'the model (since {_when(entry["since"])}): {reason}. A `kelmo executor` older than '
+                        '0.3.1 answers this way: if the command runs one from another install, bring that '
+                        'install to this build, since notes are edited under its instructions meanwhile. '
+                        'This is repeated once a day until the command names its instructions.')
+                if lasting and entry['alerted_at']:
+                    text += f' Day {int((now - entry["since"]) // REMINDER_SECONDS) + 1}.'
+                if self.send(text) or not self.argv:
+                    entry['alerted_at'] = now
+            self._keep(command, entry, read=None if asked else before)
+        except Exception as failure:  # noqa: BLE001 - Alerting must not turn a check into a failed pass.
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    def failed(self, command, name, ours, now=None):
+        """The question itself failed. Returns how many times in a row it has now failed for this command
+        and this build (1 when no record can be kept)."""
+        now = time.time() if now is None else now
+        try:
+            before = self.entry(command)
+            again = before is not None and before.get('ours') == ours
+            failures = (before.get('failures', 0) if again else 0) + 1
+            entry = dict(before) if again else {'standing': 'unasked', 'name': name, 'ours': ours}
+            self._keep(command, {**entry, 'failures': failures, 'failed_at': now}, read=before if again else None)
+            return failures
+        except Exception as failure:  # noqa: BLE001
+            print(json.dumps({'executor_record': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+            return 1

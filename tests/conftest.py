@@ -18,6 +18,16 @@ def _no_requested_stop_leaks():
 
 
 @pytest.fixture(autouse=True)
+def _no_executor_answer_leaks():
+    # What an executor command said of its instructions is believed for minutes, process-wide
+    # (kelmo.creation.instructions_standing); one test's command must not answer for the next test's.
+    from kelmo import creation
+    creation._STANDINGS.clear()
+    creation._UNASKED.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _registry_views_stay_unchanged():
     yield
     changed = engine.changed_views()

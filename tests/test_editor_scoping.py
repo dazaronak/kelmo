@@ -991,11 +991,13 @@ def test_a_reconcile_round_past_the_receipt_ceiling_runs_no_search_and_sends_the
     assert world.outcome(source)['disposition'] == 'archive-only'
     assert search_rows(world) == 0, 'the searches of a refused round were never run'
     first, second = executor.jobs
-    assert first.payload['budget']['receipt_ceiling'] == budget // 4
+    # Half of the budget, and never more than the room the pages leave: here the room is the ceiling.
+    ceiling = budget - (first.payload['budget']['used_tokens'] - first.payload['budget']['receipt_tokens'])
+    assert first.payload['budget']['receipt_ceiling'] == ceiling == 355 < budget // 2
     assert first.payload['reconciliations'] == [] and 'candidates' not in first.payload
     refusal = second.payload['refusal']
     assert refusal['code'] == 'E_PROPOSAL' and set(refusal) == {'code', 'reason'}
-    assert 'may cost at most ' + str(budget // 4) + ' estimated tokens of its ' + str(budget) in refusal['reason']
+    assert 'may cost at most ' + str(ceiling) + ' estimated tokens of its ' + str(budget) in refusal['reason']
     assert 'No search was run: ask for fewer facts at once, propose with the receipts you already have' \
         in refusal['reason']
     assert len(refusal['reason']) <= outcomes.REASON_LIMIT

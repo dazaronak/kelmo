@@ -225,14 +225,18 @@ def validate_editor(data):
     per batch of waiting sources of one project instead of once per source; batch_max_sources (a
     positive integer) caps the sources in one batch; batch_ready_sources (a positive integer, default
     the value of batch_max_sources) is how many first-pass notes of one project make it ready for
-    `kelmo dream apply --ready`. Nothing else is accepted."""
+    `kelmo dream apply --ready`; batch_budget_tokens (a positive integer) raises the budget of one batch
+    conversation: a batch carries the receipts and pages of several notes, and without this key it gets
+    the largest budget among its notes, which is one note's; coverage (a boolean, default false) makes
+    the editor account for every unit of a note: the answer says which item states each one or why it
+    is in none, and what stays unaccounted for is recorded on the note's trace. Nothing else is accepted."""
     if data is None:
         return None
     try:
         if not isinstance(data, dict):
             raise TypeError('[editor] must be a table')
         unknown = set(data) - {'budget_tokens', 'mode', 'batch_apply', 'batch_max_sources',
-                               'batch_ready_sources'}
+                               'batch_ready_sources', 'batch_budget_tokens', 'coverage'}
         if unknown:
             raise ValueError('keys not accepted: ' + ', '.join(sorted(unknown)))
         settings = {'budget_tokens': data.get('budget_tokens', DEFAULT_EDITOR_BUDGET),
@@ -240,6 +244,14 @@ def validate_editor(data):
                     'batch_apply': data.get('batch_apply', False),
                     'batch_max_sources': data.get('batch_max_sources', DEFAULT_BATCH_MAX_SOURCES)}
         settings['batch_ready_sources'] = data.get('batch_ready_sources', settings['batch_max_sources'])
+        if 'batch_budget_tokens' in data:
+            settings['batch_budget_tokens'] = data['batch_budget_tokens']
+            if type(settings['batch_budget_tokens']) is not int or settings['batch_budget_tokens'] <= 0:
+                raise ValueError('batch_budget_tokens must be a positive integer')
+        if 'coverage' in data:
+            settings['coverage'] = data['coverage']
+            if type(settings['coverage']) is not bool:
+                raise ValueError('coverage must be a boolean')
         if type(settings['budget_tokens']) is not int or settings['budget_tokens'] <= 0:
             raise ValueError('budget_tokens must be a positive integer')
         if settings['mode'] not in EDITOR_MODES:
@@ -334,6 +346,24 @@ class Config:
         the model about eight at a time. When the vault names none it is the value of `batch_max_sources`."""
         editor = self.editor or {}
         return editor.get('batch_ready_sources', editor.get('batch_max_sources', DEFAULT_BATCH_MAX_SOURCES))
+
+    @property
+    def batch_budget(self):
+        """The budget of one batch conversation, or None when the vault names none.
+
+        A note's own budget is sized for one note: its receipts and its pages. A batch carries those of
+        every note in it next to the same fixed part (the person rules, the project index), so the vault
+        gives it a budget of its own. Without one a batch runs in the largest budget among its notes."""
+        return (self.editor or {}).get('batch_budget_tokens')
+
+    @property
+    def coverage(self):
+        """True when an editor answer must say what became of every unit of a note.
+
+        Off unless the vault names `[editor] coverage = true`: the payload then carries each note cut into
+        numbered units, an answer that leaves one unaccounted for is sent back for repair, and the note's
+        trace records the fate of each."""
+        return bool((self.editor or {}).get('coverage', False))
 
     @property
     def state(self):

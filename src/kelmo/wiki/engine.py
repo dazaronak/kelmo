@@ -174,10 +174,12 @@ def rejected(item, cause, repair, length=None):
                        fact_key=key, target=target, length=length, repair=repair)
 
 
-def validate_changes(changes):
-    if not isinstance(changes, list) or len(changes) > 30:
-        raise WikiProblem('wiki-changes must be an array of at most 30 facts; permitted repair: '
-                          'split the note into separate notes')
+def validate_changes(changes, ceiling=30):
+    # The ceiling is a note's: one `wiki-changes` block promotes at most 30 facts. An editor proposal is sized
+    # where it is read (30 facts per note of a batch), so its gate passes the size it already accepted.
+    if not isinstance(changes, list) or len(changes) > ceiling:
+        raise WikiProblem('wiki-changes must be an array of at most ' + str(ceiling) + ' facts; permitted '
+                          'repair: split the note into separate notes')
     keys = set()
     for item in changes:
         if not isinstance(item, dict) or set(item) != FIELDS:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 
+from kelmo import coverage
 from kelmo.contracts import ContextBundle
 from kelmo.errors import KelmoError
 
@@ -91,7 +92,7 @@ def _mandatory(reader, generation):
 
 
 def editor_view(reader, generation, project, selected, budget_tokens, *, source_text=None, evidence=None,
-                expansions=(), reconciliations=(), sources=None, candidates=()):
+                expansions=(), reconciliations=(), sources=None, candidates=(), units=False):
     """Everything one editor job may read from `generation`, within `budget_tokens` estimated tokens.
 
     `reconciliations` are the fact_checks search receipts already issued for this job; like the
@@ -108,6 +109,9 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
     with a list of `{'operation_id', 'text', 'evidence'}` (optionally `hint`) in capture order: the
     payload then names `sources` instead of `source` and the bundle carries every reference. Without
     it the view is the one-source view, byte for byte.
+
+    `units` (the vault's `[editor] coverage`) gives every source its text cut into numbered units next to
+    the text itself, which an answer then accounts for; they are part of the source and charged with it.
     """
     registry = reader.registry(generation)
     if not isinstance(project, str) or not pages.PROJECT.fullmatch(project):
@@ -121,6 +125,8 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
     batch = None if sources is None else list(sources)
     if batch is None:
         source = {'evidence': evidence.to_dict(), 'text': source_text}
+        if units:
+            source['units'] = coverage.numbered(source_text)
         blocks, references, cost = [source], (evidence,), _cost(source)
     else:
         if not batch or not all(isinstance(item, dict) and {'operation_id', 'text', 'evidence'} <= item.keys()
@@ -129,7 +135,8 @@ def editor_view(reader, generation, project, selected, budget_tokens, *, source_
                                for item in batch):
             raise KelmoError('E_INPUT', 'A batch view names each source with its operation id, text and evidence.')
         blocks = [{**{'operation_id': item['operation_id'], 'evidence': item['evidence'].to_dict(),
-                      'text': item['text']}, **({'hint': dict(item['hint'])} if item.get('hint') else {})}
+                      'text': item['text']}, **({'hint': dict(item['hint'])} if item.get('hint') else {}),
+                   **({'units': coverage.numbered(item['text'])} if units else {})}
                   for item in batch]
         references = tuple(item['evidence'] for item in batch)
         cost = _cost(blocks)

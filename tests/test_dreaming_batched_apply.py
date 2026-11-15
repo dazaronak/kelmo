@@ -30,12 +30,15 @@ def world(tmp_path, monkeypatch):
         built.close()
 
 
-def editor_table(world, batch_apply=True, max_sources=None, budget=None, ready=None):
+def editor_table(world, batch_apply=True, max_sources=None, budget=None, ready=None, batch_budget=None,
+                 coverage=None):
     """Write the `[editor]` table the pass runs under: nightly mode, and the batch flag with its ceiling.
 
     `ready` sets `[editor] batch_ready_sources`, the number of a project's first-pass notes that make it
-    join a `--ready` pass; `max_sources` sets `batch_max_sources`, the ceiling of one batch. Writes only:
-    a case that asks the config to refuse a value calls this one and loads the config itself."""
+    join a `--ready` pass; `max_sources` sets `batch_max_sources`, the ceiling of one batch; `batch_budget`
+    sets `batch_budget_tokens`, the budget of one batch conversation; `coverage` sets `coverage`, the
+    accounting of every unit of a note. Writes only: a case that asks the
+    config to refuse a value calls this one and loads the config itself."""
     lines = ['mode = "nightly"', 'batch_apply = ' + ('true' if batch_apply else 'false')]
     if max_sources is not None:
         lines.append('batch_max_sources = ' + str(max_sources))
@@ -43,6 +46,11 @@ def editor_table(world, batch_apply=True, max_sources=None, budget=None, ready=N
         lines.append('batch_ready_sources = ' + str(ready))
     if budget is not None:
         lines.append('budget_tokens = ' + str(budget))
+    if batch_budget is not None:
+        lines.append('batch_budget_tokens = ' + str(batch_budget))
+    if coverage is not None:
+        lines.append('coverage = ' + ('true' if coverage is True else 'false' if coverage is False
+                                      else str(coverage)))
     toml = world.root / 'kelmo.toml'
     text = toml.read_text(encoding='utf-8')
     # The table is replaced, not appended: a case that changes the mode mid-test (a pass under one flag,
@@ -81,7 +89,7 @@ def notes(count, project='app', start=0):
 
 
 PAD = 'The audit recorded the same reading on every shift of that week. '
-SHRINK_BUDGET = 1950
+SHRINK_BUDGET = 2600
 
 
 def long_notes(count, pads=12, project='app'):
@@ -458,8 +466,9 @@ def test_the_budget_shrink_drops_the_newest_source_and_it_stays_in_the_pass(worl
     from kelmo.creation import apply_pending
     # Measured on this fixture with FEATURE selected (the batch view's `budget.used_tokens`): the fixed
     # part of the view costs 687, the FEATURE page 272 and each 841-character note 464, so the
-    # three-source view needs 2079 and the two-source one 1886. At SHRINK_BUDGET the batch therefore
-    # shrinks from the newest source, which the same pass then publishes alone.
+    # three-source view needs 2079 and the two-source one 1886. A batch also keeps a quarter of its budget
+    # free for receipts: at SHRINK_BUDGET that is 650, three notes leave 521 and two leave 714. The batch
+    # therefore shrinks from the newest source, which the same pass then publishes alone.
     editor_mode(world, budget=SHRINK_BUDGET)
     ids = capture(world, long_notes(3))
     before = commits(world)
@@ -476,15 +485,15 @@ def test_the_budget_shrink_drops_the_newest_source_and_it_stays_in_the_pass(worl
     assert world.outcome(ids[2])['disposition'] == 'applied'
 
 
-def test_a_shrink_inside_the_conversation_drops_the_newest_source_into_its_own_attempt(world):
-    """The shrink the preflight cannot see: a reconciliation round makes the view too big mid-batch."""
+def test_a_reconciliation_round_never_shrinks_the_batch_it_was_sized_for(world):
+    """A batch is sized with room for its receipts, and a receipt round is allowed only into that room: the
+    round that once pushed the selected page out of the view, and the newest note out of the batch, now
+    leaves both where they were."""
     from kelmo.creation import apply_pending
-    # Measured on this fixture with FEATURE selected at budget 2000 (the batch view's `budget.used_tokens`):
-    # the three padded sources cost 1570 and fit, the same view with one reconciliation receipt costs 1788
-    # and sends no selected page (the FEATURE page needs 390), and the two-source view with that receipt
-    # costs 1857 and sends FEATURE. 2000 also leaves the receipt round (492) under the ceiling of 500, so
-    # the round runs and the shrink is the view's, not the ceiling's.
-    editor_mode(world, budget=2000)
+    # Measured on this fixture with FEATURE selected (the batch view's `budget.used_tokens`): the three
+    # padded sources cost 1570 with the page, and one reconciliation receipt with its candidates 492. At
+    # 2400 the batch keeps 600 free for receipts and has 830, so the round runs and the view then uses 2062.
+    editor_mode(world, budget=2400)
     texts = long_notes(3, pads=2)
     ids = capture(world, texts)
     before = commits(world)
@@ -492,18 +501,18 @@ def test_a_shrink_inside_the_conversation_drops_the_newest_source_into_its_own_a
     report = apply_pending(world.service, model)
     batched = [job for job in model.inner.jobs if 'sources' in job.payload]
     assert [[len(job.payload['sources']), len(job.payload['reconciliations'])] for job in batched] == \
-        [[3, 0], [2, 1]], 'the batch shrank from the newest source after the reconciliation round'
+        [[3, 0], [3, 1]], 'the round ran and no source was shrunk out'
+    assert [[page['target'] for page in job.payload['pages']] for job in batched] == [[FEATURE], [FEATURE]], \
+        'the receipts did not push the selected page out'
+    assert batched[1].payload['omitted'] == [] and batched[1].payload['complete']
     assert sorted(report['applied']) == sorted(ids) and (report['parked'], report['failed']) == ([], [])
-    assert commits(world) - before == 2, 'the shrunk batch publishes its two, the dropped source publishes alone'
-    assert ids[2] not in [block['operation_id'] for block in batched[-1].payload['sources']]
-    assert [event for event in world.service.trace(ids[2])['events'] if event['stage'] == 'parked'] == [], \
-        'the source the batch shrank out spends no attempt and is never refused under its own key'
+    assert commits(world) - before == 1, 'the batch publishes its three notes in one commit'
 
 
-def test_a_shrink_inside_the_conversation_takes_the_dropped_note_s_own_pages_out_of_the_view(world):
-    """The same mid-batch shrink, where the newest note also selected the notes page: once that note is
-    dropped, the two notes the batch keeps read only the page they selected. (The notes page, 239 tokens on
-    this fixture, fits neither after the receipt nor beside FEATURE, so it changes nothing about the shrink.)"""
+def test_a_note_the_batch_is_sized_without_takes_its_own_pages_out_of_the_view(world):
+    """The newest note also selected the notes page, and the budget does not hold all three with room for
+    receipts: once that note is left for the next turn, the two notes the batch keeps read only the page
+    they selected."""
     from test_editor_scoping import NOTES
     editor_mode(world, budget=2000)
     texts = long_notes(3, pads=2)
@@ -511,21 +520,25 @@ def test_a_shrink_inside_the_conversation_takes_the_dropped_note_s_own_pages_out
     model = counted(Reconciling(world))
     report = pending_pass(world, model)
     batched = [job.payload for job in model.inner.jobs if 'sources' in job.payload]
-    assert [len(payload['sources']) for payload in batched] == [3, 2], [len(p['sources']) for p in batched]
-    assert NOTES in [page['target'] for page in batched[0]['pages']] + batched[0]['omitted'], \
-        'the fixture: the first round carries the page only the newest note selected'
-    assert [page['target'] for page in batched[1]['pages']] + batched[1]['omitted'] == [FEATURE], \
-        'after the shrink the view holds only the page the kept notes selected'
+    assert [len(payload['sources']) for payload in batched] == [2, 2], [len(p['sources']) for p in batched]
+    for payload in batched:
+        assert [page['target'] for page in payload['pages']] + payload['omitted'] == [FEATURE], \
+            'the view holds only the page the kept notes selected'
     assert sorted(report['applied']) == sorted(ids), report
+    assert [event for event in world.service.trace(ids[2])['events'] if event['stage'] == 'parked'] == [], \
+        'the note the batch was sized without spends no attempt and is never refused under its own key'
 
 
 def test_a_batch_reconcile_past_the_receipt_ceiling_runs_no_search_and_keeps_the_batch(world):
-    """The batch half of the receipt ceiling: the round is refused before its searches run, the model gets
-    the repair, and the batch publishes with the pages it already had — no `E_BUDGET` anywhere in the pass."""
+    """The batch half of the receipt ceiling: the round is refused before its searches run, the model is told
+    why, and the batch publishes with the pages it already had — no `E_BUDGET` anywhere in the pass."""
     from kelmo import outcomes
     from kelmo.creation import apply_pending
     from kelmo.fact_checks import binding
-    budget = 1800
+    # At 2000 the three notes leave 588 of the 500 a batch of this budget keeps for receipts, so all three
+    # go together. The receipts may take half of the budget and never more than that room, so the room is
+    # the ceiling here.
+    budget = 2000
     editor_mode(world, budget=budget)
     ids = capture(world, notes(3))
     before = commits(world)
@@ -537,13 +550,14 @@ def test_a_batch_reconcile_past_the_receipt_ceiling_runs_no_search_and_keeps_the
     assert sorted(report['applied']) == sorted(ids) and (report['parked'], report['failed']) == ([], [])
     assert commits(world) - before == 1, 'the batch still publishes its three notes in one commit'
     first, second = batched
-    assert first.payload['budget']['receipt_ceiling'] == budget // 4
+    ceiling = budget - (first.payload['budget']['used_tokens'] - first.payload['budget']['receipt_tokens'])
+    assert first.payload['budget']['receipt_ceiling'] == ceiling == 588 < budget // 2
     assert second.payload['reconciliations'] == [] and 'candidates' not in second.payload
     refusal = second.payload['refusal']
     assert refusal['code'] == 'E_PROPOSAL' and set(refusal) == {'code', 'reason'}
-    assert 'may cost at most ' + str(budget // 4) + ' estimated tokens of its ' + str(budget) in refusal['reason']
-    assert 'No search was run: ask for fewer facts at once, propose with the receipts you already have' \
-        in refusal['reason']
+    assert 'may cost at most ' + str(ceiling) + ' estimated tokens of its ' + str(budget) in refusal['reason']
+    assert 'No search was run: ask for the facts of the oldest sources that fit and leave every other source ' \
+        'out of your answer whole' in refusal['reason']
     assert len(refusal['reason']) <= outcomes.REASON_LIMIT
     asked = world.service.journal.conn.execute('SELECT COUNT(*) AS total FROM fact_searches WHERE binding LIKE ?',
                                                (binding(CEILING_ASK, FEATURE) + ':%',)).fetchone()
@@ -621,7 +635,10 @@ def test_a_batch_answer_to_partial_context_sends_each_note_to_its_own_budget_ref
                                       for operation_id, text in zip(ids, texts)])
     cost = views._cost(next(block for block in full['payload']['pages']
                             if block['target'] == 'projects/app/notes.md'))
-    editor_mode(world, budget=full['used_tokens'] - cost)
+    # 40 tokens short of nothing: the notes page (238) still fits beside neither note, and the head alone
+    # is left the room one reconciliation receipt needs (175 on this fixture).
+    budget = full['used_tokens'] - cost + 40
+    editor_mode(world, budget=budget)
 
     known = next(fact for fact in world.registry()['facts'].values() if fact.get('target') == FEATURE)
 
@@ -649,15 +666,18 @@ def test_a_batch_answer_to_partial_context_sends_each_note_to_its_own_budget_ref
     report = apply_pending(world.service, model)
     assert sorted(report['parked']) == sorted(ids) and (report['applied'], report['failed']) == ([], [])
     assert commits(world) == before and world.service.journal.prepared_intents() == []
-    # Two repair rounds when the answer left the notes unaccounted for; a reconcile round before a recorded one.
-    rounds = [True, True, True] if answer == 'nothing' else [True, True]
+    # The batch is sized to its head: with both notes the budget leaves out a page they selected. The head's
+    # own page still does not fit, so it is not asked for an item again (no repair round is spent on an
+    # answer nobody can give); a reconcile round comes before a recorded answer.
+    rounds = [True] if answer == 'nothing' else [True, True]
     assert ['sources' in job.payload for job in model.jobs] == [*rounds, False, False], \
         'one batch conversation, then each note judged on its own context'
+    assert [len(job.payload['sources']) for job in model.jobs if 'sources' in job.payload] == [1] * len(rounds)
     for operation_id in ids:
         reason = world.outcome(operation_id)['reason']
         assert 'the model saw incomplete context and proposed nothing' in reason, reason
         assert 'omitted projects/app/notes.md: needs ' + str(cost) + ' tokens, ' in reason, reason
-        assert ' of ' + str(full['used_tokens'] - cost) + ' left' in reason, reason
+        assert ' of ' + str(budget) + ' left' in reason, reason
         assert len(reason) <= outcomes.REASON_LIMIT
         assert len(charged_parkings(world, operation_id)[0]) == 1, 'refused once, on its own turn'
 
@@ -712,8 +732,11 @@ def test_publish_batch_stops_at_a_source_another_attempt_holds(world):
     assert [operation_id for block in model.inner.jobs[0].payload['sources']
             for operation_id in [block['operation_id']]] == [ids[0]], \
         'the batch stops at the held source: the newer one waits its own turn'
-    assert [outcome[operation_id] for operation_id in (ids[1], ids[2])] == \
-        [{'state': 'waiting', 'code': 'E_CLAIM'}] * 2, 'neither spent an attempt'
+    held_back = {'state': 'waiting', 'code': 'E_CLAIM',
+                 'reason': 'another attempt holds a source of the batch; this one was not consulted and waits '
+                           'behind it'}
+    assert [outcome[operation_id] for operation_id in (ids[1], ids[2])] == [held_back] * 2, \
+        'neither spent an attempt, and each says why it was left'
     assert outcome[ids[0]] == {'state': 'applied', 'code': None}
     row = world.service.journal.get(ids[1])
     assert (row['state'], row['terminal']) == ('archived', False), 'a held source is not touched by the batch'
@@ -3868,13 +3891,17 @@ class ExpandsSentPage(BatchModel):
 
 
 def test_a_batch_request_the_conversation_cannot_serve_charges_no_note_and_each_runs_alone(world):
-    """An expansion nobody can serve ends the batch's conversation; every note then publishes on its own."""
+    """An expansion nobody can serve refuses no proposal: the model is told why twice, and the third such
+    answer ends the batch's conversation; every note then publishes on its own."""
     editor_mode(world)
     ids = capture(world, notes(3))
     model = counted(ExpandsSentPage(world))
     report = pending_pass(world, model)
     assert [len(job.payload['sources']) if 'sources' in job.payload else 1
-            for job in model.inner.jobs] == [3, 1, 1, 1], 'one batch conversation, then each note alone'
+            for job in model.inner.jobs] == [3, 3, 3, 1, 1, 1], 'one batch conversation, then each note alone'
+    told = model.inner.jobs[1].payload['refusal']
+    assert told['code'] == 'E_PROPOSAL' and 'not expandable' in told['reason'], told
+    assert model.inner.jobs[1].payload['expansions_left'] == 2, 'a refused expansion spends none'
     assert sorted(report['applied']) == sorted(ids), report
     assert (report['parked'], report['failed'], report['skipped']) == ([], [], []), report
     for operation_id in ids:
@@ -3923,7 +3950,9 @@ def test_a_note_that_resolves_a_legacy_note_is_sent_alone_and_its_neighbour_sett
                         lambda registry, reference: reference['content_sha256'] == legacy)
     batch = batch_members(world.service, pending_operations(world.service), world.service.config.batch_max_sources)
     outcome = publish_batch(world.service, batch, counted(RecordedEveryNote(world, pairs)))
-    assert outcome[ids[0]] == {'state': 'waiting', 'code': 'E_PROPOSAL', 'alone': True}, outcome
+    assert (outcome[ids[0]]['state'], outcome[ids[0]]['code'], outcome[ids[0]]['alone']) == \
+        ('waiting', 'E_PROPOSAL', True), outcome
+    assert 'a batch that publishes nothing does not resolve a legacy note' in outcome[ids[0]]['reason'], outcome
     assert outcome[ids[1]] == {'state': 'applied', 'code': None}, outcome
     assert charged_parkings(world, ids[0]) == ([], 0), 'the legacy note spends no attempt for its batch'
     assert member_rows(world, ids)[0]['state'] == 'open', 'its attempt was ended, not refused'
@@ -3951,7 +3980,12 @@ def test_a_later_source_whose_stored_request_cannot_be_read_ends_the_batch_and_i
     outcome = creation.publish_batch(world.service, batch, counted(BatchModel(world)))
     assert set(outcome) == set(ids), 'every source of the batch is named'
     assert outcome[ids[0]]['state'] == 'applied', outcome
-    assert outcome[ids[1]] == outcome[ids[2]] == {'state': 'waiting', 'code': None}, outcome
+    assert outcome[ids[1]] == {'state': 'waiting', 'code': None,
+                               'reason': 'its stored request could not be read, so the batch ended before it; '
+                                         'it takes its own turn'}, outcome
+    assert outcome[ids[2]] == {'state': 'waiting', 'code': None,
+                               'reason': 'the batch ended before a source whose stored request could not be '
+                                         'read; this one was not consulted'}, outcome
     for operation_id in ids[1:]:
         assert world.service.journal.claim(operation_id, lease_seconds=1) is not None, 'its claim was given back'
 
@@ -3987,7 +4021,9 @@ def test_a_legacy_note_behind_a_silent_one_still_goes_alone_in_the_same_pass(wor
     outcome = publish_batch(world.service, batch, counted(RecordedAllButFirst(world, pairs)))
     assert outcome[ids[0]].get('alone') and outcome[ids[1]].get('alone'), outcome
     assert outcome[ids[1]]['code'] == 'E_PROPOSAL', 'sent alone for the legacy note, not held as claimed'
-    assert outcome[ids[2]] == {'state': 'waiting', 'code': None}, 'behind the silent note, it rejoins later'
+    assert (outcome[ids[2]]['state'], outcome[ids[2]]['code'], outcome[ids[2]].get('alone')) == \
+        ('waiting', None, None), 'behind the silent note, it rejoins later'
+    assert 'waits behind it' in outcome[ids[2]]['reason'], outcome[ids[2]]
     for operation_id in ids:
         assert charged_parkings(world, operation_id) == ([], 0), operation_id
 
@@ -4138,6 +4174,71 @@ def test_a_note_the_answer_left_out_is_published_before_the_newer_notes_of_its_b
     assert len(facts_of(world)) == 4
     for operation_id in ids:
         assert charged_parkings(world, operation_id) == ([], 0)
+
+
+# ---------------------------------------------------------------------------
+# What a batch commits may hold more facts than one note promotes
+# ---------------------------------------------------------------------------
+
+
+class ManyFacts(BatchModel):
+    """The batch replay with `each` facts for every source instead of one."""
+
+    def __init__(self, world, each):
+        super().__init__(world)
+        self.each = each
+
+    def execute(self, job):
+        from kelmo.executor import ModelOutcome
+        self.jobs.append(job)
+        payload = job.payload
+        batch = payload.get('sources')
+        blocks = list(batch) if batch is not None else [dict(payload['source'], operation_id=None)]
+        facts, checks = [], []
+        for block in blocks:
+            stem = block['evidence']['content_sha256'][:10]
+            settled = block['text'].strip().split('. ')[0]
+            for number in range(self.each):
+                key = f"{payload['project']}.replay-{stem}-{number:02d}"
+                fact = dict(fact_key=key, target=payload['pages'][0]['target'],
+                            text=f'{settled}, reading {number:02d} of that shift', status='active',
+                            expected_revision=None)
+                check = {'fact_key': key, 'verified_match': {'result': 'not_found',
+                                                             'search_id': self.world.service.reconcile(
+                                                                 fact['text'], fact['target'])['search_id']}}
+                if block['operation_id'] is not None:
+                    fact['source'] = check['source'] = block['operation_id']
+                facts.append(fact)
+                checks.append(check)
+        return ModelOutcome('proposal', {'facts': facts, 'fact_checks': checks})
+
+
+def test_a_batch_whose_notes_together_propose_more_facts_than_one_note_may_is_committed(world):
+    """Two notes with 16 facts each: 32 facts in one commit, two over what a single note may promote."""
+    editor_mode(world)
+    ids = capture(world, notes(2))
+    model = counted(ManyFacts(world, 16))
+    report = pending_pass(world, model)
+    assert report['applied'] == ids, report
+    assert (report['parked'], report['failed'], report['skipped']) == ([], [], []), report
+    assert [len(job.payload['sources']) if 'sources' in job.payload else 1
+            for job in model.inner.jobs] == [2], 'one batch conversation and no note sent alone'
+    assert len(facts_of(world)) == 32
+    for operation_id in ids:
+        assert charged_parkings(world, operation_id) == ([], 0)
+
+
+def test_the_commit_gate_names_what_it_refused_a_change_for(world):
+    """A change the gate cannot read is refused with its own cause, not with the general sentence."""
+    from kelmo.editor import verify_fact_checks
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import engine
+    fact = dict(fact_key='app.replay-one', target=FEATURE, text='two\nlines', status='active',
+                expected_revision=None)
+    with pytest.raises(KelmoError) as refused:
+        verify_fact_checks(world.service.journal.conn, engine.load_registry(world.root), [fact], [])
+    assert refused.value.code == 'E_FACT_CHECK'
+    assert 'one plain line' in str(refused.value), str(refused.value)
 
 
 # ---------------------------------------------------------------------------
@@ -5256,11 +5357,11 @@ def test_a_head_that_cannot_carry_what_the_conversation_gathered_is_not_refused_
     real = Editor._batch_view
 
     def outgrown(self, reader, generation, project, selected, selections, budget, blocks, expansions,
-                 reconciliations, candidates=()):
+                 reconciliations, candidates=(), **sizing):
         if reconciliations:
             raise HeadRefusal('E_BUDGET', 'the editor budget cannot hold the source with its receipts')
         return real(self, reader, generation, project, selected, selections, budget, blocks, expansions,
-                    reconciliations, candidates)
+                    reconciliations, candidates, **sizing)
 
     monkeypatch.setattr(Editor, '_batch_view', outgrown)
     model = counted(Reconciling(world))

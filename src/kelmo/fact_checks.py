@@ -119,6 +119,11 @@ def check(connection, registry, content):
         checks = json.loads(blocks[0])
     except ValueError:
         reject('the fact-checks block is not JSON', 'write the checks as a JSON array')
+    verify(connection, registry, changes, checks)
+
+
+def verify(connection, registry, changes, checks):
+    """The gate itself: every validated change has one check, and each check holds against the registry."""
     if not isinstance(checks, list):
         reject('the fact-checks block must be an array of checks', 'write the checks as a JSON array')
     by_key = {}

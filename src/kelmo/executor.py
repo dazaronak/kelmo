@@ -216,6 +216,56 @@ return {"unresolved":true}. If task is probe, return exactly {"ok":true}.
 '''
 
 
+IDENTIFY = 'identify'
+
+
+def identity():
+    """What this Kelmo tells a model, by digest: its version and, for each task, the sha256 of the
+    instructions and the answer schema it would send.
+
+    The executor process builds both from its own installed Kelmo; the worker checks the answer against
+    the rules of its own. Where the two run from different installs (an executor under another account,
+    with a runtime of its own) they can differ, and then the model answers under rules the worker never
+    wrote: a batch that publishes nothing, an accounting the schema forbids. The worker asks for this
+    before a pass and compares it with its own (`creation.require_same_instructions`); the task `identify`
+    is answered here and reaches no model.
+    """
+    import hashlib
+    from . import __version__
+
+    def digest(task, payload=None):
+        instructions, schema = prepared(task, payload)
+        return hashlib.sha256((instructions + '\0' + json.dumps(schema, sort_keys=True)).encode()).hexdigest()
+
+    # Each digest is taken from `prepared`, which is what `resolve` sends for a job of that kind. What is not
+    # in it: the provider's own arguments, how an answer is decoded, and anything a custom command adds.
+    return {'version': __version__, 'instructions': {
+        'edit_pages': digest('edit_pages', {'source': {}}),
+        'edit_pages_covered': digest('edit_pages', {'source': {'units': []}}),
+        'extract': digest('extract_final'),
+        'reconcile_session': digest('reconcile_session'),
+        'dream': digest('dream'),
+        'resolve': digest(None)}}
+
+
+def prepared(task, payload=None):
+    """The instructions and the answer schema a model gets for one job: the one place `resolve` and
+    `identity` both read, so what the executor says it sends is what it sends."""
+    if task in ('extract_checkpoint', 'extract_final'):
+        from .session_prompts import EXTRACTION, EXTRACTION_SCHEMA
+        return EXTRACTION, EXTRACTION_SCHEMA
+    if task == 'reconcile_session':
+        from .session_prompts import RECONCILIATION, RECONCILIATION_SCHEMA
+        return RECONCILIATION, RECONCILIATION_SCHEMA
+    if task == 'edit_pages':
+        from .editor import editing
+        return editing(payload)
+    if task == 'dream':
+        from .dreaming import DREAMING, DREAMING_SCHEMA
+        return DREAMING, DREAMING_SCHEMA
+    return INSTRUCTIONS, None
+
+
 def provider_path(provider, executable=None):
     selected = executable or shutil.which('claude' if provider == 'claude' else 'codex')
     if (selected is None or not Path(selected).is_absolute()
@@ -380,19 +430,7 @@ def resolve(provider, model, payload, *, executable=None, timeout=120, command=N
         raise KelmoError('E_EXECUTOR', 'Model must be a nonempty name when supplied.')
     validate_timeout(timeout)
     task=payload.get('task') if isinstance(payload,dict) else None
-    instructions,schema=INSTRUCTIONS,None
-    if task in ('extract_checkpoint','extract_final'):
-        from .session_prompts import EXTRACTION, EXTRACTION_SCHEMA
-        instructions,schema=EXTRACTION,EXTRACTION_SCHEMA
-    elif task=='reconcile_session':
-        from .session_prompts import RECONCILIATION, RECONCILIATION_SCHEMA
-        instructions,schema=RECONCILIATION,RECONCILIATION_SCHEMA
-    elif task=='edit_pages':
-        from .editor import EDITING, EDITING_SCHEMA
-        instructions,schema=EDITING,EDITING_SCHEMA
-    elif task=='dream':
-        from .dreaming import DREAMING, DREAMING_SCHEMA
-        instructions,schema=DREAMING,DREAMING_SCHEMA
+    instructions, schema = prepared(task, payload)
     if provider == 'custom':
         validate_argv(command)
         request = {'protocol': 'kelmo-executor/1', 'task': task, 'instructions': instructions,

@@ -3,6 +3,7 @@ import fcntl
 import json
 import plistlib
 import sqlite3
+import sys
 import time
 from contextlib import closing, nullcontext
 from pathlib import Path
@@ -39,9 +40,18 @@ def status(root):
         recent = connection.execute(
             "SELECT run_id,state,started_at,finished_at FROM dream_runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone() if "dream_runs" in tables else None
-    return {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
-            "next_attempt": values.get("next_attempt", 0), "findings": counts,
-            "last_run": dict(recent) if recent else None}
+    answer = {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
+              "next_attempt": values.get("next_attempt", 0), "findings": counts,
+              "last_run": dict(recent) if recent else None}
+    # What each executor command last said of the instructions it gives the model, once it was asked
+    # (`creation.instructions_standing`): its name, `same`, `own`, `differs` or `unidentified`, when and why.
+    from .alerts import ExecutorWatch
+    commands = [{name: entry[name] for name in ("name", "standing", "asked_at", "executor_version", "reason",
+                                                 "failures") if entry.get(name) is not None}
+                for _command, entry in sorted(ExecutorWatch.for_config(config).entries().items())]
+    if commands:
+        answer["executors"] = commands
+    return answer
 
 
 def waiting_status(root):
@@ -213,6 +223,18 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
         return {"state": "finished", "apply": applied}
     if should_stop is not None and should_stop():
         raise Stopping()
+    # The findings pass asks the same executor. One that gives the model another build's instructions stopped
+    # the apply pass above, or was never asked because no note waited: either way it is not consulted here.
+    # The answer is `blocked`, which is not a day's run done: the daemon tries the run again (`core.jobs`).
+    # The check itself tells the owner, once a day.
+    from .creation import DREAM_TASKS, require_same_instructions
+    from .errors import VaultFailure
+    try:
+        require_same_instructions(executor, service.config, DREAM_TASKS, "the findings pass")
+    except VaultFailure as error:
+        print("kelmo: the findings pass did not run: " + str(error), file=sys.stderr)
+        return {"state": "blocked", "apply": applied,
+                "blocked": {"error_code": error.code, "reason": str(error)}}
     with step():
         result = dream.run(executor, origin=service.origin, contexts=contexts,
                            **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
