@@ -256,6 +256,33 @@ def test_a_session_end_whose_journal_is_locked_while_it_reads_is_tried_again(tmp
     assert seconds < HOOK_DEADLINE, seconds
 
 
+def test_a_session_end_whose_journal_is_locked_again_between_statements_ends_inside_its_deadline(
+        tmp_path, monkeypatch, capsys):
+    """The journal is locked when the hook starts and freed after 4.5 s; as soon as the intake opens it is locked
+    again for 5 s. No single wait of the attempt may run on past the hook's deadline."""
+    root, source = prepared(tmp_path)
+    original = Sessions.__init__
+    again = []
+
+    def relocked(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        if not again:
+            holder = held(root, 5.0, ['BEGIN EXCLUSIVE'])
+            holder.__enter__()
+            again.append(holder)
+
+    monkeypatch.setattr(Sessions, '__init__', relocked)
+    try:
+        with held(root, 4.5, ['BEGIN EXCLUSIVE']):
+            code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+    finally:
+        for holder in again:
+            holder.__exit__(None, None, None)
+
+    assert again, 'the journal was never locked again'
+    assert seconds < HOOK_DEADLINE, (seconds, printed)
+
+
 def test_a_session_end_whose_intake_opened_late_still_ends_inside_its_deadline(tmp_path, monkeypatch):
     """The state core's call: the attempt's intake opens 0.5 s before the hook's deadline and the journal stays
     busy, so the capture has 0.5 s left, not a fresh 1.5 s."""

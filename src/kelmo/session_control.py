@@ -143,16 +143,18 @@ def _bounded_attempt(config,journal,provider,native_id,source,selected,event,lef
     `left` seconds; a lock still held then is `E_BUSY`."""
     from .journal import Journal
     until=time.monotonic()+left
+    # No statement of the attempt waits for a lock (each would wait anew): a lock refuses it at once, and the
+    # loop above is what waits. Only the capture's own transaction waits, bounded by the attempt's deadline.
     try:
         if journal is None:
-            own=Journal(config.internal('.state/journal.sqlite3'),wait_seconds=left)
+            own=Journal(config.internal('.state/journal.sqlite3'),wait_seconds=0)
             try:
                 _capture_once(config,own,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
             finally:
                 own.close()
             return
         previous=journal.conn.execute('PRAGMA busy_timeout').fetchone()[0]
-        journal.conn.execute(f'PRAGMA busy_timeout={max(1,int(left*1000))}')
+        journal.conn.execute('PRAGMA busy_timeout=0')
         try:
             _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
         finally:
