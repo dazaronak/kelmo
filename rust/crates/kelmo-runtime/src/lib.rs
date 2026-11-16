@@ -11,12 +11,22 @@ pub mod supervisor;
 pub mod sys;
 
 /// Writes one line to the daemon's log (its standard error), led by the UTC time, so that a restart or a
-/// recycle can be dated from the log.
+/// recycle can be dated from the log. A line break inside the message is written escaped, so one entry is
+/// always one line and every line of the log starts with its time.
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {
-        eprintln!("{} {}", $crate::stamp(std::time::SystemTime::now()), format_args!($($arg)*))
+        eprintln!(
+            "{} {}",
+            $crate::stamp(std::time::SystemTime::now()),
+            $crate::one_line(&format!($($arg)*))
+        )
     };
+}
+
+/// `text` with every carriage return and line feed written as `\r` and `\n`.
+pub fn one_line(text: &str) -> String {
+    text.replace('\r', "\\r").replace('\n', "\\n")
 }
 
 /// `at` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, in UTC. A time before 1970 is written as the epoch.
@@ -50,7 +60,7 @@ pub fn stamp(at: std::time::SystemTime) -> String {
 
 #[cfg(test)]
 mod stamp_tests {
-    use super::stamp;
+    use super::{one_line, stamp};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -64,5 +74,17 @@ mod stamp_tests {
             "2000-02-29T00:00:00.000Z"
         );
         assert_eq!(stamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn a_line_break_in_a_message_stays_on_the_one_line() {
+        assert_eq!(
+            one_line("core state\nkelmod: forged\r"),
+            "core state\\nkelmod: forged\\r"
+        );
+        assert_eq!(
+            one_line("core state uses 279 MiB"),
+            "core state uses 279 MiB"
+        );
     }
 }
