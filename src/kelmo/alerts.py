@@ -34,8 +34,8 @@ DREAM_WATCH_LOCK = 'dream-watch.lock'
 SEND_RETRY_SECONDS = 900
 # Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
 _REFUSALS_TOLD = {}
-# Dreaming alerts this process told while the watch file took no write: {file: (fingerprint, records)}. Read only
-# while the file is still as it was then; a file another process changed since wins.
+# Dreaming alerts this process told while the watch file took no write: {file: (fingerprint, records, whether the
+# file then held a told alert)}. Read only while the file is still as it was then; a file changed since wins.
 _DREAM_UNKEPT = {}
 # When this process last tried a Dreaming alert the command did not take, on the monotonic clock: {(file, kind): t}.
 _DREAM_TRIED = {}
@@ -44,6 +44,12 @@ _mono = time.monotonic
 
 def _when(epoch):
     return time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(epoch))
+
+
+def _told_in(records):
+    """Whether the DreamWatch records hold an alert that went out."""
+    return ((records['stuck'] is not None and records['stuck']['told'] is not None)
+            or (records['failed'] is not None and bool(records['failed']['told'])))
 
 
 class LoginWatch:
@@ -279,7 +285,7 @@ class DreamWatch(LoginWatch):
         try:
             self._keep(records)
         except OSError:
-            _DREAM_UNKEPT[str(self.marker)] = (before, records)
+            _DREAM_UNKEPT[str(self.marker)] = (before, records, _told_in(self._records()))
             raise
         _DREAM_UNKEPT.pop(str(self.marker), None)
 
@@ -361,6 +367,9 @@ class DreamWatch(LoginWatch):
             told_failure = records['failed'] is not None and bool(records['failed']['told'])
             records['failed'] = None  # the run completed
             stuck = records['stuck'] or {'since': min(held, now), 'told': None}
+            # A clock set back since the hold was first seen: it counts from now, so the alert still comes one
+            # interval later instead of once the clock catches up.
+            stuck['since'] = min(stuck['since'], now)
             records['stuck'] = stuck
             last = stuck['told']
             if ((last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due_today(last, now)
@@ -372,10 +381,17 @@ class DreamWatch(LoginWatch):
                     text += f' Day {max(0, int((now - stuck["since"]) // REMINDER_SECONDS)) + 1}.'
                 if self._send_kind(('stuck',), text):
                     stuck['told'] = now
-            # The run completed: its recovery goes before the record, so a file that takes no write keeps it too.
+            # The run completed. The record goes first, as in `ran`: a process that dies between the two loses the
+            # recovery rather than sending it twice; a file that takes no write still gets it.
+            recovery = f'{self.label}: the Dreaming run completes again.'
+            try:
+                self._write(records)
+            except OSError:
+                if told_failure:
+                    self.send(recovery)
+                raise
             if told_failure:
-                self.send(f'{self.label}: the Dreaming run completes again.')
-            self._write(records)
+                self.send(recovery)
         self._guarded(self._exclusive(work))
 
     def failed(self, code, reason, now=None):
@@ -409,12 +425,12 @@ class DreamWatch(LoginWatch):
             unkept = _DREAM_UNKEPT.pop(mine, None)
             for key in [key for key in _DREAM_TRIED if key[0] == mine]:
                 del _DREAM_TRIED[key]
-            def told_in(records):
-                return ((records['stuck'] is not None and records['stuck']['told'] is not None)
-                        or (records['failed'] is not None and bool(records['failed']['told'])))
-            # What this process told while the file took no write counts when the file itself tells nothing: at
-            # worst one recovery message more, never none for an alert that went out.
-            told = told_in(self._records()) or (unkept is not None and told_in(unkept[1]))
+            # What this process told while the file took no write counts when the file itself tells nothing,
+            # unless the file then held a told alert and has changed since: whoever changed it saw that alert and
+            # owns its recovery. A file that never held one leaves the recovery to this process.
+            owed = (unkept is not None and _told_in(unkept[1])
+                    and (unkept[0] == self._fingerprint() or not unkept[2]))
+            told = _told_in(self._records()) or owed
             # The marker goes first: one recovery message, even if its delivery fails.
             if self.marker.exists():
                 self.marker.unlink()

@@ -646,3 +646,53 @@ def test_an_idle_answer_after_a_failure_alert_tells_the_recovery_though_the_file
     since = datetime.fromtimestamp(START - 2 * DAY, UTC).isoformat()
     watch.idle(2, now=START + 10, since=since)
     assert any(line.endswith('the Dreaming run completes again.') for line in messages(tmp_path)), messages(tmp_path)
+
+
+def test_a_process_that_dies_between_the_idle_recovery_and_its_record_sends_no_second_recovery(tmp_path):
+    from datetime import UTC, datetime
+
+    class Killed(BaseException):
+        pass
+
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    since = datetime.fromtimestamp(START - 3600, UTC).isoformat()
+
+    def killed(records):
+        raise Killed
+    watch._keep = killed
+    with pytest.raises(Killed):
+        watch.idle(2, now=START + 10, since=since)
+    del watch._keep
+    watch.idle(2, now=START + 20, since=since)
+    recoveries = [line for line in messages(tmp_path) if line.endswith('the Dreaming run completes again.')]
+    assert len(recoveries) == 1, messages(tmp_path)
+
+
+def test_a_recovery_another_process_owns_is_not_sent_again(tmp_path):
+    # A told failure is in the watch file; this process tells a second code but the file takes no write. Another
+    # process's run then completes: it sees the told failure, takes the file away and sends the recovery.
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    keep = watch._keep
+
+    def full(records):
+        raise OSError('no space left')
+    watch._keep = full
+    watch.failed('E_PROTOCOL', 'bad answer', START + 60)
+    watch._keep = keep
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+    watch.marker.unlink()
+    watch.ran(START + 120)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_clock_set_back_before_the_first_stuck_alert_delays_it_by_one_interval_at_most(tmp_path):
+    from datetime import UTC, datetime
+    watch = _watch(tmp_path)
+    since = datetime.fromtimestamp(START - 3600, UTC).isoformat()
+    watch.idle(2, now=START, since=since)
+    back = START - 3 * DAY + 10
+    watch.idle(2, now=back, since=since)
+    watch.idle(2, now=back + DAY, since=since)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
