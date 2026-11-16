@@ -21,6 +21,8 @@ entry here.
   the note it went out as: with that note's outcome, its refusal, or as queued under its new key. Before, the
   old key always answered that the request was queued and would be delivered on the next contact, even after
   the resent note had been delivered or refused.
+- `kelmo client resend` counts a refusal as a duplicate only of a queued or delivered note of the same project
+  with the same text. Before, a note of any project with that text answered for it.
 
 ## [0.3.1] - 2026-11-15
 
