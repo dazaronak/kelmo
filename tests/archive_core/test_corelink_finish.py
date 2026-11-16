@@ -33,7 +33,11 @@ def finishing_link():
 
 
 def call(link):
-    return link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+    """`link.call`, which hands back a future and never raises: a raise fails the test."""
+    try:
+        return link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+    except Exception as error:  # noqa: BLE001 - the contract is a future, failed or not
+        pytest.fail(f'call() raised {error!r} instead of returning a future')
 
 
 def failure(future, seconds=2):
