@@ -60,9 +60,33 @@ def test_forgotten_evidence_ahead_of_readable_evidence_lets_the_cursor_pass_both
     result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
     assert result['state'] == 'finished', result
     assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] != [world.seed.archive_id]
+    readable = world.service.journal.get(later['id'])['archive_id']
+    assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] == [readable], (
+        executor.jobs[0].payload['evidence'])
     second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
     assert second == {'state': 'idle'}, second
     assert len(executor.jobs) == 1, 'the second pass read the same evidence again'
+
+
+def test_a_window_record_that_fails_to_read_for_another_reason_still_fails_the_run(world, monkeypatch):
+    """Only a forgotten record is skipped: any other read failure fails the run, and the cursor stays, so the next
+    run reads the record again."""
+    import json
+
+    def broken(*args, **kwargs):
+        raise KelmoError('E_IO', 'Synthetic archive read failure.')
+
+    monkeypatch.setattr(world.service, 'show', broken)
+    executor = Scripted(ModelOutcome('proposal', {'findings': []}))
+    result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'failed', result
+    assert 'E_IO' in json.dumps(result), result
+    assert len(executor.jobs) == 0
+    monkeypatch.undo()
+    second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert second['state'] == 'finished', second
+    assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] == [world.seed.archive_id], (
+        'the failed read moved the cursor past the record')
 
 
 def test_link_publication_fails_once_stays_open_then_publishes(world, monkeypatch):
