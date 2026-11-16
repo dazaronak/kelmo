@@ -638,7 +638,10 @@ def run(service, config_path, *, once=False, open_service=None):
                 continue
             if once:
                 return result
-            held = {item['operation_id'] for item in result.get('skipped', ())}
+            # Only an operation another attempt holds: a refused resolution request names no operation, and a
+            # note skipped for the executor or the vault is held by nobody.
+            held = {item['operation_id'] for item in result.get('skipped', ())
+                    if 'operation_id' in item and item.get('error_code') in ('E_BUSY', 'E_CLAIM')}
             if held - reported:
                 # A claim left by a dead worker blocks its operation until the lease expires; say so.
                 print('kelmo worker: skipped operations held by another attempt: '

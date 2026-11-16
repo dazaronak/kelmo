@@ -6,6 +6,14 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `kelmo worker daemon` no longer stops with `KeyError: 'operation_id'` when the executor check sends a resolution
+  request back. The loop takes its next pass, and the request stays pending with its attempts. The line about
+  operations held by another attempt now names only operations skipped as busy or claimed, never a resolution
+  request or a note held back by the executor check or the vault. The worker job of the 0.2 daemon was not
+  affected.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
