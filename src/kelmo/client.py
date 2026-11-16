@@ -1259,20 +1259,23 @@ class SharedClient:
                 self.outbox.settle(key, 'delivered', value)
                 delivered += 1
                 continue
-            if value['retryable']:
+            if value['cut']:
+                # The bridge lost its server after the write was sent and ended: the next pass opens a new
+                # bridge and sends it again under its key. A write that ends the channel every time it is
+                # delivered would hold every write behind it, so on its CUT_LIMIT-th cut it is refused with its
+                # effect unknown, as a cut write was before.
+                self._drop(channel)
+                if self.outbox.cut(key) < CUT_LIMIT:
+                    self.outbox.note(key, value['code'])
+                    stopped = value['code']
+                    break
+                value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is not sent '
+                                            'again.')
+            elif value['retryable']:
                 if value['code'] == 'E_TRANSPORT':
-                    # The bridge may have lost its server and ended: the next pass opens a new one.
+                    # The bridge may have lost its server and ended: the next pass opens a new one. A server's
+                    # own retryable E_TRANSPORT is no cut and leaves the write pending.
                     self._drop(channel)
-                    # Only the bridge's own cut counts; a server's retryable E_TRANSPORT leaves it pending.
-                    if value['cut'] and self.outbox.cut(key) >= CUT_LIMIT:
-                        # A write that ends the channel every time it is delivered would hold every write
-                        # behind it: it is refused with its effect unknown, as a cut write was before.
-                        value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is '
-                                                    'not sent again.')
-                        outcome = {'code': value['code'], 'message': value['message']}
-                        self.outbox.settle(key, 'refused', outcome)
-                        refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
-                        continue
                 self.outbox.note(key, value['code'])
                 stopped = value['code']
                 break

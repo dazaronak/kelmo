@@ -62,12 +62,12 @@ def bridge(tmp_path):
         pytest.fail(f'kelmod is missing at {KELMOD}: build it with tools/build_kelmod.sh', pytrace=False)
     made = []
 
-    def make(*script, answer=v1_answer):
+    def make(*script, answer=v1_answer, timeout_seconds=20):
         daemon = ScriptedDaemon(*script, answer=answer)
         command = [str(KELMOD), 'attach', '--client-id', CLIENT_ID, '--protocol', '1',
                    '--runtime-dir', str(daemon.directory)]
         root = tmp_path / f'client-{len(made)}'
-        prepare_profile(root, AUTHORITY, command, timeout_seconds=20)
+        prepare_profile(root, AUTHORITY, command, timeout_seconds=timeout_seconds)
         client = SharedClient(ClientProfile.load(root))
         made.append((daemon, client))
         return daemon, client
@@ -149,6 +149,23 @@ def test_a_keyed_write_cut_after_it_was_sent_stays_pending_and_goes_again_under_
     assert requests(daemon) == [('create', 'k-1', 'k-1'), ('create', 'k-1', 'k-1')]
 
 
+def test_a_keyed_request_cut_after_it_was_sent_reads_as_final_to_a_client_that_does_not_count_cuts(bridge):
+    # The bridge runs on the server and cannot tell an older client: that one reads `retryable` alone and would
+    # send a write that cuts every time without end. So the refusal stays not retryable, as before this change,
+    # and `cut` is what a client that counts cuts goes by.
+    daemon, _ = bridge(Connection(CLOSE))
+    command = [str(KELMOD), 'attach', '--client-id', CLIENT_ID, '--protocol', '1',
+               '--runtime-dir', str(daemon.directory)]
+    line = json.dumps({'protocol': PROTOCOL, 'request_id': 'r-1', 'op': 'create', 'idempotency_key': 'k-1',
+                       'args': {'content': 'Keyed.', 'filename': 'keyed.md'}}) + '\n'
+    finished = subprocess.run(command, input=line.encode(), capture_output=True, timeout=30)
+    reply = json.loads(finished.stdout.decode().splitlines()[0])
+    assert reply['request_id'] == 'r-1' and reply['ok'] is False, reply
+    assert reply['error']['code'] == 'E_TRANSPORT' and reply['error']['retryable'] is False, reply
+    assert reply['error']['cut'] is True, reply
+    assert daemon.connections == 1 and len(daemon.calls) == 1
+
+
 def test_a_keyless_request_cut_after_it_was_sent_is_refused_as_unknown(bridge):
     daemon, _ = bridge(Connection(CLOSE))
     command = [str(KELMOD), 'attach', '--client-id', CLIENT_ID, '--protocol', '1',
@@ -192,6 +209,36 @@ def test_a_resend_that_waits_for_the_client_lock_ends_inside_its_deadline(bridge
     assert result == {'refused': 'E_TRANSPORT'}, result
     assert ended < 3.5, ended
     assert requests(daemon) == [('search', None, None)]
+
+
+def test_a_resend_with_no_deadline_set_waits_for_the_client_lock_only_until_the_profile_timeout(bridge):
+    # An MCP server's shared client calls with no deadline of its own: the profile timeout is the read's limit.
+    # Time spent before the resend counts against it, so the resend's wait for the lock ends at that limit.
+    daemon, client = bridge(Connection(ANSWER, CLOSE), Connection(ANSWER, ANSWER), timeout_seconds=3)
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with client._lock:
+            held.set()
+            release.wait(8)
+    real_drop = client._drop
+
+    def drop(*args):
+        real_drop(*args)
+        if not held.is_set():
+            time.sleep(1.5)
+            threading.Thread(target=holder, daemon=True).start()
+            assert held.wait(2)
+    client._drop = drop
+    started = time.monotonic()
+    try:
+        result = client.call('search', {'query': 'q'})
+    except KelmoError as error:
+        result = {'refused': error.code}
+    ended = time.monotonic() - started
+    release.set()
+    assert result == {'refused': 'E_TRANSPORT'}, result
+    assert ended < 3.5, ended
 
 
 def test_a_keyed_write_cut_every_time_is_refused_on_its_third_cut_and_the_writes_behind_it_go(bridge):

@@ -18,11 +18,12 @@ entry here.
   Running the same command again reuses its idempotency key, so the note is not captured twice.
 - A note delivered while the server's kelmod restarts is no longer lost. `kelmod attach` refused a request
   that was sent and then cut as final, even when it carried an idempotency key, so the client's outbox
-  settled the note as refused for good. A keyed request is now refused as retryable: the note stays pending
-  and the next flush sends it again under the same key. On its third cut it is refused as before, so a note
-  that ends the channel every time cannot hold the notes behind it. Only a cut counts: a retryable refusal the
-  server itself gives leaves the note pending however often it comes. A request without a key is still
-  refused, with its effect reported as unknown.
+  settled the note as refused for good. The refusal now marks a keyed request as cut: the note stays pending
+  and the next flush sends it again under the same key. On its third cut it is refused with its effect
+  unknown, so a note that ends the channel every time cannot hold the notes behind it. Only a cut counts: a
+  retryable refusal the server itself gives leaves the note pending however often it comes. A client from
+  before this release does not read the mark and refuses a cut note at once, as it did. A request without a
+  key is still refused, with its effect reported as unknown.
 - A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
   server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
   doubling the pause up to 2 seconds.
