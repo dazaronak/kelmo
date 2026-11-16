@@ -14,6 +14,10 @@ entry here.
   Otherwise it answers at once with `"outbox": {"busy": true}`, where it used to answer
   `{"error": "The edge core is busy ..."}`, the same shape as a failed read. A failed read still answers
   `{"error": ...}`.
+- On an edge machine `kelmo status` and `kelmo client status` no longer hold the outbox while they wait
+  for the authority. A hook that arrived meanwhile waited for the whole command and could hand its session
+  a cached context marked unavailable; it now gets the outbox at once. `kelmo client flush` and `resend`
+  still hold it for the whole command.
 
 ## [0.3.1] - 2026-11-15
 

@@ -14,7 +14,7 @@ import inspect
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -340,7 +340,7 @@ class EdgeCore:
 
     def handle_cli(self, context, body):
         """One installed-CLI call on this client root, over the core's own SharedClient."""
-        from ..cli import run_borrowed_client
+        from ..cli import borrowed_read_only, run_borrowed_client
         argv = body.get('argv') if isinstance(body, dict) else None
         if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
             raise KelmoError('E_PROTOCOL', 'edge.cli carries {argv: [strings]}.')
@@ -351,7 +351,9 @@ class EdgeCore:
                            for pair in sources.values())):
             raise KelmoError('E_PROTOCOL', 'edge.cli sources are {name: [content, filename]}, stdin a string.')
         # A CLI command may read and rewrite the outbox in several steps (resend, flush): it holds it throughout.
-        with self.owned(context.remaining()), self.serving(context):
+        # A status command only reads it, and holding it across its wait for the server would keep a hook out.
+        held = nullcontext() if borrowed_read_only(argv) else self.owned(context.remaining())
+        with held, self.serving(context):
             result = run_borrowed_client(self.client, argv, sources, stdin, root=self.root)
         self.wake()
         return result

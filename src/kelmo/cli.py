@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from contextlib import nullcontext, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from . import __version__, timings
@@ -273,6 +273,18 @@ def _dispatch_borrowed(service, args, commands, sources, stdin):
     finally:
         _BORROWED_INPUT.reset(lent)
         _BORROWED_SERVICE.reset(token)
+
+
+def borrowed_read_only(argv):
+    """True for `status` and `client status`: they read the outbox and ask the server, and change neither, so the
+    edge core runs them without holding the outbox; the reads take it only where they touch it."""
+    parser, _commands = build_parser(__version__)
+    try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            args = parser.parse_args(argv)
+    except SystemExit:
+        return False
+    return args.command == 'status' or (args.command == 'client' and getattr(args, 'action', None) == 'status')
 
 
 def run_borrowed_client(client, argv, sources=None, stdin=None, *, root=None):
