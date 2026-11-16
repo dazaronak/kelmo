@@ -39,6 +39,9 @@ class DescriptorChannel:
         os.set_blocking(fd, True)  # sendall's write loop expects a write to wait, not to fail with EAGAIN
         self._wake_read, self._wake_write = os.pipe()
         self._closed = False
+        # `close` frees the descriptors and the process may reuse their numbers at once: a wake after it must not
+        # write into whatever file got the number, so the two take turns.
+        self._closing = threading.Lock()
 
     def recv(self, size):
         import select
@@ -58,16 +61,20 @@ class DescriptorChannel:
             view = view[os.write(self.fd, view):]
 
     def shutdown(self, _how):
-        try:
-            os.write(self._wake_write, b'x')
-        except OSError:
-            pass
+        with self._closing:
+            if self._closed:
+                return
+            try:
+                os.write(self._wake_write, b'x')
+            except OSError:
+                pass
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        fds, self.fd = (self.fd, self._wake_read, self._wake_write), -1  # a late write fails with EBADF
+        with self._closing:
+            if self._closed:
+                return
+            self._closed = True
+            fds, self.fd = (self.fd, self._wake_read, self._wake_write), -1  # a late write fails with EBADF
         for fd in fds:
             try:
                 os.close(fd)

@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A sandboxed core that woke its channel reader after the channel was closed wrote a byte into whatever
+  file had since been given the freed descriptor number. The wake now does nothing once the channel is
+  closed.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
