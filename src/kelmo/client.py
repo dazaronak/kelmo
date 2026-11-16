@@ -135,6 +135,8 @@ def prepare_profile(root, authority_id, command, *, sessions=None, timeout_secon
 
 
 COMPACT_MIN_FREE_BYTES = 16 * 1048576
+# A cached context no delivery has refreshed for this long is removed by the daily HOT sweep.
+CACHE_RETAIN_SECONDS = 30 * 86400
 OUTBOX_WAIT_SECONDS = 60
 REFUSED_SHOWN = 20
 
@@ -1290,10 +1292,15 @@ class SharedClient:
         return result
 
     def _cached_set_names(self):
-        """The HOT sets the cached contexts were delivered with: a stale delivery reads its set by name."""
-        names = set()
+        """The HOT sets the cached contexts were delivered with: a stale delivery reads its set by name. Run by
+        the daily HOT sweep, it also removes a cached context no delivery has refreshed for CACHE_RETAIN_SECONDS:
+        its binding has not been used since, and its set loses the hold."""
+        names, now = set(), time.time()
         for path in (self.profile.state / 'cache').glob('context-*.json'):
             try:
+                if now - path.stat().st_mtime > CACHE_RETAIN_SECONDS:
+                    path.unlink()
+                    continue
                 name = json.loads(path.read_bytes()).get('hub_set_name')
             except (OSError, ValueError, AttributeError):
                 continue
