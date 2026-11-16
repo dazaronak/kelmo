@@ -162,3 +162,17 @@ def test_a_run_whose_lock_cannot_be_opened_waits_the_delay_and_counts_its_try(tm
     assert starts == []
     assert len(attempts) == DREAM_TRIES, attempts
     assert all(later - earlier >= DREAM_RETRY_SECONDS for earlier, later in zip(attempts, attempts[1:])), attempts
+
+
+def test_a_scheduled_run_that_reaches_the_job_inside_the_delay_starts_nothing(tmp_path, monkeypatch):
+    # The tick read the gate open, then a failing run ended before this job started (or a local client sent
+    # `scheduled` itself): the job reads the gate again and starts nothing.
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('a broken configuration')])
+    jobs._tick()
+    assert len(starts) == 1
+    try:
+        answer = jobs._dream({'action': 'run', 'scheduled': True})
+    except RuntimeError as error:
+        answer = error
+    assert len(starts) == 1, answer
+    assert answer == {'state': 'not_due'}

@@ -247,6 +247,10 @@ class Jobs:
                     # What the local run answers too; a scheduled job that meets it starts nothing and records
                     # no start, so the next tick asks again.
                     return {'state': 'busy'}
+                if scheduled and action == 'run' and not self._dream_try_allowed():
+                    # The tick read the gate before this job started: a failing run may have ended meanwhile and
+                    # started the delay, and a local client may send `scheduled` itself. Read it again here.
+                    return {'state': 'not_due'}
                 return self._dream_run(action, scheduled, ready)
         except Exception:
             # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try too:
