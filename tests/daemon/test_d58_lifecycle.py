@@ -44,6 +44,19 @@ def test_kelmod_log_lines_about_a_recycle_carry_their_time(start, monkeypatch):
     assert all(stamped.match(line) for line in lines), lines
 
 
+def test_every_line_kelmod_writes_while_it_serves_carries_its_time(start, monkeypatch):
+    """The asking, agreeing, stopping and restarting lines of a recycle, not only the budget ones."""
+    import re
+    daemon = start_d58(start, monkeypatch, sample_ms=100, state_budget={"soft_mb": 80},
+                       state_argv=["--soft-trigger-once"])
+    wait_for(lambda: daemon.settled(restarts=1), what="restart after an agreed recycle")
+    log = (daemon.spec_path.parent / "kelmod.log").read_text()
+    lines = [line for line in log.splitlines() if "kelmod: " in line]
+    assert any("planned restart" in line for line in lines), log
+    stamped = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z kelmod: ")
+    assert [line for line in lines if not stamped.match(line)] == [], log
+
+
 def test_core_over_soft_budget_that_declines_recycle_is_kept(start, monkeypatch):
     daemon = start_d58(start, monkeypatch, sample_ms=100, state_budget={"soft_mb": 80},
                        state_argv=["--soft-trigger-once", "--decline-recycle"])

@@ -12,8 +12,9 @@ pub mod sys;
 
 /// Writes one line to the daemon's log (its standard error), led by the UTC time, so that a restart or a
 /// recycle can be dated from the log. A line separator inside the message is written escaped, and the whole
-/// line goes out in one write, so a core writing to the same log cannot split it: every line of the log that
-/// kelmod writes starts with its time. A failed write is dropped; logging never stops the daemon.
+/// line goes out in one write, so a core writing to the same log cannot split it. A failed write is dropped
+/// (logging never stops the daemon), and the next line then starts on a fresh line. Rust's own panic message
+/// is not written through here, and a line follows whatever a core left unfinished on the same log.
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {
@@ -23,21 +24,60 @@ macro_rules! logln {
 
 /// The line `logln!` writes: the time, a space, the message on one line, a line feed; one `write_all`.
 pub fn write_log_line(message: &str) {
-    use std::io::Write;
+    static BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    emit_log_line(&mut std::io::stderr().lock(), message, &BROKEN);
+}
+
+/// How many times a line waits a millisecond for a log that answers it would block.
+const LOG_WOULD_BLOCK_TRIES: u32 = 50;
+
+/// Writes one stamped line to `sink`, already locked by the caller, so the time is read in the order the
+/// lines are written. After a write that failed part way (`broken`), the line starts with a line feed, so it
+/// does not continue the cut one. A sink that would block is waited for briefly; then the line is dropped.
+pub fn emit_log_line(
+    sink: &mut dyn std::io::Write,
+    message: &str,
+    broken: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    let lead = if broken.load(Ordering::Relaxed) {
+        "\n"
+    } else {
+        ""
+    };
     let line = format!(
-        "{} {}\n",
+        "{lead}{} {}\n",
         stamp(std::time::SystemTime::now()),
         one_line(message)
     );
-    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    let mut rest = line.as_bytes();
+    let mut tries = 0;
+    while !rest.is_empty() {
+        match sink.write(rest) {
+            Ok(0) => break,
+            Ok(n) => rest = &rest[n..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && tries < LOG_WOULD_BLOCK_TRIES =>
+            {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => break,
+        }
+    }
+    broken.store(!rest.is_empty(), Ordering::Relaxed);
 }
 
 /// `text` with every character a reader may take for a line break (CR, LF, vertical tab, form feed, the
-/// separators 0x1C-0x1E, NEL, U+2028, U+2029) written as its escape, such as `\n` or `\u{2028}`.
+/// separators 0x1C-0x1E, NEL, U+2028, U+2029) written as its escape, such as `\n` or `\u{2028}`, and a
+/// backslash as `\\`, so an escaped break cannot be told apart from text that spells one.
 pub fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| match c {
-            '\r'
+            '\\'
+            | '\r'
             | '\n'
             | '\u{b}'
             | '\u{c}'
@@ -50,11 +90,14 @@ pub fn one_line(text: &str) -> String {
         .collect()
 }
 
-/// `at` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, in UTC. A time before 1970 is written as the epoch.
+/// `at` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, in UTC, a time before 1970 included.
 pub fn stamp(at: std::time::SystemTime) -> String {
-    let since = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    let seconds = since.as_secs();
-    let (days, rest) = ((seconds / 86_400) as i64, seconds % 86_400);
+    let millis: i128 = match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => since.as_millis() as i128,
+        Err(before) => -(before.duration().as_millis() as i128),
+    };
+    let (seconds, millis) = (millis.div_euclid(1_000) as i64, millis.rem_euclid(1_000));
+    let (days, rest) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
     // Days since 1970-01-01 to a civil date (proleptic Gregorian calendar).
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
@@ -75,13 +118,15 @@ pub fn stamp(at: std::time::SystemTime) -> String {
         rest / 3_600,
         rest % 3_600 / 60,
         rest % 60,
-        since.subsec_millis()
+        millis
     )
 }
 
 #[cfg(test)]
 mod stamp_tests {
-    use super::{one_line, stamp};
+    use super::{emit_log_line, one_line, stamp};
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -116,5 +161,85 @@ mod stamp_tests {
                 "{escaped:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_backslash_is_escaped_so_an_escaped_break_cannot_be_forged() {
+        assert_eq!(one_line("a\\nb"), "a\\\\nb");
+        assert_ne!(one_line("a\\nb"), one_line("a\nb"));
+    }
+
+    #[test]
+    fn a_time_before_1970_is_written_as_that_time() {
+        assert_eq!(
+            stamp(UNIX_EPOCH - Duration::from_millis(1_500)),
+            "1969-12-31T23:59:58.500Z"
+        );
+    }
+
+    struct Sink {
+        written: Vec<u8>,
+        fail_after: Option<usize>,
+        would_block: usize,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.would_block > 0 {
+                self.would_block -= 1;
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            if let Some(left) = self.fail_after {
+                if left == 0 {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                let n = buf.len().min(left);
+                self.fail_after = Some(left - n);
+                self.written.extend_from_slice(&buf[..n]);
+                return Ok(n);
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_line_after_a_cut_write_starts_on_a_line_of_its_own() {
+        let broken = AtomicBool::new(false);
+        let mut sink = Sink {
+            written: Vec::new(),
+            fail_after: Some(5),
+            would_block: 0,
+        };
+        emit_log_line(&mut sink, "first message", &broken);
+        sink.fail_after = None;
+        emit_log_line(&mut sink, "second message", &broken);
+        let text = String::from_utf8(sink.written).unwrap();
+        let last = text.lines().last().unwrap();
+        assert!(last.ends_with("Z second message"), "{text:?}");
+        assert_eq!(
+            last.len(),
+            "YYYY-MM-DDTHH:MM:SS.mmmZ second message".len(),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_line_waits_out_a_full_nonblocking_log_briefly() {
+        let broken = AtomicBool::new(false);
+        let mut sink = Sink {
+            written: Vec::new(),
+            fail_after: None,
+            would_block: 3,
+        };
+        emit_log_line(&mut sink, "kept", &broken);
+        assert!(
+            String::from_utf8(sink.written)
+                .unwrap()
+                .ends_with("Z kept\n")
+        );
     }
 }

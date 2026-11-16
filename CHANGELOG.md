@@ -8,12 +8,14 @@ entry here.
 
 ### Changed
 
-- Each line `kelmod` itself writes to its log while it serves (core starts, restarts, recycles, memory budgets,
-  stops, the HTTP endpoint) now begins with the UTC time, as in
+- Each line `kelmod` itself writes to its log while it serves (core failures and restarts, recycles, memory
+  budgets, stops, the HTTP endpoint) now begins with the UTC time, as in
   `2026-11-16T07:40:00.250Z kelmod: core state uses 279 MiB ...`, so a recycle can be dated from the log. A line
-  break inside such a message is written as `\n`, and the line goes out in one write, so every line of it
-  starts with its time. Lines the cores write to the same log, and an error that stops `kelmod` before it
-  serves (the client quotes those to the user), are written as before.
+  break inside such a message is written as `\n` and a backslash as `\\`, and the line goes out in one write,
+  so a core writing to the same log cannot split it. After a write that failed part way, the next line starts
+  on a fresh line. Lines the cores write to the same log, Rust's own panic message, and an error that stops
+  `kelmod` before it serves (the client quotes those to the user) are written as before; a stamped line that
+  follows a core's unfinished line continues it.
 
 ## [0.3.1] - 2026-11-15
 
