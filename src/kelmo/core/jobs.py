@@ -287,7 +287,8 @@ class Jobs:
                 self._record_dream_try(undo=True)
             raise
         except Exception:
-            if daily:
+            # A scheduled run that failed before it really started took no try, but waits the retry delay too.
+            if daily or scheduled and action == 'run':
                 self._record_dream_try_end()
             raise
         finally:

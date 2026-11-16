@@ -103,6 +103,23 @@ def test_a_usage_limit_leaves_the_day_all_three_tries(tmp_path, monkeypatch):
     assert len(starts) == 1 + DREAM_TRIES, starts
 
 
+def test_a_run_that_fails_before_it_starts_waits_the_delay(tmp_path, monkeypatch):
+    """A scheduled run that fails before it really starts (reading Dreaming's settings, say) is no try, but the
+    scheduler still waits DREAM_RETRY_SECONDS before it calls it again instead of calling it on every tick."""
+    from kelmo import dreaming_cli
+    jobs, now, _ = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+    calls = []
+
+    def failing_before_the_start(*args, **kwargs):
+        calls.append(now[0])
+        raise RuntimeError('the settings could not be read')
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', failing_before_the_start)
+    tick_until(jobs, now, day_at(6))
+    assert len(calls) >= 2, calls
+    assert all(later - earlier >= DREAM_RETRY_SECONDS for earlier, later in zip(calls, calls[1:])), calls
+
+
 def test_a_run_that_fails_after_midnight_waits_the_delay_on_the_new_day(tmp_path, monkeypatch):
     """A run started one day and failing the next, after the daily hour: the new day's first try still waits
     DREAM_RETRY_SECONDS from that failure instead of starting on the next tick."""
