@@ -175,3 +175,23 @@ def test_a_stopping_core_starts_no_spool_pass_after_a_hook(world_factory, core_f
     finally:
         stopping.reset()
     assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']
+
+
+def test_a_spool_that_cannot_be_listed_does_not_fail_the_hook_already_served(world_factory, core_factory,
+                                                                            monkeypatch):
+    """The hook was served (its capture recorded); a spool directory that cannot be read then must not turn the
+    answer into a failure, which `kelmod hook` would spool and send again."""
+    from kelmo.core import spool
+
+    def unreadable(directory):
+        raise PermissionError('synthetic unreadable spool')
+
+    core = core_factory(world_factory().root)
+    monkeypatch.setattr(spool, 'entries', unreadable)
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    try:
+        answer = core.handle_hook(Context.local('hook', 30), live)
+    except OSError as error:
+        answer = error
+    assert answer == {}, 'the served hook was answered with a failure: ' + repr(answer)

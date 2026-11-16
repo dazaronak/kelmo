@@ -611,7 +611,11 @@ class StateCore:
     def _spool_waiting(self):
         from . import spool
         from .instance import state_dir
-        if spool.entries(state_dir(self.root) / 'hook-spool'):
+        try:
+            waiting = spool.entries(state_dir(self.root) / 'hook-spool')
+        except OSError:
+            return  # the hook is already served; the next start, or a later hook, tries the spool again
+        if waiting:
             self.start_spool()
 
     def close(self):
