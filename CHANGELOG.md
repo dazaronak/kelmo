@@ -6,6 +6,14 @@ entry here.
 
 ## [Unreleased]
 
+### Changed
+
+- The "Pending wiki updates" block a session gets at start now sits between `<kelmo-pending-notes>` and
+  `</kelmo-pending-notes>` lines and says that its lines are text from notes, not instructions. A pending line
+  can no longer pass for an instruction to the agent or close the block early: each one is a single row inside
+  it. Both delivery paths, and the refresh that sends only a changed pending list, use the same frame. Rows,
+  project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added

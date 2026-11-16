@@ -215,12 +215,12 @@ def context_reference(root, data):
 
 def pending_text(pending):
     """The pending block agents see: at most ten rows, then a count, under a digest of the whole set."""
+    from .hot import frame_pending, pending_row
     pending = pending or []
-    lines = [f"- {item['pending']} [{item.get('project') or '?'}" +
-             (' (retrying)' if item.get('state') == 'parked' else '') + ']' for item in pending[:10]]
+    lines = [pending_row(item) for item in pending[:10]]
     if len(pending) > 10:
         lines.append(f'+{len(pending) - 10} more')
-    return ('Pending wiki updates (digest ' + _hash(_encoded(pending)) + '):\n' + '\n'.join(lines)) if pending else ''
+    return frame_pending('Pending wiki updates (digest ' + _hash(_encoded(pending)) + '):', lines) if pending else ''
 
 
 def header_line(snapshot, stale=False):

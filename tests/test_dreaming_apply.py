@@ -637,7 +637,7 @@ def test_pending_lines_are_delivered_at_startup_until_the_note_is_applied(world)
         {'operation_id': first['id'], 'project': 'app', 'state': 'archived', 'pending': 'Export time moves to 10:00.'}]
     assert pending_summaries(world.service, 'other') == []
     block = pending_block(pending_summaries(world.service))
-    assert block.startswith('Pending wiki updates (archived, applied by the next Dreaming pass')
+    assert block.split('\n')[1].startswith('Pending wiki updates (archived, applied by the next Dreaming pass')
     assert '- Export time moves to 10:00. [app]' in block and 'Quiet note' not in block
     assert pending_block([]) == ''
     executor = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run at 10:00.')]))
@@ -851,7 +851,7 @@ def test_hook_start_appends_the_pending_block(world, monkeypatch):
     toml = world.root / 'kelmo.toml'
     toml.write_text(toml.read_text(encoding='utf-8') + '\n[hot]\npages = []\n', encoding='utf-8')
     context = hook(world.service, 'start', {})['hookSpecificOutput']['additionalContext']
-    assert context.rstrip().endswith('- Export time moves to 14:00. [app]')
+    assert context.rstrip().endswith('- Export time moves to 14:00. [app]\n</kelmo-pending-notes>')
     assert 'Pending wiki updates' in context
 
 
