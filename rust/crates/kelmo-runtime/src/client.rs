@@ -54,8 +54,8 @@ async fn next_frame(
 }
 
 /// Sends one call and returns (reply header, reply body). The call's deadline plus five seconds bounds all of
-/// it, the hello and the write of the call frame included, so a daemon that accepts the connection and then
-/// stalls ends the call with `E_DEADLINE`.
+/// it, the connection, the hello and the write of the call frame included, so a daemon that accepts the
+/// connection and then stalls ends the call with `E_DEADLINE`.
 pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), CallError> {
     let end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
     let keyed = request.key.is_some();
@@ -67,8 +67,9 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
         message,
         retryable: keyed,
     };
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = tokio::time::timeout_at(end, UnixStream::connect(socket))
         .await
+        .map_err(|_| unsent("E_DEADLINE: no connection".to_owned()))?
         .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;
     let mut reader = kelmo_wire::FrameReader::new();
     let hello = json!({"v": 2, "kind": "hello", "id": random_id(), "body_type": "json",

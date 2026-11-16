@@ -98,7 +98,9 @@ fn a_daemon_that_never_answers_the_hello_ends_the_call_at_its_deadline() {
 fn a_daemon_that_never_reads_the_call_ends_it_at_its_deadline() {
     let dir = runtime_dir();
     stalled_daemon(&dir, true);
-    let body = json!({"text": "x".repeat(400 * 1024)}).to_string();
+    // Under Linux's 128 KiB limit for one argument; over the 8 KiB socket buffer of macOS, where the write
+    // itself blocks. A buffer that takes it all ends at the reply wait with the same answer.
+    let body = json!({"text": "x".repeat(120 * 1024)}).to_string();
     let (error, elapsed) = bounded_call(&dir, &["--body", &body]);
     assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     assert_eq!(error["code"], "E_DEADLINE", "{error}");
