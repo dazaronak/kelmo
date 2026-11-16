@@ -84,11 +84,15 @@ def _render_generation(config, project, paths, budget, reader, *, generation=Non
     generation = generation or reader.generation()
     # The canonical mandatory set (pages.mandatory_paths): person pages, whose facts need no flag,
     # and every page holding a mandatory or protected record. Each is delivered whole, once.
+    # Mandatory pages lose the fact and source labels of their fact rows; graph_read returns them whole.
+    from .wiki.hot_views import strip_evidence
     mandatory = [page.path for page in reader.mandatory(generation)]
     selected = [name for name in dict.fromkeys(paths) if name not in mandatory]
     blocks, pages = [], []
     for name in mandatory + selected:
         text = _published(reader, generation, name)
+        if name in mandatory:
+            text = strip_evidence(text)
         blocks.append(f'## {name}\n\n{text}')
         pages.append({'path': name, 'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
                       'bytes': len(text.encode('utf-8'))})

@@ -54,6 +54,11 @@ DEGRADE_STEPS = (
 )
 _FRONTMATTER = re.compile(r'\A---\n.*?\n---\n+', re.DOTALL)
 _RETIRED_ROW = re.compile(r'^- .*\[status: retired\].*$\n?', re.MULTILINE)
+# The label group the publisher writes at the end of a fact row (pages._fact_row): the fact id, its sources,
+# then an optional status label. Text shaped like a label anywhere else is the author's and stays.
+_FACT_LABELS = re.compile(r'^(- .*?)( \[f:[^\]\s]+\](?: \[source:[^\]\s]+\])*)'
+                          r'((?: \[status: [^\]\n]+\]| \[unresolved legacy state; retained status: [^\]\n]+\])?)$',
+                          re.MULTILINE)
 
 
 def view_name(project):
@@ -199,10 +204,15 @@ def over_budget(text):
     return int(match.group(1)) if match else None
 
 
+def strip_evidence(text):
+    """`text` without the fact and source labels of its fact rows; status labels and all other text stay."""
+    return _FACT_LABELS.sub(r'\1\3', text)
+
+
 def render_mandatory(text):
-    """A mandatory page as delivered at startup: no frontmatter, no retired rows; everything else
-    byte for byte."""
-    return _RETIRED_ROW.sub('', _FRONTMATTER.sub('', text, 1))
+    """A mandatory page as delivered at startup: no frontmatter, no retired rows, no fact and source labels;
+    everything else byte for byte."""
+    return strip_evidence(_RETIRED_ROW.sub('', _FRONTMATTER.sub('', text, 1)))
 
 
 def project_maps(registry):

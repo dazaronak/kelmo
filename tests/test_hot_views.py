@@ -136,15 +136,15 @@ def test_view_that_cannot_fit_is_written_with_a_marker_not_refused():
     assert hot_views.over_budget(hot_views.render(value, MAP, MAP_TEXT)) is None
 
 
-def test_mandatory_render_drops_frontmatter_and_retired_rows_only():
+def test_mandatory_render_drops_frontmatter_retired_rows_and_fact_labels_only():
     from kelmo.wiki import hot_views
     page_text = ('---\nkind: hub\nlayout: person\n---\n\n# User Profile\n\n## Facts\n\n'
                  '- Live fact. [f:1] [source:a]\n'
                  '- Gone fact. [f:2] [source:b] [status: retired]\n'
                  '- Shipped fact. [f:3] [source:c] [status: shipped]\n\n## See Also\n\n- [[life]]\n')
     assert hot_views.render_mandatory(page_text) == (
-        '# User Profile\n\n## Facts\n\n- Live fact. [f:1] [source:a]\n'
-        '- Shipped fact. [f:3] [source:c] [status: shipped]\n\n## See Also\n\n- [[life]]\n')
+        '# User Profile\n\n## Facts\n\n- Live fact.\n'
+        '- Shipped fact. [status: shipped]\n\n## See Also\n\n- [[life]]\n')
     assert hot_views.render_mandatory('# Bare\n\nNo frontmatter.\n') == '# Bare\n\nNo frontmatter.\n'
 
 
@@ -165,8 +165,8 @@ def test_one_view_per_project_map_and_one_render_per_mandatory_page(tmp_path):
     assert sorted(path.name for path in views) == ['app.md', 'mandatory-person.md', 'mandatory-preferences.md',
                                                    'other.md']
     assert '**Other task** (H1)' in views[tmp_path / 'hot/other.md']
-    assert views[tmp_path / 'hot/mandatory-person.md'] == '# Person\n\n- Rule. [f:p]\n'
-    assert views[tmp_path / 'hot/mandatory-preferences.md'] == '# Preferences\n\n- Mandatory pref. [f:q]\n'
+    assert views[tmp_path / 'hot/mandatory-person.md'] == '# Person\n\n- Rule.\n'
+    assert views[tmp_path / 'hot/mandatory-preferences.md'] == '# Preferences\n\n- Mandatory pref.\n'
     assert views[tmp_path / 'hot/app.md'] == hot_views.render(value, MAP, '')
 
 
@@ -337,3 +337,42 @@ def test_publication_writes_views_in_the_same_commit_and_generation(tmp_path, mo
     assert 'knowledge/hot/app.md' in head
     report = doctor.diagnose(root)
     assert report['checks']['wiki_consistency'] and report['checks']['wiki_committed']
+
+
+TAGGED_PERSON = ('---\nkind: hub\nlayout: person\n---\n\n# Person\n\n## Facts\n\n'
+                 '- Rule. [f:0123456789ab] [source:a1b2c3] [source:2026-08-28_150000_person_rule.md]\n'
+                 '- Shipped fact. [f:aaaaaaaaaaaa] [source:e5f6] [status: shipped]\n'
+                 '- Legacy fact. [f:bbbbbbbbbbbb] [unresolved legacy state; retained status: active]\n'
+                 '- Cite it as [source:quoted] in the note. [f:eeeeeeeeeeee] [source:c9d0]\n'
+                 '- Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian]. [f:ffffffffffff]\n'
+                 '[f:dddddddddddd] starts a line the renderer never writes.\n\n## See Also\n\n- [[life]]\n')
+UNTAGGED_PERSON = ('# Person\n\n## Facts\n\n'
+                   '- Rule.\n'
+                   '- Shipped fact. [status: shipped]\n'
+                   '- Legacy fact. [unresolved legacy state; retained status: active]\n'
+                   '- Cite it as [source:quoted] in the note.\n'
+                   '- Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian].\n'
+                   '[f:dddddddddddd] starts a line the renderer never writes.\n\n## See Also\n\n- [[life]]\n')
+SELECTED = '# Extra\n\n- A selected page keeps its labels. [f:999999999999] [source:s1]\n'
+
+
+def test_generated_mandatory_files_carry_no_evidence_tags(tmp_path):
+    from kelmo.wiki import hot_views
+    value = registry()
+    value['pages']['person.md'] = page('Person', 'hub', 'person')
+    value['facts']['p'] = fact('person.md', 'Rule.')
+    wiki = tmp_path / 'wiki'
+    rendered = {wiki / 'person.md': TAGGED_PERSON, wiki / MAP: MAP_TEXT,
+                wiki / 'projects/other/other.md': '# Other\n', wiki / 'extra.md': SELECTED}
+    views = hot_views.render_all(value, rendered, wiki, tmp_path / 'hot', generation=7,
+                                 selection={'pages': ['extra.md'], 'projects': {}})
+    assert hot_views.render_mandatory(TAGGED_PERSON) == UNTAGGED_PERSON
+    for name in ('mandatory.md', 'mandatory-person.md', 'app.full.md'):
+        text = views[tmp_path / 'hot' / name]
+        assert UNTAGGED_PERSON in text, name
+        for label in ('[f:0123456789ab]', '[source:a1b2c3]', '[source:2026-08-28_150000_person_rule.md]',
+                      '[f:aaaaaaaaaaaa]', '[source:e5f6]', '[f:bbbbbbbbbbbb]', '[f:eeeeeeeeeeee]', '[source:c9d0]',
+                      '[f:ffffffffffff]'):
+            assert label not in text, (name, label)
+    # A page selected through [hot] pages is not a mandatory page: it stays byte for byte.
+    assert SELECTED in views[tmp_path / 'hot' / 'mandatory.md']
