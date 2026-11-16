@@ -67,6 +67,33 @@ class PytestShardsTests(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn('report 2 outcome(s) for the 4 case(s) they were dealt: 2 never ran', done.stdout)
 
+    def test_a_shard_that_died_after_a_case_ran_does_not_say_its_cases_never_ran(self):
+        """The first of two shards runs test_a, then dies before it reports."""
+        (self.root / 'conftest.py').write_text(
+            'import os\n'
+            'def pytest_runtest_logreport(report):\n'
+            '    if report.when == "teardown" and report.nodeid.endswith("::test_a"):\n'
+            '        os._exit(9)\n')
+        done = self.shards(width='2')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn('dealt: 2 never ran or ran unreported', done.stdout)
+
+    def test_the_summary_stays_the_last_line_when_the_step_summary_cannot_be_written(self):
+        env = dict(os.environ, GATE_SHARD_WIDTH='2', PYTHONUNBUFFERED='1',
+                   GITHUB_STEP_SUMMARY=str(self.root / 'missing' / 'summary.md'))
+        env.pop('PYTEST_ADDOPTS', None)
+        done = subprocess.run([sys.executable, str(SHARDS), '-q'], cwd=self.root, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn('step summary not written', done.stdout)
+        self.assertTrue(done.stdout.splitlines()[-1].startswith('4 passed in '), done.stdout)
+
+    def test_a_shard_whose_output_is_not_utf8_still_gives_a_summary(self):
+        (self.root / 'test_bytes.py').write_text('import os\n\ndef test_e():\n    os.write(1, b"\\xff\\xfe\\n")\n')
+        done = self.shards('-s', width='2')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(done.stdout.splitlines()[-1].startswith('5 passed in '), done.stdout + done.stderr)
+
     def test_coloured_pytest_output_still_gives_a_summary(self):
         done = self.shards(width='2', PY_COLORS='1')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)

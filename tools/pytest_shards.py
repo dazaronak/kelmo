@@ -101,7 +101,8 @@ def counts(text):
 
 
 def run_shard(index, ids, options):
-    with tempfile.TemporaryFile(mode='w+') as out:
+    # Bytes a case wrote that are not text in the locale must not cost the shard its summary.
+    with tempfile.TemporaryFile(mode='w+', errors='replace') as out:
         code = subprocess.call([sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider', *options, '--', *ids],
                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
         out.seek(0)
@@ -132,9 +133,12 @@ def main(args):
     print('collected %d cases in %d shards' % (len(ids), count), flush=True)
     results, done = [], 0
     with ThreadPoolExecutor(max_workers=count) as pool:
-        running = [pool.submit(run_shard, index, shard, options) for index, shard in enumerate(shards)]
+        running = {pool.submit(run_shard, index, shard, options): index for index, shard in enumerate(shards)}
         for future in as_completed(running):
-            index, code, text = future.result()
+            try:
+                index, code, text = future.result()
+            except Exception as error:  # noqa: BLE001 - one shard the runner could not read is that shard's red
+                index, code, text = running[future], -1, 'the runner failed: %s: %s' % (type(error).__name__, error)
             results.append((index, code, text))
             # A shard can end before it ran every case it was dealt, so only the outcomes it reported count.
             found = counts(text) or {}
@@ -164,7 +168,8 @@ def main(args):
     if ran < len(ids):
         # Every dealt id is one collected item, and each item ends as one of these outcomes at least once.
         failed = True
-        reports.append('ERROR the shards report %d outcome(s) for the %d case(s) they were dealt: %d never ran'
+        reports.append('ERROR the shards report %d outcome(s) for the %d case(s) they were dealt: '
+                       '%d never ran or ran unreported'
                        % (ran, len(ids), len(ids) - ran))
     for line in reports:
         print(line)
@@ -172,9 +177,10 @@ def main(args):
              for key in ORDER if total.get(key) or key == 'passed']
     passed = '%d of %d collected cases passed' % (total.get('passed', 0), len(ids))
     summary = '%s in %.2fs (%d shards)' % (', '.join(parts), time.time() - started, count)
+    sys.stdout.flush()
+    step_summary(reports, passed, summary)  # its warning comes before the summary, which stays the last line
     print(passed)
     print(summary)
-    step_summary(reports, passed, summary)
     return 1 if failed else 0
 
 
