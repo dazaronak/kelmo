@@ -118,6 +118,26 @@ def test_a_failure_the_core_stop_caused_leaves_the_operation_waiting_and_uncharg
     assert 'failed' not in [event['stage'] for event in service.trace(op['id'])['events']]
 
 
+def test_a_promotion_the_core_stop_cut_in_the_editor_waits_uncharged(service):
+    """The editor call of a promote note fails because the core is stopping (a call no core answers any more):
+    the note waits for the next start, uncharged, as a stop met earlier in `run` leaves it."""
+    from kelmo import stopping
+    from kelmo.errors import KelmoError, Stopping
+    op = service.capture(note(service), 'source.md', 'lead', 'promote')
+
+    def cut_by_the_stop(*args, **kwargs):
+        stopping.request()
+        raise KelmoError('E_TRANSPORT', 'The channel to the archive core is closed.')
+
+    with patch.object(service.editor, 'edit', side_effect=cut_by_the_stop):
+        with pytest.raises(Stopping):
+            service.run(op['id'])
+    after = service.journal.get(op['id'])
+    assert after['state'] != 'failed' and not after['terminal']
+    assert 'failed' not in [event['stage'] for event in service.trace(op['id'])['events']]
+    assert service.journal.claim(op['id'], lease_seconds=1) is not None, 'the stopped attempt kept its claim'
+
+
 def test_source_tampering_stops_before_archival(service):
     op = service.capture(note(service), 'source.md', 'lead', 'promote')
     (service.root / op['source_path']).write_text('replaced')

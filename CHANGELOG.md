@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A promote note whose editor call fails because the core is stopping now waits for the next start
+  without being charged an attempt, as a stop met earlier in the same run already did. It used to be
+  staged failed and needed a manual retry.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
