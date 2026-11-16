@@ -8,12 +8,13 @@ entry here.
 
 ### Fixed
 
-- `kelmo forget` on a note that still waits for the editor now withdraws it. `kelmo dream apply` and the worker
-  never publish it, and it drops out of the pending block a session gets at start and out of the waiting count
-  of `kelmo dream status`. Its operation ends in the new terminal state `withdrawn`; the archived record keeps
-  every byte, and the trace still shows the `forgotten` event, as before. A note the editor is working on at
-  that moment, or whose publication is already decided and waits for its commit, is refused with a retryable
-  `E_BUSY` that says which.
+- `kelmo forget` on a created note that still waits for the editor now withdraws it, and so does a failed one
+  that `kelmo queue retry` could queue again. `kelmo dream apply` and the worker never publish it, and it drops
+  out of the pending block a session gets at start and out of the waiting count of `kelmo dream status`. Its
+  operation ends in the new terminal state `withdrawn`; the archived record keeps every byte, and the trace
+  still shows the `forgotten` event, as before. A note the editor is working on at that moment, or whose
+  publication is already decided and waits for its commit, is refused with a retryable `E_BUSY` that says
+  which, and then no note of that record is withdrawn. Notes filed with `--intent promote` behave as before.
 
 ## [0.3.1] - 2026-11-15
 

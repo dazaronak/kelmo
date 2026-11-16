@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from test_editor_scoping import FEATURE, Scripted, build_world
+from test_editor_scoping import FEATURE, NOTES, Scripted, build_world
 
 
 @pytest.fixture
@@ -238,3 +238,46 @@ def test_forget_on_a_note_whose_publication_is_decided_answers_busy(world, monke
     assert note['id'] in str(refused.value)
     assert world.service.archive_api.hidden_at(note['archive_id']) is None
     assert not world.service.trace(note['id'])['operation']['terminal']
+
+
+def test_a_busy_forget_on_a_record_with_two_notes_withdraws_neither(world):
+    """Two notes with the same bytes share one archive record; one of them is being edited. The refused forget
+    leaves the other note waiting too, not withdrawn behind a call that failed."""
+    from kelmo.errors import KelmoError
+    nightly(world)
+    first = waiting(world, 'Exports moved to 22:10.')
+    second = world.service.create('Exports moved to 22:10.', project='app', selected=[FEATURE, NOTES])
+    second = world.service.run(second['id'])
+    assert second['id'] != first['id'] and second['archive_id'] == first['archive_id'], (first, second)
+    token = world.service.journal.claim(second['id'], lease_seconds=60)
+    assert token is not None
+    try:
+        with pytest.raises(KelmoError) as refused:
+            world.service.forget(first['archive_id'])
+    finally:
+        world.service.journal.release(second['id'], token)
+
+    assert (refused.value.code, refused.value.retryable) == ('E_BUSY', True)
+    for note in (first, second):
+        operation = world.service.trace(note['id'])['operation']
+        assert operation['state'] == 'archived' and not operation['terminal'], operation
+    assert world.service.archive_api.hidden_at(first['archive_id']) is None
+
+
+def test_a_failed_note_that_was_forgotten_is_never_retried_into_the_wiki(world, tmp_path, capsys):
+    """A note whose editor attempts ran out is `failed`; `kelmo queue retry` would queue it again. Forgotten,
+    it is withdrawn: the retry is refused and no pass publishes it."""
+    from kelmo.errors import KelmoError
+    nightly(world)
+    config, log = logging_executor(world, tmp_path)
+    note = waiting(world, 'Exports moved to 22:20.')
+    world.service.journal.stage(note['id'], 'failed', terminal=True, error_code='E_PROPOSAL')
+    world.service.forget(note['archive_id'])
+
+    with pytest.raises(KelmoError) as refused:
+        world.service.retry(note['id'])
+    report = dream_apply(world, capsys, config)
+
+    assert refused.value.code == 'E_STATE'
+    assert note['id'] not in report['applied'] and 'Exports moved to 22:20.' not in edited(log)
+    assert world.fact('app.export')['text'] != 'Exports moved to 22:20.'

@@ -1176,20 +1176,22 @@ class Service:
         # A note still waiting for the editor is withdrawn before the record is hidden, in the journal every
         # reader of waiting notes reads: a failure after this point leaves it hidden from no one yet, but never
         # published. A note the editor holds now, or whose publication it has already decided (the next pass
-        # finishes that whatever happens here), is refused rather than reported withdrawn.
-        for row in self.journal.conn.execute(
-                "SELECT id FROM operations WHERE archive_id=? AND intent='create' AND terminal=0 ORDER BY created_at",
-                (memory_id,)).fetchall():
-            if self.editor.publication_decided(row['id']):
-                raise _busy(f'Note {row["id"]} already has a decided publication that the next pass completes; '
+        # finishes that whatever happens here), is refused rather than reported withdrawn. A failed note waits
+        # too: a retry would queue it again. Every note of the record is withdrawn together or none is.
+        waiting = [row['id'] for row in self.journal.conn.execute(
+            "SELECT id FROM operations WHERE archive_id=? AND intent='create' AND (terminal=0 OR state='failed') "
+            'ORDER BY created_at', (memory_id,))]
+        for operation_id in waiting:
+            if self.editor.publication_decided(operation_id):
+                raise _busy(f'Note {operation_id} already has a decided publication that the next pass completes; '
                             'it cannot be withdrawn. Forget the record again once it is published.')
-            try:
-                self.journal.stage(row['id'], 'withdrawn', terminal=True)
-            except KelmoError as error:
-                if error.code != 'E_CLAIM':
-                    raise
-                raise _busy(f'Note {row["id"]} is being edited now; forget it again once that pass has '
-                            'ended.') from error
+        try:
+            self.journal.withdraw(waiting)
+        except KelmoError as error:
+            if error.code != 'E_CLAIM':
+                raise
+            raise _busy(f'A note of this record is being edited now; forget it again once that pass has '
+                        f'ended. {error}') from error
         # Each CLI call has a fresh identity; archive idempotency remains available to transports.
         receipt = self.archive_api.hide(memory_id, origin, idempotency_key or str(uuid.uuid4()), reason=reason)
         hidden = receipt.outcome == 'hidden'
