@@ -755,20 +755,31 @@ def test_execute_timeout_includes_wait_after_child_closes_pipes(tmp_path):
 
 
 def test_sigterm_interrupts_idle_poll_wait(tmp_path):
+    """A 60 s poll wait ends at SIGTERM. The bound leaves a loaded runner time to exit the interpreter and is a
+    quarter of the wait, so a wait that runs to its end still fails."""
+    import json
     import os
     import subprocess
     import time
-    script = ("import kelmo.daemon as daemon\n"
+    config = tmp_path / 'executor.json'
+    config.write_text(json.dumps({'poll_seconds': 60}))
+    script = ("import sys\n"
+              "import kelmo.daemon as daemon\n"
               "daemon.tick=lambda *a,**k: (print('ready',flush=True) or {})\n"
-              "daemon.run(None,None)\n")
-    process = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE,
+              "daemon.run(None,sys.argv[1])\n")
+    process = subprocess.Popen([sys.executable, '-c', script, str(config)], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         assert process.stdout.readline().strip() == 'ready'
         started = time.monotonic()
         os.kill(process.pid, __import__('signal').SIGTERM)
-        assert process.wait(timeout=2) == 0
-        assert time.monotonic() - started < 2
+        try:
+            code = process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            code = None
+        elapsed = time.monotonic() - started
+        assert code == 0, f'the worker did not stop within 15 s of SIGTERM (exit {code}, {elapsed:.1f} s)'
+        assert elapsed < 15
     finally:
         if process.poll() is None:
             process.kill()
