@@ -383,19 +383,46 @@ def test_a_commit_that_meets_a_reader_late_in_an_attempt_ends_inside_its_deadlin
 def test_a_session_end_that_must_migrate_the_schema_under_an_exclusive_lock_ends_inside_its_deadline(
         tmp_path, monkeypatch, capsys):
     """A vault on the version 1 session schema migrates (and first backs the journal up) when the intake opens; an
-    exclusive lock held meanwhile still ends the hook with E_BUSY inside its deadline."""
+    exclusive lock taken right before that backup still ends the hook with E_BUSY inside its deadline, and the
+    unfinished backup file is not left behind."""
+    import uuid as real_uuid
+
+    from kelmo import sessions as module
     root, source = prepared(tmp_path)
     connection = sqlite3.connect(journal_path(root), isolation_level=None)
     connection.execute('DROP TABLE session_processing')
     connection.execute('UPDATE session_schema SET version=1')
     connection.close()
+    backups = Config.load(root).internal('.state/backups')
+    before = set(backups.glob('sessions-v2-*')) if backups.exists() else set()
+    holder = sqlite3.connect(journal_path(root), isolation_level=None, check_same_thread=False)
+    taken = threading.Event()
+    timer = threading.Timer(HOOK_DEADLINE + 5, lambda: holder.execute('ROLLBACK'))
 
-    with held(root, HOOK_DEADLINE + 5, ['BEGIN EXCLUSIVE']):
+    class LockingUuid:
+        """`uuid.uuid4()` names the backup file right before the backup starts: the lock is taken there."""
+        @staticmethod
+        def uuid4():
+            if not taken.is_set():
+                holder.execute('BEGIN EXCLUSIVE')
+                taken.set()
+                timer.start()
+            return real_uuid.uuid4()
+
+    monkeypatch.setattr(module, 'uuid', LockingUuid)
+    try:
         code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+    finally:
+        timer.cancel()
+        if holder.in_transaction:
+            holder.execute('ROLLBACK')
+        holder.close()
 
+    assert taken.is_set(), 'the hook never reached the backup'
     assert code != 0, printed
     assert printed['error']['code'] == 'E_BUSY', printed
     assert seconds < HOOK_DEADLINE, seconds
+    assert set(backups.glob('sessions-v2-*')) == before
 
 
 def test_a_session_end_whose_attempt_overran_its_budget_is_not_tried_past_the_deadline(tmp_path, monkeypatch, capsys):

@@ -175,7 +175,7 @@ def _capture_once(config,journal,provider,native_id,source,selected,event,budget
     (monotonic), the capture gets at most the time left after the intake opened."""
     from .sessions import Sessions
     from .journal import now
-    sessions=Sessions(config,journal=journal)
+    sessions=Sessions(config,journal=journal,deadline=until)
     try:
         if until is not None:
             budget=min(budget,until-time.monotonic())
