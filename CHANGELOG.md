@@ -14,7 +14,8 @@ entry here.
   written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
   frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
   When the start context is too large for a Claude hook and the pending lines are left in the referenced
-  context file instead, that file's `pending` field is not framed yet.
+  context file instead, that file's `pending` field holds the same framed block, with a row for every waiting
+  note. It used to hold the raw list of notes.
 
 ## [0.3.1] - 2026-11-15
 
