@@ -29,3 +29,22 @@ def test_a_session_whose_record_was_removed_gets_the_whole_context_without_a_res
     state = tmp_path / 'hub-sessions' / 'gone.json'
     update = refresh(state, 'the whole context', verified=True, identity='identity', core='core')
     assert update['context'] == 'the whole context'
+
+
+def test_the_sweep_leaves_records_behind_a_symlinked_sessions_folder_alone(tmp_path):
+    elsewhere = tmp_path / 'elsewhere'
+    report = _record(elsewhere, 'report', days=40)
+    (tmp_path / 'hub-sessions').symlink_to(elsewhere, target_is_directory=True)
+    Client(tmp_path).context(binding=BINDING)
+    assert report.exists(), 'the sweep followed a symlinked hub-sessions folder'
+
+
+def test_the_sweep_leaves_a_symlinked_record_and_its_target_alone(tmp_path):
+    target = _record(tmp_path / 'elsewhere', 'target', days=40)
+    sessions = tmp_path / 'hub-sessions'
+    sessions.mkdir()
+    link = sessions / 'linked.json'
+    link.symlink_to(target)
+    os.utime(link, (time.time() - 40 * DAY,) * 2, follow_symlinks=False)
+    Client(tmp_path).context(binding=BINDING)
+    assert link.is_symlink() and target.exists(), 'the sweep removed a symlinked record'

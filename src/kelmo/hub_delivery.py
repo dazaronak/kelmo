@@ -171,9 +171,11 @@ def prune_sets(root, keep=None):
             os.rename(path, trash)
             shutil.rmtree(trash, ignore_errors=True)
             removed.append(path.name)
-    for record in (root.parent / 'hub-sessions').glob('*.json'):
+    folder = root.parent / 'hub-sessions'
+    # Kelmo makes this folder itself; behind a link, or as a link, a file is not its own to remove.
+    for record in (() if folder.is_symlink() else folder.glob('*.json')):
         try:
-            if now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
+            if not record.is_symlink() and now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
                 record.unlink()
         except OSError:
             continue
