@@ -9,7 +9,9 @@ entry here.
 ### Fixed
 
 - A resolution request whose model call the core's stop ended is given back at once, without being
-  charged an attempt. It used to stay claimed until its lease ran out, with the attempt counted.
+  charged an attempt. It used to stay claimed until its lease ran out, with the attempt counted. If the
+  journal cannot be written at that moment, the request still waits out its lease and the attempt counts,
+  as before; the stop is reported either way.
 
 ## [0.3.1] - 2026-11-15
 
