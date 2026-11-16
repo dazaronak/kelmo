@@ -137,6 +137,8 @@ class Journal:
             # Every per-operation read (an operation's stages, its events, one event of a stage) filters events
             # by operation; without this index each one scans the whole table.
             self.conn.execute('CREATE INDEX IF NOT EXISTS events_operation_stage ON events(operation_id, stage)')
+            # A record's operations, looked up for every search hit and list item (compat metadata) and by forget.
+            self.conn.execute('CREATE INDEX IF NOT EXISTS operations_archive ON operations(archive_id, created_at, id)')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS operation_origins (
                 operation_id TEXT PRIMARY KEY REFERENCES operations(id), origin TEXT NOT NULL
             )''')
