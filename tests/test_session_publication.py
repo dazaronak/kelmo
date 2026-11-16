@@ -175,3 +175,34 @@ def test_archive_only_never_reconciles_or_edits(tmp_path, monkeypatch):
     with Service(root) as service:
         operation = service.journal.get(note_operation(root, job_id))
     assert operation['durable_stage'] == 'archived', 'the whole note is still archived'
+
+
+def test_session_note_forgotten_after_an_unfinished_editor_request_is_not_published(tmp_path, monkeypatch):
+    """The first attempt records the editor's answer but stops before its publication is prepared; the note is
+    forgotten, then the job runs again: an open request is no started publication, so nothing is published."""
+    from kelmo.editor import Editor
+    root, job_id = adopted_session(tmp_path, monkeypatch)
+    before = commits(root)
+    calls = []
+
+    def busy(*args, **kwargs):
+        raise KelmoError('E_BUSY', 'Synthetic coordinator lock held.')
+
+    monkeypatch.setattr(Editor, '_settle', busy)
+    assert tick(root, ['/synthetic/executor'], execute=executor(calls))['jobs'][0]['state'] != 'wiki_applied'
+    monkeypatch.undo()
+    for key, value in GIT_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr('kelmo.store.memory.store.embed', unavailable)
+    monkeypatch.setattr('kelmo.store.memory.search.embed', unavailable)
+    with Service(root) as service:
+        assert service.forget(service.journal.get(note_operation(root, job_id))['archive_id'])['forgotten']
+    db = sqlite3.connect(root / '.state' / 'journal.sqlite3')
+    with db:
+        # The busy retry waits; the test does not.
+        db.execute('UPDATE session_processing SET eligible=0 WHERE job_id=?', (job_id,))
+    db.close()
+    job = tick(root, ['/synthetic/executor'], execute=executor(calls))['jobs'][0]
+    assert 'demo.session.0' not in engine.load_registry(root)['facts']
+    assert commits(root) == before
+    assert job['state'] == 'wiki_unchanged', job

@@ -16,8 +16,9 @@ entry here.
   publication is already decided and waits for its commit, is refused with a retryable `E_BUSY` that says
   which, and then no note of that record is withdrawn. Notes filed with `--intent promote` behave as before.
 - A session note forgotten while the session worker waits for its reconcile call is no longer published: the
-  job ends `wiki_unchanged`. A session note whose publication had already started is finished as before, and a
-  replay of a finished one still makes no second commit.
+  job ends `wiki_unchanged`. So is one forgotten after an attempt that got the editor's answer but stopped
+  before its publication was prepared; that request is refused. A session note whose publication was already
+  prepared is finished as before, and a replay of a finished one still makes no second commit.
 
 ## [0.3.1] - 2026-11-15
 
