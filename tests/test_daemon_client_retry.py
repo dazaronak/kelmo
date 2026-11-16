@@ -251,6 +251,8 @@ def test_a_cli_call_its_caller_marks_safe_to_resend_is_sent_again_after_a_cut(da
     (['create', '--text', 'A note.', '--project', 'p', '--idempotency-key', 'k-1'], True),
     (['create', '--text', 'A note.', '--project', 'p'], False),
     (['forget', 'm-1'], False),
+    # Its state handler does not pass the key on, so a resend would answer "already registered".
+    (['register', 'projects/p/x.md', '--apply', '--idempotency-key', 'k-1'], False),
 ])
 def test_the_cli_lets_a_read_or_a_keyed_write_be_sent_again(tmp_path, monkeypatch, argv, resend):
     """A command that changes nothing, or a write whose own key the server settles once, may go again after a
@@ -265,3 +267,14 @@ def test_the_cli_lets_a_read_or_a_keyed_write_be_sent_again(tmp_path, monkeypatc
                         or {'ok': True})
     cli.through_daemon(args, [*argv, '--vault', str(tmp_path)], str(tmp_path / 'kelmo'))
     assert [(op, kwargs.get('resend', False)) for op, kwargs in calls] == [('state.cli', resend)]
+
+
+def test_a_resend_whose_connect_blocks_ends_with_its_reconnect_window(daemon, monkeypatch):
+    # The read was sent and cut; the daemon's listen queue then takes no connection. The resend tries for the
+    # reconnect window, not for the rest of the call's deadline.
+    monkeypatch.setattr(daemon_client, 'RECONNECT_SECONDS', 1.0)
+    peer = daemon(Connection(hold(0.2, CLOSE)), Connection(ANSWER))
+    _stall_after(monkeypatch, 1)
+    got = outcome(peer, 'state.scheduler_status', {}, seconds=6.0)
+    assert got[:2] == ('error', 'E_TRANSPORT'), got
+    assert got[-1] < 2.5, got

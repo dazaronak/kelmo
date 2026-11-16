@@ -191,11 +191,16 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None, resend=False
             raise _unknown(cut) from cut
         if limit - time.monotonic() <= 0:
             raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
+        window = min(limit, time.monotonic() + RECONNECT_SECONDS)
         try:
-            sock = _connect(target, limit, min(limit, time.monotonic() + RECONNECT_SECONDS))
+            # Each connect ends with the reconnect window too, so a listen queue that takes nothing cannot hold the
+            # resend until the call's deadline.
+            sock = _connect(target, window, window)
         except KelmoError as error:
             if error.code == 'E_DEADLINE' and not cut.sent:  # neither attempt reached kelmod
                 raise _unsent(error) from error
+            if error.code == 'E_DEADLINE' and window < limit:  # the window ended, the deadline did not
+                raise KelmoError('E_TRANSPORT', f'No daemon answers at {target}.') from error
             raise
         left = limit - time.monotonic()
         if left <= 0:

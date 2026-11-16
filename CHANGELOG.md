@@ -35,9 +35,11 @@ entry here.
 - A call from the installed CLI to the local daemon follows kelmod's replay rule when kelmod drops the
   socket. A call cut before it was sent goes once more within the deadline, and so does one cut after it was
   sent when it changes nothing (a daemon status or scheduler read, or a command a fenced server still runs,
-  such as `search`, `show` or `status`) or carries `--idempotency-key`. Any other command cut after it was
-  sent fails at once with `E_TRANSPORT` and its effect reported as unknown, on the second attempt as on the
-  first. The resend tries to reconnect for at most 15 seconds, and the whole call stays inside its deadline.
+  such as `search`, `show` or `status`), or when it is a `create`, `add` or `promote` that carries
+  `--idempotency-key`, which the server settles once. Any other command cut after it was sent fails at once
+  with `E_TRANSPORT` and its effect reported as unknown, on the second attempt as on the first. The resend
+  tries to reconnect for at most 15 seconds, and the whole call stays inside its deadline; a daemon that takes
+  no connection in that time ends the call with `E_TRANSPORT`.
   A connection the daemon does not take in time, and a hello it never answers, are now `E_TRANSPORT` with
   nothing sent, not `E_DEADLINE`, so `kelmo dream` no longer reports a pass running that was never asked for.
 

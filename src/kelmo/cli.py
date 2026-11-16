@@ -221,10 +221,15 @@ def through_daemon(args, argv, launcher):
     from .config import ClientProfile
     op = 'edge.cli' if ClientProfile.selected(root) else 'state.cli'
     # After a cut, a command that changes nothing, or one whose own key the server settles once, may go again.
-    resend = served_while_fenced(args) or bool(getattr(args, 'idempotency_key', None))
+    resend = served_while_fenced(args) or (args.command in KEY_SETTLED_COMMANDS
+                                           and bool(getattr(args, 'idempotency_key', None)))
     return daemon_client.call(root, op, body, path=path, resend=resend,
                               seconds=WAIT_CALL_SECONDS if getattr(args, 'wait', False) else 60.0)
 
+
+# Commands whose `state.cli` handler hands `--idempotency-key` to the service, which settles the key once: sent
+# again after a cut, they answer what the first send did. `register` takes the option for shared clients only.
+KEY_SETTLED_COMMANDS = frozenset({'create', 'add', 'promote'})
 
 # A `--wait` call follows the operation through its model calls.
 WAIT_CALL_SECONDS = 900.0
