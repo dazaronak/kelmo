@@ -123,6 +123,17 @@ entry here.
   archived after a retry is read once more unless a finding already cites it, because the journal of 0.3.1
   cannot show whether that build read it, and reading it twice is better than never reading it. After that
   pass a 0.3.1 build cannot read the cursor.
+- A daily Dreaming run that fails waits 15 minutes from the end of the run before the scheduler tries it
+  again. The wait used to count from the start, so a run that took longer than that and failed was started
+  again at once, and the three daily tries could go in about an hour. The same wait holds for a run that
+  started one day and failed the next. A run that fails before it starts (its lock, Dreaming's settings) is
+  now one of the three tries and waits the same 15 minutes; it used to be started again on every scheduler
+  tick, all day. A run that answers a usage limit whose reset time has already passed still costs no try,
+  but now waits the same 15 minutes instead of starting again on every scheduler tick. The tries and the wait
+  are read again when the run starts, so a run that failed just after the scheduler looked gets the answer
+  `not_due` instead of an extra try. A run the daemon's stop ends, or one whose call to another part of the
+  daemon fails because it is stopping, costs no try and keeps the wait it found; a run that had already
+  answered with a failure keeps its try. A `kelmo dream run` by hand is not limited.
 
 ## [0.3.1] - 2026-11-15
 

@@ -45,8 +45,9 @@ APPLY_NO_PROGRESS_SECONDS = 7200
 # in a row; further cuts wait APPLY_MIN_INTERVAL_SECONDS, so a run of restarts cannot restart model calls at will.
 APPLY_RESUME_SECONDS = 60
 APPLY_QUICK_RESUMES = 2
-# A daily Dreaming run that did not complete (it failed, or the core died under it) is tried again after
-# DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day; one the core's stop ended costs no try.
+# A daily Dreaming run that did not complete (it failed, before or after its start, or the core died under it)
+# is tried again DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day. One the core's stop ended
+# and one that met a usage limit cost no try; a limit whose reset has passed still waits DREAM_RETRY_SECONDS.
 DREAM_TRIES = 3
 DREAM_RETRY_SECONDS = 900
 # Answers of a started daily run that complete the day; answers that give the try back.
@@ -239,12 +240,42 @@ class Jobs:
             raise KelmoError('E_INPUT', 'Only a Dreaming apply runs over ready projects; a run drains every project.')
         if scheduled and self._fenced():
             return {'state': 'fenced'}
-        with self._dreaming_lock() as free:
-            if not free:
-                # What the local run answers too; a scheduled job that meets it starts nothing and records
-                # no start, so the next tick asks again.
-                return {'state': 'busy'}
-            return self._dream_run(action, scheduled, ready)
+        self._dream_started = False
+        self._dream_stop_cut = False  # set by _dream_run: a started run the stop ended, decided once
+        daily = scheduled and action == 'run'
+        found = self._read_state().get('dream_tries') if daily else None
+        try:
+            with self._dreaming_lock() as free:
+                if not free:
+                    # What the local run answers too; a scheduled job that meets it starts nothing and records
+                    # no start, so the next tick asks again.
+                    return {'state': 'busy'}
+                if scheduled and action == 'run' and not self._dream_try_allowed():
+                    # The tick read the gate before this job started: a failing run may have ended meanwhile and
+                    # started the delay, and a local client may send `scheduled` itself. Read it again here.
+                    return {'state': 'not_due'}
+                return self._dream_run(action, scheduled, ready)
+        except Stopping:
+            if daily:
+                self._write_state(dream_tries=found)  # a stop costs no try and keeps the wait it found
+            raise
+        except Exception:
+            if not daily:
+                raise
+            if self._dream_started:
+                if self._dream_stop_cut:
+                    # While the core is stopping, a call to another core fails as a KelmoError rather than
+                    # Stopping (stopping.py): the stop caused it, so like a stop it costs nothing.
+                    self._write_state(dream_tries=found)
+            elif self.should_stop():
+                self._write_state(dream_tries=found)  # the same for a call that failed before the start
+            else:
+                # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try
+                # too: it counts towards DREAM_TRIES and waits DREAM_RETRY_SECONDS. One that started is counted
+                # in _dream_run.
+                self._record_dream_try()
+                self._record_dream_try_end()
+            raise
 
     @contextmanager
     def _dreaming_lock(self):
@@ -267,6 +298,7 @@ class Jobs:
         daily = []
 
         def started():
+            self._dream_started = True
             if scheduled and action == 'run':
                 daily.append(True)
                 self._record_dream_try()
@@ -286,23 +318,36 @@ class Jobs:
                                clock=self.clock, on_start=started, should_stop=self.should_stop, step=self.step,
                                ready=ready, boundary=boundary)
         except Stopping:
-            stopped = True
+            stopped = True  # _dream puts the try state back
+            raise
+        except Exception:
             if daily:
-                self._record_dream_try(undo=True)
+                # Decided once: a failure while the core stops is the stop's, and _dream gives its try back; any
+                # other keeps its try and waits from now, even if a stop arrives right after.
+                if self.should_stop():
+                    self._dream_stop_cut = True
+                else:
+                    self._record_dream_try_end()
             raise
         finally:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
                 self._record_apply_end(stopped=stopped)
         if daily:
             state = result.get('state') if isinstance(result, dict) else None
+            # An answer is the run's own, whatever the stop flag reads now: a stopped executor raises Stopping
+            # (daemon.py checks the stop while it waits), and a `failed` answer comes from a provider that ended on
+            # its own, so it keeps its try and its wait.
             if state in DREAM_DAY_STATES:
                 self._record_dream_day()
             elif state in DREAM_HELD_STATES:
-                # A usage limit or a pause met after the start: Dreaming's own hold brings the run back, and the
-                # try is not the run's failure.
-                self._record_dream_try(undo=True)
-            # Any other answer (a failed findings pass) keeps its try: the run is tried again after
-            # DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day.
+                # A usage limit or a pause met after the start costs no try. While Dreaming's own hold is on it
+                # brings the run back; a limit whose reset has passed holds nothing, so the run waits the retry
+                # delay instead of starting again on every tick.
+                self._record_dream_try(undo=True, delay=not self._held_after(result))
+            else:
+                # Any other answer (a failed findings pass) keeps its try: the run is tried again
+                # DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day.
+                self._record_dream_try_end()
         return result
 
     def _admin(self):
@@ -373,26 +418,48 @@ class Jobs:
     def _record_dream_day(self):
         self._write_state(dream_day=self._today())
 
-    def _record_dream_try(self, undo=False):
-        """Counts a start of today's scheduled run, or takes back the one the core's stop ended."""
+    def _record_dream_try(self, undo=False, delay=False):
+        """Counts a start of today's scheduled run, or takes back one that cost no try (the core's stop, a usage
+        limit). With `delay`, the next start waits DREAM_RETRY_SECONDS even when no try is left counted."""
         def counted():
             tries = self._read_state().get('dream_tries')
             today = self._today()
             count = tries.get('count', 0) if isinstance(tries, dict) and tries.get('day') == today else 0
             if undo:
-                return {'day': today, 'count': max(0, count - 1), 'at': self.clock()}
+                return {'day': today, 'count': max(0, count - 1), 'at': self.clock(), 'delay': delay}
             return {'day': today, 'count': count + 1, 'at': self.clock()}
         self._write_state(dream_tries=counted)
 
+    def _record_dream_try_end(self):
+        """Starts the retry delay again when today's try ended without completing, so a long run that fails
+        waits DREAM_RETRY_SECONDS from its end, not from its start, on the day it ended too."""
+        def ended():
+            tries = self._read_state().get('dream_tries')
+            today = self._today()
+            count = tries.get('count', 0) if isinstance(tries, dict) and tries.get('day') == today else 0
+            return {'day': today, 'count': count, 'at': self.clock(), 'delay': True}
+        self._write_state(dream_tries=ended)
+
+    def _held_after(self, result):
+        """A paused or deferred answer is held by Dreaming itself (`_dream_hold`) only while a pause is on or a
+        reset time is still ahead; a deferral whose reset has passed holds nothing."""
+        if result.get('state') == 'paused':
+            return True
+        reset = result.get('reset_at')
+        return isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > self.clock()
+
     def _dream_try_allowed(self):
-        """Today's scheduled run may start: no try yet, or fewer than DREAM_TRIES and the last one long enough ago."""
+        """Today's scheduled run may start: no try yet and no delay running, or fewer than DREAM_TRIES and the last
+        try (or a delayed answer that cost none) long enough ago."""
         tries = self._read_state().get('dream_tries')
         if not isinstance(tries, dict) or tries.get('day') != self._today():
             return True
         count, at = tries.get('count', 0), tries.get('at', 0)
         if not isinstance(count, int) or not isinstance(at, (int, float)):
             return True
-        return count == 0 or count < DREAM_TRIES and self.clock() >= at + DREAM_RETRY_SECONDS
+        if count == 0 and tries.get('delay') is not True:
+            return True
+        return count < DREAM_TRIES and self.clock() >= at + DREAM_RETRY_SECONDS
 
     def _daily_due(self):
         return (time.localtime(self.clock()).tm_hour >= DREAM_HOUR and self._last_dream_day() != self._today()

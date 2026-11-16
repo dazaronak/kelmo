@@ -43,7 +43,8 @@ resumes while one of its projects is still ready; what it left below
 not cut. A pass the daemon did not see end,
 because the core died under it, waits 15 minutes from its start, or two hours if
 none of its notes was published by then. Paused or deferred Dreaming waits until it can
-run. A server fence holds all scheduled jobs until it is lifted: no job starts,
+run; a daily run that met a usage limit whose reset time had already passed waits the same 15
+minutes. A server fence holds all scheduled jobs until it is lifted: no job starts,
 and a running backfill stops before its next batch. The daemon also refuses a job
 submitted by hand and any command that changes the vault (`worker run`,
 `queue retry`) with `E_FENCED`. It still answers `status`, `search` and other
