@@ -15,8 +15,8 @@ entry here.
     a cached context names stay. A local vault that saves a copy for a cut context sweeps its sets too.
   - A cached context no delivery, online or from the cache, has used for 30 days goes, and with it the
     hold on its set. That binding has no offline fallback until its next delivery.
-  - A session's delivery record no delivery has written for 30 days goes. Such a session, if it prompts
-    again, gets the whole context once, as a new session does.
+  - A session's delivery record no delivery has written for 30 days goes. Such a session, if it resumes,
+    gets the whole context once as a new session does, with no restart notice.
   - A saved context reference no delivery has used for 30 days goes. A reference used again counts from
     that use.
 
