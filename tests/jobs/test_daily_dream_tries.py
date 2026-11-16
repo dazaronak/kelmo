@@ -3,6 +3,8 @@ run starts again only after DREAM_RETRY_SECONDS, and no more than DREAM_TRIES ru
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from kelmo.core.jobs import DREAM_RETRY_SECONDS, DREAM_TRIES, Jobs
 from kelmo.errors import Stopping
 
@@ -11,9 +13,10 @@ def day_at(hour, minute=0):
     return time.mktime((2026, 11, 16, hour, minute, 0, 0, 0, -1))
 
 
-def ticking(tmp_path, monkeypatch, outcomes):
+def ticking(tmp_path, monkeypatch, outcomes, duration=0):
     """Jobs whose tick runs the daily job on the calling thread, through `_quietly`, `run` and `_dream`. The n-th
-    run started answers with `outcomes[n]` (the last one repeats): raised when it is an exception."""
+    run started takes `duration` seconds and answers with `outcomes[n]` (the last one repeats): raised when it
+    is an exception."""
     from kelmo import dreaming_cli
     (tmp_path / '.state').mkdir(exist_ok=True)
     now = [day_at(4)]
@@ -28,6 +31,7 @@ def ticking(tmp_path, monkeypatch, outcomes):
     def run_dream(*args, **kwargs):
         kwargs['on_start']()
         starts.append(now[0])
+        now[0] += duration
         outcome = outcomes[min(len(starts), len(outcomes)) - 1]
         if isinstance(outcome, BaseException):
             raise outcome
@@ -70,3 +74,21 @@ def test_a_core_stop_gives_its_daily_try_back(tmp_path, monkeypatch):
     tick_until(jobs, now, day_at(23, 59))
     # Two failed tries, one the stop gave back, then the third counted try: the day still had it.
     assert len(starts) == DREAM_TRIES + 1
+
+
+@pytest.mark.parametrize('failure', [RuntimeError('a broken configuration'), {'state': 'failed', 'code': 'E_EXECUTOR'}],
+                         ids=['raised', 'answered'])
+def test_a_long_failed_run_waits_the_delay_from_its_end(tmp_path, monkeypatch, failure):
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [failure], duration=1200)
+    tick_until(jobs, now, day_at(23, 59))
+    assert len(starts) == DREAM_TRIES
+    # Each run takes 1200 s and fails at its end; the next starts no sooner than DREAM_RETRY_SECONDS after that.
+    assert all(later - earlier >= 1200 + DREAM_RETRY_SECONDS for earlier, later in zip(starts, starts[1:])), starts
+
+
+def test_a_deferral_whose_reset_has_passed_counts_as_a_try(tmp_path, monkeypatch):
+    """A usage limit whose reset time is already over holds nothing: such an answer keeps its try, so the scheduler
+    does not start the run again on every tick."""
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [{'state': 'deferred', 'reset_at': day_at(4) - 20}])
+    tick_until(jobs, now, day_at(23, 59))
+    assert len(starts) == DREAM_TRIES

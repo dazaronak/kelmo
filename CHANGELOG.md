@@ -6,6 +6,13 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A daily Dreaming run that fails waits 15 minutes from the end of the run before the scheduler tries it
+  again. The wait used to count from the start, so a run that took longer than that and failed was started
+  again at once, and the three daily tries could go in about an hour. A run that answers a usage limit whose
+  reset time has already passed now keeps its try instead of starting again on every scheduler tick.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added

@@ -286,6 +286,10 @@ class Jobs:
             if daily:
                 self._record_dream_try(undo=True)
             raise
+        except Exception:
+            if daily:
+                self._record_dream_try_end()
+            raise
         finally:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
                 self._record_apply_end(stopped=stopped)
@@ -293,12 +297,14 @@ class Jobs:
             state = result.get('state') if isinstance(result, dict) else None
             if state in DREAM_DAY_STATES:
                 self._record_dream_day()
-            elif state in DREAM_HELD_STATES:
+            elif state in DREAM_HELD_STATES and self._held_after(result):
                 # A usage limit or a pause met after the start: Dreaming's own hold brings the run back, and the
                 # try is not the run's failure.
                 self._record_dream_try(undo=True)
-            # Any other answer (a failed findings pass) keeps its try: the run is tried again after
-            # DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day.
+            else:
+                # Any other answer (a failed findings pass, a limit whose reset has passed) keeps its try: the
+                # run is tried again DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day.
+                self._record_dream_try_end()
         return result
 
     def _admin(self):
@@ -379,6 +385,24 @@ class Jobs:
                 return {'day': today, 'count': max(0, count - 1), 'at': self.clock()}
             return {'day': today, 'count': count + 1, 'at': self.clock()}
         self._write_state(dream_tries=counted)
+
+    def _record_dream_try_end(self):
+        """Starts the retry delay again when today's try ended without completing, so a long run that fails
+        waits DREAM_RETRY_SECONDS from its end, not from its start."""
+        def ended():
+            tries = self._read_state().get('dream_tries')
+            today = self._today()
+            count = tries.get('count', 0) if isinstance(tries, dict) and tries.get('day') == today else 0
+            return {'day': today, 'count': count, 'at': self.clock()}
+        self._write_state(dream_tries=ended)
+
+    def _held_after(self, result):
+        """A paused or deferred answer is held by Dreaming itself (`_dream_hold`) only while a pause is on or a
+        reset time is still ahead; a deferral whose reset has passed holds nothing."""
+        if result.get('state') == 'paused':
+            return True
+        reset = result.get('reset_at')
+        return isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > self.clock()
 
     def _dream_try_allowed(self):
         """Today's scheduled run may start: no try yet, or fewer than DREAM_TRIES and the last one long enough ago."""
