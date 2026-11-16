@@ -1293,8 +1293,8 @@ class SharedClient:
 
     def _cached_set_names(self):
         """The HOT sets the cached contexts were delivered with: a stale delivery reads its set by name. Run by
-        the daily HOT sweep, it also removes a cached context no delivery has refreshed for CACHE_RETAIN_SECONDS:
-        its binding has not been used since, and its set loses the hold."""
+        the daily HOT sweep, it also removes a cached context no delivery, online or from the cache, has used for
+        CACHE_RETAIN_SECONDS: its binding has not been used since, and its set loses the hold."""
         names, now = set(), time.time()
         for path in (self.profile.state / 'cache').glob('context-*.json'):
             try:
@@ -1316,11 +1316,19 @@ class SharedClient:
         path = self._cache_path(key)
         reason = ('the connected shared kelmo server does not advertise the required capability'
                   if error.code == 'E_CAPABILITY' else 'the shared kelmo server could not be reached')
+        missing = KelmoError(error.code, reason[0].upper() + reason[1:] + '; this repository has no '
+                             'cached generation, so nothing was delivered.')
         if not path.is_file():
-            raise KelmoError(error.code, reason[0].upper() + reason[1:] + '; this repository has no '
-                            'cached generation, so nothing was delivered.')
+            raise missing
         try:
-            record = json.loads(path.read_bytes())
+            data = path.read_bytes()
+        except FileNotFoundError:
+            raise missing from None  # another process's daily sweep removed it after the look above
+        except OSError as failure:
+            raise KelmoError('E_CACHE', 'The cached generation failed its hash or binding check; '
+                                       'nothing was delivered.') from failure
+        try:
+            record = json.loads(data)
             generation = _sealed(record, key, self.profile.authority_id)
         except (OSError, KeyError, TypeError, ValueError, UnicodeError) as failure:
             raise KelmoError('E_CACHE', 'The cached generation failed its hash or binding check; '
@@ -1369,6 +1377,10 @@ class SharedClient:
                           pending=record['pending'],
                           hub_directory=str(self.profile.state / 'hot' / record.get('hub_set_name', 'current')),
                           hub_work_pointer=str(path) + ' (hub_work field; STALE CACHE)')
+        try:
+            os.utime(path)  # used now: the daily sweep measures a cached context's age from its last use
+        except OSError:
+            pass
         return result
 
     # Transcript capture

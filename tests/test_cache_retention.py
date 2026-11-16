@@ -48,3 +48,32 @@ def test_a_cached_context_refreshed_within_a_month_keeps_its_set(tmp_path):
     client.context(binding=dict(BINDING, work='other-task'))
     assert record.exists() and first in _sets(hot)
     assert client.context(binding=BINDING, unreachable=Unbound('E_TRANSPORT', 'offline'))['freshness'] == 'stale'
+
+
+def test_an_offline_delivery_from_the_cache_counts_as_a_use(tmp_path):
+    cache = tmp_path / 'cache'
+    client = Client(tmp_path)
+    client.context(binding=BINDING)
+    [record] = list(cache.glob('context-*.json'))
+    _age(record, 29)
+    assert client.context(binding=BINDING, unreachable=Unbound('E_TRANSPORT', 'offline'))['freshness'] == 'stale'
+    assert time.time() - record.stat().st_mtime < DAY, 'an offline delivery left the cache looking unused'
+
+
+def test_a_cached_context_removed_while_it_is_read_is_no_cached_generation(tmp_path, monkeypatch):
+    from pathlib import Path
+    cache = tmp_path / 'cache'
+    client = Client(tmp_path)
+    client.context(binding=BINDING)
+    [record] = list(cache.glob('context-*.json'))
+    read_bytes = Path.read_bytes
+
+    def swept_first(path):
+        if path == record:
+            path.unlink()  # another process's sweep, between the reader's look and its read
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, 'read_bytes', swept_first)
+    with pytest.raises(KelmoError) as error:
+        client.context(binding=BINDING, unreachable=Unbound('E_TRANSPORT', 'offline'))
+    assert error.value.code == 'E_TRANSPORT' and 'no cached generation' in str(error.value)
