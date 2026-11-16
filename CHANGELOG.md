@@ -9,8 +9,9 @@ entry here.
 ### Fixed
 
 - A promote note whose editor call fails because the core is stopping now waits for the next start
-  without being charged an attempt, as a stop met earlier in the same run already did. It used to be
-  staged failed and needed a manual retry.
+  without being charged an attempt, as a stop met earlier in the same run already did, also when the editor
+  answers busy. It used to be staged failed and charged: retried later for a transient code, needing a
+  manual retry otherwise.
 
 ## [0.3.1] - 2026-11-15
 

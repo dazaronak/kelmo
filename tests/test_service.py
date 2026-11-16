@@ -138,6 +138,25 @@ def test_a_promotion_the_core_stop_cut_in_the_editor_waits_uncharged(service):
     assert service.journal.claim(op['id'], lease_seconds=1) is not None, 'the stopped attempt kept its claim'
 
 
+@pytest.mark.parametrize('code', ['E_BUSY', 'E_CLAIM'])
+def test_a_promotion_stop_the_editor_reports_as_busy_is_still_a_stop(service, code):
+    """The editor answers busy (a lease another attempt left) after the core's stop was asked: `run` raises the
+    stop, as for any other error the stop caused."""
+    from kelmo import stopping
+    from kelmo.errors import KelmoError, Stopping
+    op = service.capture(note(service), 'source.md', 'lead', 'promote')
+
+    def busy_after_the_stop(*args, **kwargs):
+        stopping.request()
+        raise KelmoError(code, 'Another attempt holds the request.')
+
+    with patch.object(service.editor, 'edit', side_effect=busy_after_the_stop):
+        with pytest.raises(Stopping):
+            service.run(op['id'])
+    after = service.journal.get(op['id'])
+    assert after['state'] != 'failed' and not after['terminal']
+
+
 def test_source_tampering_stops_before_archival(service):
     op = service.capture(note(service), 'source.md', 'lead', 'promote')
     (service.root / op['source_path']).write_text('replaced')
