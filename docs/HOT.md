@@ -126,14 +126,15 @@ Shared pending notices obey the client's enrolled project boundary.
 When it installs a set (a shared client on each delivery that brings one, a local
 vault when it saves a copy), Kelmo removes, at most once a day, the sets older than
 two days; a set installed again counts as new. It keeps the eight newest whatever
-their age (the current set among them), on a shared client every set a cached context
-names, so offline delivery keeps working, and every set a session's delivery gave a
-path into while that session's delivery record is younger than 30 days, so the
-session can still read the path. An online delivery points at the current set, an
-offline one at the set its cache names, and an offline delivery whose set is gone
-says that no cached generation is left. The same sweep removes a cached context no delivery,
-online or from the cache, has used for 30 days: nobody has used its binding since,
-and that binding then has no offline fallback until its next delivery.
+their age (the current set among them), on a shared client every set a cached
+context names, so offline delivery keeps working, and every set a session's delivery
+gave a path into while that session's delivery record is younger than 30 days, so
+the session can still read the path. An online delivery points at the current set,
+an offline one at the set its cache names, and an offline delivery whose set is gone
+says that no cached generation is left. The same sweep removes a cached context no
+delivery, online or from the cache, has used for 30 days: nobody has used its
+binding since, and that binding then has no offline fallback until its next
+delivery.
 
 Codex managed blocks contain the published combined view. Bound work and pending
 notes travel through the hook and are not persisted into the repository's instruction file.
