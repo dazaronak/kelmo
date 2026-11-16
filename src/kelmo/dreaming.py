@@ -204,6 +204,25 @@ class Dreaming:
                 break
         return found, last
 
+    def _waiting_evidence(self, cursor):
+        """How many archived operations after `cursor` the pass did not reach, and when the first of them
+        reached the archive: an operation still on its way there holds the cursor in front of them. Dreaming's
+        own notes are left out, as in `_changed_evidence`. One aggregate over `events`, which has no index on
+        `operation_id`."""
+        query = ('SELECT COUNT(*), MIN(s.reached_at) FROM operations o JOIN ('
+                 " SELECT operation_id, MAX(stage IN ('archived','applied')) AS reached,"
+                 " MIN(CASE WHEN stage IN ('archived','applied') THEN created_at END) AS reached_at,"
+                 " MAX(stage = 'purged') AS purged FROM events GROUP BY operation_id"
+                 ') s ON s.operation_id = o.id'
+                 ' WHERE s.reached = 1 AND s.purged = 0 AND substr(o.filename, 1, ?) != ?'
+                 ' AND o.id NOT IN (SELECT note_operation_id FROM dream_findings'
+                 ' WHERE note_operation_id IS NOT NULL)')
+        params = [len(NOTE_PREFIX), NOTE_PREFIX]
+        if cursor:
+            query += ' AND (o.created_at > ? OR (o.created_at = ? AND o.id > ?))'
+            params += [cursor[0], cursor[0], cursor[1]]
+        return tuple(self.journal.conn.execute(query, params).fetchone())
+
     def _related(self, registry, references, max_pages):
         """Non-person pages whose facts cite the evidence, then their neighbours, at most max_pages."""
         cited = {reference.archive_id for reference in references}
@@ -234,7 +253,9 @@ class Dreaming:
         if not evidence:
             if last != self._state('cursor'):
                 self._set_state('cursor', last)
-            return {'state': 'idle'}
+            # A quiet vault and a held cursor both answer idle; `waiting` tells them apart (alerts.DreamWatch).
+            waiting, since = self._waiting_evidence(last)
+            return {'state': 'idle', 'waiting': waiting, **({'waiting_since': since} if waiting else {})}
         run_id = _digest({'generation': generation.to_dict(), 'evidence': [item[0] for item in evidence]})[:16]
         with self.journal.conn:
             self.journal.conn.execute('INSERT OR REPLACE INTO dream_runs VALUES (?,?,NULL,?,NULL)',

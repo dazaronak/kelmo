@@ -124,7 +124,41 @@ def prepare_schedule(root, args):
             "scheduler_started": False}
 
 
+UNCONFIGURED = "Configure Dreaming before running it."
+
+
 def dispatch(root, args):
+    """A `kelmo dream` call the CLI runs itself. A `run` here is a pass outside the daemon (a `--server-profile`
+    timer), told to the owner as the daemon's are: whatever ends it, from its service and lock to the pass."""
+    if args.action != "run":
+        return _dispatch(root, args)
+    try:
+        return _dispatch(root, args)  # what the pass ends with is told under the Dreaming lock
+    except _ToldUnderLock as told:
+        raise told.error from None
+    except Exception as error:
+        if not (isinstance(error, KelmoError) and error.code == "E_CONFIG" and str(error) == UNCONFIGURED):
+            # Before the lock: no run of this call set the start mark, so a pass that holds the lock keeps its own.
+            tell_dream_watch(_alert_config(root), failure_outcome(error), run_ended=False)
+        raise
+
+
+class _ToldUnderLock(Exception):
+    """A pass that raised under the Dreaming lock, already told to the owner; `dispatch` re-raises its error."""
+
+    def __init__(self, error):
+        super().__init__(error)
+        self.error = error
+
+
+def _alert_config(root):
+    try:
+        return Config.load(root)
+    except Exception:  # noqa: BLE001 - tell_dream_watch then reports the delivery as failed
+        return None
+
+
+def _dispatch(root, args):
     configured = None
     if args.action == "configure":
         for name in ("max_sources", "max_pages", "budget_tokens"):
@@ -177,13 +211,77 @@ def dispatch(root, args):
         if args.action == "findings":
             return {"findings": dream.findings(args.state)}
         if not settings:
-            raise KelmoError("E_CONFIG", "Configure Dreaming before running it.")
+            raise KelmoError("E_CONFIG", UNCONFIGURED)
         with service.config.internal(".state/dreaming.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            if args.action != "run":
+                return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            # Told before the lock goes, answer or failure: a daemon pass that takes it next is told after this.
+            _dream_watch_starting(service.config)
+            try:
+                result = run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            except KeyboardInterrupt:
+                _dream_watch_ended(service.config)  # stopped at the terminal on purpose: nothing died
+                raise
+            except Exception as error:
+                tell_dream_watch(service.config, failure_outcome(error))
+                raise _ToldUnderLock(error) from error
+            tell_dream_watch(service.config, result)
+            return result
+
+
+def _dream_watch_starting(config):
+    from .alerts import DreamWatch
+    try:
+        DreamWatch.for_config(config).starting()
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
+
+
+def _dream_watch_ended(config):
+    from .alerts import DreamWatch
+    try:
+        DreamWatch.for_config(config).ended()
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
+
+
+def failure_outcome(error):
+    """A Dreaming run that raised, as the failed answer the owner hears of."""
+    return {"state": "failed", "code": getattr(error, "code", None) or type(error).__name__,
+            "reason": str(error) or type(error).__name__}
+
+
+def tell_dream_watch(config, result, run_ended=True):
+    """What the owner hears of a findings pass (`alerts.DreamWatch`), from the daemon's runs and the CLI's own.
+    `blocked` (an executor on another build's instructions) is told by `ExecutorWatch`; `deferred` and `paused`
+    are holds, not failures. Alerting never changes the run's answer or its tries."""
+    from .alerts import DreamWatch
+    state = result.get("state") if isinstance(result, dict) else None
+    try:
+        watch = DreamWatch.for_config(config)
+        if state == "finished":
+            watch.ran()
+        elif state == "idle":
+            watch.idle(result.get("waiting", 0), since=result.get("waiting_since"))
+        elif state == "failed":
+            watch.failed(result.get("code") or "E_FAILED", result.get("reason") or "no reason given")
+        # The start mark goes last: a process killed before the outcome is recorded leaves it for the next run.
+        if run_ended:
+            watch.ended()
+    except KeyboardInterrupt:
+        # Stopped at the terminal on purpose while the outcome was told: nothing died, as for a Ctrl-C in the run.
+        if run_ended:
+            _dream_watch_ended(config)
+        raise
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
 
 
 def deferred_until(state, now):
