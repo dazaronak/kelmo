@@ -146,8 +146,6 @@ class Sessions:
                 _check_deadline(deadline)
         except sqlite3.OperationalError as error:
             if getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                if db.in_transaction:  # a commit refused as busy leaves its transaction open
-                    db.rollback()
                 raise KelmoError('E_BUSY', 'Session journal is busy; retry capture.') from error
             raise
         finally:

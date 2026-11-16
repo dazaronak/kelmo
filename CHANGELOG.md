@@ -6,6 +6,15 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The last capture of a session in a local vault is no longer lost to a moment of contention. A `SessionEnd`
+  hook captured once, and a busy journal or another capture holding the session intake ended it. It now tries
+  again for up to 5 seconds, within the 7 seconds `kelmod hook` gives a capture hook. `Stop` and `PreCompact`
+  still make one attempt.
+- A capture hook that found the session intake busy no longer closes the state core's journal. Until the
+  daemon restarted, every write it served afterwards failed.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
