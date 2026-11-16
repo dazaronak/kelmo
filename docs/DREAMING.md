@@ -40,17 +40,20 @@ The findings pass reads evidence in the order notes reached the archive, not the
 order they were captured. Its cursor is the journal position of the first
 archive event of the last note a finished pass read. A note still on its way to
 the archive, or one that rests captured and is never archived, holds nothing
-back: the first pass after it is archived reads it. A finished pass never reads
+back: once it is archived it is read in its turn, in archive order, by the first
+pass whose window of `max_sources` notes reaches it. A finished pass never reads
 a note again, and a pass with nothing new answers `idle`. A pass that fails,
 defers or stops keeps the cursor, so the next pass reads the same evidence. A
 forgotten or purged record is passed. A cursor written by Kelmo 0.3.1 is
 converted on the first pass after the upgrade: what that build had not reached
 is read, including a note it passed because the note had failed and that was
 archived later, and what it read is not read again, with one exception. A note
-at or before the old cursor that failed and was archived after a retry may be
-read once more: the 0.3.1 journal cannot show whether that build read it, and
-reading it twice is better than never reading it. The 0.3.1 build cannot read
-the converted cursor.
+at or before the old cursor that failed and was archived after a retry, and that
+no finding cites, may be read once more: the 0.3.1 journal cannot show whether
+that build read it, and reading it twice is better than never reading it. A
+finding that cites a note shows it was read, so a cited note is not read again.
+A failure here includes a moment's `E_BUSY` that the worker retried by itself.
+The 0.3.1 build cannot read the converted cursor.
 
 `apply` keeps capture order. It takes only notes captured before the pass began,
 waits for an older create note still on its way to the editor (queued, or failed

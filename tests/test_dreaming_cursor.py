@@ -158,3 +158,28 @@ def test_a_failed_note_before_a_0_3_1_cursor_is_read_once_it_is_archived(world, 
 
     after, read_after = dream()
     assert after['state'] == 'idle' and read_after is None, after
+
+
+def test_a_retried_note_a_finding_already_cites_is_not_read_again_after_a_0_3_1_cursor(world, dream):
+    # F failed, was retried and archived, and 0.3.1 read it: a finding cites it. Its earlier failure alone does
+    # not mean 0.3.1 passed it unread, so the converted cursor does not offer it again.
+    dream.drain()
+    cited = waiting(world, 'Evidence F: failed once, archived after its retry, then read.', 'f-cited')
+    world.service.journal.stage(cited, 'failed', terminal=True, error_code='E_BUSY')
+    world.service.retry(cited)
+    assert world.service.run(cited)['durable_stage'] == 'archived'
+    finding = {'kind': 'stale', 'pages': ['projects/app/feature'], 'reason': 'F changed the export time.',
+               'sources': [{'archive_id': archive_id(world, cited), 'version': 1}]}
+    with world.service.journal.conn as db:
+        db.execute("INSERT INTO dream_findings (fingerprint, kind, finding, baseline, state, first_seen, last_seen) "
+                   "VALUES ('f-cited-finding', 'stale', ?, '{}', 'open', '2026-11-15', '2026-11-15')",
+                   (json.dumps(finding),))
+    b, _ = world.archive('Evidence B: the export runs daily.', key='b-three')
+    b_row = world.service.journal.get(b)
+    # What 0.3.1 leaves after a pass that read F and B.
+    world.service.dreaming._set_state('cursor', [b_row['created_at'], b_row['id']])
+    newer, _ = world.archive('Evidence N: the export moved to 21:00.', key='n-three')
+
+    result, read = dream()
+    assert result['state'] != 'idle', result
+    assert read == [archive_id(world, newer)]

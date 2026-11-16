@@ -136,7 +136,7 @@ class Dreaming:
         first `archived` or `applied` event. Purge keeps the events, so a purged operation is left out by its
         `purged` event."""
         return self.journal.conn.execute(
-            'SELECT o.id, o.created_at, o.filename, d.first, EXISTS (SELECT 1 FROM events e WHERE '
+            'SELECT o.id, o.created_at, o.filename, o.archive_id, d.first, EXISTS (SELECT 1 FROM events e WHERE '
             "e.operation_id = o.id AND e.stage IN ('failed', 'withdrawn') AND e.sequence < d.first) AS retried "
             'FROM operations o JOIN (SELECT operation_id, MIN(sequence) AS first FROM events '
             "WHERE stage IN ('archived', 'applied') GROUP BY operation_id) d ON d.operation_id = o.id "
@@ -149,8 +149,9 @@ class Dreaming:
         A cursor written by 0.3.1 is `[created_at, id]`: 0.3.1 read every operation up to it that was durable when
         its window was scanned, and passed unread one that had failed. It is converted once and written at once:
         the sequence stops just below the first operation that may still wait (any durable one after it, or one
-        at or before it that failed before it was archived), and `seen` names the others above that sequence,
-        which 0.3.1 already read."""
+        at or before it that failed before it was archived and that no finding cites), and `seen` names the
+        others above that sequence, which 0.3.1 already read. A finding that cites a note proves it was read,
+        whatever became of the finding."""
         cursor = self._state('cursor')
         if cursor is None:
             return {'sequence': 0}
@@ -158,7 +159,9 @@ class Dreaming:
             return cursor
         old = (cursor[0], cursor[1])
         rows = self._durable()
-        waits = {row['id'] for row in rows if (row['created_at'], row['id']) > old or row['retried']}
+        cited = self._cited() if any(row['retried'] for row in rows) else set()
+        waits = {row['id'] for row in rows if (row['created_at'], row['id']) > old
+                 or (row['retried'] and row['archive_id'] not in cited)}
         firsts = [row['first'] for row in rows if row['id'] in waits]
         sequence = min(firsts) - 1 if firsts else max((row['first'] for row in rows), default=0)
         seen = [row for row in rows if row['first'] > sequence and row['id'] not in waits]
@@ -167,6 +170,16 @@ class Dreaming:
             converted.update(seen=[row['id'] for row in seen], seen_until=max(row['first'] for row in seen))
         self._set_state('cursor', converted)
         return converted
+
+    def _cited(self):
+        """Archive ids the recorded findings cite as sources, in any state."""
+        cited = set()
+        for (finding,) in self.journal.conn.execute('SELECT finding FROM dream_findings'):
+            sources = json.loads(finding).get('sources')
+            for source in sources if isinstance(sources, list) else ():
+                if isinstance(source, dict) and source.get('archive_id'):
+                    cited.add(source['archive_id'])
+        return cited
 
     def _changed_evidence(self, limit):
         """Operations that became evidence after the cursor, in the order they did; Dreaming's own notes are
