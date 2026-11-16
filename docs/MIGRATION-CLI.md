@@ -93,7 +93,8 @@ produced archive records. `session_tables` names changed session tables without
 printing their content. A record forgotten after the baseline counts too:
 `hidden` lists its id, and the refusal names the number of forgotten records.
 For a baseline written before Kelmo recorded forgotten records, a record counts
-when it was forgotten after the baseline's `marked_at`. An older baseline that did not record session state
+when it was forgotten after the baseline's `marked_at`, which has whole seconds, so a
+record forgotten within that same second also counts. An older baseline that did not record session state
 cannot prove existing sessions safe to discard, so it also refuses when such
 state exists. The check does not restore or delete anything. Preserve those writes through
 forward recovery, with a spec containing only the new independent `roots`:

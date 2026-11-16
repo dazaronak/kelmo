@@ -8,11 +8,12 @@ entry here.
 
 ### Fixed
 
-- `kelmo snapshot rollback-check` refuses when a record was forgotten after the cutover. A forget writes only a
-  visibility marker, which the cutover baseline did not record, so the check called the store untouched and a
-  rollback would have brought the record back into search and list. The baseline now records the forgotten
-  records, `kelmo snapshot tail` lists the ones forgotten since under `hidden`, and the refusal names how many.
-  A baseline written by an earlier release counts a record forgotten after its `marked_at`.
+- `kelmo snapshot rollback-check` refuses when a record was forgotten after the cutover. A forget changes
+  nothing the cutover baseline recorded (the record, its versions and its journal operation stay as they
+  were), so the check called the store untouched and a rollback would have brought the record back into search
+  and list. The baseline now records the forgotten records, `kelmo snapshot tail` lists the ones forgotten since
+  under `hidden`, and the refusal names how many. A baseline written by an earlier release counts a record
+  forgotten after its `marked_at`, or within the same second, since `marked_at` has whole seconds.
 
 ## [0.3.1] - 2026-11-15
 
