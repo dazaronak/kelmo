@@ -32,6 +32,7 @@ SUMMARY = re.compile(r'^=*\s*\d+ [a-z]+.*\bin [\d.]+s\b')
 COUNT = re.compile(r'(\d+) (failed|passed|skipped|errors?|xfailed|xpassed|warnings?|deselected)')
 REPORT = re.compile(r'^(?:FAILED|ERROR|SUBFAILED|SKIPPED|XFAIL|XPASS)\b')
 ORDER = ('failed', 'passed', 'skipped', 'error', 'xfailed', 'xpassed', 'warning', 'deselected')
+OUTCOMES = ('failed', 'passed', 'skipped', 'error', 'xfailed', 'xpassed')
 
 
 def width():
@@ -111,9 +112,14 @@ def main(args):
         # A module that fails to import still lets the others list their ids, and pytest exits 2 (1 with
         # --continue-on-collection-errors): dealing those ids out ran a green suite without that module.
         listed = set(ids)
-        sys.stdout.write(''.join(line + '\n' for line in collected.stdout.splitlines() if line.strip() not in listed))
+        shown = [line for line in collected.stdout.splitlines() if line.strip() not in listed]
+        sys.stdout.write(''.join(line + '\n' for line in shown))
         sys.stdout.write(collected.stderr)
-        return collected.returncode or 5
+        code = collected.returncode or 5
+        errors = [line for line in shown + collected.stderr.splitlines() if line.startswith('ERROR')]
+        step_summary(errors, 'collection failed (pytest exit %d): no case ran' % code,
+                     '%d cases collected in %.2fs' % (len(ids), time.time() - started))
+        return code
     if root:
         ids = [os.path.join(root, node) for node in ids]
     count = min(width(), len(ids))
@@ -126,7 +132,9 @@ def main(args):
         for future in as_completed(running):
             index, code, text = future.result()
             results.append((index, code, text))
-            done += len(shards[index])
+            # A shard can end before it ran every case it was dealt, so only the outcomes it reported count.
+            found = counts(text) or {}
+            done += min(len(shards[index]), sum(found.get(key, 0) for key in OUTCOMES))
             print('progress: shard %d of %d ended with exit %d, %d of %d cases done'
                   % (index + 1, count, code, done, len(ids)), flush=True)
     total, reports, failed = {}, [], False
@@ -147,7 +155,7 @@ def main(args):
         for key, value in found.items():
             total[key] = total.get(key, 0) + value
         reports.extend(line for line in text.splitlines() if REPORT.match(line))
-    ran = sum(total.get(key, 0) for key in ('failed', 'passed', 'skipped', 'error', 'xfailed', 'xpassed'))
+    ran = sum(total.get(key, 0) for key in OUTCOMES)
     if ran < len(ids):
         # Every dealt id is one collected item, and each item ends as one of these outcomes at least once.
         failed = True

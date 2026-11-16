@@ -89,6 +89,26 @@ class PytestShardsTests(unittest.TestCase):
         self.assertIn('4 of 4 collected cases passed', written)
         self.assertIn(done.stdout.splitlines()[-1], written)
 
+    def test_progress_counts_the_cases_a_shard_ran_not_the_ones_it_was_dealt(self):
+        (self.root / 'conftest.py').write_text(
+            'def pytest_collection_modifyitems(config, items):\n'
+            '    if not config.option.collectonly:\n'
+            '        items[:] = [item for item in items if item.name != "test_b"]\n')
+        done = self.shards(width='1')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        progress = [line for line in done.stdout.splitlines() if line.startswith('progress: ')]
+        self.assertEqual(progress, ['progress: shard 1 of 1 ended with exit 0, 3 of 4 cases done'], done.stdout)
+
+    def test_a_module_that_does_not_import_still_reaches_the_step_summary(self):
+        (self.root / 'test_broken.py').write_text('def test_e(:\n')
+        summary = self.root / 'step-summary.md'
+        done = self.shards(GITHUB_STEP_SUMMARY=str(summary))
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertTrue(summary.is_file(), 'the collection red wrote no step summary')
+        written = summary.read_text()
+        self.assertIn('collection failed', written)
+        self.assertIn('test_broken.py', written)
+
 
 if __name__ == '__main__':
     unittest.main()
