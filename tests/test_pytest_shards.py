@@ -18,9 +18,11 @@ class PytestShardsTests(unittest.TestCase):
         self.root = Path(scratch.name)
         (self.root / 'test_four.py').write_text(FOUR)
 
-    def shards(self, *args, width='2', cwd=None):
-        env = dict(os.environ, GATE_SHARD_WIDTH=width)
+    def shards(self, *args, width='2', cwd=None, **extra):
+        env = dict(os.environ, GATE_SHARD_WIDTH=width, **extra)
         env.pop('PYTEST_ADDOPTS', None)
+        if 'GITHUB_STEP_SUMMARY' not in extra:
+            env.pop('GITHUB_STEP_SUMMARY', None)
         return subprocess.run([sys.executable, str(SHARDS), '-q', *args], cwd=cwd or self.root, env=env,
                               capture_output=True, text=True, timeout=120)
 
@@ -66,6 +68,26 @@ class PytestShardsTests(unittest.TestCase):
         # No shard printed a summary: the runner still ends on its own summary line, not a traceback.
         self.assertNotIn('Traceback', done.stderr)
         self.assertTrue(done.stdout.splitlines()[-1].startswith('0 passed, 2 errors in '), done.stdout)
+
+    def test_the_run_says_what_it_collected_and_each_shard_as_it_ends(self):
+        done = self.shards()
+        self.assertEqual(done.returncode, 0, done.stdout)
+        lines = done.stdout.splitlines()
+        self.assertEqual(lines[0], 'collected 4 cases in 2 shards', done.stdout)
+        progress = [line for line in lines if line.startswith('progress: ')]
+        self.assertEqual(len(progress), 2, done.stdout)
+        self.assertTrue(progress[-1].endswith(', 4 of 4 cases done'), done.stdout)
+        self.assertEqual(lines[-2], '4 of 4 collected cases passed', done.stdout)
+        self.assertTrue(lines[-1].startswith('4 passed in '), done.stdout)
+
+    def test_a_github_step_summary_file_gets_the_result(self):
+        summary = self.root / 'step-summary.md'
+        done = self.shards(GITHUB_STEP_SUMMARY=str(summary))
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertTrue(summary.is_file(), 'the run wrote no step summary')
+        written = summary.read_text()
+        self.assertIn('4 of 4 collected cases passed', written)
+        self.assertIn(done.stdout.splitlines()[-1], written)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,14 @@ entry here.
 
 ## [Unreleased]
 
+### Changed
+
+- The test runner `tools/pytest_shards.py`, which CI uses for the suite, now reports while it runs: it says how
+  many cases it collected, prints a `progress:` line with the cases done so far as each of its processes ends,
+  and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY` names a
+  file, it appends the result there, so a GitHub run shows it on the job's page. The summary line is unchanged
+  and still last.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added

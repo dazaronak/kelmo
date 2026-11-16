@@ -11,7 +11,10 @@ group, so a gate that kills the group it started kills every shard.
 
 What is printed is what a gate reads of a pytest run: the whole output of a shard that failed (its tracebacks),
 every FAILED / ERROR / SKIPPED summary line of every shard, and last one summary line in pytest's own shape
-(`N failed, M passed, K skipped, E errors in Ts`) summing the shards. A shard that ends without a summary line
+(`N failed, M passed, K skipped, E errors in Ts`) summing the shards. Before them, as the run goes, it says what it
+collected (`collected N cases in K shards`) and a `progress:` line as each shard ends, with the cases done so
+far; just before the summary, how many of the collected cases passed. None of these lines has a summary's or a
+report line's shape. When GITHUB_STEP_SUMMARY names a file, the result is appended to it as well. A shard that ends without a summary line
 is an error that names the shard and its last lines. Exit 0 only when every shard passed and the shards together
 report an outcome for every case they were dealt. A collection that ended in an error (a module that does not
 import) is not sharded: its output is printed and its exit code returned.
@@ -23,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SUMMARY = re.compile(r'^=*\s*\d+ [a-z]+.*\bin [\d.]+s\b')
 COUNT = re.compile(r'(\d+) (failed|passed|skipped|errors?|xfailed|xpassed|warnings?|deselected)')
@@ -116,8 +119,16 @@ def main(args):
     count = min(width(), len(ids))
     shards = [ids[index::count] for index in range(count)]
     options = split(args)
+    print('collected %d cases in %d shards' % (len(ids), count), flush=True)
+    results, done = [], 0
     with ThreadPoolExecutor(max_workers=count) as pool:
-        results = list(pool.map(lambda pair: run_shard(pair[0], pair[1], options), enumerate(shards)))
+        running = [pool.submit(run_shard, index, shard, options) for index, shard in enumerate(shards)]
+        for future in as_completed(running):
+            index, code, text = future.result()
+            results.append((index, code, text))
+            done += len(shards[index])
+            print('progress: shard %d of %d ended with exit %d, %d of %d cases done'
+                  % (index + 1, count, code, done, len(ids)), flush=True)
     total, reports, failed = {}, [], False
     for index, code, text in sorted(results):
         found = counts(text)
@@ -146,8 +157,27 @@ def main(args):
         print(line)
     parts = ['%d %s' % (total.get(key, 0), {'error': 'errors', 'warning': 'warnings'}.get(key, key))
              for key in ORDER if total.get(key) or key == 'passed']
-    print('%s in %.2fs (%d shards)' % (', '.join(parts), time.time() - started, count))
+    passed = '%d of %d collected cases passed' % (total.get('passed', 0), len(ids))
+    summary = '%s in %.2fs (%d shards)' % (', '.join(parts), time.time() - started, count)
+    print(passed)
+    print(summary)
+    step_summary(reports, passed, summary)
     return 1 if failed else 0
+
+
+def step_summary(reports, passed, summary):
+    """Appends the result to the file GITHUB_STEP_SUMMARY names, when it names one; a file that cannot be
+    written costs the run nothing."""
+    target = os.environ.get('GITHUB_STEP_SUMMARY')
+    if not target:
+        return
+    lines = ['### pytest', '', summary, '', passed, '']
+    lines += ['    ' + line for line in reports]
+    try:
+        with open(target, 'a', encoding='utf-8') as out:
+            out.write('\n'.join(lines) + '\n')
+    except OSError as error:
+        print('step summary not written: %s' % error, file=sys.stderr)
 
 
 if __name__ == '__main__':
