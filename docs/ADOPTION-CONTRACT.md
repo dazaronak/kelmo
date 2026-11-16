@@ -274,7 +274,7 @@ The foundation is extended as follows:
   - Request settlement and its source outcome commit in one journal transaction.
   - A budget refusal predictable at admission is diagnosed before an intent is prepared, and stays retryable. A later environment change can still block recovery until repaired.
   - Installing the live harness hook that calls capture, and a shared transport, belong to later work.
-- **Mandatory delivery.** Startup context (HOT and `KnowledgeReader.context`) delivers whole, once, every person page and every page holding a mandatory record, selected by one helper. The `person` project listing keeps its own meaning. Overflow refuses.
+- **Mandatory delivery.** Startup context (HOT and `KnowledgeReader.context`) delivers whole, once, every person page and every page holding a mandatory record, selected by one helper; HOT drops the fact and source labels of their fact rows, and the editor's context keeps them. The `person` project listing keeps its own meaning. Overflow refuses.
 - **Pinned history.** A historical generation is found only in manifests reachable from HEAD. A commit that deleted the manifest is skipped; matching but invalid evidence and an unmeasured pin both refuse.
 
 Current integration boundaries:

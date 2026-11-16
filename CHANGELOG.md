@@ -51,6 +51,15 @@ entry here.
   `"retryable": false`. An error before the call was sent, such as no daemon socket, stays retryable.
   So does a call with `--key`, as the daemon answers for it, but the key only stops a second run of an
   operation that replays by key; tool, hook and CLI calls ignore it.
+- Mandatory pages reach a session without the fact and source labels of their fact rows. The `[f:...]` and
+  `[source:...]` labels at the end of each fact row are the wiki's own bookkeeping and take startup space.
+  `kelmo hot`, the SessionStart hook and the generated `mandatory.md`, `mandatory-<page>.md` and
+  `<project>.full.md` files now leave them out; a status label such as `[status: shipped]` stays, and so
+  does label-shaped text inside a fact's text or elsewhere on the page. `graph_read` and the published page
+  keep the labels. Pages selected through `[hot] pages` that are not mandatory are delivered as before. A
+  store with generated views keeps delivering the files it has until its next publication rewrites them, and
+  a cache written before the upgrade can still show the labels while the server is unreachable. A
+  `mandatory.md` that now fits the hook limit arrives whole instead of as a pointer.
 
 ## [0.3.1] - 2026-11-15
 

@@ -178,7 +178,11 @@ def test_person_page_arrives_whole_with_ordinary_unflagged_facts(tmp_path, world
 
     context = start(SimpleNamespace(root=root))
 
-    assert f'## person.md\n\n{person}' in context
+    # Whole, apart from the fact labels a mandatory page loses at startup.
+    labels = [' [f:' + rule['id'] + ']', ' [f:' + ordinary['id'] + ']']
+    assert all(label in person for label in labels)
+    assert f'## person.md\n\n{untagged(person, labels)}' in context
+    assert rule['text'] in context and ordinary['text'] in context
     assert 'mandatory pages: person.md.' in header(context)
 
 
@@ -207,12 +211,15 @@ def test_mandatory_record_on_a_project_page_is_delivered_whole_once(tmp_path, wo
     app = reader.page(APP_PAGE, generation).content.decode('utf-8')
     person = reader.page('person.md', generation).content.decode('utf-8')
     assert project['text'] in app
+    rule_label, project_label = ' [f:' + rule['id'] + ']', ' [f:' + project['id'] + ']'
+    assert rule_label in person and project_label in app
 
     for selected in ([], [APP_PAGE]):
         configure(root, selected)
         context = start(SimpleNamespace(root=root))
-        assert f'## {APP_PAGE}\n\n{app}' in context and context.count(f'## {APP_PAGE}\n') == 1
-        assert f'## person.md\n\n{person}' in context
+        assert f'## {APP_PAGE}\n\n{untagged(app, [project_label])}' in context
+        assert context.count(f'## {APP_PAGE}\n') == 1
+        assert f'## person.md\n\n{untagged(person, [rule_label])}' in context
         assert f'mandatory pages: person.md, {APP_PAGE}.' in header(context)
     # Mandatory delivery does not redefine the person project listing.
     assert [page.path for page in reader.pages('person', generation).entries] == ['person.md']
@@ -365,3 +372,91 @@ def test_corrupt_committed_generation_is_an_honest_refusal(world):
     context = start(world.service)
     assert context.startswith('Kelmo HOT unavailable (E_GENERATION)')
     assert '## person.md' not in context
+
+
+def tagged_person_vault(root, views=False, sources=('rule-source', 'tea-source')):
+    """A store whose person page carries two exact-evidence facts, one with a status label; `sources` are their
+    source ids."""
+    import registry_seed
+    from kelmo.contracts import EvidenceRef
+    from kelmo.service import Service
+    from test_editor_context import fact
+    Service.initialize(root, 'fixture-node')
+    configure(root, [])
+    if views:
+        with (root / 'kelmo.toml').open('a') as handle:
+            handle.write('views = true\n')
+    rule = fact('person.rule', 'person.md', 'Show the exact draft before sending; local drafts are exempt.')
+    tea = fact('person.tea', 'person.md', 'Answers in [Russian] first and drinks green tea.', status='shipped')
+    facts = (rule, tea)
+    spec = {'facts': {item['fact_key']: item for item in facts},
+            'notes': {item['note_id']: {'filename': 'source.md', 'ark_id': item['ark_id']} for item in facts}}
+    bindings = {rule['note_id']: EvidenceRef(rule['ark_id'], 1, rule['note_id'], sources[0]),
+                tea['note_id']: EvidenceRef(tea['ark_id'], 1, tea['note_id'], sources[1])}
+    registry_seed.seed(root, spec, evidence_bindings=bindings, pages_settings={'person.md': PAGES['person.md']},
+                       protected_fact_keys=('person.rule',))
+    return [' [f:' + rule['id'] + ']', ' [f:' + tea['id'] + ']',
+            ' [source:' + sources[0] + ']', ' [source:' + sources[1] + ']']
+
+
+def untagged(text, labels):
+    for label in labels:
+        text = text.replace(label, '')
+    return text
+
+
+def test_session_start_delivers_mandatory_pages_without_evidence_tags(tmp_path, world_factory):
+    from kelmo.config import Config
+    from kelmo.service import Service
+    from kelmo.wiki.pages import KnowledgeReader
+    root = tmp_path / 'tagged-vault'
+    labels = tagged_person_vault(root)
+    reader = KnowledgeReader(Config.load(root))
+    person = reader.page('person.md', reader.generation()).content.decode('utf-8')
+    assert all(label in person for label in labels)
+
+    context = start(SimpleNamespace(root=root))
+
+    assert f'## person.md\n\n{untagged(person, labels)}' in context
+    assert '[f:' not in context and '[source:' not in context
+    assert '[Russian]' in context and '[status: shipped]' in context
+    # Whole pages are still read whole: the committed page, and graph_read on the working wiki file.
+    assert reader.page('person.md', reader.generation()).content.decode('utf-8') == person
+    working = (Config.load(root).wiki / 'person.md').read_text(encoding='utf-8')
+    assert all(label in working for label in labels)
+    assert Service(root).graph_read('person')['content'] == working
+
+
+def test_session_start_strips_labels_whatever_the_source_id_holds(tmp_path, world_factory):
+    """A source id is any nonempty text: a legacy note name with spaces, or one holding a closing bracket. The
+    delivered person page still loses the fact and source labels of both rows."""
+    from kelmo.config import Config
+    from kelmo.wiki.pages import KnowledgeReader
+    root = tmp_path / 'odd-source-vault'
+    labels = tagged_person_vault(root, sources=('2026-10-05 person rule.md', 'odd]id\nnext line'))
+    reader = KnowledgeReader(Config.load(root))
+    person = reader.page('person.md', reader.generation()).content.decode('utf-8')
+    assert all(label in person for label in labels)
+
+    context = start(SimpleNamespace(root=root))
+
+    assert f'## person.md\n\n{untagged(person, labels)}' in context
+    assert '[f:' not in context and '[source:' not in context
+
+
+def test_session_start_from_published_views_carries_no_evidence_tags(tmp_path, world_factory):
+    from kelmo.config import Config
+    from kelmo.wiki.pages import KnowledgeReader
+    root = tmp_path / 'tagged-views-vault'
+    labels = tagged_person_vault(root, views=True)
+    config = Config.load(root)
+    assert (config.wiki.parent / 'hot' / 'mandatory.md').is_file(), 'the publication wrote the generated views'
+    reader = KnowledgeReader(config)
+    person = reader.page('person.md', reader.generation()).content.decode('utf-8')
+
+    context = start(SimpleNamespace(root=root))
+
+    for line in untagged(person, labels).splitlines():
+        if line.startswith('- '):
+            assert line + '\n' in context, line
+    assert '[f:' not in context and '[source:' not in context

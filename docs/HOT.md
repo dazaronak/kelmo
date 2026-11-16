@@ -31,6 +31,10 @@ project still takes precedence. `kelmo projects --json` includes the exclusions.
 
 Without a `[hot]` table, selection is empty and `configured=false`. Explicit page
 selection preserves order, removes duplicates and reads whole UTF-8 pages.
+Mandatory pages arrive without the labels the publisher writes at the end of each
+fact row: the fact id (`[f:...]`) and its sources (`[source:...]`). A status label
+stays, and so does label-shaped text inside a fact or elsewhere on the page.
+`graph_read` and the published page itself keep the labels.
 Published knowledge is read from a pinned Git generation. Hand edits to managed
 files are not a new published generation.
 
@@ -59,7 +63,8 @@ views_max_bytes = 48000
 Project setup enables views. Each publication writes the following files beside
 the wiki, normally under `knowledge/hot/`, in the same commit:
 
-- `mandatory.md`: all mandatory pages, with frontmatter and retired fact rows removed.
+- `mandatory.md`: all mandatory pages, with frontmatter, retired fact rows and the fact and
+  source labels of fact rows removed.
 - `<project>.md`: the project's overview, constraints, trap index, WIP and Backlog.
 - `<project>.full.md`: mandatory memory and that project's view together.
 
