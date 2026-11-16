@@ -196,7 +196,12 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
 
     `ready` belongs to `apply` alone: the owner's "run the editor now" over ready projects only (see
     `apply_pending`). `run` keeps draining everything, because the night pass is what publishes small
-    projects. `boundary` is the apply pass's capture boundary, read by a caller before its first step waits."""
+    projects. `boundary` is the apply pass's capture boundary, read by a caller before its first step waits;
+    a caller with a `step` must give it (TypeError otherwise, before any step)."""
+    if step is not None and boundary is None:
+        raise TypeError('A pass that enters a caller step needs its boundary: read capture_boundary '
+                        'before the first step, which may wait for the journal.')
+    caller_step = step
     step = step or nullcontext
     with step():
         # Built inside the step: its first use creates the Dreaming tables on the shared journal connection.
@@ -217,7 +222,7 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
     # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
     # is the owner's "run the editor now".
     from .creation import apply_pending
-    applied = apply_pending(service, executor, should_stop=should_stop, step=step,
+    applied = apply_pending(service, executor, should_stop=should_stop, step=caller_step,
                             ready=ready and action == "apply", boundary=boundary)
     if action == "apply":
         return {"state": "finished", "apply": applied}

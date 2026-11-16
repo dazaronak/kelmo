@@ -177,7 +177,7 @@ def test_a_pass_waiting_for_an_older_note_lets_go_of_the_baton(world):
     pass lets the baton go while it waits; holding it would stall them all until its wait budget is spent."""
     import threading
     from kelmo.core import baton as batons
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     nightly(world)
     older = world.service.create('Exports run at 11:00.', project='app', selected=[FEATURE])
     newer = world.service.create('Exports run at 12:00.', project='app', selected=[FEATURE])
@@ -197,10 +197,11 @@ def test_a_pass_waiting_for_an_older_note_lets_go_of_the_baton(world):
         thread.join(5)
         world.service.run(older['id'])  # the worker's write, which needed that baton
 
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     batons.install(baton)
     try:
         report = apply_pending(world.service, echo_export(world), sleep=sleep,
-                               step=lambda: baton.hold(interactive=False))
+                               step=lambda: baton.hold(interactive=False), boundary=boundary)
     finally:
         batons.install(None)
     assert report['applied'] == [older['id'], newer['id']] and report['stalled'] == []
@@ -214,7 +215,7 @@ def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch,
     import threading
     import time
     from kelmo.core import baton as batons
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     from kelmo.service import Service
     from kelmo.wiki import engine
     nightly(world)
@@ -222,6 +223,7 @@ def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch,
     world.service = Service(world.root, shared_journal=True)
     note = world.service.create('Exports run at 13:00.', project='app', selected=[FEATURE])
     world.service.run(note['id'])
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     baton = batons.Baton()
     entered, release, captured = threading.Event(), threading.Event(), threading.Event()
     real = getattr(engine, slow)
@@ -237,7 +239,7 @@ def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch,
 
     def apply():
         outcome['report'] = apply_pending(world.service, echo_export(world),
-                                          step=lambda: baton.hold(interactive=False))
+                                          step=lambda: baton.hold(interactive=False), boundary=boundary)
 
     def capture():
         with baton.hold():
@@ -274,7 +276,7 @@ def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finis
     import threading
     import time
     from kelmo.core import baton as batons
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     from kelmo.publication import coordinator_lock
     from kelmo.service import Service
     from kelmo.wiki import engine
@@ -282,6 +284,7 @@ def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finis
     world.service = Service(world.root, shared_journal=True)
     note = world.service.create('Exports run at 15:00.', project='app', selected=[FEATURE])
     world.service.run(note['id'])
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     baton = batons.Baton()
     entered, release = threading.Event(), threading.Event()
     real = engine.publish_semantic
@@ -297,7 +300,7 @@ def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finis
 
     def apply():
         outcome['report'] = apply_pending(world.service, echo_export(world),
-                                          step=lambda: baton.hold(interactive=False))
+                                          step=lambda: baton.hold(interactive=False), boundary=boundary)
         order.append('pass')
 
     def writer():
@@ -337,6 +340,7 @@ def test_a_dream_apply_reaches_the_journal_only_inside_its_steps(world, tmp_path
     import sys
     from kelmo.core import baton as batons
     from kelmo.dreaming_cli import run_dream
+    from kelmo.creation import capture_boundary
     nightly(world)
     operation = world.service.create('Exports run at 16:00.', project='app', selected=[FEATURE])
     world.service.run(operation['id'])
@@ -348,11 +352,13 @@ def test_a_dream_apply_reaches_the_journal_only_inside_its_steps(world, tmp_path
                                                    'max_pages': 10, 'budget_tokens': 100000})
     world.service.dreaming._set_state('paused', False)
     vars(world.service).pop('_dreaming', None)
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     baton = batons.Baton()
     world.service.journal.guard = baton.check
     batons.install(baton)
     try:
-        result = run_dream(world.service, 'apply', step=lambda: baton.hold(interactive=False))
+        result = run_dream(world.service, 'apply', step=lambda: baton.hold(interactive=False),
+                           boundary=boundary)
     finally:
         batons.install(None)
         world.service.journal.guard = None
@@ -475,6 +481,32 @@ def test_a_note_written_while_the_pass_waits_for_its_first_step_waits_for_the_ne
     assert report['waiting'] == {}
     assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
     assert apply_pending(world.service, echo_export(world))['applied'] == [late[0]['id']]
+
+
+@pytest.mark.parametrize('entry', ['apply_pending', 'run_dream'])
+def test_a_pass_given_a_step_but_no_boundary_is_refused_before_it_enters_one(world, entry):
+    """A step may wait for the journal, and a boundary read inside it would be read after that wait: a caller
+    with a step reads the boundary first (capture_boundary), so the pass refuses to read it itself."""
+    from contextlib import contextmanager
+
+    from kelmo import creation, dreaming_cli
+    nightly(world)
+    note = world.service.create('Exports run at 05:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    entered = []
+
+    @contextmanager
+    def step():
+        entered.append(True)
+        yield
+
+    with pytest.raises(TypeError, match='boundary'):
+        if entry == 'apply_pending':
+            creation.apply_pending(world.service, echo_export(world), step=step)
+        else:
+            dreaming_cli.run_dream(world.service, 'apply', step=step)
+    assert entered == [], 'the pass entered a step before refusing'
+    assert world.service.journal.get(note['id'])['state'] == 'archived'
 
 
 def step_the_journal_clock_back(monkeypatch, seconds):

@@ -1085,7 +1085,8 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                   should_stop=None, step=None, boundary=None):
     """One `kelmo dream apply` pass: publish every note captured before the pass began through the
     editor, oldest first. `boundary` (`capture_boundary`) says where "before" ends; a caller whose first step
-    waits for the journal reads it before that wait, and without it the pass reads it in its first step.
+    waits for the journal reads it before that wait. A pass given a `step` and no `boundary` is refused
+    with TypeError before it enters a step; without a step the pass reads it in its first unit.
 
     Each source gets one attempt here; a refused one is parked for the next pass or fails after its
     last charged attempt (see `park`). A note waits while an older note is still in the intake, and a
@@ -1146,6 +1147,9 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
         raise KelmoError('E_CONFIG', 'The ready apply pass needs [editor] batch_apply: it publishes a ready '
                                      'project in batches of batch_max_sources, and with batch_apply off it '
                                      'would take no note of that project.')
+    if step is not None and boundary is None:
+        raise TypeError('A pass that enters a caller step needs its boundary: read capture_boundary '
+                        'before the first step, which may wait for the journal.')
     ready_at = service.config.batch_ready_sources if ready else 0
     report = {'applied': [], 'parked': [], 'failed': [], 'deferred': [], 'skipped': [], 'stalled': [],
               'waiting': {}}
@@ -1162,8 +1166,8 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
     turns = _Turns(report, rest, clock)
     # The notes that exist when the pass begins are its own; one captured later belongs to the next pass. Which
     # is which comes from the order the journal recorded them in, never from their stamps, which a clock step
-    # moves. A caller whose first step waits for the journal reads `boundary` before that wait; otherwise the
-    # first step reads it, together with the set of notes.
+    # moves. A caller with a step reads `boundary` before that step can wait; a pass with no step reads it in
+    # its first unit, together with the set of notes.
     own = None
     # `held_back` names, per project, the note the pass could not get past. Every note captured after it has
     # left the pass, so a note that is held later is older than the one named: the newest hold replaces it.
