@@ -195,3 +195,42 @@ def test_a_spool_that_cannot_be_listed_does_not_fail_the_hook_already_served(wor
     except OSError as error:
         answer = error
     assert answer == {}, 'the served hook was answered with a failure: ' + repr(answer)
+
+
+def test_a_capture_spooled_during_a_pass_is_ingested_after_a_hook_served_meanwhile(world_factory, core_factory):
+    """A pass lists the spool once. A capture spooled after that list, while the pass still runs, and a hook
+    served in the meantime: the capture is taken once the running pass ends, not left for the next start."""
+    import threading
+    import time
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    served = []
+    gate = threading.Event()
+    inside = threading.Event()
+    serve_hook = core.serve_hook
+
+    def record(body):
+        order = body['payload'].get('order')
+        if order == 'first':
+            inside.set()
+            assert gate.wait(10)
+        served.append(order)
+        return serve_hook(body)
+
+    core.serve_hook = record
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('first'))
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    assert inside.wait(10), 'the pass did not start'
+    (spool / '00000000000000000002-101.json').write_text(capture_frame('late'))
+    again = {'action': 'session-stop', 'payload': {'order': 'again'},
+             'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), again) == {}
+    gate.set()
+    limit = time.monotonic() + 10
+    while list(spool.iterdir()) and time.monotonic() < limit:
+        time.sleep(0.05)
+    assert list(spool.iterdir()) == [], 'the capture spooled during the pass still waits for the next start'
+    assert served == ['live', 'again', 'first', 'late'], served

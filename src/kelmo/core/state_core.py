@@ -190,6 +190,7 @@ class StateCore:
         self.root = Path(root).expanduser().resolve()
         self._spool = None
         self._spool_lock = threading.Lock()
+        self._spool_again = False
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.profile_path = Path(profile_path) if profile_path is not None else None
@@ -582,31 +583,56 @@ class StateCore:
     def recycle(self):
         """admin.recycle: the background work running now; none means the core may be restarted, and no job starts
         until it is (`Jobs.quiesce`)."""
-        if self._spool is not None and self._spool.is_alive():
+        spool = self._spool  # read once: a pass that ends clears it
+        if spool is not None and spool.is_alive():
             return ['hook-spool']
         return self.jobs.quiesce()
 
     def begin_stop(self):
         """The core is told to stop: model calls end now, and every job ends at its next step."""
         from .. import stopping
-        stopping.request()
+        # Under the spool lock, so no pass is started between start_spool's look at the flag and its start.
+        with self._spool_lock:
+            stopping.request()
         self.jobs.request_stop()
 
     def wait_stopped(self):
         """Waits for the jobs and the spooled-capture pass to end; kelmod kills the core at its drain deadline."""
         self.jobs.stop()
-        if self._spool is not None:
-            self._spool.join()
+        spool = self._spool  # read once: a pass that ends clears it
+        if spool is not None:
+            spool.join()
 
     def start_spool(self):
         """Applies the captures spooled while no daemon ran, beside serving. One pass at a time, none once the
         core is stopping."""
         from .. import stopping
         with self._spool_lock:
-            if stopping.requested() or (self._spool is not None and self._spool.is_alive()):
+            if stopping.requested():
                 return
-            self._spool = threading.Thread(target=self.ingest_spool, name='hook-spool', daemon=True)
+            if self._spool is not None and self._spool.is_alive():
+                # The running pass listed the spool already: it lists it again before it ends.
+                self._spool_again = True
+                return
+            self._spool_again = False
+            self._spool = threading.Thread(target=self._spool_passes, name='hook-spool', daemon=True)
             self._spool.start()
+
+    def _spool_passes(self):
+        """Passes over the spool until no hook asked for one while the last ran. A pass that stopped early (the
+        core stopping, a busy journal) ends them: the captures it left wait for the next hook served."""
+        from .. import stopping
+        while True:
+            result = self.ingest_spool()
+            with self._spool_lock:
+                if not self._spool_again or 'stopped' in result or stopping.requested():
+                    self._spool_again = False
+                    # Done under the lock: a hook served from here on starts a new pass rather than asking this
+                    # one, which no longer looks.
+                    if self._spool is threading.current_thread():
+                        self._spool = None
+                    return
+                self._spool_again = False
 
     def _spool_waiting(self):
         from . import spool
