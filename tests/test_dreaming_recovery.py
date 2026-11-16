@@ -281,9 +281,13 @@ def test_an_idle_findings_pass_names_the_notes_waiting_behind_its_cursor(world):
     first = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
     assert first['state'] == 'finished'  # the seed is past the cursor now
     world.service.create('A capture that never reaches the archive.', project='app', selected=[FEATURE])
+    notes = []
     for text in ('Exports run at 01:00.', 'Exports run at 02:00.'):
-        note = world.service.create(text, project='app', selected=[FEATURE])
-        world.service.run(note['id'])
+        notes.append(world.service.create(text, project='app', selected=[FEATURE])['id'])
+        world.service.run(notes[-1])
     stuck = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
-    assert stuck == {'state': 'idle', 'waiting': 2}
+    archived = world.service.journal.conn.execute(
+        "SELECT MIN(created_at) FROM events WHERE stage IN ('archived', 'applied') AND operation_id IN (?, ?)",
+        notes).fetchone()[0]
+    assert stuck == {'state': 'idle', 'waiting': 2, 'waiting_since': archived}
     assert executor.jobs == []

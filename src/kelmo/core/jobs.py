@@ -239,12 +239,19 @@ class Jobs:
             raise KelmoError('E_INPUT', 'Only a Dreaming apply runs over ready projects; a run drains every project.')
         if scheduled and self._fenced():
             return {'state': 'fenced'}
-        with self._dreaming_lock() as free:
-            if not free:
-                # What the local run answers too; a scheduled job that meets it starts nothing and records
-                # no start, so the next tick asks again.
-                return {'state': 'busy'}
-            return self._dream_run(action, scheduled, ready)
+        try:
+            with self._dreaming_lock() as free:
+                if not free:
+                    # What the local run answers too; a scheduled job that meets it starts nothing and records
+                    # no start, so the next tick asks again.
+                    return {'state': 'busy'}
+                return self._dream_run(action, scheduled, ready)
+        except Exception as error:  # the lock, the settings or the run itself: the owner hears of it
+            if action == 'run':
+                self._tell_dream_watch({'state': 'failed',
+                                        'code': getattr(error, 'code', None) or type(error).__name__,
+                                        'reason': str(error) or type(error).__name__})
+            raise
 
     @contextmanager
     def _dreaming_lock(self):
@@ -286,12 +293,6 @@ class Jobs:
             if daily:
                 self._record_dream_try(undo=True)
             raise
-        except Exception as error:
-            if scheduled and action == 'run':
-                self._tell_dream_watch({'state': 'failed',
-                                        'code': getattr(error, 'code', None) or type(error).__name__,
-                                        'reason': str(error) or type(error).__name__})
-            raise
         finally:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
                 self._record_apply_end(stopped=stopped)
@@ -305,12 +306,12 @@ class Jobs:
                 self._record_dream_try(undo=True)
             # Any other answer (a failed findings pass) keeps its try: the run is tried again after
             # DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day.
-        if scheduled and action == 'run':
+        if action == 'run':  # the daemon's own runs and those of the timer `kelmo dream schedule` writes
             self._tell_dream_watch(result)
         return result
 
     def _tell_dream_watch(self, result):
-        """What the owner hears of a scheduled run (`alerts.DreamWatch`). `blocked` (an executor on another
+        """What the owner hears of a findings pass (`alerts.DreamWatch`). `blocked` (an executor on another
         build's instructions) is told by `ExecutorWatch`; `deferred` and `paused` are holds, not failures.
         Alerting never changes the run's answer or its tries."""
         from ..alerts import DreamWatch
@@ -320,7 +321,7 @@ class Jobs:
             if state == 'finished':
                 watch.ran()
             elif state == 'idle':
-                watch.idle(result.get('waiting', 0))
+                watch.idle(result.get('waiting', 0), since=result.get('waiting_since'))
             elif state == 'failed':
                 watch.failed(result.get('code') or 'E_FAILED', result.get('reason') or 'no reason given')
         except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.

@@ -144,3 +144,50 @@ def test_a_run_that_completes_before_anything_was_told_sends_nothing(tmp_path, m
     scheduled_run(jobs)
     assert messages(tmp_path) == []
     assert not (tmp_path / '.state' / 'dream-watch.json').exists()
+
+
+def test_a_scheduled_run_whose_lock_cannot_be_opened_is_told_to_the_owner(tmp_path, monkeypatch):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now)
+    (tmp_path / '.state' / 'dreaming.lock').mkdir()  # the lock file cannot be opened for writing
+    with pytest.raises(OSError):
+        jobs._dream({'scheduled': True, 'action': 'run'})
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    assert 'IsADirectoryError' in messages(tmp_path)[0]
+
+
+def test_an_idle_alert_names_when_the_oldest_waiting_note_reached_the_archive(tmp_path, monkeypatch):
+    # The cursor was held long before the first scheduled run that saw it: the alert goes at once and names
+    # that time, not the time of the run.
+    from datetime import UTC, datetime
+
+    from kelmo.alerts import _when
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    since = START - 30 * DAY
+    stuck = {'state': 'idle', 'waiting': 2, 'waiting_since': datetime.fromtimestamp(since, UTC).isoformat()}
+    answering(monkeypatch, now, stuck)
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    assert _when(since) in messages(tmp_path)[0], messages(tmp_path)
+    assert _when(START) not in messages(tmp_path)[0], messages(tmp_path)
+
+
+def test_passes_started_by_the_users_timer_are_watched_too(tmp_path, monkeypatch):
+    # `kelmo dream schedule` writes a timer that runs `kelmo dream run`: its passes reach _dream with no
+    # `scheduled` flag, and the owner hears of them as of the daemon's own.
+    from kelmo.alerts import DREAM_IDLE_SECONDS
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    stuck = {'state': 'idle', 'waiting': 2}
+    failure = {'state': 'failed', 'code': 'E_EXECUTOR', 'reason': 'no findings answer'}
+    answering(monkeypatch, now, stuck, stuck, failure)
+    jobs._dream({'action': 'run'})
+    now[0] = START + DREAM_IDLE_SECONDS
+    jobs._dream({'action': 'run'})
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    now[0] += DAY
+    jobs._dream({'action': 'run'})
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+    assert 'E_EXECUTOR' in messages(tmp_path)[1]

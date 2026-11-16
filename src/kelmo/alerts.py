@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 REMINDER_SECONDS = 86400
 MARKER = 'login-outage.json'
@@ -21,7 +22,7 @@ VAULT_MARKER = 'vault-outage.json'
 EXECUTOR_MARKER = 'executor-identity.json'
 DREAM_MARKER = 'dream-watch.json'
 # How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
-# of it: the scheduled run is daily, so two runs a day apart.
+# of it: the daemon's run is daily, so two runs a day apart.
 DREAM_IDLE_SECONDS = 86400
 # Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
 _REFUSALS_TOLD = {}
@@ -176,13 +177,13 @@ class VaultWatch(LoginWatch):
 
 
 class DreamWatch(LoginWatch):
-    """What the owner hears of the scheduled Dreaming run (`core.jobs`).
+    """What the owner hears of Dreaming runs (`core.jobs`): the daemon's daily run and those a timer starts.
 
     - `idle(waiting)`: the findings pass found nothing to read. With archived notes waiting behind its cursor
       (`waiting` > 0) an operation that never reached the archive holds the cursor, and nothing behind it is ever
       read: once that has lasted DREAM_IDLE_SECONDS the owner is told, then once a day while it lasts. With none
       waiting the vault is only quiet, and the run completed.
-    - `failed(code, reason)`: a scheduled run failed. Told at once, then once a day for each code.
+    - `failed(code, reason)`: a run failed. Told at once, then once a day for each code.
     - `ran()`: a run completed. Both records end; one recovery message goes out when anything was told.
 
     The marker keeps both records, so a restart neither repeats an alert nor drops one. As in `VaultWatch`, with
@@ -236,8 +237,11 @@ class DreamWatch(LoginWatch):
             print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
                   flush=True)
 
-    def idle(self, waiting, now=None):
+    def idle(self, waiting, now=None, since=None):
+        """`since` (ISO 8601) is when the first waiting note reached the archive: the hold is at least that
+        old, even when this is the first run to see it."""
         now = time.time() if now is None else now
+        held = datetime.fromisoformat(since).timestamp() if since else now
         if not waiting:
             self.ran(now)
             return
@@ -246,20 +250,20 @@ class DreamWatch(LoginWatch):
             records = self._records()
             told_failure = records['failed'] is not None and bool(records['failed']['told'])
             records['failed'] = None  # the run completed
-            stuck = records['stuck'] or {'since': now, 'told': None}
+            stuck = records['stuck'] or {'since': min(held, now), 'told': None}
             records['stuck'] = stuck
             last = stuck['told']
             if now - stuck['since'] >= DREAM_IDLE_SECONDS and (last is None or now - last >= REMINDER_SECONDS):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
                         f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
-                        'archive holds it. kelmo dream status shows the cursor.')
+                        'archive holds it.')
                 if last is not None:
                     text += f' Day {int((now - stuck["since"]) // REMINDER_SECONDS) + 1}.'
                 if self.send(text) or not self.argv:
                     stuck['told'] = now
             self._keep(records)
             if told_failure:
-                self.send(f'{self.label}: the scheduled Dreaming run completes again.')
+                self.send(f'{self.label}: the Dreaming run completes again.')
         self._guarded(work)
 
     def failed(self, code, reason, now=None):
@@ -273,7 +277,7 @@ class DreamWatch(LoginWatch):
             if last is not None and now - last < REMINDER_SECONDS:
                 self._keep(records)
                 return
-            text = (f'{self.label}: the scheduled Dreaming run failed with {code}: '
+            text = (f'{self.label}: the Dreaming run failed with {code}: '
                     + ' '.join(str(reason).split())[:300] + '. It is tried again later.')
             if last is not None:
                 text += f' Failing since {_when(failed["since"])}.'
@@ -295,7 +299,7 @@ class DreamWatch(LoginWatch):
             # The marker goes first: one recovery message, even if its delivery fails.
             self.marker.unlink()
             if told:
-                self.send(f'{self.label}: the scheduled Dreaming run completes again; the findings pass reads '
+                self.send(f'{self.label}: the Dreaming run completes again; the findings pass reads '
                           'new evidence.')
         self._guarded(work)
 
