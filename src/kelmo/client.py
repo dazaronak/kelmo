@@ -336,6 +336,28 @@ class Outbox:
         return [item for _, item in sorted(items, key=lambda pair: pair[0])]
 
     @_serial
+    def dismiss(self, codes, keys, *, apply=False):
+        """Stop listing refusals the owner has read: they become `dismissed` and are never sent again.
+
+        A refusal matches when its code is in `codes` or its key in `keys`; with neither, every refusal
+        matches. Without `apply` nothing changes. The entry keeps its request, key and refusal, so the same
+        request under its key is still that entry and `resend` no longer selects it."""
+        items = []
+        with self.conn:
+            if apply:
+                self.conn.execute('BEGIN IMMEDIATE')
+            for row in self.conn.execute("SELECT * FROM entries WHERE state='refused' ORDER BY seq").fetchall():
+                outcome = json.loads(row['outcome'] or '{}')
+                if (codes or keys) and outcome.get('code') not in codes and row['idempotency_key'] not in keys:
+                    continue
+                items.append({'idempotency_key': row['idempotency_key'], 'op': row['op'],
+                              'code': outcome.get('code'), 'at': row['settled_at']})
+                if apply:
+                    self.conn.execute("UPDATE entries SET state='dismissed', outcome=? WHERE seq=?",
+                                      (canonical(dict(outcome, dismissed_at=utc_now())), row['seq']))
+        return items
+
+    @_serial
     def summary(self):
         counts = {row['state']: row['n'] for row in self.conn.execute(
             'SELECT state, COUNT(*) AS n FROM entries GROUP BY state')}
@@ -354,6 +376,8 @@ class Outbox:
             result['oldest_pending'] = dict(head)
         if counts.get('resent'):
             result['resent'] = counts['resent']
+        if counts.get('dismissed'):
+            result['dismissed'] = counts['dismissed']
         if counts.get('refused', 0) > len(refused):
             # Refusals are final and only accumulate; the newest stay readable, the rest are counted.
             result['refused_total'] = counts['refused']
@@ -1195,7 +1219,7 @@ class SharedClient:
     def _entry_result(self, entry):
         if entry['state'] == 'delivered':
             return json.loads(entry['outcome'])
-        if entry['state'] == 'refused':
+        if entry['state'] in ('refused', 'dismissed'):
             outcome = json.loads(entry['outcome'])
             raise KelmoError(outcome['code'], outcome['message'])
         return {'queued': True, 'accepted': False, 'op': entry['op'], 'idempotency_key': entry['idempotency_key'],
@@ -1776,6 +1800,9 @@ def dispatch(root, args, read_source, client=None):
                 items = client.outbox.resend(tuple(args.code or ('E_INPUT',)), apply=args.apply)
                 result = {'applied': args.apply, 'resent': items}
                 return dict(result, flushed=client.flush()) if args.apply and items else result
+            if args.action == 'dismiss':
+                return {'applied': args.apply,
+                        'dismissed': client.outbox.dismiss(tuple(args.code), tuple(args.key), apply=args.apply)}
             result = client.local_status()
             if getattr(args, 'probe', False):
                 result['connection'] = client.probe()

@@ -201,7 +201,7 @@ def build_parser(version):
                              help='JSON array: absolute channel executable and its arguments')
     client_init.add_argument('--sessions-json', help='JSON object of enrolled transcript roots per provider')
     client_init.add_argument('--timeout', type=float, default=20)
-    for name in ('status', 'flush', 'resend'):
+    for name in ('status', 'flush', 'resend', 'dismiss'):
         action = client_actions.add_parser(name)
         common(action)
         if name == 'status':
@@ -212,6 +212,14 @@ def build_parser(version):
                                 help='Refusal code to resend (repeatable; default E_INPUT)')
             action.add_argument('--apply', action='store_true',
                                 help='Queue them again under new keys and deliver; without it only list them')
+        if name == 'dismiss':
+            action.add_argument('--code', action='append', default=[], metavar='CODE',
+                                help='Refusal code to dismiss (repeatable)')
+            action.add_argument('--key', action='append', default=[], metavar='KEY',
+                                help='Idempotency key of one refused entry (repeatable)')
+            action.add_argument('--apply', action='store_true',
+                                help='Stop listing them and never send them again; without it only list them. '
+                                     'With no --code and no --key every refused entry matches')
     tool = command('tool', 'Call one archive tool handler by name (the handlers behind the MCP tools) '
                            'with a JSON object on stdin.')
     tool.add_argument('tool')
