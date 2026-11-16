@@ -441,3 +441,20 @@ def test_a_bound_work_page_that_is_mandatory_loses_its_fact_labels(tmp_path, mon
     untagged = '# Task\n\n<!-- kb -->\n- Never deploy on Friday.\n<!-- /kb -->\n'
     assert hot.hub_context(selected, tmp_path, reader=reader)['hub_work'] == untagged
     assert _published_work(reader, 2, target) == untagged
+
+
+def test_a_fact_whose_text_holds_another_facts_label_keeps_its_own_text():
+    """Fact A's text ends in fact B's label, so A's published row without A's own label reads exactly like B's row.
+    Each line of the page is matched once, on the text as published: A loses only its own label and B only its."""
+    from kelmo.wiki import hot_views
+    value = registry()
+    value['pages']['person.md'] = page('Person', 'hub', 'person')
+    value['facts']['a.first'] = row_fact('person.md', 'aaaaaaaaaaa1', 'Use the token [f:bbbbbbbbbbb2]')
+    value['facts']['b.second'] = row_fact('person.md', 'bbbbbbbbbbb2', 'Use the token')
+    tagged = ('# Person\n\n<!-- kb -->\n\n'
+              '- Use the token [f:bbbbbbbbbbb2] [f:aaaaaaaaaaa1]\n'
+              '- Use the token [f:bbbbbbbbbbb2]\n\n<!-- /kb -->\n')
+    assert hot_views.render_mandatory(tagged, value, 'person.md') == (
+        '# Person\n\n<!-- kb -->\n\n'
+        '- Use the token [f:bbbbbbbbbbb2]\n'
+        '- Use the token\n\n<!-- /kb -->\n')

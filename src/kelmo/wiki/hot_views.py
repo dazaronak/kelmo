@@ -203,19 +203,19 @@ def strip_evidence(text, registry, target):
     """`text`, the page `target`, without the fact and source labels of its fact rows: in its `<!-- kb -->`
     regions, whole lines that are exactly the row the publisher writes for one of the page's registered facts
     become that row without them. Status labels and every other line stay byte for byte, so no label is parsed
-    and a source id may hold any character, a line break included (the row then spans lines)."""
+    and a source id may hold any character, a line break included (the row then spans lines). Every line is
+    matched once, on the region as published, so a fact whose text ends like another fact's row stays itself."""
     rows = {}
     for fact in registry['facts'].values():
         if fact['target'] == target:
             rows[pages._fact_row(fact)] = pages._fact_row(fact, evidence=False)
     if not rows:
         return text
+    # A whole line, or lines for a row that spans them: a row another row starts with never takes its line.
+    whole = re.compile('(?<![^\\n])(?:' + '|'.join(map(re.escape, rows)) + ')(?![^\\n])')
     parts, rest = [], text
     while (start := rest.find(pages.KB_START)) >= 0 and (end := rest.find(pages.KB_END, start)) >= 0:
-        framed = '\n' + rest[start:end] + '\n'
-        for row, bare in rows.items():
-            framed = framed.replace('\n' + row + '\n', '\n' + bare + '\n')
-        parts += [rest[:start], framed[1:-1]]
+        parts += [rest[:start], whole.sub(lambda match: rows[match.group(0)], rest[start:end])]
         rest = rest[end:]
     return ''.join(parts) + rest
 
