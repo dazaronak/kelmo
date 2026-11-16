@@ -224,3 +224,72 @@ def test_stop_and_precompact_still_make_one_attempt(tmp_path, monkeypatch, capsy
         assert printed['error']['code'] == 'E_BUSY', (action, printed)
         assert seconds < 2.5, (action, seconds)  # gave up before the journal was free: no second attempt
     assert inspect(root)['jobs'] == []
+
+
+def test_a_session_end_whose_journal_is_locked_while_it_reads_is_tried_again(tmp_path, monkeypatch, capsys):
+    """The journal is locked for 2 s right after the transcript is parsed, while the capture reads the session's
+    rows before its write transaction: the attempt runs out of its time and the next one captures."""
+    import kelmo.sessions as sessions_module
+
+    root, source = prepared(tmp_path)
+    original = sessions_module.parse
+    holders = []
+
+    def locking_parse(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not holders:
+            holder = held(root, 2.0, ['BEGIN EXCLUSIVE'])
+            holder.__enter__()
+            holders.append(holder)
+        return result
+
+    monkeypatch.setattr(sessions_module, 'parse', locking_parse)
+    try:
+        code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+    finally:
+        for holder in holders:
+            holder.__exit__(None, None, None)
+
+    assert holders, 'the journal was never locked'
+    assert (code, printed) == (0, {}), printed
+    assert len(final_jobs(root)) == 1
+    assert seconds < HOOK_DEADLINE, seconds
+
+
+def test_a_session_end_whose_intake_opened_late_still_ends_inside_its_deadline(tmp_path, monkeypatch):
+    """The state core's call: the attempt's intake opens 0.5 s before the hook's deadline and the journal stays
+    busy, so the capture has 0.5 s left, not a fresh 1.5 s."""
+    root, source = prepared(tmp_path)
+    began = time.monotonic()
+    deadline = began + HOOK_DEADLINE - 0.5
+    original = Sessions.__init__
+
+    def late(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        time.sleep(max(0.0, deadline - 0.5 - time.monotonic()))
+
+    monkeypatch.setattr(Sessions, '__init__', late)
+    with lent(root) as journal, journal_held(root, 30.0):
+        try:
+            outcome = capture_hook(root, 'claude', 'session-end', payload(source), internal_job=False,
+                                   journal=journal, deadline=deadline)
+        except KelmoError as error:
+            outcome = error
+        seconds = time.monotonic() - began
+
+    assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
+    assert seconds < deadline - began + 0.2, seconds
+
+
+def test_a_lent_journal_whose_commit_never_meets_a_free_reader_is_left_without_a_transaction(tmp_path):
+    """A reader holds the journal for longer than every attempt: each commit is refused, and the state core's
+    writer journal is handed back with no transaction open, so the baton gives it back cleanly and the hook
+    answers E_BUSY (retryable) rather than a processing failure."""
+    root, source = prepared(tmp_path)
+    with lent(root) as journal:
+        with journal_read(root, 6.0):
+            outcome = state_core_hook(root, source, 'session-end', journal)
+        assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
+        assert not journal.conn.in_transaction
+        assert answers(journal)
+    assert final_jobs(root) == []

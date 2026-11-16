@@ -119,16 +119,22 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
     until=time.monotonic()+SESSION_END_SECONDS
     if deadline is not None:
         until=min(until,deadline)
+    last=None
     while True:
         left=until-time.monotonic()
         if left<SESSION_END_PAUSE:
+            if last is not None and last.code!='E_BUSY':
+                raise last
             raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
         try:
             _bounded_attempt(config,journal,provider,native_id,source,selected,event,left)
             return {}
         except KelmoError as error:
-            if error.code!='E_BUSY':
+            # An attempt that waited for a locked journal outside its write transaction runs out of its own time
+            # (E_CAPTURE_RETRY) just as one refused inside it does (E_BUSY): both are tried again.
+            if error.code not in ('E_BUSY','E_CAPTURE_RETRY'):
                 raise
+            last=error
         time.sleep(SESSION_END_PAUSE)
 
 
@@ -136,18 +142,19 @@ def _bounded_attempt(config,journal,provider,native_id,source,selected,event,lef
     """One SessionEnd attempt whose every wait for the journal, opening and schema reads included, ends within
     `left` seconds; a lock still held then is `E_BUSY`."""
     from .journal import Journal
+    until=time.monotonic()+left
     try:
         if journal is None:
             own=Journal(config.internal('.state/journal.sqlite3'),wait_seconds=left)
             try:
-                _capture_once(config,own,provider,native_id,source,selected,event,min(CAPTURE_BUDGET,left))
+                _capture_once(config,own,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
             finally:
                 own.close()
             return
         previous=journal.conn.execute('PRAGMA busy_timeout').fetchone()[0]
         journal.conn.execute(f'PRAGMA busy_timeout={max(1,int(left*1000))}')
         try:
-            _capture_once(config,journal,provider,native_id,source,selected,event,min(CAPTURE_BUDGET,left))
+            _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
         finally:
             journal.conn.execute(f'PRAGMA busy_timeout={previous}')
     except sqlite3.OperationalError as error:
@@ -157,12 +164,17 @@ def _bounded_attempt(config,journal,provider,native_id,source,selected,event,lef
         raise KelmoError('E_BUSY','Session journal is busy; retry capture.') from error
 
 
-def _capture_once(config,journal,provider,native_id,source,selected,event,budget):
-    """One attempt: open the session intake, capture the transcript, record the native event."""
+def _capture_once(config,journal,provider,native_id,source,selected,event,budget,*,until=None):
+    """One attempt: open the session intake, capture the transcript, record the native event. With `until`
+    (monotonic), the capture gets at most the time left after the intake opened."""
     from .sessions import Sessions
     from .journal import now
     sessions=Sessions(config,journal=journal)
     try:
+        if until is not None:
+            budget=min(budget,until-time.monotonic())
+            if budget<=0:
+                raise KelmoError('E_BUSY','Session journal is busy; retry capture.')
         sessions.capture(provider,native_id,source,selected,event,
                          checkpoint_turns=config.sessions['checkpoint_turns'],time_budget=budget)
         with sessions.journal.conn as db:

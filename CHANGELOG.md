@@ -12,8 +12,8 @@ entry here.
   hook captured once, and a busy journal or another capture holding the session intake ended it. It now tries
   again for up to 5 seconds. Every wait for the journal counts against that time, opening it included, and
   the daemon counts the time the hook waited for its writer, so a session end that stays busy fails within
-  the 7 seconds `kelmod hook` gives a capture hook. Before, an exclusive lock on the journal could hold the
-  hook for up to 30 seconds. `Stop` and `PreCompact` still make one attempt, as before.
+  the 7 seconds `kelmod hook` gives a capture hook, unless another write keeps the daemon's writer for longer
+  than that. Before, an exclusive lock on the journal could hold the hook for up to 30 seconds. `Stop` and `PreCompact` still make one attempt, as before.
 - A capture hook that found the session intake busy no longer closes the state core's journal. Until the
   daemon restarted, every write it served afterwards failed.
 
