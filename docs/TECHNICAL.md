@@ -366,7 +366,9 @@ published HOT available with a warning and no acknowledgement. Local view pointe
 the existing immutable set cache; omitted work/pending and legacy context use private
 content-addressed JSON references under `hub-context`. Those files retain the complete
 source for the emitted pointer, including during offline delivery; their `pending` field
-is the framed pending block, one row for every waiting note.
+is the framed pending block, one row for each note the delivery was given (every waiting
+note on the hub path, the 20 newest on the legacy path). A pending list whose ten-line
+block fits inline writes no such file, and the notes past ten show only as a count.
 
 ## Verification and context pitfalls
 

@@ -14,8 +14,10 @@ entry here.
   written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
   frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
   When the start context is too large for a Claude hook and the pending lines are left in the referenced
-  context file instead, that file's `pending` field holds the same framed block, with a row for every waiting
-  note. It used to hold the raw list of notes.
+  context file instead, that file's `pending` field holds the same framed block, with a row for each note the
+  path was given: every waiting note on the hub path, the 20 newest on the older path for vaults without hub
+  views. It used to hold the raw list of notes. When the ten-line block itself fits, no such file is written
+  and the notes past ten still show only as a count, as before.
 
 ## [0.3.1] - 2026-11-15
 

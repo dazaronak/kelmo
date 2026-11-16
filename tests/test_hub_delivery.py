@@ -397,12 +397,13 @@ def test_omitted_pending_has_an_immutable_readable_source(tmp_path):
     pending = [{'pending': str(index) + '_' + 'P' * 239} for index in range(10)]
     output = prepare(SimpleNamespace(state=tmp_path), {}, value, 'alpha', '', pending,
                      provider='claude', current=tmp_path/'hot', stale=True, acknowledge=None)
-    from kelmo.hot import pending_block
     paths = [path for path in tmp_path.rglob('*.json')
-             if json.loads(path.read_text()).get('pending') == pending_block(pending)]
+             if str(json.loads(path.read_text()).get('pending', '')).startswith('<kelmo-pending-notes>\n')]
     assert len(paths) == 1 and str(paths[0]) in output
     assert len(output) <= 10000 and 'STALE' in output
-    assert pending[-1]['pending'] in json.loads(Path(paths[0]).read_text())['pending'].split('\n')[-2]
+    rows = json.loads(Path(paths[0]).read_text())['pending'].split('\n')
+    assert rows[0] == '<kelmo-pending-notes>' and rows[-1] == '</kelmo-pending-notes>', rows
+    assert rows[3:-1] == ['- ' + item['pending'] + ' [?]' for item in pending], rows
 
 
 def test_omitted_pending_reference_is_framed_and_complete(tmp_path):

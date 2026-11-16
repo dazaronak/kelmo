@@ -80,7 +80,7 @@ applied. The block sits between `<kelmo-pending-notes>` and
 instructions; a marker tag inside a pending line is written with `&lt;`. When the
 start context is too large for a Claude hook, the pending lines are left in the
 referenced context file, whose `pending` field holds the same framed block with a
-row for every waiting note. A note whose text carries two frontmatter blocks in a row has them
+row for each note the delivery was given (on the legacy path, the 20 newest). A note whose text carries two frontmatter blocks in a row has them
 merged at capture; a note that is frontmatter alone is refused at capture.
 
 An existing wiki file that no registry entry names is registered explicitly,
