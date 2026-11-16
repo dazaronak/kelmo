@@ -164,3 +164,33 @@ def test_heartbeats_are_answered_while_a_status_probe_waits():
         release.set()
         parent.close()
         serving.join(30)
+
+
+def test_a_frame_the_core_cannot_decode_ends_the_channel_as_a_stop_not_a_crash(capfd):
+    """kelmod sends bytes that are not a frame (here a prefix over the frame bound): the channel ends the way a
+    closed channel does, the owner is asked to stop, and `serve` returns instead of raising."""
+    import struct
+    parent, child = socket.socketpair()
+    asked, raised = threading.Event(), []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = asked.set
+
+    def run():
+        try:
+            link.serve()
+        except Exception as error:  # noqa: BLE001 - the test asserts that nothing escapes
+            raised.append(error)
+
+    serving = threading.Thread(target=run, daemon=True)
+    serving.start()
+    peer = Peer(parent)
+    try:
+        peer.frame()  # hello
+        parent.sendall(struct.pack('>I', wire.MAX_FRAME + 1))
+        serving.join(30)
+        assert not serving.is_alive()
+        assert raised == [], raised
+        assert asked.is_set()
+        assert 'E_LIMIT' in capfd.readouterr().err
+    finally:
+        parent.close()
