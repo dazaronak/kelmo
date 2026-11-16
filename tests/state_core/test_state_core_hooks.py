@@ -253,9 +253,9 @@ def test_a_core_whose_channel_was_told_to_stop_starts_no_spool_pass_after_a_hook
     assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']
 
 
-def test_a_spooled_capture_refused_as_retryable_stays_for_the_next_pass(world_factory, core_factory):
-    """A capture whose transcript read ran out of time (E_CAPTURE_RETRY) is retryable: the pass stops on it and the
-    file stays in the spool, instead of being set aside as bad."""
+def test_a_spooled_capture_refused_every_time_does_not_hold_back_the_ones_behind_it(world_factory, core_factory):
+    """A capture whose transcript read runs out of time on every try (E_CAPTURE_RETRY) is set aside as bad, as the
+    edge core does: kept at the head, it would stop every pass and the captures behind it would never run."""
     import time
 
     from kelmo.errors import KelmoError
@@ -271,10 +271,11 @@ def test_a_spooled_capture_refused_as_retryable_stays_for_the_next_pass(world_fa
 
     core.serve_hook = slow_transcript
     (spool / '00000000000000000001-101.json').write_text(capture_frame('slow'))
+    (spool / '00000000000000000002-101.json').write_text(capture_frame('behind'))
     live = {'action': 'session-stop', 'payload': {'order': 'live'},
             'context': {'provider': 'claude', 'internal_job': True}}
     assert core.handle_hook(Context.local('hook', 30), live) == {}
     limit = time.monotonic() + 10
     while core._spool is not None and time.monotonic() < limit:
         time.sleep(0.05)
-    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']
+    assert sorted(path.name for path in spool.iterdir()) == ['00000000000000000001-101.bad']

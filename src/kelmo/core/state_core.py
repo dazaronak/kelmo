@@ -503,12 +503,9 @@ class StateCore:
                 if self._told_to_stop():
                     # The stop caused it (the archive no longer answers): the capture stays for the next pass.
                     return {'ingested': ingested, 'stopped': 'stopping'}
-                retryable = getattr(error, 'retryable', None)
-                if not isinstance(retryable, bool):
-                    # The same verdict a caller of the hook gets for this code (CoreLink._run).
-                    from ..server import RETRYABLE
-                    retryable = error.code in RETRYABLE
-                if not retryable and error.code != 'E_BUSY':
+                # Only a refusal worth retrying keeps the file; one that repeats on every try (a transcript read
+                # that never fits its time) would stop every pass and hold back every later capture.
+                if not getattr(error, 'retryable', False) and error.code not in ('E_BUSY',):
                     spool.reject(path)
                     continue
                 return {'ingested': ingested, 'stopped': error.code}
