@@ -83,7 +83,8 @@ def test_a_second_serve_on_the_same_root_exits_75(start):
 
 
 def test_an_error_that_stops_kelmod_before_it_serves_is_written_without_a_time(start):
-    """The client quotes such an error to the user (daemon_client.ensure), and the changelog keeps it as before."""
+    """Errors before serving stay plain, as the changelog says; the client quotes those that end with another
+    code than 75 (daemon_client.ensure), and E_BUSY is the one a test can provoke without breaking the setup."""
     daemon = start()
     result = subprocess.run([str(KELMOD), "serve", "--spec", str(daemon.spec_path)],
                             capture_output=True, text=True, timeout=30)

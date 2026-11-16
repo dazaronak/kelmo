@@ -11,10 +11,11 @@ pub mod supervisor;
 pub mod sys;
 
 /// Writes one line to the daemon's log (its standard error), led by the UTC time, so that a restart or a
-/// recycle can be dated from the log. A line separator inside the message is written escaped, and the whole
-/// line goes out in one write, so a core writing to the same log cannot split it. A failed write is dropped
-/// (logging never stops the daemon), and the next line then starts on a fresh line. Rust's own panic message
-/// is not written through here, and a line follows whatever a core left unfinished on the same log.
+/// recycle can be dated from the log. A line separator or other control character inside the message is
+/// written escaped, and the whole line is handed to the log in one write, so a core writing to the same log
+/// does not split it as a rule. A failed write is dropped (logging never stops the daemon); after one cut part
+/// way the next line starts on a fresh line. Rust's own panic message is not written through here, and a line
+/// follows whatever a core left unfinished on the same log.
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {
@@ -22,7 +23,7 @@ macro_rules! logln {
     };
 }
 
-/// The line `logln!` writes: the time, a space, the message on one line, a line feed; one `write_all`.
+/// The line `logln!` writes: the time, a space, the message on one line, a line feed.
 pub fn write_log_line(message: &str) {
     static BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     emit_log_line(&mut std::io::stderr().lock(), message, &BROKEN);
@@ -67,24 +68,23 @@ pub fn emit_log_line(
             Err(_) => break,
         }
     }
-    broken.store(!rest.is_empty(), Ordering::Relaxed);
+    // Cut part way: the next line must not continue it. Nothing written at all: nothing to end, so a line cut
+    // earlier still waits for its line feed and one that was whole stays whole.
+    if rest.is_empty() {
+        broken.store(false, Ordering::Relaxed);
+    } else if rest.len() < line.len() {
+        broken.store(true, Ordering::Relaxed);
+    }
 }
 
-/// `text` with every character a reader may take for a line break (CR, LF, vertical tab, form feed, the
-/// separators 0x1C-0x1E, NEL, U+2028, U+2029) written as its escape, such as `\n` or `\u{2028}`, and a
-/// backslash as `\\`, so an escaped break cannot be told apart from text that spells one.
+/// `text` with every control character (line breaks, tabs, escape sequences a terminal would act on) and the
+/// separators U+2028 and U+2029 written as its escape, such as `\n` or `\u{1b}`, and a backslash as `\\`,
+/// so an escaped break cannot be told apart from text that spells one.
 pub fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| match c {
-            '\\'
-            | '\r'
-            | '\n'
-            | '\u{b}'
-            | '\u{c}'
-            | '\u{1c}'..='\u{1e}'
-            | '\u{85}'
-            | '\u{2028}'
-            | '\u{2029}' => c.escape_default().to_string(),
+            '\\' | '\u{2028}' | '\u{2029}' => c.escape_default().to_string(),
+            c if c.is_control() => c.escape_default().to_string(),
             _ => c.to_string(),
         })
         .collect()
@@ -94,7 +94,8 @@ pub fn one_line(text: &str) -> String {
 pub fn stamp(at: std::time::SystemTime) -> String {
     let millis: i128 = match at.duration_since(std::time::UNIX_EPOCH) {
         Ok(since) => since.as_millis() as i128,
-        Err(before) => -(before.duration().as_millis() as i128),
+        // Rounded down, as after 1970: a nanosecond before the epoch is 23:59:59.999.
+        Err(before) => -(before.duration().as_nanos().div_ceil(1_000_000) as i128),
     };
     let (seconds, millis) = (millis.div_euclid(1_000) as i64, millis.rem_euclid(1_000));
     let (days, rest) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
@@ -241,5 +242,38 @@ mod stamp_tests {
                 .unwrap()
                 .ends_with("Z kept\n")
         );
+    }
+
+    #[test]
+    fn a_time_just_before_1970_rounds_down() {
+        assert_eq!(
+            stamp(UNIX_EPOCH - Duration::from_nanos(1)),
+            "1969-12-31T23:59:59.999Z"
+        );
+        assert_eq!(
+            stamp(UNIX_EPOCH - Duration::from_micros(1_000_500)),
+            "1969-12-31T23:59:58.999Z"
+        );
+    }
+
+    #[test]
+    fn a_control_character_is_escaped() {
+        let escaped = one_line("core\u{1b}[31mred\u{7}\u{0}\ttab");
+        assert!(!escaped.chars().any(|c| c.is_control()), "{escaped:?}");
+    }
+
+    #[test]
+    fn a_line_that_wrote_nothing_leaves_no_blank_line() {
+        let broken = AtomicBool::new(false);
+        let mut sink = Sink {
+            written: Vec::new(),
+            fail_after: Some(0),
+            would_block: 0,
+        };
+        emit_log_line(&mut sink, "dropped", &broken);
+        sink.fail_after = None;
+        emit_log_line(&mut sink, "next", &broken);
+        let text = String::from_utf8(sink.written).unwrap();
+        assert!(!text.starts_with('\n'), "{text:?}");
     }
 }
