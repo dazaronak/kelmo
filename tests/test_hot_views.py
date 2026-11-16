@@ -14,7 +14,15 @@ def page(title, kind='work', layout='feature', parent='', priority='', summary='
 
 
 def fact(target, text, status='active', role=None):
-    return {'target': target, 'text': text, 'status': status, 'role': role}
+    return {'target': target, 'text': text, 'status': status, 'role': role, 'id': 'id-' + text,
+            'evidence_resolution': 'exact', 'evidence_refs': []}
+
+
+def row_fact(target, ident, text, sources=(), status='active', exact=True):
+    """A registered fact as the publisher writes its row (pages._fact_row)."""
+    return {'id': ident, 'target': target, 'text': text, 'status': status,
+            'evidence_resolution': 'exact' if exact else 'legacy',
+            'evidence_refs': [{'source_id': source} for source in sources]}
 
 
 def registry():
@@ -143,10 +151,13 @@ def test_mandatory_render_drops_frontmatter_retired_rows_and_fact_labels_only():
                  '- Gone fact. [f:2] [source:b] [status: retired]\n'
                  '- Shipped fact. [f:3] [source:c] [status: shipped]\n\n<!-- /kb -->\n\n'
                  '## See Also\n\n- [[life]]\n')
-    assert hot_views.render_mandatory(page_text) == (
+    value = {'facts': {'1': row_fact('person.md', '1', 'Live fact.', ('a',)),
+                       '2': row_fact('person.md', '2', 'Gone fact.', ('b',), 'retired'),
+                       '3': row_fact('person.md', '3', 'Shipped fact.', ('c',), 'shipped')}}
+    assert hot_views.render_mandatory(page_text, value, 'person.md') == (
         '# User Profile\n\n<!-- kb -->\n\n## Facts\n\n- Live fact.\n'
         '- Shipped fact. [status: shipped]\n\n<!-- /kb -->\n\n## See Also\n\n- [[life]]\n')
-    assert hot_views.render_mandatory('# Bare\n\nNo frontmatter.\n') == '# Bare\n\nNo frontmatter.\n'
+    assert hot_views.render_mandatory('# Bare\n\nNo frontmatter.\n', value, 'person.md') == '# Bare\n\nNo frontmatter.\n'
 
 
 def test_one_view_per_project_map_and_one_render_per_mandatory_page(tmp_path):
@@ -154,9 +165,9 @@ def test_one_view_per_project_map_and_one_render_per_mandatory_page(tmp_path):
     value = registry()
     value['pages']['person.md'] = page('Person', 'hub', 'person')
     value['pages']['life/preferences.md'] = page('Preferences', 'hub', 'topic')
-    value['facts']['p'] = fact('person.md', 'Rule.')
-    value['facts']['q'] = dict(fact('life/preferences.md', 'Mandatory pref.'), mandatory=True)
-    value['facts']['r'] = fact('life/preferences.md', 'Old pref.', status='retired')
+    value['facts']['p'] = row_fact('person.md', 'p', 'Rule.')
+    value['facts']['q'] = dict(row_fact('life/preferences.md', 'q', 'Mandatory pref.'), mandatory=True)
+    value['facts']['r'] = row_fact('life/preferences.md', 'r', 'Old pref.', status='retired')
     wiki = tmp_path / 'wiki'
     (wiki / 'life').mkdir(parents=True)
     (wiki / 'life/preferences.md').write_text('---\nkind: hub\n---\n\n# Preferences\n\n<!-- kb -->\n'
@@ -348,6 +359,8 @@ TAGGED_PERSON = ('---\nkind: hub\nlayout: person\n---\n\n# Person\n\n<!-- kb -->
                  '- Legacy fact. [f:bbbbbbbbbbbb] [unresolved legacy state; retained status: active]\n'
                  '- Cite it as [source:quoted] in the note. [f:eeeeeeeeeeee] [source:c9d0]\n'
                  '- Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian]. [f:ffffffffffff]\n'
+                 '- Spaced source. [f:111111111111] [source:2026-10-05 person rule.md]\n'
+                 '- Bracket source. [f:222222222222] [source:odd]id]\n'
                  '[f:dddddddddddd] starts a line the renderer never writes.\n\n<!-- /kb -->\n\n'
                  '- The reference for this example is [f:external-record]\n\n## See Also\n\n- [[life]]\n')
 UNTAGGED_PERSON = ('# Person\n\n<!-- kb -->\n\n## Facts\n\n'
@@ -356,28 +369,43 @@ UNTAGGED_PERSON = ('# Person\n\n<!-- kb -->\n\n## Facts\n\n'
                    '- Legacy fact. [unresolved legacy state; retained status: active]\n'
                    '- Cite it as [source:quoted] in the note.\n'
                    '- Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian].\n'
+                   '- Spaced source.\n'
+                   '- Bracket source.\n'
                    '[f:dddddddddddd] starts a line the renderer never writes.\n\n<!-- /kb -->\n\n'
                    '- The reference for this example is [f:external-record]\n\n## See Also\n\n- [[life]]\n')
 SELECTED = '# Extra\n\n- A selected page keeps its labels. [f:999999999999] [source:s1]\n'
+PERSON_FACTS = [
+    row_fact('person.md', '0123456789ab', 'Rule.', ('a1b2c3', '2026-08-28_150000_person_rule.md')),
+    row_fact('person.md', 'aaaaaaaaaaaa', 'Shipped fact.', ('e5f6',), 'shipped'),
+    row_fact('person.md', 'bbbbbbbbbbbb', 'Legacy fact.', exact=False),
+    row_fact('person.md', 'eeeeeeeeeeee', 'Cite it as [source:quoted] in the note.', ('c9d0',)),
+    row_fact('person.md', 'ffffffffffff',
+             'Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian].'),
+    # Source ids nobody constrains: a legacy note name with spaces, and one holding a closing bracket.
+    row_fact('person.md', '111111111111', 'Spaced source.', ('2026-10-05 person rule.md',)),
+    row_fact('person.md', '222222222222', 'Bracket source.', ('odd]id',)),
+]
 
 
 def test_generated_mandatory_files_carry_no_evidence_tags(tmp_path):
     from kelmo.wiki import hot_views
     value = registry()
     value['pages']['person.md'] = page('Person', 'hub', 'person')
-    value['facts']['p'] = fact('person.md', 'Rule.')
+    for registered in PERSON_FACTS:
+        value['facts']['p-' + registered['id']] = registered
     wiki = tmp_path / 'wiki'
     rendered = {wiki / 'person.md': TAGGED_PERSON, wiki / MAP: MAP_TEXT,
                 wiki / 'projects/other/other.md': '# Other\n', wiki / 'extra.md': SELECTED}
     views = hot_views.render_all(value, rendered, wiki, tmp_path / 'hot', generation=7,
                                  selection={'pages': ['extra.md'], 'projects': {}})
-    assert hot_views.render_mandatory(TAGGED_PERSON) == UNTAGGED_PERSON
+    assert hot_views.render_mandatory(TAGGED_PERSON, value, 'person.md') == UNTAGGED_PERSON
     for name in ('mandatory.md', 'mandatory-person.md', 'app.full.md'):
         text = views[tmp_path / 'hot' / name]
         assert UNTAGGED_PERSON in text, name
         for label in ('[f:0123456789ab]', '[source:a1b2c3]', '[source:2026-08-28_150000_person_rule.md]',
                       '[f:aaaaaaaaaaaa]', '[source:e5f6]', '[f:bbbbbbbbbbbb]', '[f:eeeeeeeeeeee]', '[source:c9d0]',
-                      '[f:ffffffffffff]'):
+                      '[f:ffffffffffff]', '[f:111111111111]', '[source:2026-10-05 person rule.md]',
+                      '[f:222222222222]', '[source:odd]id]'):
             assert label not in text, (name, label)
     # A page selected through [hot] pages is not a mandatory page: it stays byte for byte.
     assert SELECTED in views[tmp_path / 'hot' / 'mandatory.md']
@@ -394,11 +422,13 @@ def test_a_bound_work_page_that_is_mandatory_loses_its_fact_labels(tmp_path, mon
     selected = config(tmp_path, '[hot]\nviews=true\n[hot.projects.app]\nroots=[]\n')
     target = 'projects/app/task.md'
     text = '# Task\n\n<!-- kb -->\n- Never deploy on Friday. [f:0123456789ab] [source:s1]\n<!-- /kb -->\n'
-    registry = {'pages': {target: {'page_id': 'work-id', 'kind': 'work'}}, 'redirects': {}}
+    registry = {'pages': {target: {'page_id': 'work-id', 'kind': 'work'}}, 'redirects': {},
+                'facts': {'w': row_fact(target, '0123456789ab', 'Never deploy on Friday.', ('s1',))}}
     root, registry_path, wiki_path, *_ = generation_paths(selected)
     mandatory = []
     reader = SimpleNamespace(config=selected, root=root, registry_path=registry_path, wiki_path=wiki_path,
                              generation=lambda: 2, _pinned=lambda _: {'paths': {target}, 'registry': registry},
+                             registry_view=lambda generation: registry,
                              page=lambda name, generation: SimpleNamespace(content=text.encode('utf-8')),
                              mandatory=lambda generation: [SimpleNamespace(path=path) for path in mandatory])
     monkeypatch.setattr(projects, 'resolve', lambda config, cwd: 'app')

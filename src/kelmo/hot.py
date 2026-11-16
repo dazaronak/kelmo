@@ -92,7 +92,7 @@ def _render_generation(config, project, paths, budget, reader, *, generation=Non
     for name in mandatory + selected:
         text = _published(reader, generation, name)
         if name in mandatory:
-            text = strip_evidence(text)
+            text = strip_evidence(text, reader.registry_view(generation), name)
         blocks.append(f'## {name}\n\n{text}')
         pages.append({'path': name, 'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
                       'bytes': len(text.encode('utf-8'))})
@@ -164,7 +164,7 @@ def published_work(reader, generation, name):
     text = reader.page(name, generation).content.decode('utf-8')
     if '[f:' in text and name in {page.path for page in reader.mandatory(generation)}:
         from .wiki.hot_views import strip_evidence
-        text = strip_evidence(text)
+        text = strip_evidence(text, reader.registry_view(generation), name)
     return text
 
 

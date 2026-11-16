@@ -54,11 +54,6 @@ DEGRADE_STEPS = (
 )
 _FRONTMATTER = re.compile(r'\A---\n.*?\n---\n+', re.DOTALL)
 _RETIRED_ROW = re.compile(r'^- .*\[status: retired\].*$\n?', re.MULTILINE)
-# The label group the publisher writes at the end of a fact row (pages._fact_row): the fact id, its sources,
-# then an optional status label. Text shaped like a label anywhere else is the author's and stays.
-_FACT_LABELS = re.compile(r'^(- .*?)( \[f:[^\]\s]+\](?: \[source:[^\]\s]+\])*)'
-                          r'((?: \[status: [^\]\n]+\]| \[unresolved legacy state; retained status: [^\]\n]+\])?)$',
-                          re.MULTILINE)
 
 
 def view_name(project):
@@ -204,20 +199,28 @@ def over_budget(text):
     return int(match.group(1)) if match else None
 
 
-def strip_evidence(text):
-    """`text` without the fact and source labels of the fact rows in its `<!-- kb -->` regions, where the publisher
-    writes them; status labels and all other text, the hand-written text around the regions included, stay."""
+def strip_evidence(text, registry, target):
+    """`text`, the page `target`, without the fact and source labels of its fact rows: in its `<!-- kb -->`
+    regions, a line that is exactly the row the publisher writes for one of the page's registered facts becomes
+    that row without them. Status labels and every other line stay byte for byte, so no label is parsed and a
+    source id may hold any character."""
+    rows = {}
+    for fact in registry['facts'].values():
+        if fact['target'] == target:
+            rows[pages._fact_row(fact)] = pages._fact_row(fact, evidence=False)
+    if not rows:
+        return text
     parts, rest = [], text
     while (start := rest.find(pages.KB_START)) >= 0 and (end := rest.find(pages.KB_END, start)) >= 0:
-        parts += [rest[:start], _FACT_LABELS.sub(r'\1\3', rest[start:end])]
+        parts += [rest[:start], '\n'.join(rows.get(line, line) for line in rest[start:end].split('\n'))]
         rest = rest[end:]
     return ''.join(parts) + rest
 
 
-def render_mandatory(text):
-    """A mandatory page as delivered at startup: no frontmatter, no retired rows, no fact and source labels;
-    everything else byte for byte."""
-    return strip_evidence(_RETIRED_ROW.sub('', _FRONTMATTER.sub('', text, 1)))
+def render_mandatory(text, registry, target):
+    """The mandatory page `target` as delivered at startup: no frontmatter, no retired rows, no fact and source
+    labels; everything else byte for byte."""
+    return strip_evidence(_RETIRED_ROW.sub('', _FRONTMATTER.sub('', text, 1)), registry, target)
 
 
 def project_maps(registry):
@@ -255,7 +258,7 @@ def render_all(registry, rendered_pages, wiki_root, hot_root, max_bytes=DEFAULT_
             text = _page_text(rendered_pages, wiki_root, target)
             if text is None:
                 raise ValueError('Mandatory page is missing: ' + target)
-            mandatory.append(render_mandatory(text) if target in canonical_mandatory else text)
+            mandatory.append(render_mandatory(text, registry, target) if target in canonical_mandatory else text)
         body = '\n\n'.join(mandatory)
         if body and not body.endswith('\n'):
             body += '\n'
@@ -288,7 +291,8 @@ def render_all(registry, rendered_pages, wiki_root, hot_root, max_bytes=DEFAULT_
             aliases.setdefault(mandatory_name(target), []).append(target)
         for name, sources in aliases.items():
             result[hot_root / name] = header + '\n\n'.join(
-                render_mandatory(_page_text(rendered_pages, wiki_root, source)) for source in sources)
+                render_mandatory(_page_text(rendered_pages, wiki_root, source), registry, source)
+                for source in sources)
         return result
     for target in maps:
         text = _page_text(rendered_pages, wiki_root, target)
@@ -298,5 +302,5 @@ def render_all(registry, rendered_pages, wiki_root, hot_root, max_bytes=DEFAULT_
     for target in pages.mandatory_paths(registry, known):
         text = _page_text(rendered_pages, wiki_root, target)
         if text is not None:
-            result[hot_root / mandatory_name(target)] = render_mandatory(text)
+            result[hot_root / mandatory_name(target)] = render_mandatory(text, registry, target)
     return result

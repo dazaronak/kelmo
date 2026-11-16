@@ -374,8 +374,9 @@ def test_corrupt_committed_generation_is_an_honest_refusal(world):
     assert '## person.md' not in context
 
 
-def tagged_person_vault(root, views=False):
-    """A store whose person page carries two exact-evidence facts, one with a status label."""
+def tagged_person_vault(root, views=False, sources=('rule-source', 'tea-source')):
+    """A store whose person page carries two exact-evidence facts, one with a status label; `sources` are their
+    source ids."""
     import registry_seed
     from kelmo.contracts import EvidenceRef
     from kelmo.service import Service
@@ -390,11 +391,12 @@ def tagged_person_vault(root, views=False):
     facts = (rule, tea)
     spec = {'facts': {item['fact_key']: item for item in facts},
             'notes': {item['note_id']: {'filename': 'source.md', 'ark_id': item['ark_id']} for item in facts}}
-    bindings = {rule['note_id']: EvidenceRef(rule['ark_id'], 1, rule['note_id'], 'rule-source'),
-                tea['note_id']: EvidenceRef(tea['ark_id'], 1, tea['note_id'], 'tea-source')}
+    bindings = {rule['note_id']: EvidenceRef(rule['ark_id'], 1, rule['note_id'], sources[0]),
+                tea['note_id']: EvidenceRef(tea['ark_id'], 1, tea['note_id'], sources[1])}
     registry_seed.seed(root, spec, evidence_bindings=bindings, pages_settings={'person.md': PAGES['person.md']},
                        protected_fact_keys=('person.rule',))
-    return [' [f:' + rule['id'] + ']', ' [f:' + tea['id'] + ']', ' [source:rule-source]', ' [source:tea-source]']
+    return [' [f:' + rule['id'] + ']', ' [f:' + tea['id'] + ']',
+            ' [source:' + sources[0] + ']', ' [source:' + sources[1] + ']']
 
 
 def untagged(text, labels):
@@ -423,6 +425,23 @@ def test_session_start_delivers_mandatory_pages_without_evidence_tags(tmp_path, 
     working = (Config.load(root).wiki / 'person.md').read_text(encoding='utf-8')
     assert all(label in working for label in labels)
     assert Service(root).graph_read('person')['content'] == working
+
+
+def test_session_start_strips_labels_whatever_the_source_id_holds(tmp_path, world_factory):
+    """A source id is any nonempty text: a legacy note name with spaces, or one holding a closing bracket. The
+    delivered person page still loses the fact and source labels of both rows."""
+    from kelmo.config import Config
+    from kelmo.wiki.pages import KnowledgeReader
+    root = tmp_path / 'odd-source-vault'
+    labels = tagged_person_vault(root, sources=('2026-10-05 person rule.md', 'odd]id'))
+    reader = KnowledgeReader(Config.load(root))
+    person = reader.page('person.md', reader.generation()).content.decode('utf-8')
+    assert all(label in person for label in labels)
+
+    context = start(SimpleNamespace(root=root))
+
+    assert f'## person.md\n\n{untagged(person, labels)}' in context
+    assert '[f:' not in context and '[source:' not in context
 
 
 def test_session_start_from_published_views_carries_no_evidence_tags(tmp_path, world_factory):
