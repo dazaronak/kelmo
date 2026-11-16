@@ -156,6 +156,25 @@ def archive_census(path):
     return sorted(set(rows))
 
 
+def visibility_census(path):
+    """Forgotten records: `[id, forgotten_at]` for every visibility marker in the archive."""
+    with _source_database(path) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'record_visibility' not in tables:
+            return []
+        return [list(row) for row in conn.execute('SELECT id, forgotten_at FROM record_visibility ORDER BY id')]
+
+
+def _added_markers(baseline, current):
+    """Ids of markers written after the cutover. A baseline from before markers were recorded has no `hidden`
+    and is never rewritten, so a marker counts there when it is later than the baseline itself."""
+    if 'hidden' in baseline:
+        known = {tuple(row) for row in baseline['hidden']}
+        return sorted(row[0] for row in current if tuple(row) not in known)
+    marked = datetime.fromisoformat(baseline['marked_at'])
+    return sorted(row[0] for row in current if datetime.fromisoformat(row[1]) > marked)
+
+
 def journal_census(path):
     """Operation identities and content digests for durable session state."""
     with _source_database(path) as conn:
@@ -625,7 +644,7 @@ def mark_cutover(control):
     baseline = {'snapshot': state['snapshot'], 'records': archive_census(config.archive),
                 'head': _git(config.knowledge_git_root, 'rev-parse', 'HEAD'),
                 'operations': census['operations'], 'action_requests': census.get('action_requests', []),
-                'session_state': census['session_state'],
+                'session_state': census['session_state'], 'hidden': visibility_census(config.archive),
                 'marked_at': _now()}
     _write_json(path, baseline)
     return baseline
@@ -651,9 +670,10 @@ def tail(control):
     current_sessions = census['session_state']
     session_tables = sorted(table for table in known_sessions.keys() | current_sessions.keys()
                             if known_sessions.get(table) != current_sessions.get(table))
+    hidden = _added_markers(baseline, visibility_census(config.archive))
     return {'records': records, 'commits': commits, 'operations': operations, 'requests': requests,
-            'session_tables': session_tables,
-            'empty': not (records or commits or operations or requests or session_tables)}
+            'session_tables': session_tables, 'hidden': hidden,
+            'empty': not (records or commits or operations or requests or session_tables or hidden)}
 
 
 def rollback_check(control):
@@ -662,8 +682,9 @@ def rollback_check(control):
     if not found['empty']:
         raise KelmoError('E_TAIL', f"Rollback would lose {len(found['records'])} record versions, "
                                   f"{len(found['commits'])} commits, {len(found['operations'])} operations and "
-                                  f"{len(found['requests'])} requests and changes in "
-                                  f"{len(found['session_tables'])} session tables after cutover; recover forward instead.")
+                                  f"{len(found['requests'])} requests, changes in "
+                                  f"{len(found['session_tables'])} session tables and "
+                                  f"{len(found['hidden'])} forgotten records after cutover; recover forward instead.")
     return found
 
 

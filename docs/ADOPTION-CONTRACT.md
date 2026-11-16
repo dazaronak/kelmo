@@ -502,9 +502,11 @@ disposition tracking, step-by-step verified import into schema-2 vaults, and tai
   raise `E_IMPORT`.
 - Cutover baseline and tail: `snapshot.mark_cutover(control)` requires verified import completion and
   writes `.import/cutover.json`, recording snapshot ID, archive record census, Git HEAD, journal
-  operations, action requests and timestamp. `snapshot.tail(control)` inspects writes accepted after
-  cutover: new archive record versions, Git commits beyond the baseline HEAD, and new or updated journal
-  operations and action requests.
+  operations, action requests, session state, visibility markers (`hidden`, the forgotten records) and
+  timestamp. `snapshot.tail(control)` inspects writes accepted after cutover: new archive record versions,
+  Git commits beyond the baseline HEAD, new or updated journal operations and action requests, changed
+  session tables, and records forgotten after the cutover (`hidden`; for a baseline without `hidden`, the
+  markers later than its timestamp).
 - Rollback prevention and forward recovery: `snapshot.rollback_check(control)` raises `KelmoError('E_TAIL', ...)`
   when any post-cutover writes exist, refusing rollback to the pre-cutover snapshot. Post-cutover
   disaster recovery uses `snapshot.forward_recover(control, snapshot, destination, roots=...)`. It
@@ -587,7 +589,6 @@ here retain the reviewed proposal names. StateAPI publication,
 full retrieval/backfill, scoped semantic publication and shared transport are
 implemented. Native isolation, installed-client delivery and deployment acceptance
 need their own target-environment receipts.
-
 
 Chunk-index maintenance is exposed through `kelmo admin backfill` and `reembed`;
 it is not run implicitly after model selection. A broker service must report
