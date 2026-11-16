@@ -24,8 +24,12 @@ DREAM_MARKER = 'dream-watch.json'
 # Set while a Dreaming run is under way; a run that finds it left over tells the owner the last one died.
 DREAM_RUNNING = 'dream-running.json'
 # How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
-# of it: the daemon's run is daily, so two runs a day apart.
-DREAM_IDLE_SECONDS = 86400
+# of it: the daemon's run is daily, so two runs a day apart, less an hour for the minutes a run starts earlier or
+# later than the day before.
+DREAM_IDLE_SECONDS = 82800
+# The lock every change of the watch file is made under: a failure told before the Dreaming lock was taken and a
+# pass's own outcome may change the file at the same time.
+DREAM_WATCH_LOCK = 'dream-watch.lock'
 # A Dreaming alert the owner's command failed to take is tried again after this long, not on every tick.
 SEND_RETRY_SECONDS = 900
 # Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
@@ -245,6 +249,20 @@ class DreamWatch(LoginWatch):
         for key in [key for key in _DREAM_SENT if key[0] == mine and (not kinds or key[1][0] in kinds)]:
             del _DREAM_SENT[key]
 
+    def _exclusive(self, work):
+        """Runs `work` (read the watch file, send, write it) holding the watch's file lock; a state directory
+        that cannot even hold the lock file still gets the alert, unlocked, rather than silence."""
+        def run():
+            try:
+                lock = self.marker.with_name(DREAM_WATCH_LOCK).open('a')
+            except OSError:
+                work()
+                return
+            with lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                work()
+        return run
+
     def ended(self):
         """The run under way ended with something to tell (its answer, a failure, the core's stop)."""
         def work():
@@ -322,7 +340,7 @@ class DreamWatch(LoginWatch):
             self._keep(records)
             if told_failure:
                 self.send(f'{self.label}: the Dreaming run completes again.')
-        self._guarded(work)
+        self._guarded(self._exclusive(work))
 
     def failed(self, code, reason, now=None):
         now = time.time() if now is None else now
@@ -344,7 +362,7 @@ class DreamWatch(LoginWatch):
             if self._send_once(('failed', code), text, now):
                 failed['told'] = {**failed['told'], code: now}
             self._keep(records)
-        self._guarded(work)
+        self._guarded(self._exclusive(work))
 
     def ran(self, now=None):
         now = time.time() if now is None else now
@@ -361,7 +379,7 @@ class DreamWatch(LoginWatch):
             if told:
                 self.send(f'{self.label}: the Dreaming run completes again; the findings pass reads '
                           'new evidence.')
-        self._guarded(work)
+        self._guarded(self._exclusive(work))
 
 
 class ExecutorWatch(LoginWatch):

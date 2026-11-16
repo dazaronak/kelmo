@@ -527,3 +527,39 @@ def test_a_daemon_failure_before_the_lock_leaves_the_start_mark_of_a_pass_that_h
         jobs._dream({'scheduled': True, 'action': 'run'})
     assert len(messages(tmp_path)) == 1, messages(tmp_path)
     assert running.exists()
+
+
+def test_the_next_daily_run_tells_a_hold_although_it_starts_a_few_minutes_earlier(tmp_path, monkeypatch):
+    # Day one's idle answer came at 03:04 (the apply before it took four minutes), day two's at 03:00:40: the
+    # hold has lasted the two daily runs the interval stands for, and day two tells it.
+    now = [START]
+    stuck = {'state': 'idle', 'waiting': 2}
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, stuck, stuck)
+    scheduled_run(jobs)
+    assert messages(tmp_path) == []
+    now[0] += DAY - 210
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+
+
+def test_the_watch_file_is_changed_by_one_teller_at_a_time(tmp_path):
+    # A failure told outside the Dreaming lock (before it was taken) and a pass's own outcome change the same
+    # watch file: each read, send and write is done under the watch's own lock, one teller at a time.
+    import fcntl
+    import threading
+    import time
+
+    from kelmo.alerts import DreamWatch
+    config = SimpleNamespace(state=tmp_path / '.state', alerts={'command': recorder(tmp_path), 'label': 'K'})
+    config.state.mkdir()
+    watch = DreamWatch.for_config(config)
+    with (config.state / 'dream-watch.lock').open('a') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        teller = threading.Thread(target=watch.failed, args=('E_X', 'broke', START))
+        teller.start()
+        time.sleep(0.5)
+        assert messages(tmp_path) == [], messages(tmp_path)
+        fcntl.flock(held, fcntl.LOCK_UN)
+    teller.join(10)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
