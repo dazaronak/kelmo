@@ -735,7 +735,15 @@ def test_execute_cleans_group_after_parent_exits(tmp_path, successful):
         assert raised.value.code == 'E_EXECUTOR'
     child_pid = int(pid_file.read_text())
     try:
-        __import__('time').sleep(1)
+        # No fixed wait: the child is gone within the deadline, so it can never write its file later.
+        end = __import__('time').monotonic() + 5
+        while True:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            assert __import__('time').monotonic() < end, 'the child outlived its parent group'
+            __import__('time').sleep(0.02)
         assert not survived.exists()
     finally:
         try:
