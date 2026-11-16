@@ -203,3 +203,21 @@ def test_a_write_that_cannot_get_the_outbox_in_time_is_refused_as_busy(edge, mon
 
     assert isinstance(refused, KelmoError)
     assert (refused.code, refused.retryable) == ('E_BUSY', True)
+
+
+def test_a_waiter_woken_after_its_deadline_gives_up_though_the_lock_is_free(monkeypatch):
+    """The holder lets go just as the waiter's deadline passes: the waiter wakes to a free lock, too late. The
+    clock is the test's, so the moment is exact."""
+    import kelmo.core.edge_core as edge_core
+
+    lock = OwnerLock()
+    arrived = count_waits(lock, monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(edge_core.time, 'monotonic', lambda: clock[0])
+    lock.acquire()
+    waiter = call_in_thread(take, lock, timeout=1.0)
+    assert arrived.acquire(timeout=5)
+    clock[0] = 101.5  # its deadline (101.0) passed while it waited
+    lock.release()
+
+    assert waiter() is False

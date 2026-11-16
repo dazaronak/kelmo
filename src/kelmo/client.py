@@ -68,6 +68,11 @@ def utc_now():
     return datetime.now(UTC).isoformat(timespec='microseconds')
 
 
+_RLOCK = type(threading.RLock())
+# Cuts after which a keyed write is refused instead of sent again under its key.
+CUT_LIMIT = 3
+
+
 class Unbound(KelmoError):
     """No server verdict on this request: the launcher, the channel, hello, the authority pin, or a reply
     bound to no request. A queued write is never settled by one; it stays pending under its key."""
@@ -168,6 +173,10 @@ def _serial(method):
     return guarded
 
 
+# What a failed read names when it knows no channel of its own: `_drop` then leaves the current one alone.
+_NO_CHANNEL = object()
+
+
 class Outbox:
     """The durable local queue; an entry exists before any byte is sent."""
 
@@ -180,11 +189,17 @@ class Outbox:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA synchronous=FULL')
         with self.conn:
+            # Another process may be opening the same older outbox: the schema is read and brought up to date
+            # under one write lock, so a column is added once.
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS entries (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
                 op TEXT NOT NULL, args TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at TEXT NOT NULL,
                 settled_at TEXT, outcome TEXT)''')
+            # How often kelmod's channel ended under an entry after it was sent (`SharedClient._deliver`).
+            if 'cuts' not in {row[1] for row in self.conn.execute('PRAGMA table_info(entries)')}:
+                self.conn.execute('ALTER TABLE entries ADD COLUMN cuts INTEGER NOT NULL DEFAULT 0')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS transcripts (
                 provider TEXT NOT NULL, native_id TEXT NOT NULL, file_identity TEXT NOT NULL,
                 size INTEGER NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY (provider, native_id))''')
@@ -294,6 +309,13 @@ class Outbox:
     def attempt(self, key):
         with self.conn:
             self.conn.execute('UPDATE entries SET attempts=attempts+1 WHERE idempotency_key=?', (key,))
+
+    @_serial
+    def cut(self, key):
+        """Counts one more cut under the entry and returns the count."""
+        with self.conn:
+            self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
+        return self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
 
     @_serial
     def note(self, key, code):
@@ -898,7 +920,8 @@ def _sealed(record, key, authority_id):
 
 
 class Busy(KelmoError):
-    """The owner of the outbox did not free it within the caller's deadline; nothing was done."""
+    """The owner of the outbox did not free it within the caller's deadline. Nothing was done, unless the
+    message names what was."""
 
     def __init__(self, message):
         super().__init__('E_BUSY', message)
@@ -907,6 +930,20 @@ class Busy(KelmoError):
 
 # How long a client that found a kelmo-client/1 server waits before it offers kelmo/2 again.
 LEGACY_RETRY_SECONDS = 300
+# A read cut under it reconnects for at most this long, pausing 0.25 s, then doubling up to 2 s between tries.
+RECONNECT_SECONDS = 15.0
+RECONNECT_FIRST_PAUSE = 0.25
+RECONNECT_LAST_PAUSE = 2.0
+
+
+def _replayable_read(op):
+    """Whether a request that went through `call` may be sent again after a cut: only an operation the
+    server's table marks as a read (some, such as `reconcile`, go through `call` and still write) and the
+    state core does not run as a write (`graph_rebuild` rewrites the graph index)."""
+    from .core.operations import REPLAY_READ, by_name
+    from .core.state_core import WRITES
+    found = by_name().get('state.' + op)
+    return found is not None and found.replay == REPLAY_READ and op not in WRITES
 
 
 class SharedClient:
@@ -990,6 +1027,10 @@ class SharedClient:
         finally:
             self._deadline = previous
 
+    def time_left(self):
+        """Seconds left before the active deadline, not capped by the profile timeout; None without one."""
+        return None if self._deadline is None else max(0.0, self._deadline - time.monotonic())
+
     def remaining(self):
         """Seconds left before the active deadline (the profile timeout without one); refused at zero."""
         if self._deadline is None:
@@ -1071,7 +1112,7 @@ class SharedClient:
         if not isinstance(error.get('code'), str) or type(error.get('retryable')) is not bool:
             raise Unbound('E_TRANSPORT', 'The refusal names no server code or retryability.')
         return False, {'code': error['code'], 'message': str(error.get('message', '')),
-                       'retryable': error['retryable']}
+                       'retryable': error['retryable'], 'cut': error.get('cut') is True}
 
     def _connect(self):
         # One thread connects; the others wait for its channel instead of starting their own.
@@ -1108,13 +1149,53 @@ class SharedClient:
 
     def call(self, op, args=None):
         """A read: no outbox, and a transport failure is reported, never answered from the cache. Over a
-        channel that carries several requests it does not wait for the owner of the outbox."""
+        channel that carries several requests it does not wait for the owner of the outbox.
+
+        A read whose channel fails under it (the server's kelmod restarting, the bridge to it cut) is sent
+        once more within the active deadline: a read has no effect to repeat. Reconnecting starts the
+        profile's command again, so it is tried with a growing pause for at most RECONNECT_SECONDS."""
+        limit = time.monotonic() + self.remaining()
+        try:
+            return self._read_once(op, args)
+        except KelmoError as error:
+            if (isinstance(error, Unsent) or error.code != 'E_TRANSPORT' or time.monotonic() >= limit
+                    or not _replayable_read(op)):
+                raise
+            failed = error
+        # Only the channel this read failed on: another thread may already have opened the next one.
+        self._drop(getattr(failed, 'channel', None) or _NO_CHANNEL)
+        window, pause = min(limit, time.monotonic() + RECONNECT_SECONDS), RECONNECT_FIRST_PAUSE
+        while True:
+            try:
+                with self.deadline(window - time.monotonic()):
+                    self._connect()
+                break
+            except Unbound as error:
+                if error.code != 'E_TRANSPORT':  # a refusal (another authority, a bad profile) stays one
+                    raise
+                failed = error
+                if time.monotonic() + pause >= window:
+                    raise failed from None
+                self.pause(pause)
+                pause = min(pause * 2, RECONNECT_LAST_PAUSE)
+        with self.deadline(limit - time.monotonic()):
+            return self._read_once(op, args, resend=True)
+
+    def _read_once(self, op, args, resend=False):
         if self._multiplex:
             channel = self._connect()
             if getattr(channel, 'concurrent', False):
                 return self._read(op, args, channel)
-        with self._lock:
+        if not resend or not isinstance(self._lock, _RLOCK):  # the edge core's gate bounds its own wait
+            with self._lock:
+                return self._read(op, args)
+        # The resend waits for another request only until the deadline the first try left it.
+        if not self._lock.acquire(timeout=self.remaining()):
+            raise Unsent('E_TRANSPORT', 'The deadline passed while another request held the shared client.')
+        try:
             return self._read(op, args)
+        finally:
+            self._lock.release()
 
     def _read(self, op, args, channel=None):
         try:
@@ -1127,7 +1208,9 @@ class SharedClient:
             raise
         if ok:
             return value
-        raise KelmoError(value['code'], value['message'])
+        refused = KelmoError(value['code'], value['message'])
+        refused.channel = channel  # SharedClient.call drops this channel, and only this one, before a resend
+        raise refused
 
     def submit(self, op, args, key):
         """Persist first, then deliver everything queued in order; report this entry's state."""
@@ -1206,7 +1289,23 @@ class SharedClient:
                 self.outbox.settle(key, 'delivered', value)
                 delivered += 1
                 continue
-            if value['retryable']:
+            if value['cut']:
+                # The bridge lost its server after the write was sent and ended: the next pass opens a new
+                # bridge and sends it again under its key. A write that ends the channel every time it is
+                # delivered would hold every write behind it, so on its CUT_LIMIT-th cut it is refused with its
+                # effect unknown, as a cut write was before.
+                self._drop(channel)
+                if self.outbox.cut(key) < CUT_LIMIT:
+                    self.outbox.note(key, value['code'])
+                    stopped = value['code']
+                    break
+                value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is not sent '
+                                            'again.')
+            elif value['retryable']:
+                if value['code'] == 'E_TRANSPORT':
+                    # The bridge may have lost its server and ended: the next pass opens a new one. A server's
+                    # own retryable E_TRANSPORT is no cut and leaves the write pending.
+                    self._drop(channel)
                 self.outbox.note(key, value['code'])
                 stopped = value['code']
                 break
@@ -1537,7 +1636,14 @@ class ClientService:
                 if ((not following['terminal'] or (following['state'] == 'failed'
                                                    and following.get('error_code') == 'E_BUSY'))
                         and following['state'] != 'captured'):
-                    self.client.pause(max(0, min(0.25, limit - time.monotonic())))
+                    try:
+                        self.client.pause(max(0, min(0.25, limit - time.monotonic())))
+                    except Busy as error:
+                        if limit - time.monotonic() <= 0:
+                            continue  # the wait's own deadline ended it: reported as a timed-out wait
+                        raise Busy(f'{error} Operation {operation["id"]} was accepted; kelmo trace '
+                                   f'{operation["id"]} shows it, and the same command again reuses its '
+                                   'idempotency key.') from error
 
     def _capture(self, content, filename, role, intent, idempotency_key, supersedes):
         if intent not in ('archive', 'promote'):

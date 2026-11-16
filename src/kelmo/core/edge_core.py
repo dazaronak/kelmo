@@ -69,6 +69,8 @@ class OwnerLock:
                     if left is not None and left <= 0:
                         return False
                     self._condition.wait(left)
+                    if end is not None and time.monotonic() >= end:
+                        return False  # woken too late: a lock freed after the deadline is not taken
                 self._holder, self._count, self._last_urgent = me, 1, urgent
                 return True
             finally:
@@ -84,6 +86,11 @@ class OwnerLock:
                 return False
             self._holder, self._count = threading.get_ident(), 1
             return True
+
+    def held(self):
+        """How many times the calling thread holds the lock: 0 when another thread or nobody does."""
+        with self._condition:
+            return self._count if self._holder == threading.get_ident() else 0
 
     def release(self):
         with self._condition:
@@ -129,7 +136,6 @@ class EdgeCore:
         self._owner = OwnerLock()
         self._urgent = threading.local()
         self.client._lock = _OwnerGate(self)
-        self._depth = threading.local()
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.client.pause = self._pause
@@ -146,12 +152,12 @@ class EdgeCore:
         from ..client import Busy
         if not self._owner.acquire(timeout=max(0.0, seconds), urgent=urgent):
             raise Busy('The edge core is busy with another write; retry.')
-        self._depth.count = getattr(self._depth, 'count', 0) + 1
         try:
             yield self.client
         finally:
-            self._depth.count -= 1
-            self._owner.release()
+            # A pause that could not take the outbox back left this thread holding nothing.
+            if self._owner.held():
+                self._owner.release()
 
     @contextmanager
     def serving(self, context, cap=None, urgent=False):
@@ -196,15 +202,40 @@ class EdgeCore:
         return {'acknowledged': True}
 
     def _pause(self, seconds):
-        """A wait between polls (`memory_create --wait`) gives the client to other callers meanwhile."""
-        depth = getattr(self._depth, 'count', 0)
+        """A wait between polls (`kelmo create --wait`) gives the outbox to other callers meanwhile and takes it
+        back before the call's deadline, or fails as busy. A tool call holds nothing across its wait, so it lends
+        nothing and takes nothing back."""
+        from ..client import Busy
+        depth = self._owner.held()
+        if not depth:
+            time.sleep(seconds)
+            return
         for _ in range(depth):
             self._owner.release()
         try:
-            time.sleep(seconds)
+            time.sleep(max(0.0, min(seconds, self._left())))
         finally:
-            for _ in range(depth):
+            left = self._left()
+            # With nothing left, even a free outbox is not taken: the next poll would run past the deadline.
+            if left <= 0 or not self._owner.acquire(timeout=left, urgent=getattr(self._urgent, 'value', False)):
+                raise Busy('The edge core stayed busy past this call\'s deadline while it waited between polls.')
+            if self._left() <= 0:
+                # Taken back after the deadline (the thread was held up before it asked): give it back.
+                self._owner.release()
+                raise Busy('The edge core gave the outbox back too late for this call\'s deadline.')
+            for _ in range(depth - 1):
                 self._owner.acquire()
+
+    def _left(self):
+        """Seconds left before the nearest deadline of this thread's call (the request's, or a wait's inside it),
+        not capped by the profile timeout as `remaining()` is."""
+        left = self.client.time_left()
+        if left is not None:
+            return left
+        try:  # no deadline on this thread: the profile timeout bounds it
+            return self.client.remaining()
+        except KelmoError:
+            return 0.0
 
     # --- delivery --------------------------------------------------------------------------------------
 

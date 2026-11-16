@@ -60,6 +60,40 @@ entry here.
   store with generated views keeps delivering the files it has until its next publication rewrites them, and
   a cache written before the upgrade can still show the labels while the server is unreachable. A
   `mandatory.md` that now fits the hook limit arrives whole instead of as a pointer.
+- `kelmo create --wait` and `kelmo add --wait` run by the edge daemon no longer wait without limit between
+  their polls. Such a command lends the outbox to other callers while it waits, and it took the outbox back
+  with no deadline, so it could hang behind another writer. It now takes it back before its wait ends. When
+  `--wait-timeout` ends first, the command answers `wait_timed_out` with the operation, as documented, even
+  while another writer holds the outbox; before, the wait went on until the writer let go. When the daemon's
+  deadline for the call ends first (it gives a `--wait` command 900 seconds, so this takes a longer
+  `--wait-timeout`), the command fails with `E_BUSY` and names the operation the server already accepted.
+  Running the same command again reuses its idempotency key, so the note is not captured twice.
+- A note delivered while the server's kelmod restarts is no longer lost. `kelmod attach` refused a request
+  that was sent and then cut as final, even when it carried an idempotency key, so the client's outbox
+  settled the note as refused for good. The refusal now marks a keyed request as cut: the note stays pending
+  and the next flush sends it again under the same key. On its third cut it is refused with its effect
+  unknown, so a note whose delivery `kelmod attach` reports cut every time cannot hold the notes behind it.
+  This counting covers a shared client that reaches the server without the edge daemon; through the edge
+  daemon a cut note was already sent again, and its cuts are not counted yet, nor is a bridge process that
+  dies or times out under a note. Only a cut counts: a retryable refusal the server
+  itself gives leaves the note pending however often it comes. The mark comes from the server's `kelmod
+  attach`, so the server needs this release too: with an older server a cut note is refused at once, as before,
+  and so it is for a client from before this release, which does not read the mark. A request without a key is still refused, with its
+  effect reported as unknown.
+- A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
+  server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
+  doubling the pause up to 2 seconds.
+  A request that writes, such as `reconcile` or `graph rebuild`, is not sent again.
+- A call from the installed CLI to the local daemon follows kelmod's replay rule when kelmod drops the
+  socket. A call cut before it was sent goes once more within the deadline, and so does one cut after it was
+  sent when it changes nothing (a daemon status or scheduler read, or a command a fenced server still runs,
+  such as `search`, `show` or `status`), or when it is a `create`, `add` or `promote` that carries
+  `--idempotency-key`, which the server settles once. Any other command cut after it was sent fails at once
+  with `E_TRANSPORT` and its effect reported as unknown, on the second attempt as on the first. The resend
+  tries to reconnect for at most 15 seconds, and the whole call stays inside its deadline; a daemon that takes
+  no connection in that time ends the call with `E_TRANSPORT`.
+  A connection the daemon does not take in time, and a hello it never answers, are now `E_TRANSPORT` with
+  nothing sent, not `E_DEADLINE`, so `kelmo dream` no longer reports a pass running that was never asked for.
 
 ## [0.3.1] - 2026-11-15
 

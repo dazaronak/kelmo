@@ -403,6 +403,9 @@ async fn v1_request(
         }
     };
     let call_id = id(counter);
+    // A request under a key is settled at most once by the server's request ledger, so after a cut its
+    // client may send it again under the same key; one without a key may have taken effect.
+    let keyed = key.is_some();
     let mut header = json!({"v": 2, "kind": "call", "id": call_id, "op": "state.client_request",
                             "body_type": "json", "deadline_ms": V1_DEADLINE.as_millis() as u64});
     if let Some(key) = key {
@@ -438,13 +441,17 @@ async fn v1_request(
                     ));
                 }
                 Err(_) => {
-                    // Sent and unanswered: whether it took effect is unknown.
-                    let refusal = v1_refusal(
+                    // Sent and unanswered: whether it took effect is unknown. Not retryable, as before cuts
+                    // were counted: a client that reads `retryable` alone refuses it once instead of sending
+                    // a write that cuts every time without end. `cut` tells a client that counts cuts that
+                    // the bridge lost the daemon; only a keyed request may go again under its key.
+                    let mut refusal = v1_refusal(
                         request_id,
                         "E_TRANSPORT",
                         "The daemon closed the channel; the effect of the request is unknown.",
                         false,
                     );
+                    refusal["error"]["cut"] = Value::Bool(keyed);
                     return Outcome::End(Some(refusal), 1);
                 }
             },
