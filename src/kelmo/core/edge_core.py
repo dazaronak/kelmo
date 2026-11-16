@@ -210,6 +210,10 @@ class EdgeCore:
             # With nothing left, even a free outbox is not taken: the next poll would run past the deadline.
             if left <= 0 or not self._owner.acquire(timeout=left, urgent=getattr(self._urgent, 'value', False)):
                 raise Busy('The edge core stayed busy past this call\'s deadline while it waited between polls.')
+            if self._left() <= 0:
+                # Taken back after the deadline (the thread was held up before it asked): give it back.
+                self._owner.release()
+                raise Busy('The edge core gave the outbox back too late for this call\'s deadline.')
             for _ in range(depth - 1):
                 self._owner.acquire()
 

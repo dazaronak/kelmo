@@ -300,6 +300,33 @@ def test_a_take_back_woken_after_the_deadline_fails_busy(profile, monkeypatch):
     assert client.polls == 1
 
 
+def test_a_take_back_that_reaches_a_free_outbox_after_the_deadline_fails_busy(profile, monkeypatch):
+    """The pause read time left, then the command thread was held up before it asked for the outbox, past the
+    deadline. The outbox is free by then, but taking it would send the next poll past the deadline: the command
+    gives it back and fails as busy, naming the accepted operation."""
+    with edge_core(profile) as (core, client):
+        real = core._owner.acquire
+        delayed = []
+
+        def late(*args, **kwargs):
+            if client.polls >= 1 and not delayed:  # the take-back after the first poll
+                delayed.append(True)
+                time.sleep(2.3)  # past the 2.0 s deadline
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(core._owner, 'acquire', late)
+        try:
+            result = create_wait(core, 2.0)
+        except KelmoError as error:
+            result = error
+        assert delayed, 'the command never took the outbox back'
+        assert (core._owner._holder, core._owner._count) == (None, 0)
+
+    assert isinstance(result, KelmoError) and result.code == 'E_BUSY', result
+    assert OPERATION in str(result)
+    assert client.polls == 1
+
+
 def test_a_wait_timeout_bounds_the_wait_while_the_outbox_is_held(profile):
     """`--wait-timeout` limits the wait (docs/USAGE.md): a held outbox does not stretch it."""
     with edge_core(profile) as (core, client):
