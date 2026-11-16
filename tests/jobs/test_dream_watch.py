@@ -696,3 +696,46 @@ def test_a_clock_set_back_before_the_first_stuck_alert_delays_it_by_one_interval
     watch.idle(2, now=back, since=since)
     watch.idle(2, now=back + DAY, since=since)
     assert len(messages(tmp_path)) == 1, messages(tmp_path)
+
+
+def _refusing_command(tmp_path):
+    script = tmp_path / 'refusing_alert.py'
+    script.write_text('import sys\nsys.exit(1)\n')
+    return [sys.executable, str(script)]
+
+
+@pytest.mark.parametrize('completion', ['finished', 'idle with notes waiting', 'idle with nothing waiting'])
+def test_a_failure_the_command_never_took_is_told_when_the_run_completes(tmp_path, completion):
+    from datetime import UTC, datetime
+    watch = _watch(tmp_path, _refusing_command(tmp_path))
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.argv = recorder(tmp_path)
+    if completion == 'finished':
+        watch.ran(START + 900)
+    elif completion == 'idle with notes waiting':
+        watch.idle(2, now=START + 900, since=datetime.fromtimestamp(START, UTC).isoformat())
+    else:
+        watch.idle(0, now=START + 900)
+    told = messages(tmp_path)
+    assert len(told) == 1, told
+    assert 'E_EXECUTOR' in told[0] and 'did not go out' in told[0] and 'completes again' in told[0], told
+
+
+def test_a_held_cursor_alert_the_command_never_took_is_told_when_the_run_completes(tmp_path):
+    from datetime import UTC, datetime
+    watch = _watch(tmp_path, _refusing_command(tmp_path))
+    watch.idle(2, now=START, since=datetime.fromtimestamp(START - 2 * DAY, UTC).isoformat())
+    watch.argv = recorder(tmp_path)
+    watch.ran(START + 900)
+    told = messages(tmp_path)
+    assert len(told) == 1, told
+    assert 'read nothing' in told[0] and 'did not go out' in told[0] and 'completes again' in told[0], told
+
+
+def test_a_hold_that_ends_before_its_alert_was_due_tells_nothing(tmp_path):
+    # Seen 23 hours into its hold, over by the next run two hours later: no alert was ever due, so none is missed.
+    from datetime import UTC, datetime
+    watch = _watch(tmp_path)
+    watch.idle(2, now=START, since=datetime.fromtimestamp(START - 23 * 3600, UTC).isoformat())
+    watch.ran(START + 2 * 3600)
+    assert messages(tmp_path) == []

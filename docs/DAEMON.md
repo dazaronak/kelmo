@@ -130,8 +130,11 @@ reached the archive, then once a calendar day. An idle pass with nothing waiting
 a quiet vault and tells nothing. The first run that completes after an alert sends
 one message that it is over; after an idle pass with nothing waiting, it says no
 note waits behind the cursor any more. An alert the command fails to take is sent
-again with the next failure or idle answer, no sooner than 15 minutes later. The
-marker is `dream-watch.json` in the state directory.
+again with the next failure or idle answer; the daemon waits at least 15 minutes
+between such tries, and a timer tries once in each of its runs. When a run
+completes after a failure or a held cursor whose alert never went out, its one
+message names what was missed. The marker is `dream-watch.json` in the state
+directory.
 
 Wiki/Git persistence errors use the same bounded retry path as other resolution
 failures. A dirty managed page stays untouched, the operation remains visible,
