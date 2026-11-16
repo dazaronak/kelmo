@@ -33,6 +33,8 @@ COUNT = re.compile(r'(\d+) (failed|passed|skipped|errors?|xfailed|xpassed|warnin
 REPORT = re.compile(r'^(?:FAILED|ERROR|SUBFAILED|SKIPPED|XFAIL|XPASS)\b')
 ORDER = ('failed', 'passed', 'skipped', 'error', 'xfailed', 'xpassed', 'warning', 'deselected')
 OUTCOMES = ('failed', 'passed', 'skipped', 'error', 'xfailed', 'xpassed')
+# PY_COLORS or FORCE_COLOR make pytest colour its lines; the patterns above read them without the colour codes.
+COLOUR = re.compile(r'\x1b\[[0-9;]*m')
 
 
 def width():
@@ -102,7 +104,7 @@ def run_shard(index, ids, options):
         code = subprocess.call([sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider', *options, '--', *ids],
                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
         out.seek(0)
-        return index, code, out.read()
+        return index, code, COLOUR.sub('', out.read())
 
 
 def main(args):
@@ -137,7 +139,7 @@ def main(args):
             done += min(len(shards[index]), sum(found.get(key, 0) for key in OUTCOMES))
             print('progress: shard %d of %d ended with exit %d, %d of %d cases done'
                   % (index + 1, count, code, done, len(ids)), flush=True)
-    total, reports, failed = {}, [], False
+    total, reports, failed, unreported = {}, [], False, 0
     for index, code, text in sorted(results):
         found = counts(text)
         if code != 0:
@@ -151,11 +153,12 @@ def main(args):
             reports.append('ERROR shard %d of %d ended without a pytest summary (exit %d): %s'
                            % (index + 1, count, code, tail))
             total['error'] = total.get('error', 0) + 1
+            unreported += 1  # that error stands for the shard, not for one of its cases
             continue
         for key, value in found.items():
             total[key] = total.get(key, 0) + value
         reports.extend(line for line in text.splitlines() if REPORT.match(line))
-    ran = sum(total.get(key, 0) for key in OUTCOMES)
+    ran = sum(total.get(key, 0) for key in OUTCOMES) - unreported
     if ran < len(ids):
         # Every dealt id is one collected item, and each item ends as one of these outcomes at least once.
         failed = True

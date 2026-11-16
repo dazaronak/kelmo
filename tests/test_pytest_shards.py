@@ -56,6 +56,22 @@ class PytestShardsTests(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn('report 3 outcome(s) for the 4 case(s) they were dealt: 1 never ran', done.stdout)
 
+    def test_a_shard_killed_before_its_cases_ran_counts_every_one_of_them_as_never_run(self):
+        """Round robin over two shards deals test_a and test_c to the first; it dies before either runs."""
+        (self.root / 'conftest.py').write_text(
+            'import os\n'
+            'def pytest_collection_modifyitems(config, items):\n'
+            '    if not config.option.collectonly and any(item.name == "test_a" for item in items):\n'
+            '        os._exit(9)\n')
+        done = self.shards(width='2')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn('report 2 outcome(s) for the 4 case(s) they were dealt: 2 never ran', done.stdout)
+
+    def test_coloured_pytest_output_still_gives_a_summary(self):
+        done = self.shards(width='2', PY_COLORS='1')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(done.stdout.splitlines()[-1].startswith('4 passed in '), done.stdout)
+
     def test_an_option_whose_value_is_the_next_argument_keeps_it(self):
         done = self.shards('--deselect', 'test_four.py::test_a')
         self.assertEqual(done.returncode, 0, done.stdout)
