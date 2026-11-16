@@ -8,6 +8,8 @@ import socket
 import threading
 import uuid
 
+import pytest
+
 from archive_core_support import Peer
 
 from kelmo.core import wire
@@ -192,5 +194,51 @@ def test_a_frame_the_core_cannot_decode_ends_the_channel_as_a_stop_not_a_crash(c
         assert raised == [], raised
         assert asked.is_set()
         assert 'E_LIMIT' in capfd.readouterr().err
+    finally:
+        parent.close()
+
+
+def _raw_frame(header, body_bytes):
+    import json
+    import struct
+    head = json.dumps(header).encode()
+    payload = struct.pack('>H', len(head)) + head + body_bytes
+    return struct.pack('>I', len(payload)) + payload
+
+
+@pytest.mark.parametrize('shape', ['unhashable body type', 'unhashable kind', 'nested past the recursion limit'])
+def test_a_frame_whose_header_or_body_breaks_the_decoder_ends_the_channel_as_a_stop(capfd, shape):
+    """Inside the frame bound, a header field of the wrong JSON type or a body nested deeper than the decoder can go
+    is refused like any other bad frame: the owner is asked to stop and `serve` returns."""
+    header, _ = wire.decode(wire.encode(*wire.reply(uuid.uuid4().hex, {})))
+    body = b'{}'
+    if shape == 'unhashable body type':
+        header['body_type'] = {}
+    elif shape == 'unhashable kind':
+        header['kind'] = []
+    else:
+        body = b'[' * 100_000 + b']' * 100_000
+    parent, child = socket.socketpair()
+    asked, raised = threading.Event(), []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = asked.set
+
+    def run():
+        try:
+            link.serve()
+        except BaseException as error:  # noqa: BLE001 - the test asserts that nothing escapes
+            raised.append(error)
+
+    serving = threading.Thread(target=run, daemon=True)
+    serving.start()
+    peer = Peer(parent)
+    try:
+        peer.frame()  # hello
+        parent.sendall(_raw_frame(header, body))
+        serving.join(30)
+        assert not serving.is_alive()
+        assert raised == [], raised
+        assert asked.is_set()
+        assert 'E_PROTOCOL' in capfd.readouterr().err
     finally:
         parent.close()
