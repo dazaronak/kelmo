@@ -46,7 +46,8 @@ APPLY_NO_PROGRESS_SECONDS = 7200
 APPLY_RESUME_SECONDS = 60
 APPLY_QUICK_RESUMES = 2
 # A daily Dreaming run that did not complete (it failed, or the core died under it) is tried again after
-# DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day; one the core's stop ended costs no try.
+# DREAM_RETRY_SECONDS from its end, at most DREAM_TRIES times a day. One the core's stop ended, one that met a
+# usage limit and one that failed before it started cost no try; the last two still wait DREAM_RETRY_SECONDS.
 DREAM_TRIES = 3
 DREAM_RETRY_SECONDS = 900
 # Answers of a started daily run that complete the day; answers that give the try back.
