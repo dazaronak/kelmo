@@ -83,6 +83,9 @@ class OwnerLock:
                     if left is not None and left <= 0:
                         return False
                     self._condition.wait(left)
+                    # Woken after its time ran out: it gave up, and the turn is for those still within theirs.
+                    if end is not None and time.monotonic() >= end:
+                        return False
                 self._holder, self._count, self._last_urgent = me, 1, urgent
                 return True
             finally:
