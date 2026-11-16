@@ -191,6 +191,8 @@ class StateCore:
         self._spool = None
         self._spool_lock = threading.Lock()
         self._spool_again = False
+        # The channel's draining event (CoreLink sets it when admin.stop arrives, before it asks the core to stop).
+        self._draining = None
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.profile_path = Path(profile_path) if profile_path is not None else None
@@ -482,11 +484,10 @@ class StateCore:
         a hook that fails otherwise stays for the next pass (the next start, or the next hook served)."""
         from . import spool
         from .instance import state_dir
-        from .. import stopping
         names = spool.entries(state_dir(self.root) / 'hook-spool')
         ingested = 0
         for path in names:
-            if stopping.requested():
+            if self._told_to_stop():
                 return {'ingested': ingested, 'stopped': 'stopping'}
             try:
                 body = json.loads(path.read_text(encoding='utf-8'))
@@ -499,10 +500,15 @@ class StateCore:
             try:
                 self.serve_hook(body)
             except KelmoError as error:
-                if stopping.requested():
+                if self._told_to_stop():
                     # The stop caused it (the archive no longer answers): the capture stays for the next pass.
                     return {'ingested': ingested, 'stopped': 'stopping'}
-                if not getattr(error, 'retryable', False) and error.code not in ('E_BUSY',):
+                retryable = getattr(error, 'retryable', None)
+                if not isinstance(retryable, bool):
+                    # The same verdict a caller of the hook gets for this code (CoreLink._run).
+                    from ..server import RETRYABLE
+                    retryable = error.code in RETRYABLE
+                if not retryable and error.code != 'E_BUSY':
                     spool.reject(path)
                     continue
                 return {'ingested': ingested, 'stopped': error.code}
@@ -603,12 +609,17 @@ class StateCore:
         if spool is not None:
             spool.join()
 
+    def _told_to_stop(self):
+        """The core's stop flag, or the channel already draining: admin.stop marks the channel before the drain
+        thread asks the core to stop, and no spool pass starts or goes on in between."""
+        from .. import stopping
+        return stopping.requested() or (self._draining is not None and self._draining.is_set())
+
     def start_spool(self):
         """Applies the captures spooled while no daemon ran, beside serving. One pass at a time, none once the
         core is stopping."""
-        from .. import stopping
         with self._spool_lock:
-            if stopping.requested():
+            if self._told_to_stop():
                 return
             if self._spool is not None and self._spool.is_alive():
                 # The running pass listed the spool already: it lists it again before it ends.
@@ -621,11 +632,10 @@ class StateCore:
     def _spool_passes(self):
         """Passes over the spool until no hook asked for one while the last ran. A pass that stopped early (the
         core stopping, a busy journal) ends them: the captures it left wait for the next hook served."""
-        from .. import stopping
         while True:
             result = self.ingest_spool()
             with self._spool_lock:
-                if not self._spool_again or 'stopped' in result or stopping.requested():
+                if not self._spool_again or 'stopped' in result or self._told_to_stop():
                     self._spool_again = False
                     # Done under the lock: a hook served from here on starts a new pass rather than asking this
                     # one, which no longer looks.
@@ -702,6 +712,7 @@ def main(argv=None):
                      archive_link=link if args.archive_core else None)
     link.handlers, link.trim, link.status = core.handlers(), core.trim, core.status
     link.recycle, link.begin_stop, link.wait_stopped = core.recycle, core.begin_stop, core.wait_stopped
+    core._draining = link._draining
     link.operations = sorted(link.handlers)
     if stopping.requested():
         core.begin_stop()  # the stop came while the core was starting

@@ -234,3 +234,47 @@ def test_a_capture_spooled_during_a_pass_is_ingested_after_a_hook_served_meanwhi
         time.sleep(0.05)
     assert list(spool.iterdir()) == [], 'the capture spooled during the pass still waits for the next start'
     assert served == ['live', 'again', 'first', 'late'], served
+
+
+def test_a_core_whose_channel_was_told_to_stop_starts_no_spool_pass_after_a_hook(world_factory, core_factory):
+    """admin.stop marks the channel draining before the core's own stop flag is set: a hook served in between
+    starts no pass either, and the capture stays for the next start."""
+    import threading
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+    core._draining = threading.Event()
+    core._draining.set()
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    assert core._spool is None
+    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']
+
+
+def test_a_spooled_capture_refused_as_retryable_stays_for_the_next_pass(world_factory, core_factory):
+    """A capture whose transcript read ran out of time (E_CAPTURE_RETRY) is retryable: the pass stops on it and the
+    file stays in the spool, instead of being set aside as bad."""
+    import time
+
+    from kelmo.errors import KelmoError
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    serve_hook = core.serve_hook
+
+    def slow_transcript(body):
+        if body['payload'].get('order') == 'slow':
+            raise KelmoError('E_CAPTURE_RETRY', 'Synthetic transcript read over its time.')
+        return serve_hook(body)
+
+    core.serve_hook = slow_transcript
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('slow'))
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    limit = time.monotonic() + 10
+    while core._spool is not None and time.monotonic() < limit:
+        time.sleep(0.05)
+    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']

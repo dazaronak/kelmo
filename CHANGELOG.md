@@ -10,7 +10,9 @@ entry here.
 
 - A session capture that `kelmod hook` spooled while the daemon was running, because no reply came in time, no
   longer waits for the next start of the state core. The next hook the core serves starts a pass over the spool,
-  one pass at a time, and none once the core is stopping.
+  one pass at a time, and none once the core is told to stop. A spooled capture refused for a reason a caller
+  may retry, such as a transcript that took too long to read, now stays in the spool for the next pass; it was
+  set aside as `.bad` and its session job was never queued.
 
 ## [0.3.1] - 2026-11-15
 
