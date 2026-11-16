@@ -36,6 +36,19 @@ the findings pass reads the pages the notes changed, then runs the bounded
 findings pass; its result carries the apply report under `apply`. Both honour
 the pause and the quota deadline.
 
+The findings pass reads evidence in the order notes reached the archive, not the
+order they were captured. Its cursor is the journal position of the first
+archive event of the last note a finished pass read. A note still on its way to
+the archive, or one that rests captured and is never archived, holds nothing
+back: the first pass after it is archived reads it. A finished pass never reads
+a note again, and a pass with nothing new answers `idle`. A pass that fails,
+defers or stops keeps the cursor, so the next pass reads the same evidence. A
+forgotten or purged record is passed. A cursor written by Kelmo 0.3.1 is
+converted on the first pass after the upgrade: what that build read is not read
+again, and what it had not reached is read, including a note it passed because
+the note had failed and that was archived later. The 0.3.1 build cannot read
+the converted cursor.
+
 `apply` keeps capture order. It takes only notes captured before the pass began,
 waits for an older create note still on its way to the editor (queued, or failed
 on a cause the worker retries) and retries a note that met another writer's lock

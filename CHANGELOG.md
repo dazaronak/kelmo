@@ -6,6 +6,17 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The findings pass of `kelmo dream run` reads evidence again when a capture rests in `captured`. Its cursor
+  followed capture time and stopped at the first note not yet archived, so one collector capture that is never
+  archived held it for good and every pass answered `idle`. The pass now reads notes in the order they reached
+  the archive, so a note still on its way holds nothing back and is read by the first pass after it is
+  archived. A finished pass never reads a note twice. A forgotten or purged record no longer fails the pass:
+  it is passed. A cursor written by 0.3.1 is converted on the first pass: what 0.3.1 read is not read again,
+  and the notes it had not reached are read, one window of `--max-sources` per pass. After that pass a 0.3.1
+  build cannot read the cursor.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
