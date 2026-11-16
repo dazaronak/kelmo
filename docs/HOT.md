@@ -124,8 +124,9 @@ still proves the generation and revision. Damaged metadata refuses automatic rep
 Shared pending notices obey the client's enrolled project boundary.
 When it installs a new set, a client removes, at most once a day, the sets older
 than two days. It keeps the current set, the eight newest whatever their age, and
-every set a cached context names, so offline delivery and a session that still
-points at the set it was given keep working.
+every set a cached context names, so offline delivery keeps working. A pointer a
+session was given more than two days ago may name a removed set; each delivery
+points at the current one.
 
 Codex managed blocks contain the published combined view. Bound work and pending
 notes travel through the hook and are not persisted into the repository's instruction file.
