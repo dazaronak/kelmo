@@ -19,8 +19,8 @@ entry here.
   starts. The message goes to the `[alerts]` command once when it starts (for a held cursor, once the first
   waiting note has waited a day), once a calendar day while it lasts, even after the clock was set back, and
   once when a run completes again. An alert the command fails to take is sent again with the next failure or
-  idle answer: the daemon waits at least 15 minutes between such tries, a timer tries once in each of its
-  runs. A run that completes after an alert that never went out says in its one message what was missed. An
+  idle answer: while it runs, the daemon waits at least 15 minutes between such tries (a restarted daemon may
+  try at once), a timer tries once in each of its runs. A run that completes after an alert that never went out says in its one message what was missed. An
   alert this process sent is not sent again the same day even when the state directory cannot keep the
   record. The findings pass's idle answer now carries
   `waiting`, the number of archived notes behind the cursor, and with any waiting, `waiting_since`, when the
