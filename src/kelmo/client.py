@@ -968,6 +968,10 @@ class SharedClient:
         finally:
             self._deadline = previous
 
+    def time_left(self):
+        """Seconds left before the active deadline, not capped by the profile timeout; None without one."""
+        return None if self._deadline is None else max(0.0, self._deadline - time.monotonic())
+
     def remaining(self):
         """Seconds left before the active deadline (the profile timeout without one); refused at zero."""
         if self._deadline is None:

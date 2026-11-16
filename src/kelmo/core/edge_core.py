@@ -206,14 +206,20 @@ class EdgeCore:
         try:
             time.sleep(max(0.0, min(seconds, self._left())))
         finally:
-            if not self._owner.acquire(timeout=self._left(), urgent=getattr(self._urgent, 'value', False)):
+            left = self._left()
+            # With nothing left, even a free outbox is not taken: the next poll would run past the deadline.
+            if left <= 0 or not self._owner.acquire(timeout=left, urgent=getattr(self._urgent, 'value', False)):
                 raise Busy('The edge core stayed busy past this call\'s deadline while it waited between polls.')
             for _ in range(depth - 1):
                 self._owner.acquire()
 
     def _left(self):
-        """Seconds left before the nearest deadline of this thread's call: the request's, or a wait's inside it."""
-        try:
+        """Seconds left before the nearest deadline of this thread's call (the request's, or a wait's inside it),
+        not capped by the profile timeout as `remaining()` is."""
+        left = self.client.time_left()
+        if left is not None:
+            return left
+        try:  # no deadline on this thread: the profile timeout bounds it
             return self.client.remaining()
         except KelmoError:
             return 0.0

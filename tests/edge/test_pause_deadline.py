@@ -38,10 +38,12 @@ class Authority:
     authority accepts one capture and answers trace polls.
 
     `applied_at` is the poll whose trace is terminal (None: never). `order` lists, in order, the write the
-    command queued, its polls and the captures that hooks queued."""
+    command queued, its polls and the captures that hooks queued. `timeout_seconds` caps `remaining()` as the
+    profile's timeout caps it in SharedClient (None: no cap)."""
 
-    def __init__(self, profile, applied_at=None):
+    def __init__(self, profile, applied_at=None, timeout_seconds=None):
         self.profile = profile
+        self.timeout_seconds = timeout_seconds
         self.flushed = threading.Event()
         self.wait_seconds = 5.0  # what remaining() answers outside any deadline
         self.files = threading.RLock()
@@ -69,7 +71,11 @@ class Authority:
         left = limit - time.monotonic()
         if left <= 0:
             raise Unbound('E_TRANSPORT', 'The deadline passed before the shared kelmo server answered.')
-        return left
+        return left if self.timeout_seconds is None else min(self.timeout_seconds, left)
+
+    def time_left(self):
+        limit = getattr(self._local, 'deadline', None)
+        return None if limit is None else max(0.0, limit - time.monotonic())
 
     def submit(self, op, args, key):
         with self._lock:  # a write queues in the outbox under the owner gate, as in SharedClient
@@ -104,8 +110,8 @@ class Authority:
 
 
 @contextmanager
-def edge_core(profile, applied_at=None):
-    client = Authority(profile, applied_at)
+def edge_core(profile, applied_at=None, timeout_seconds=None):
+    client = Authority(profile, applied_at, timeout_seconds)
     core = EdgeCore(profile.root, client=client)
     assert client.flushed.wait(10), 'the deliverer finished no first pass'
     core.wake = lambda: None  # the deliverer must not take the outbox on its own during the test
@@ -255,6 +261,45 @@ def test_a_tool_call_that_waits_lends_nothing_and_takes_nothing_back(profile):
         assert (core._owner._holder, core._owner._count) == (None, 0)
 
 
+def test_a_take_back_waits_past_the_profile_timeout_up_to_the_deadline(profile, monkeypatch):
+    """SharedClient caps `remaining()` at the profile's timeout (20 s by default); a request deadline of 900 s
+    for `--wait` is longer. Getting the outbox back after that cap but before the deadline is getting it back
+    in time."""
+    with edge_core(profile, applied_at=2, timeout_seconds=0.3) as (core, client):
+        arrived = waiters(core, monkeypatch)
+        thread, outcome = start(create_wait, core, 10.0)
+        assert client.polled.wait(5), 'the command made no poll'
+        assert core._owner.acquire(timeout=5), 'the command never lent the outbox out'
+        try:
+            assert arrived(thread.ident).wait(5), 'the command did not wait to take the outbox back'
+            thread.join(0.8)  # held past the 0.3 s cap, well inside the 10 s deadline
+        finally:
+            core._owner.release()
+        thread.join(10)
+
+        assert not thread.is_alive(), 'the command is still blocked'
+        result = outcome[0]
+        assert not isinstance(result, Exception), result
+        assert result['operation']['state'] == 'applied'
+
+
+def test_a_take_back_woken_after_the_deadline_fails_busy(profile, monkeypatch):
+    """The pause's sleep returns late (a busy scheduler), after the deadline, to a free outbox. Taking it then
+    would send the next poll past the deadline; the command fails as busy instead."""
+    import kelmo.core.edge_core as edge_core_module
+
+    sleep = time.sleep
+    monkeypatch.setattr(edge_core_module.time, 'sleep', lambda seconds: sleep(seconds + 0.3))
+    with edge_core(profile) as (core, client):
+        try:
+            result = create_wait(core, 0.2)
+        except KelmoError as error:
+            result = error
+
+    assert isinstance(result, KelmoError) and result.code == 'E_BUSY', result
+    assert client.polls == 1
+
+
 def test_a_wait_timeout_bounds_the_wait_while_the_outbox_is_held(profile):
     """`--wait-timeout` limits the wait (docs/USAGE.md): a held outbox does not stretch it."""
     with edge_core(profile) as (core, client):
@@ -284,3 +329,17 @@ def test_a_wait_timeout_shorter_than_the_request_deadline_still_ends_timed_out(p
         assert not isinstance(result, Exception), result
         assert result['wait_timed_out'] is True
         assert result['operation']['id'] == OPERATION
+
+
+def test_the_shared_clients_time_left_is_not_capped_by_the_profile_timeout(profile):
+    """What the edge core's take-back reads from the real client: the deadline, past the profile's cap."""
+    from kelmo.client import SharedClient
+
+    client = SharedClient(profile)
+    try:
+        assert client.time_left() is None
+        with client.deadline(profile.timeout_seconds + 100):
+            assert client.remaining() <= profile.timeout_seconds
+            assert client.time_left() > profile.timeout_seconds + 99
+    finally:
+        client.close()
