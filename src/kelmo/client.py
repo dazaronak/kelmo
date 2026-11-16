@@ -1058,30 +1058,34 @@ class SharedClient:
                 # It ended between two requests: the next one starts a new channel, as after a failed request.
                 self._channel = channel = None
             if channel is None:
-                self.remaining()
-                try:
-                    channel = self._factory()
-                except Unbound:
-                    raise
-                except KelmoError as error:
-                    raise Unbound(error.code, str(error)) from error
-                except OSError as error:
-                    raise Unbound('E_TRANSPORT',
-                                  'The configured shared-memory channel could not be started.') from error
-                try:
-                    ok, hello = self._send(channel, 'hello', {}, None)
-                    if not ok:
-                        raise Unbound(hello['code'], hello['message'])
-                    if not isinstance(hello, dict) or hello.get('authority_id') != self.profile.authority_id:
-                        raise Unbound('E_AUTHORITY', 'The channel reached a different memory authority than '
-                                                     'this client is pinned to; nothing was sent.')
-                except BaseException:
-                    if isinstance(channel, StdioChannel):
-                        channel.grace = 0
-                    channel.close()
-                    raise
+                channel, hello = self._hello_channel()
                 self._channel, self.server = channel, hello
             return channel
+
+    def _hello_channel(self):
+        """A new channel whose hello named this client's authority, and that hello; closed on any failure."""
+        self.remaining()
+        try:
+            channel = self._factory()
+        except Unbound:
+            raise
+        except KelmoError as error:
+            raise Unbound(error.code, str(error)) from error
+        except OSError as error:
+            raise Unbound('E_TRANSPORT', 'The configured shared-memory channel could not be started.') from error
+        try:
+            ok, hello = self._send(channel, 'hello', {}, None)
+            if not ok:
+                raise Unbound(hello['code'], hello['message'])
+            if not isinstance(hello, dict) or hello.get('authority_id') != self.profile.authority_id:
+                raise Unbound('E_AUTHORITY', 'The channel reached a different memory authority than '
+                                             'this client is pinned to; nothing was sent.')
+        except BaseException:
+            if isinstance(channel, StdioChannel):
+                channel.grace = 0
+            channel.close()
+            raise
+        return channel, hello
 
     def call(self, op, args=None):
         """A read: no outbox, and a transport failure is reported, never answered from the cache. Over a
@@ -1207,19 +1211,21 @@ class SharedClient:
         return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary()}
 
     def probe(self):
-        """Verify a fresh channel's identity without flushing any queued write."""
+        """Verify a fresh channel's identity without flushing any queued write. The probe opens a channel of
+        its own and closes it, so it neither waits for the owner of the outbox nor replaces the channel the
+        client's requests use."""
         began = time.monotonic()
-        with self._lock:
-            self._drop()
-            self._connect()
-            hello = self.server
-            return {'verified': True, 'authority_id': hello['authority_id'],
-                    'client_id': hello.get('client_id'), 'machine_tag': hello.get('machine_tag'),
-                    'fenced': hello.get('fenced'), 'writer_id': hello.get('writer_id'),
-                    'writer_epoch': hello.get('writer_epoch'),
-                    'archive': hello.get('archive'),
-                    'elapsed_ms': round((time.monotonic() - began) * 1000, 1),
-                    'writes_flushed': False}
+        channel, hello = self._hello_channel()
+        if isinstance(channel, StdioChannel) and self._deadline is not None:
+            channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
+        channel.close()
+        return {'verified': True, 'authority_id': hello['authority_id'],
+                'client_id': hello.get('client_id'), 'machine_tag': hello.get('machine_tag'),
+                'fenced': hello.get('fenced'), 'writer_id': hello.get('writer_id'),
+                'writer_epoch': hello.get('writer_epoch'),
+                'archive': hello.get('archive'),
+                'elapsed_ms': round((time.monotonic() - began) * 1000, 1),
+                'writes_flushed': False}
 
     # Context delivery
 

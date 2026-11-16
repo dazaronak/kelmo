@@ -52,3 +52,53 @@ def test_a_hook_gets_the_outbox_while_a_status_command_waits(edge, monkeypatch, 
 def test_a_command_that_rewrites_the_outbox_still_holds_it(edge, monkeypatch):
     core, _client, _ = edge
     assert hook_waits(core, ['client', 'flush'], monkeypatch) is None, 'a flush let the hook in mid-command'
+
+
+class SlowHelloChannel:
+    """A channel whose hello waits until released, as an authority far away would answer."""
+
+    def __init__(self, authority, entered, release):
+        self.authority, self.entered, self.release, self.closed = authority, entered, release, False
+
+    def request(self, frame, timeout=None):
+        from kelmo.client import PROTOCOL
+        self.entered.set()
+        self.release.wait(10)
+        return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True,
+                'result': {'authority_id': self.authority, 'operations': ['hello']}}
+
+    def close(self):
+        self.closed = True
+
+
+def test_a_hook_gets_the_outbox_while_a_status_probe_waits_for_the_authority(profile):
+    from kelmo.client import SharedClient
+    from kelmo.core.edge_core import EdgeCore
+    entered, release = threading.Event(), threading.Event()
+    channels = []
+
+    def factory():
+        channels.append(SlowHelloChannel(profile.authority_id, entered, release))
+        return channels[-1]
+
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    context = SimpleNamespace(remaining=lambda: 30.0, check=lambda: None)
+    answers = []
+    command = threading.Thread(target=lambda: answers.append(
+        core.handle_cli(context, {'argv': ['client', 'status', '--probe', '--vault', str(profile.root)]})),
+        daemon=True)  # the installed CLI appends the client root it resolved (cli.py through_daemon)
+    try:
+        command.start()
+        assert entered.wait(5), 'the probe never opened a channel'
+        start = time.monotonic()
+        got = core._owner.acquire(timeout=1.0, urgent=True)
+        waited = time.monotonic() - start
+        if got:
+            core._owner.release()
+        assert got and waited < 1.0, 'the hook waited for `kelmo client status --probe`'
+    finally:
+        release.set()
+        command.join(10)
+        core.close()
+    assert answers and all(channel.closed for channel in channels), (answers, channels)

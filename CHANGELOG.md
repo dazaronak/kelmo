@@ -16,8 +16,9 @@ entry here.
   `{"error": ...}`.
 - On an edge machine `kelmo status` and `kelmo client status` no longer hold the outbox while they wait
   for the authority. A hook that arrived meanwhile waited for the whole command and could hand its session
-  a cached context marked unavailable; it now gets the outbox at once. `kelmo client flush` and `resend`
-  still hold it for the whole command.
+  a cached context marked unavailable; it now gets the outbox at once. `kelmo client status --probe` checks
+  the authority on a channel of its own and closes it, so it no longer replaces the channel the client's
+  requests use. `kelmo client flush` and `resend` still hold the outbox for the whole command.
 
 ## [0.3.1] - 2026-11-15
 
