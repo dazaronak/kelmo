@@ -241,6 +241,8 @@ class Jobs:
         if scheduled and self._fenced():
             return {'state': 'fenced'}
         self._dream_started = False
+        daily = scheduled and action == 'run'
+        found = self._read_state().get('dream_tries') if daily else None
         try:
             with self._dreaming_lock() as free:
                 if not free:
@@ -252,12 +254,21 @@ class Jobs:
                     # started the delay, and a local client may send `scheduled` itself. Read it again here.
                     return {'state': 'not_due'}
                 return self._dream_run(action, scheduled, ready)
+        except Stopping:
+            if daily:
+                self._write_state(dream_tries=found)  # a stop costs no try and keeps the wait it found
+            raise
         except Exception:
-            # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try too:
-            # it counts towards DREAM_TRIES and waits DREAM_RETRY_SECONDS. One that started is counted there.
-            # While the core is stopping, a call to another core fails as a KelmoError rather than Stopping
-            # (stopping.py): the stop caused it, so like a stop it charges no try.
-            if scheduled and action == 'run' and not self._dream_started and not self.should_stop():
+            if not daily:
+                raise
+            if self.should_stop():
+                # While the core is stopping, a call to another core fails as a KelmoError rather than Stopping
+                # (stopping.py), before or after the start: the stop caused it, so like a stop it costs nothing.
+                self._write_state(dream_tries=found)
+            elif not self._dream_started:
+                # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try
+                # too: it counts towards DREAM_TRIES and waits DREAM_RETRY_SECONDS. One that started is counted
+                # in _dream_run.
                 self._record_dream_try()
                 self._record_dream_try_end()
             raise
@@ -299,12 +310,10 @@ class Jobs:
                                clock=self.clock, on_start=started, should_stop=self.should_stop, step=self.step,
                                ready=ready)
         except Stopping:
-            stopped = True
-            if daily:
-                self._record_dream_try(undo=True)
+            stopped = True  # _dream puts the try state back
             raise
         except Exception:
-            if daily:  # one that failed before its start is counted by _dream
+            if daily and not self.should_stop():  # a stop is _dream's to undo; a failure before the start too
                 self._record_dream_try_end()
             raise
         finally:

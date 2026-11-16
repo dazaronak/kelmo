@@ -197,3 +197,39 @@ def test_a_stop_that_fails_a_call_before_the_start_charges_no_try(tmp_path, monk
     tries = jobs._read_state().get('dream_tries') or {}
     assert tries.get('count', 0) == 0, tries
     assert tries.get('delay') is not True, tries
+
+
+def test_a_stop_that_fails_a_call_after_the_start_charges_no_try(tmp_path, monkeypatch):
+    # The run started, then the core began to stop and the run's next call to another core failed as a
+    # KelmoError: the stop caused it, so the try comes back as for Stopping, with no delay.
+    from kelmo import dreaming_cli
+    from kelmo.errors import KelmoError
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+
+    def stopped_after_start(*args, **kwargs):
+        kwargs['on_start']()
+        jobs._stop.set()
+        raise KelmoError('E_UNAVAILABLE', 'The core is stopping.')
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', stopped_after_start)
+    try:
+        jobs._dream({'action': 'run', 'scheduled': True})
+    except KelmoError:
+        pass
+    tries = jobs._read_state().get('dream_tries') or {}
+    assert tries.get('count', 0) == 0, tries
+    assert tries.get('delay') is not True, tries
+
+
+def test_a_stopped_try_gives_back_the_wait_it_found(tmp_path, monkeypatch):
+    # A failed try ends at 04:05, so the next may start at 04:20. That one is stopped: the state is as before
+    # it, and the following start is allowed from 04:20, not 15 minutes after the stop.
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('a broken executor'), Stopping()], duration=300)
+    jobs._tick()
+    before = dict(jobs._read_state()['dream_tries'])
+    now[0] = day_at(4, 20)
+    jobs._tick()
+    assert len(starts) == 2
+    assert jobs._read_state()['dream_tries'] == before
+    now[0] = day_at(4, 26)
+    assert jobs._dream_try_allowed()
