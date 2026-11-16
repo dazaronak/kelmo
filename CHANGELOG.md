@@ -29,7 +29,9 @@ entry here.
 - A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
   server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
   doubling the pause up to 2 seconds.
-  A request that writes on the server, such as `reconcile`, is not sent again.
+  A request that writes the server's journal, such as `reconcile`, is not sent again. `graph rebuild`, which
+  the server lists as a read, may be: it redoes the graph index from the wiki under the graph lock, so a second
+  run leaves the same index.
 - A call from the installed CLI to the local daemon follows kelmod's replay rule when kelmod drops the
   socket. A call cut before it was sent goes once more within the deadline, and so does one cut after it was
   sent when it changes nothing (a daemon status or scheduler read, or a command a fenced server still runs,
