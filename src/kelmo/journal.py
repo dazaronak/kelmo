@@ -134,6 +134,9 @@ class Journal:
             ''')
             self.conn.commit()
         with self.conn:
+            # Every per-operation read (an operation's stages, its events, one event of a stage) filters events
+            # by operation; without this index each one scans the whole table.
+            self.conn.execute('CREATE INDEX IF NOT EXISTS events_operation_stage ON events(operation_id, stage)')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS operation_origins (
                 operation_id TEXT PRIMARY KEY REFERENCES operations(id), origin TEXT NOT NULL
             )''')
