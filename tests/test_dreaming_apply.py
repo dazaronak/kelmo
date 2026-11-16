@@ -450,6 +450,60 @@ def test_a_note_captured_after_the_pass_began_waits_for_the_next_pass(world):
     assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
 
 
+def step_the_journal_clock_back(monkeypatch, seconds):
+    """From here on the journal's clock reads `seconds` earlier than real time, as after a backward NTP step:
+    the stamps of new records and the pass's own reading of the time both come from it."""
+    from datetime import datetime, timedelta
+
+    from kelmo import journal
+
+    class Stepped(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) - timedelta(seconds=seconds)
+
+    monkeypatch.setattr(journal, 'datetime', Stepped)
+
+
+def test_a_note_captured_before_the_clock_stepped_back_is_applied_by_the_next_pass(world, monkeypatch):
+    from kelmo.creation import apply_pending, pending_operations
+    nightly(world)
+    note = world.service.create('Exports run at 19:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    step_the_journal_clock_back(monkeypatch, 3600)
+    report = apply_pending(world.service, echo_export(world))
+    assert report['applied'] == [note['id']], 'the pass after the clock stepped back left the note waiting'
+    assert world.fact('app.export')['text'] == 'Exports run at 19:00.'
+    assert pending_operations(world.service) == []
+
+
+def test_a_pass_keeps_capture_order_and_counts_only_its_own_notes(world):
+    from kelmo.creation import apply_pending
+    nightly(world)
+    before = []
+    texts = ['Exports run at 06:00.', 'Exports run at 06:30.', 'Exports run at 07:00.']
+    for text in texts:
+        operation = world.service.create(text, project='app', selected=[FEATURE])
+        world.service.run(operation['id'])
+        before.append(operation['id'])
+    late = []
+
+    def capture_during_the_pass(job):
+        if not late:
+            late.append(world.service.create('Exports run at 23:00.', project='app', selected=[FEATURE]))
+            world.service.run(late[0]['id'])
+        return world.propose(facts=[world.change('app.export', job.payload['source']['text'])])
+
+    executor = Scripted(*[capture_during_the_pass for _ in range(4)])
+    report = apply_pending(world.service, executor)
+    assert report['applied'] == before, 'the pass applies its own notes in capture order'
+    assert [job.payload['source']['text'] for job in executor.jobs] == texts
+    assert late[0]['id'] not in [entry['operation_id'] for entry in report['skipped']]
+    assert report['waiting'] == {}, 'the late note is not one the pass left behind'
+    assert world.fact('app.export')['text'] == 'Exports run at 07:00.'
+    assert apply_pending(world.service, echo_export(world))['applied'] == [late[0]['id']]
+
+
 def test_a_stale_generation_refusal_parks_without_spending_an_attempt(world):
     from kelmo import creation
     from kelmo.errors import KelmoError

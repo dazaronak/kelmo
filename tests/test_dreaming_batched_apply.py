@@ -1869,11 +1869,19 @@ def test_a_ready_pass_starts_no_batch_and_no_model_call_when_no_project_reaches_
 
 def test_a_project_that_becomes_ready_only_after_the_pass_began_stays_out_of_the_pass(world, monkeypatch):
     """Readiness is counted once, from the notes captured before the pass began."""
+    from kelmo import creation
     from kelmo.creation import apply_pending
     editor_mode(world)
-    ids = capture(world, notes(8))
-    # The pass begins at the fourth note: only the four up to it were captured before it began.
-    monkeypatch.setattr('kelmo.creation.journal_now', lambda: world.service.journal.get(ids[3])['created_at'])
+    ids = capture(world, notes(4))
+    # Four more notes are captured once the pass has begun, as it first reads the intake.
+    read = creation.pending_operations
+
+    def read_after_four_more(*args, **kwargs):
+        if len(ids) == 4:
+            ids.extend(capture(world, notes(4, start=4)))
+        return read(*args, **kwargs)
+
+    monkeypatch.setattr(creation, 'pending_operations', read_after_four_more)
     model = counted(BatchModel(world))
     report = apply_pending(world.service, model, ready=True, sleep=lambda _seconds: None)
     assert model.inner.jobs == [], 'four first-pass notes of eight do not make the project ready'

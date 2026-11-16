@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- An apply pass takes the notes that exist when it begins, read by id, and leaves notes captured during
+  it to the next pass. It used to compare capture times with its start time, so after the system clock
+  stepped back every pass skipped a note captured before the step until the clock caught up again.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
