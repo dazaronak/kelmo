@@ -793,3 +793,38 @@ def test_a_recovery_does_not_claim_the_findings_pass_read_evidence(tmp_path):
     watch.ran(START + 10)
     assert len(messages(tmp_path)) == 2, messages(tmp_path)
     assert messages(tmp_path)[-1] == 'K: the Dreaming run completes again.', messages(tmp_path)
+
+
+def test_an_alert_that_went_out_does_not_hide_one_that_did_not(tmp_path):
+    # E_EXECUTOR was told; the alert for E_PROTOCOL a retry later was refused by the command. The run that
+    # completes names the missed E_PROTOCOL instead of a bare recovery.
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    send = watch.send
+
+    def refuses_protocol(text):
+        return False if 'E_PROTOCOL' in text else send(text)
+    watch.send = refuses_protocol
+    watch.failed('E_PROTOCOL', 'bad answer', START + 900)
+    watch.send = send
+    watch.ran(START + 1800)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+    assert 'E_PROTOCOL' in messages(tmp_path)[-1], messages(tmp_path)
+    assert messages(tmp_path)[-1].endswith('the Dreaming run completes again.'), messages(tmp_path)
+
+
+def test_a_ctrl_c_while_a_completed_run_is_told_is_not_told_as_an_interrupted_run(tmp_path, monkeypatch):
+    from kelmo import alerts, dreaming_cli
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.starting()
+    config = SimpleNamespace(state=tmp_path / '.state', alerts={'command': recorder(tmp_path), 'label': 'K'})
+
+    def interrupted(self, text):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(alerts.DreamWatch, 'send', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        dreaming_cli.tell_dream_watch(config, {'state': 'finished'})
+    monkeypatch.undo()
+    _watch(tmp_path).starting()
+    assert not any('E_INTERRUPTED' in line for line in messages(tmp_path)), messages(tmp_path)

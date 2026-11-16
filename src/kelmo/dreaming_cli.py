@@ -273,6 +273,11 @@ def tell_dream_watch(config, result, run_ended=True):
         # The start mark goes last: a process killed before the outcome is recorded leaves it for the next run.
         if run_ended:
             watch.ended()
+    except KeyboardInterrupt:
+        # Stopped at the terminal on purpose while the outcome was told: nothing died, as for a Ctrl-C in the run.
+        if run_ended:
+            _dream_watch_ended(config)
+        raise
     except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
         print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
               flush=True)

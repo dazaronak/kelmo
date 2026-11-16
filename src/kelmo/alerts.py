@@ -352,14 +352,19 @@ class DreamWatch(LoginWatch):
         """What went wrong without the owner hearing of it: a failure none of whose alerts went out (every
         delivery failed, or the process died first), or a hold whose alert was sent and not taken."""
         failed, stuck = records['failed'], records['stuck']
-        if failed is not None and not failed['told']:
-            codes = ', '.join(failed['codes']) or 'an error'
-            return (f'the Dreaming run failed with {codes} from {_when(failed["since"])}, and the alert did not go '
-                    'out then')
+        missed = []
+        if failed is not None:
+            # Each code on its own: an alert that went out for one does not stand for another that did not.
+            untold = [code for code in failed['codes'] if code not in failed['told']]
+            if not untold and not failed['told'] and not failed['codes']:
+                untold = ['an error']
+            if untold:
+                missed.append(f'the Dreaming run failed with {", ".join(untold)} from {_when(failed["since"])}, '
+                              'and the alert did not go out then')
         if stuck is not None and stuck['told'] is None and stuck.get('tried') is not None:
-            return (f'the findings pass read nothing from {_when(stuck["since"])} while archived notes waited '
-                    'behind its cursor, and the alert did not go out then')
-        return None
+            missed.append(f'the findings pass read nothing from {_when(stuck["since"])} while archived notes '
+                          'waited behind its cursor, and the alert did not go out then')
+        return '; '.join(missed) or None
 
     def _guarded(self, work):
         try:
@@ -404,8 +409,8 @@ class DreamWatch(LoginWatch):
                     stuck['tried'] = now
             # The run completed. The record goes first, as in `ran`: a process that dies between the two loses the
             # recovery rather than sending it twice; a file that takes no write still gets it.
-            recovery = (f'{self.label}: the Dreaming run completes again.' if told_failure
-                        else f'{self.label}: {missed}; the Dreaming run completes again.' if missed else None)
+            recovery = (f'{self.label}: {missed}; the Dreaming run completes again.' if missed
+                        else f'{self.label}: the Dreaming run completes again.' if told_failure else None)
             try:
                 self._write(records)
             except OSError:
@@ -457,8 +462,8 @@ class DreamWatch(LoginWatch):
             on_file = unkept[1] if current else self._records()
             usable = unkept is not None and not current and not unkept[2]
             told = _told_in(on_file) or (usable and _told_in(unkept[1]))
-            # Nothing told, but something went wrong that the owner never heard of: the recovery names it.
-            missed = None if told else self._missed(on_file, now) or (usable and self._missed(unkept[1], now))
+            # Something went wrong that the owner never heard of, whatever else was told: the recovery names it.
+            missed = self._missed(on_file, now) or (usable and self._missed(unkept[1], now))
             # The marker goes first: one recovery message, even if its delivery fails.
             if self.marker.exists():
                 self.marker.unlink()
