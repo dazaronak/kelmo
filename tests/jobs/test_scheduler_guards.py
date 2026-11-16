@@ -17,7 +17,8 @@ def scheduler(tmp_path, now, operations):
     def execute(_sql):
         rows = [(op['id'], op['state']) for op in operations if op['intent'] == 'create'
                 and not op['terminal'] and op['state'] in ('archived', 'parked')]
-        return SimpleNamespace(fetchall=lambda: rows)
+        # fetchone answers the capture boundary the scheduler reads before a Dreaming run.
+        return SimpleNamespace(fetchall=lambda: rows, fetchone=lambda: (len(operations),))
 
     reader = SimpleNamespace(journal=SimpleNamespace(conn=SimpleNamespace(execute=execute)))
     writer = SimpleNamespace(config=SimpleNamespace(embedding={}, batch_apply=False, batch_ready_sources=8))
@@ -309,6 +310,33 @@ def test_manual_apply_is_not_held_by_scheduled_backoff(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, 'step', nullcontext)
     monkeypatch.setattr(dreaming_cli, 'run_dream', lambda *args, **kwargs: {'state': 'finished'})
     assert jobs.run('dream', {'action': 'apply'}) == {'state': 'finished'}
+
+
+def test_a_dreaming_run_gets_the_capture_boundary_read_before_its_first_step(tmp_path, monkeypatch):
+    """The apply pass's boundary is read on a reader before the run's first step waits for the writer, so a note
+    captured during that wait is the next pass's."""
+    from contextlib import contextmanager
+
+    from kelmo import dreaming_cli
+    events = []
+    jobs = scheduler(tmp_path, [100], [note('a'), note('b')])
+
+    @contextmanager
+    def step():
+        events.append('step')
+        yield
+
+    def run_dream(*args, **kwargs):
+        with kwargs['step']():
+            events.append(('boundary', kwargs['boundary']))
+        return {'state': 'finished'}
+
+    read = jobs.storage.read
+    monkeypatch.setattr(jobs.storage, 'read', lambda fn: (events.append('read'), read(fn))[1])
+    monkeypatch.setattr(jobs, 'step', step)
+    monkeypatch.setattr(dreaming_cli, 'run_dream', run_dream)
+    assert jobs.run('dream', {'action': 'apply'}) == {'state': 'finished'}
+    assert events == ['read', 'step', ('boundary', 2)], events
 
 
 def test_busy_daily_job_does_not_take_day(tmp_path):

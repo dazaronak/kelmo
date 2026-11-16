@@ -275,12 +275,16 @@ class Jobs:
 
         stopped = False
         try:
+            from ..creation import capture_boundary
+            # Read on a reader before the run's first step waits for the writer: a note captured during that wait
+            # belongs to the next pass.
+            boundary = self.storage.read(lambda reader: capture_boundary(reader.journal.conn))
             # One step per unit (each note, the findings pass), never the whole run. Inside a unit the writer is held
             # only for journal transactions; model calls and the publication run without it, so an interactive write
             # waits for the transaction in progress, not for the unit.
             result = run_dream(self.storage.writer, action, contexts=getattr(self.core.profile, 'contexts', None),
                                clock=self.clock, on_start=started, should_stop=self.should_stop, step=self.step,
-                               ready=ready)
+                               ready=ready, boundary=boundary)
         except Stopping:
             stopped = True
             if daily:

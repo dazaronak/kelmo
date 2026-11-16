@@ -10,7 +10,9 @@ entry here.
 
 - An apply pass takes the notes that exist when it begins, read by id, and leaves notes captured during
   it to the next pass. It used to compare capture times with its start time, so after the system clock
-  stepped back every pass skipped a note captured before the step until the clock caught up again.
+  stepped back every pass skipped a note captured before the step until the clock caught up again. Which
+  notes are the pass's now follows the order the journal recorded them in, read before the daemon's pass
+  waits for the journal, so a clock step during that wait moves no note into or out of the pass.
 
 ## [0.3.1] - 2026-11-15
 

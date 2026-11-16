@@ -186,7 +186,7 @@ def dispatch(root, args):
 
 
 def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None,
-              ready=False):
+              ready=False, boundary=None):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
     The caller makes sure no other Dreaming run is in progress.
 
@@ -196,7 +196,7 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
 
     `ready` belongs to `apply` alone: the owner's "run the editor now" over ready projects only (see
     `apply_pending`). `run` keeps draining everything, because the night pass is what publishes small
-    projects."""
+    projects. `boundary` is the apply pass's capture boundary, read by a caller before its first step waits."""
     step = step or nullcontext
     with step():
         # Built inside the step: its first use creates the Dreaming tables on the shared journal connection.
@@ -218,7 +218,7 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
     # is the owner's "run the editor now".
     from .creation import apply_pending
     applied = apply_pending(service, executor, should_stop=should_stop, step=step,
-                            ready=ready and action == "apply")
+                            ready=ready and action == "apply", boundary=boundary)
     if action == "apply":
         return {"state": "finished", "apply": applied}
     if should_stop is not None and should_stop():

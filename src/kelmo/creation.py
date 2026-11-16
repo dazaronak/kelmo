@@ -14,7 +14,6 @@ from . import outcomes, quota, stopping
 from .daemon import execute, validate_config
 from .errors import VAULT_REFUSALS, HeadRefusal, KelmoError, Stopping, VaultFailure, sqlite_busy
 from .executor import ModelOutcome, normalize_answer
-from .journal import now as journal_now
 from .wiki import engine, pages
 
 
@@ -1075,10 +1074,18 @@ HELD_REASONS = {'E_CLAIM': 'held by another attempt',
                 'E_BUSY': 'busy: another attempt, or its own prepared publication, holds it'}
 
 
+def capture_boundary(connection):
+    """The journal's last operation by the order it was recorded in. Operations are only appended (none is ever
+    deleted, and the journal is never vacuumed), so a row with a larger rowid was captured later whatever its
+    stamp says."""
+    return connection.execute('SELECT COALESCE(MAX(rowid), 0) FROM operations').fetchone()[0]
+
+
 def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.time, ready=False,
-                  should_stop=None, step=None):
+                  should_stop=None, step=None, boundary=None):
     """One `kelmo dream apply` pass: publish every note captured before the pass began through the
-    editor, oldest first.
+    editor, oldest first. `boundary` (`capture_boundary`) says where "before" ends; a caller whose first step
+    waits for the journal reads it before that wait, and without it the pass reads it in its first step.
 
     Each source gets one attempt here; a refused one is parked for the next pass or fails after its
     last charged attempt (see `park`). A note waits while an older note is still in the intake, and a
@@ -1153,12 +1160,11 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
             raise Stopping()
 
     turns = _Turns(report, rest, clock)
-    # The notes that exist when the pass begins are its own; one captured later belongs to the next pass. The
-    # set is read by id in the pass's first step, which may wait for the journal: a note stamped between the
-    # pass's start and that read was written meanwhile and is left out. A stamp later than the read itself
-    # comes from before a backward clock step, and that note is the pass's, so the clock never hides an
-    # existing note from every pass.
-    started, own = journal_now(), None
+    # The notes that exist when the pass begins are its own; one captured later belongs to the next pass. Which
+    # is which comes from the order the journal recorded them in, never from their stamps, which a clock step
+    # moves. A caller whose first step waits for the journal reads `boundary` before that wait; otherwise the
+    # first step reads it, together with the set of notes.
+    own = None
     # `held_back` names, per project, the note the pass could not get past. Every note captured after it has
     # left the pass, so a note that is held later is older than the one named: the newest hold replaces it.
     seen, held_back = set(), {}
@@ -1184,10 +1190,11 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
         with step():
             try:
                 if own is None:
-                    taken = journal_now()
+                    if boundary is None:
+                        boundary = capture_boundary(service.journal.conn)
                     own = {row['id'] for row in service.journal.conn.execute(
-                        "SELECT id, created_at FROM operations WHERE intent='create' AND terminal=0").fetchall()
-                           if not started < row['created_at'] <= taken}
+                        "SELECT id FROM operations WHERE intent='create' AND terminal=0 AND rowid<=?",
+                        (boundary,)).fetchall()}
                 pending = [(operation, request) for operation, request in pending_operations(service)
                            if operation['id'] in own]
                 if snapshot is None:

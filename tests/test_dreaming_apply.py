@@ -455,7 +455,7 @@ def test_a_note_written_while_the_pass_waits_for_its_first_step_waits_for_the_ne
     ahead of it meanwhile was written after the pass began."""
     from contextlib import contextmanager
 
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     nightly(world)
     first = world.service.create('Exports run at 20:00.', project='app', selected=[FEATURE])
     world.service.run(first['id'])
@@ -468,7 +468,9 @@ def test_a_note_written_while_the_pass_waits_for_its_first_step_waits_for_the_ne
             world.service.run(late[0]['id'])
         yield
 
-    report = apply_pending(world.service, echo_export(world), step=step)
+    # The scheduler reads the boundary before the first step waits for the journal (core.jobs).
+    report = apply_pending(world.service, echo_export(world), step=step,
+                           boundary=capture_boundary(world.service.journal.conn))
     assert report['applied'] == [first['id']], 'a note written after the pass began joined it'
     assert report['waiting'] == {}
     assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
@@ -532,6 +534,57 @@ def test_a_note_captured_during_the_pass_after_the_clock_stepped_back_holds_no_n
                            clock=lambda: now[0], sleep=sleep)
     assert report['applied'] == [first['id'], second['id']]
     assert naps == [] and report['stalled'] == [], 'the pass waited for a note captured after it began'
+
+
+def test_a_note_written_while_the_pass_waits_stays_out_when_the_clock_then_steps_back(world, monkeypatch):
+    """A capture goes ahead of the pass while it waits for its first step, and the clock steps back before the
+    pass reads its notes: the note was still written after the pass began."""
+    from contextlib import contextmanager
+
+    from kelmo.creation import apply_pending, capture_boundary
+    nightly(world)
+    first = world.service.create('Exports run at 10:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    late = []
+
+    @contextmanager
+    def step():
+        if not late:
+            late.append(world.service.create('Exports run at 11:00.', project='app', selected=[FEATURE]))
+            world.service.run(late[0]['id'])
+            step_the_journal_clock_back(monkeypatch, 3600)
+        yield
+
+    # The scheduler reads the boundary before the first step waits for the journal (core.jobs).
+    report = apply_pending(world.service, echo_export(world), step=step,
+                           boundary=capture_boundary(world.service.journal.conn))
+    assert report['applied'] == [first['id']], 'a note written after the pass began joined it'
+    assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
+
+
+def test_an_old_note_the_clock_catches_up_with_while_the_pass_waits_is_the_passs(world, monkeypatch):
+    """A note captured before the clock stepped back carries a stamp ahead of the pass's start; the clock passes
+    that stamp while the pass waits for its first step. The note existed before the pass and is applied by it."""
+    from contextlib import contextmanager
+
+    from kelmo.creation import apply_pending, capture_boundary
+    nightly(world)
+    note = world.service.create('Exports run at 12:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    step_the_journal_clock_back(monkeypatch, 60)
+    caught_up = []
+
+    @contextmanager
+    def step():
+        if not caught_up:
+            caught_up.append(True)
+            step_the_journal_clock_back(monkeypatch, 0)
+        yield
+
+    # The scheduler reads the boundary before the first step waits for the journal (core.jobs).
+    report = apply_pending(world.service, echo_export(world), step=step,
+                           boundary=capture_boundary(world.service.journal.conn))
+    assert report['applied'] == [note['id']], 'a note captured before the pass was left to the next one'
 
 
 def test_a_pass_keeps_capture_order_and_counts_only_its_own_notes(world):
