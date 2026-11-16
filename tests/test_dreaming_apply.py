@@ -450,6 +450,31 @@ def test_a_note_captured_after_the_pass_began_waits_for_the_next_pass(world):
     assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
 
 
+def test_a_note_written_while_the_pass_waits_for_its_first_step_waits_for_the_next_pass(world):
+    """A scheduled pass waits for the journal's baton before its first step; an interactive capture that goes
+    ahead of it meanwhile was written after the pass began."""
+    from contextlib import contextmanager
+
+    from kelmo.creation import apply_pending
+    nightly(world)
+    first = world.service.create('Exports run at 20:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    late = []
+
+    @contextmanager
+    def step():
+        if not late:  # the capture that held the baton while the pass waited for its first step
+            late.append(world.service.create('Exports run at 21:00.', project='app', selected=[FEATURE]))
+            world.service.run(late[0]['id'])
+        yield
+
+    report = apply_pending(world.service, echo_export(world), step=step)
+    assert report['applied'] == [first['id']], 'a note written after the pass began joined it'
+    assert report['waiting'] == {}
+    assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
+    assert apply_pending(world.service, echo_export(world))['applied'] == [late[0]['id']]
+
+
 def step_the_journal_clock_back(monkeypatch, seconds):
     """From here on the journal's clock reads `seconds` earlier than real time, as after a backward NTP step:
     the stamps of new records and the pass's own reading of the time both come from it."""
@@ -475,6 +500,38 @@ def test_a_note_captured_before_the_clock_stepped_back_is_applied_by_the_next_pa
     assert report['applied'] == [note['id']], 'the pass after the clock stepped back left the note waiting'
     assert world.fact('app.export')['text'] == 'Exports run at 19:00.'
     assert pending_operations(world.service) == []
+
+
+def test_a_note_captured_during_the_pass_after_the_clock_stepped_back_holds_no_note_of_the_pass(world,
+                                                                                                monkeypatch):
+    """A capture stamped earlier than the pass's notes because the clock stepped back is still newer than all
+    of them: it never makes a note of the pass wait for it."""
+    import time
+    from kelmo.creation import ORDER_WAIT_SECONDS, apply_pending
+    nightly(world)
+    first = world.service.create('Exports run at 08:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    second = world.service.create('Exports run at 09:00.', project='app', selected=[FEATURE])
+    world.service.run(second['id'])
+    step_the_journal_clock_back(monkeypatch, 3600)
+    late = []
+
+    def capture_during_the_pass(job):
+        if not late:  # left in the intake: captured, not yet archived
+            late.append(world.service.create('Exports run at 22:00.', project='app', selected=[FEATURE]))
+        return world.propose(facts=[world.change('app.export', job.payload['source']['text'])])
+
+    now = [time.time()]
+    naps = []
+
+    def sleep(seconds):
+        naps.append(seconds)
+        now[0] += ORDER_WAIT_SECONDS / 2
+
+    report = apply_pending(world.service, Scripted(*[capture_during_the_pass for _ in range(3)]),
+                           clock=lambda: now[0], sleep=sleep)
+    assert report['applied'] == [first['id'], second['id']]
+    assert naps == [] and report['stalled'] == [], 'the pass waited for a note captured after it began'
 
 
 def test_a_pass_keeps_capture_order_and_counts_only_its_own_notes(world):

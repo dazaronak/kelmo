@@ -14,6 +14,7 @@ from . import outcomes, quota, stopping
 from .daemon import execute, validate_config
 from .errors import VAULT_REFUSALS, HeadRefusal, KelmoError, Stopping, VaultFailure, sqlite_busy
 from .executor import ModelOutcome, normalize_answer
+from .journal import now as journal_now
 from .wiki import engine, pages
 
 
@@ -1153,9 +1154,11 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
 
     turns = _Turns(report, rest, clock)
     # The notes that exist when the pass begins are its own; one captured later belongs to the next pass. The
-    # set is read by id in the pass's first step, not by time, so a clock that steps back cannot hide an existing
-    # note from every pass.
-    own = None
+    # set is read by id in the pass's first step, which may wait for the journal: a note stamped between the
+    # pass's start and that read was written meanwhile and is left out. A stamp later than the read itself
+    # comes from before a backward clock step, and that note is the pass's, so the clock never hides an
+    # existing note from every pass.
+    started, own = journal_now(), None
     # `held_back` names, per project, the note the pass could not get past. Every note captured after it has
     # left the pass, so a note that is held later is older than the one named: the newest hold replaces it.
     seen, held_back = set(), {}
@@ -1181,8 +1184,10 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
         with step():
             try:
                 if own is None:
+                    taken = journal_now()
                     own = {row['id'] for row in service.journal.conn.execute(
-                        "SELECT id FROM operations WHERE intent='create' AND terminal=0").fetchall()}
+                        "SELECT id, created_at FROM operations WHERE intent='create' AND terminal=0").fetchall()
+                           if not started < row['created_at'] <= taken}
                 pending = [(operation, request) for operation, request in pending_operations(service)
                            if operation['id'] in own]
                 if snapshot is None:
@@ -1234,8 +1239,10 @@ def apply_pending(service, executor, *, limit=100, sleep=time.sleep, clock=time.
                 # again, because that note now goes first.
                 moved = False
                 while True:
+                    # A note captured after the pass began is newer than every note of the pass, whatever its
+                    # stamp says after a clock step: it is never ahead of one.
                     ahead = [row for row in notes_in_intake(service, operation['created_at'])
-                             if row['id'] not in report['stalled']]
+                             if row['id'] not in report['stalled'] and row['id'] in own]
                     if not ahead:
                         break
                     moved = True
