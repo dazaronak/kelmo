@@ -264,3 +264,31 @@ def test_a_pause_answered_before_the_start_leaves_an_earlier_try_counted(tmp_pat
     now[0] = day_at(4, 20)
     jobs._dream({'action': 'run', 'scheduled': True})
     assert jobs._read_state()['dream_tries'] == before
+
+
+@pytest.mark.parametrize('answered', [False, True], ids=['raised', 'answered'])
+def test_a_failure_counted_before_a_stop_arrives_keeps_its_try(tmp_path, monkeypatch, answered):
+    # The run failed on its own while the core was running, and its try and wait were recorded; the stop came only
+    # after that. The failure is not the stop's, so it keeps its try and its wait.
+    from kelmo import dreaming_cli
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+
+    def failed_on_its_own(*args, **kwargs):
+        kwargs['on_start']()
+        if answered:
+            return {'state': 'failed', 'code': 'E_EXECUTOR', 'reason': 'a broken executor'}
+        raise RuntimeError('a broken executor')
+    recorded = jobs._record_dream_try_end
+
+    def then_the_stop_arrives():
+        recorded()
+        jobs._stop.set()
+    monkeypatch.setattr(dreaming_cli, 'run_dream', failed_on_its_own)
+    monkeypatch.setattr(jobs, '_record_dream_try_end', then_the_stop_arrives)
+    try:
+        jobs._dream({'action': 'run', 'scheduled': True})
+    except RuntimeError:
+        pass
+    tries = jobs._read_state().get('dream_tries') or {}
+    assert tries.get('count', 0) == 1, tries
+    assert tries.get('delay') is True, tries

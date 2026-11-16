@@ -241,6 +241,7 @@ class Jobs:
         if scheduled and self._fenced():
             return {'state': 'fenced'}
         self._dream_started = False
+        self._dream_stop_cut = False  # set by _dream_run: a started run the stop ended, decided once
         daily = scheduled and action == 'run'
         found = self._read_state().get('dream_tries') if daily else None
         try:
@@ -254,8 +255,7 @@ class Jobs:
                     # started the delay, and a local client may send `scheduled` itself. Read it again here.
                     return {'state': 'not_due'}
                 result = self._dream_run(action, scheduled, ready)
-                state = result.get('state') if isinstance(result, dict) else None
-                if daily and self.should_stop() and state not in DREAM_DAY_STATES:
+                if daily and self._dream_stop_cut:
                     # Cut by the stop and answered rather than raised (a `failed` pass whose executor the stop
                     # ended): like a stop, it costs nothing.
                     self._write_state(dream_tries=found)
@@ -267,11 +267,14 @@ class Jobs:
         except Exception:
             if not daily:
                 raise
-            if self.should_stop():
-                # While the core is stopping, a call to another core fails as a KelmoError rather than Stopping
-                # (stopping.py), before or after the start: the stop caused it, so like a stop it costs nothing.
-                self._write_state(dream_tries=found)
-            elif not self._dream_started:
+            if self._dream_started:
+                if self._dream_stop_cut:
+                    # While the core is stopping, a call to another core fails as a KelmoError rather than
+                    # Stopping (stopping.py): the stop caused it, so like a stop it costs nothing.
+                    self._write_state(dream_tries=found)
+            elif self.should_stop():
+                self._write_state(dream_tries=found)  # the same for a call that failed before the start
+            else:
                 # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try
                 # too: it counts towards DREAM_TRIES and waits DREAM_RETRY_SECONDS. One that started is counted
                 # in _dream_run.
@@ -319,14 +322,22 @@ class Jobs:
             stopped = True  # _dream puts the try state back
             raise
         except Exception:
-            if daily and not self.should_stop():  # a stop is _dream's to undo; a failure before the start too
-                self._record_dream_try_end()
+            if daily:
+                # Decided once: a failure while the core stops is the stop's, and _dream gives its try back; any
+                # other keeps its try and waits from now, even if a stop arrives right after.
+                if self.should_stop():
+                    self._dream_stop_cut = True
+                else:
+                    self._record_dream_try_end()
             raise
         finally:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
                 self._record_apply_end(stopped=stopped)
         if daily:
             state = result.get('state') if isinstance(result, dict) else None
+            if state not in DREAM_DAY_STATES and self.should_stop():
+                self._dream_stop_cut = True  # an answer short of the day while the core stops: _dream undoes it
+                return result
             if state in DREAM_DAY_STATES:
                 self._record_dream_day()
             elif state in DREAM_HELD_STATES:
