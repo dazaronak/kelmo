@@ -14,8 +14,8 @@ every FAILED / ERROR / SKIPPED summary line of every shard, and last one summary
 (`N failed, M passed, K skipped, E errors in Ts`) summing the shards. Before them, as the run goes, it says what it
 collected (`collected N cases in K shards`) and a `progress:` line as each shard ends, with the cases done so
 far; just before the summary, how many of the collected cases passed. None of these lines has a summary's or a
-report line's shape. When GITHUB_STEP_SUMMARY names a file, the result is appended to it as well. A shard that ends without a summary line
-is an error that names the shard and its last lines. Exit 0 only when every shard passed and the shards together
+report line's shape. When GITHUB_STEP_SUMMARY names a file, the result is appended to it as well. A shard that
+ends without a summary line is an error that names the shard and its last lines. Exit 0 only when every shard passed and the shards together
 report an outcome for every case they were dealt. A collection that ended in an error (a module that does not
 import) is not sharded: its output is printed and its exit code returned.
 """
