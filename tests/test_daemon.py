@@ -771,6 +771,7 @@ def test_sigterm_interrupts_idle_poll_wait(tmp_path):
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         assert process.stdout.readline().strip() == 'ready'
+        time.sleep(0.5)  # the child is in its wait by now, so the signal interrupts a wait under way
         started = time.monotonic()
         os.kill(process.pid, __import__('signal').SIGTERM)
         try:
@@ -779,7 +780,6 @@ def test_sigterm_interrupts_idle_poll_wait(tmp_path):
             code = None
         elapsed = time.monotonic() - started
         assert code == 0, f'the worker did not stop within 15 s of SIGTERM (exit {code}, {elapsed:.1f} s)'
-        assert elapsed < 15
     finally:
         if process.poll() is None:
             process.kill()
