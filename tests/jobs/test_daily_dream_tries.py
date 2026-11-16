@@ -21,7 +21,7 @@ def ticking(tmp_path, monkeypatch, outcomes, duration=0):
     (tmp_path / '.state').mkdir(exist_ok=True)
     now = [day_at(4)]
     reader = SimpleNamespace(journal=SimpleNamespace(conn=SimpleNamespace(
-        execute=lambda _sql: SimpleNamespace(fetchall=lambda: []))))
+        execute=lambda _sql: SimpleNamespace(fetchall=lambda: [], fetchone=lambda: (0,)))))
     writer = SimpleNamespace(config=SimpleNamespace(embedding=None, batch_apply=False, batch_ready_sources=8))
     storage = SimpleNamespace(writer=writer, read=lambda fn: fn(reader))
     core = SimpleNamespace(root=tmp_path, storage=storage, profile=None, profile_path=None)
