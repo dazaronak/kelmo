@@ -173,6 +173,10 @@ def _serial(method):
     return guarded
 
 
+# What a failed read names when it knows no channel of its own: `_drop` then leaves the current one alone.
+_NO_CHANNEL = object()
+
+
 class Outbox:
     """The durable local queue; an entry exists before any byte is sent."""
 
@@ -185,6 +189,9 @@ class Outbox:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA synchronous=FULL')
         with self.conn:
+            # Another process may be opening the same older outbox: the schema is read and brought up to date
+            # under one write lock, so a column is added once.
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS entries (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
                 op TEXT NOT NULL, args TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
@@ -1130,7 +1137,8 @@ class SharedClient:
                     or not _replayable_read(op)):
                 raise
             failed = error
-        self._drop(self._channel)
+        # Only the channel this read failed on: another thread may already have opened the next one.
+        self._drop(getattr(failed, 'channel', None) or _NO_CHANNEL)
         window, pause = min(limit, time.monotonic() + RECONNECT_SECONDS), RECONNECT_FIRST_PAUSE
         while True:
             try:
@@ -1175,7 +1183,9 @@ class SharedClient:
             raise
         if ok:
             return value
-        raise KelmoError(value['code'], value['message'])
+        refused = KelmoError(value['code'], value['message'])
+        refused.channel = channel  # SharedClient.call drops this channel, and only this one, before a resend
+        raise refused
 
     def submit(self, op, args, key):
         """Persist first, then deliver everything queued in order; report this entry's state."""
