@@ -20,9 +20,10 @@ entry here.
   that was sent and then cut as final, even when it carried an idempotency key, so the client's outbox
   settled the note as refused for good. The refusal now marks a keyed request as cut: the note stays pending
   and the next flush sends it again under the same key. On its third cut it is refused with its effect
-  unknown, so a note that ends the channel every time cannot hold the notes behind it. This counting covers a
-  shared client that reaches the server without the edge daemon; through the edge daemon a cut note was
-  already sent again, and its cuts are not counted yet. Only a cut counts: a retryable refusal the server
+  unknown, so a note whose delivery `kelmod attach` reports cut every time cannot hold the notes behind it.
+  This counting covers a shared client that reaches the server without the edge daemon; through the edge
+  daemon a cut note was already sent again, and its cuts are not counted yet, nor is a bridge process that
+  dies or times out under a note. Only a cut counts: a retryable refusal the server
   itself gives leaves the note pending however often it comes. A client from before this release does not
   read the mark and refuses a cut note at once, as it did. A request without a key is still refused, with its
   effect reported as unknown.

@@ -278,3 +278,24 @@ def test_a_resend_whose_connect_blocks_ends_with_its_reconnect_window(daemon, mo
     got = outcome(peer, 'state.scheduler_status', {}, seconds=6.0)
     assert got[:2] == ('error', 'E_TRANSPORT'), got
     assert got[-1] < 2.5, got
+
+
+def _stall_only(monkeypatch, nth):
+    """daemon_client's sockets: the `nth` connect stalls, every other one is real."""
+    made = []
+
+    def make(*args):
+        made.append(1)
+        return (_Stalling if len(made) == nth else socket.socket)(*args)
+    monkeypatch.setattr(daemon_client, 'socket', types.SimpleNamespace(
+        socket=make, AF_UNIX=socket.AF_UNIX, SOCK_STREAM=socket.SOCK_STREAM))
+
+
+def test_a_resend_tries_a_new_connect_while_one_is_blocked(daemon, monkeypatch):
+    # The read was sent and cut; the resend's first connect meets a listen queue that takes nothing (the old
+    # daemon), while kelmod is back on the socket for the next connect. The resend reaches it inside the deadline.
+    peer = daemon(Connection(hold(0.2, CLOSE)), Connection(ANSWER))
+    _stall_only(monkeypatch, 2)
+    got = outcome(peer, 'state.scheduler_status', {}, seconds=6.0)
+    assert got[0] == 'ok', got
+    assert got[-1] < 3.0, got

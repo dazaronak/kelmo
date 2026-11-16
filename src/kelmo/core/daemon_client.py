@@ -60,6 +60,9 @@ def kelmod_executable(preferred=None):
 # The first attempt's socket waits this long past the deadline, so kelmod's own E_DEADLINE reply can arrive.
 GRACE_SECONDS = 5.0
 RECONNECT_PAUSE = 0.05
+# One connect try of a reconnect: a listen queue that takes nothing (a daemon that hangs) gives way to the next try,
+# which reaches a daemon that came back on the socket meanwhile.
+CONNECT_TRY_SECONDS = 1.0
 
 
 class _Cut(Exception):
@@ -104,11 +107,12 @@ def _resendable(op, key, resend=False):
 
 def _connect(target, until, limit=None):
     """A connected socket, each connect bounded by the absolute `until` (a daemon whose listen queue is full
-    leaves a connect waiting). Without `limit` one try; with it, a try every RECONNECT_PAUSE until `limit`."""
+    leaves a connect waiting). Without `limit` one try; with it, a try every RECONNECT_PAUSE until `limit`, each
+    bounded by CONNECT_TRY_SECONDS as well."""
     while True:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            _budget(sock, until)
+            _budget(sock, until if limit is None else min(until, time.monotonic() + CONNECT_TRY_SECONDS))
             sock.connect(target)
             return sock
         except OSError as error:
