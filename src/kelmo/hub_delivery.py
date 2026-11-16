@@ -3,6 +3,7 @@
 The caller owns transport and must acknowledge a refresh only after its output succeeds.
 """
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -20,6 +21,9 @@ from .errors import KelmoError
 RETAIN_SECONDS = 2 * 86400
 RETAIN_SETS = 8
 SWEEP_SECONDS = 86400
+# A set a session's delivery pointed at stays while that session's delivery record is younger than this: the
+# session may read the path days later.
+POINTED_RETAIN_SECONDS = 30 * 86400
 
 
 def _hash(raw):
@@ -151,7 +155,8 @@ def prune_sets(root, keep=None):
     sets = sorted((path for path in root.iterdir()
                    if path.name.startswith('.set-') and path.is_dir() and not path.is_symlink()),
                   key=lambda path: path.stat().st_mtime, reverse=True)
-    protected = {current, *(keep() if keep is not None else ()), *(path.name for path in sets[:RETAIN_SETS])}
+    protected = {current, *(keep() if keep is not None else ()), *(path.name for path in sets[:RETAIN_SETS]),
+                 *_pointed_sets(root.parent / 'hub-sessions', now)}
     removed = []
     for path in sets:
         if path.name not in protected and now - path.stat().st_mtime > RETAIN_SECONDS:
@@ -162,6 +167,21 @@ def prune_sets(root, keep=None):
             removed.append(path.name)
     marker.touch()
     return removed
+
+
+def _pointed_sets(sessions, now):
+    """The sets the recent session delivery records name: a session was given a path into each."""
+    names = set()
+    for record in (() if sessions.is_symlink() else sessions.glob('*.json')):
+        try:
+            if record.is_symlink() or now - record.stat().st_mtime > POINTED_RETAIN_SECONDS:
+                continue
+            name = json.loads(record.read_bytes()).get('set')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(name, str):
+            names.add(name)
+    return names
 
 
 def install_set(root, snapshot, keep=None):
@@ -383,8 +403,9 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
     try:
         record = json.loads(state_path.read_text(encoding='utf-8'))
         previous, previous_core = record.get('digest'), record.get('core')
+        pointed_before = record.get('set') if isinstance(record.get('set'), str) else None
     except (OSError, ValueError, AttributeError):
-        previous = previous_core = None
+        previous = previous_core = pointed_before = None
     changed = previous != digest
     core_changed = changed if core_digest is None else previous_core != core_digest
     forced = not verified or stale or compacted
@@ -397,12 +418,17 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
         if context and previous and changed and core_changed:
             context = RESTART_WARNING + context
 
-    def commit():
+    def commit(pointed=None):
+        """`pointed`: the set this delivery's answer gave a path into; a marker that gives none keeps the
+        set the session was pointed at before."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix='.delivery-', dir=state_path.parent)
+        written = {'digest': digest, 'core': core_digest}
+        if pointed or pointed_before:
+            written['set'] = pointed or pointed_before
         try:
             with os.fdopen(fd, 'wb') as out:
-                out.write(_encoded({'digest': digest, 'core': core_digest}))
+                out.write(_encoded(written))
             os.replace(name, state_path)
         finally:
             Path(name).unlink(missing_ok=True)
@@ -504,8 +530,11 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
                          marker=unchanged_marker(snapshot, project, installed) if hook_mode else '',
                          pending_only=pending_only)
         context = update['context']
+        pointed = next((Path(path).name for path in (current, installed)
+                        if path is not None and not callable(path) and Path(path).name.startswith('.set-')
+                        and str(path) in context), None)
         if not sync_failed and settled:
-            acknowledge(update['commit'])
+            acknowledge(functools.partial(update['commit'], pointed))
     return context
 
 

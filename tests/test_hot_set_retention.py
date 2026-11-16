@@ -191,3 +191,40 @@ def test_a_stale_delivery_whose_set_was_removed_says_it_has_no_cached_generation
     with pytest.raises(KelmoError) as before:
         client.context(binding=BINDING, unreachable=Unbound('E_TRANSPORT', 'offline'))
     assert before.value.code == 'E_TRANSPORT' and 'no cached generation' in str(before.value), before.value
+
+
+def test_a_set_a_session_was_pointed_at_stays_while_the_session_is_recent(tmp_path, monkeypatch):
+    """Oversized mandatory pages reach a session as a path into the set; the session may read it days later."""
+    import hashlib
+
+    from kelmo import hub_delivery, hub_embed
+    monkeypatch.setattr(hub_embed, 'sync', lambda *args, **kwargs: {'verified': True, 'changed': False})
+    hot, cache = tmp_path / 'hot', tmp_path / 'cache'
+    client = Client(tmp_path)
+    named = os.path.basename(client.context(binding=BINDING)['hub_directory'])
+    snapshot = hub_delivery.read_set(hot, named)
+    content = '<!-- kelmo generation 2 -->\n' + 'M' * 10500
+    snapshot['files']['mandatory.md'] = {'text': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}
+    acknowledged = []
+    output = hub_delivery.prepare(SimpleNamespace(state=tmp_path), {'session_id': 'long-session'}, snapshot,
+                                  'alpha', '', [], provider='claude', current=hot / named, stale=False,
+                                  acknowledge=acknowledged.append)
+    assert str(hot / named) in output
+    for commit in acknowledged:
+        commit()
+    for record in cache.glob('context-*.json'):
+        record.unlink()  # no cached context holds the set: only the session's pointer does
+    stamp = time.time() - 30 * DAY
+    os.utime(hot / named, (stamp, stamp))
+    for index in range(1, 13):
+        _old_set(hot, 100 + index, days=10 + index)
+    (hot / '.pruned').unlink()
+    client.generation = 3
+    client.context(binding=dict(BINDING, work='other-task'))
+    assert named in _sets(hot), 'a set a recent session was pointed at was removed'
+    for record in (tmp_path / 'hub-sessions').glob('*.json'):
+        os.utime(record, (time.time() - 31 * DAY,) * 2)
+    (hot / '.pruned').unlink()
+    client.generation = 4
+    client.context(binding=dict(BINDING, work='third-task'))
+    assert named not in _sets(hot), 'a set only a month-old session record named was kept'

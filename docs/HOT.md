@@ -125,12 +125,13 @@ still proves the generation and revision. Damaged metadata refuses automatic rep
 Shared pending notices obey the client's enrolled project boundary.
 When it installs a set (a shared client on each delivery that brings one, a local
 vault when it saves a copy), Kelmo removes, at most once a day, the sets older than
-two days; a set installed again counts as new. It keeps the current set, the eight
-newest whatever their age, and on a shared client every set a cached context names,
-so offline delivery keeps working. A pointer a session was given more than two days
-ago may name a removed set; an online delivery points at the current set, an offline
-one at the set its cache names, and an offline delivery whose set is gone says that
-no cached generation is left.
+two days; a set installed again counts as new. It keeps the eight newest whatever
+their age (the current set among them), on a shared client every set a cached context
+names, so offline delivery keeps working, and every set a session's delivery gave a
+path into while that session's delivery record is younger than 30 days, so the
+session can still read the path. An online delivery points at the current set, an
+offline one at the set its cache names, and an offline delivery whose set is gone
+says that no cached generation is left.
 
 Codex managed blocks contain the published combined view. Bound work and pending
 notes travel through the hook and are not persisted into the repository's instruction file.
