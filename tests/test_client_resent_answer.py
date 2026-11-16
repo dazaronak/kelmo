@@ -37,3 +37,14 @@ def test_a_resend_chain_answers_as_its_last_note(shared):
     client.outbox.resend(('E_INPUT',), apply=True)
     client.outbox.settle('old#resend2', 'refused', {'code': 'E_FACT_CHECK', 'message': 'third'})
     assert _answer(lambda: client.submit('create', ARGS, 'old')) == ('refused', 'E_FACT_CHECK', 'third')
+
+
+def test_a_note_of_another_project_with_the_same_text_does_not_answer_for_a_refusal(shared):
+    client = shared.client()
+    client.outbox.enqueue('create', ARGS, 'refused-in-app')
+    client.outbox.settle('refused-in-app', 'refused', {'code': 'E_INPUT', 'message': 'Page is not registered'})
+    client.outbox.enqueue('create', dict(ARGS, project='web'), 'delivered-in-web')
+    client.outbox.settle('delivered-in-web', 'delivered', {'id': 'op-web'})
+    [item] = client.outbox.resend(('E_INPUT',), apply=True)
+    assert item['resend_as'] == 'refused-in-app#resend1' and 'duplicate' not in item, item
+    assert [row['idempotency_key'] for row in client.outbox.pending()] == ['refused-in-app#resend1']

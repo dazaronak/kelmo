@@ -297,11 +297,13 @@ class Outbox:
         `resent` and names its successor. Without `apply` nothing changes. The refusals are read under the
         write lock, so two runs at once never resend one note twice.
 
-        A note is sent once: a refusal whose text another queued or delivered note already carries is not
-        sent again but names that note (`duplicate`), and of several refusals with one text only the newest
-        goes out; the older ones name it too."""
+        A note is sent once: a refusal whose text another queued or delivered note of the same project
+        already carries is not sent again but names that note (`duplicate`), and of several refusals with one
+        text in one project only the newest goes out; the older ones name it too. The targets are not
+        compared, since a refusal is often resent once its target is fixed."""
         def text(row):
-            return json.loads(row['args']).get('content', '').strip()
+            args = json.loads(row['args'])
+            return args.get('project'), args.get('content', '').strip()
 
         items = []
         with self.conn:
