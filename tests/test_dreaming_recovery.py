@@ -46,6 +46,25 @@ def test_forgotten_evidence_is_skipped_and_never_holds_the_cursor(world):
     assert second == {'state': 'idle'}
 
 
+def test_forgotten_evidence_ahead_of_readable_evidence_lets_the_cursor_pass_both(world):
+    """The forgotten record comes first in the window and a readable one after it: the pass sends the readable
+    one, and the cursor moves past both, so the next pass reads neither again."""
+    from kelmo.config import Config
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[editor]\nmode = "nightly"\n', encoding='utf-8')
+    world.service.config = Config.load(world.root)
+    later = world.service.create('The export moves to a nightly window.', project='app')
+    world.service.run(later['id'])
+    world.service.forget(world.seed.archive_id)
+    executor = Scripted(ModelOutcome('proposal', {'findings': []}), ModelOutcome('proposal', {'findings': []}))
+    result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'finished', result
+    assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] != [world.seed.archive_id]
+    second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert second == {'state': 'idle'}, second
+    assert len(executor.jobs) == 1, 'the second pass read the same evidence again'
+
+
 def test_link_publication_fails_once_stays_open_then_publishes(world, monkeypatch):
     finding = {
         'kind': 'link',
