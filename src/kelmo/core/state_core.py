@@ -431,7 +431,9 @@ class StateCore:
         if isinstance(frame.get('cwd'), str) and not payload.get('cwd'):
             payload['cwd'] = frame['cwd']
         if action.startswith('session-'):
-            with self.storage.baton.hold():
+            # A session end waits for another writer only until its deadline (`capture_hook`); Stop and
+            # PreCompact wait as before.
+            with self.storage.baton.hold(until=deadline if action == 'session-end' else None):
                 result = capture_hook(self.root, provider, action, payload,
                                       internal_job=frame.get('internal_job') is True,
                                       journal=self.storage.writer.journal, deadline=deadline)

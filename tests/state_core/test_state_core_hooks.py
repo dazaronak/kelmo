@@ -180,3 +180,49 @@ def test_a_session_end_that_waited_for_the_baton_still_ends_inside_its_deadline(
 
     assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
     assert seconds < 7.0, seconds
+
+
+def test_a_session_end_whose_baton_stays_held_past_its_deadline_fails_busy_inside_it(world_factory, core_factory,
+                                                                                    tmp_path):
+    """Another writer keeps the baton longer than the hook's deadline (its own journal statement waits on a lock
+    held outside the daemon): the session end does not wait for it past the deadline, it answers E_BUSY."""
+    import threading
+    import time
+
+    from kelmo.config import Config
+    from kelmo.errors import KelmoError
+    from kelmo.sessions import Sessions
+
+    root = world_factory().root
+    provider = tmp_path / 'native'
+    provider.mkdir()
+    transcript = provider / 'chat.jsonl'
+    transcript.write_bytes(lines('claude'))
+    configure(root, {'mode': 'auto', 'sources': {'claude': [str(provider)]}})
+    Sessions(Config.load(root)).close()
+    core = core_factory(root)
+    taken, release = threading.Event(), threading.Event()
+
+    def writer():
+        with core.storage.baton.hold():
+            taken.set()
+            release.wait(12.0)
+
+    holder = threading.Thread(target=writer, daemon=True)
+    holder.start()
+    assert taken.wait(5)
+    body = {'action': 'session-end', 'payload': {'session_id': 'native', 'transcript_path': str(transcript)},
+            'context': {'provider': 'claude', 'internal_job': False}}
+    began = time.monotonic()
+    try:
+        try:
+            outcome = core.handle_hook(Context.local('hook', 7), body)
+        except KelmoError as error:
+            outcome = error
+        seconds = time.monotonic() - began
+    finally:
+        release.set()
+        holder.join(15)
+
+    assert seconds < 7.0, seconds
+    assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
