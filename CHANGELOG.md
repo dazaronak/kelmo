@@ -6,6 +6,13 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `kelmo dream` on a shared-client machine is refused the way other server commands are: `E_CAPABILITY`, "runs
+  on the server", where `dream status` and the other local actions used to answer `E_NOT_INITIALIZED` as if the
+  vault were missing. `dream run` and `dream apply` are no longer sent to the client's daemon, which has no dream
+  job; they get the same refusal.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
