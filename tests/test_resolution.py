@@ -221,6 +221,24 @@ def test_reopen_preserves_validated_response_and_rejects_replacement(service, mo
     assert service.journal.get(operation['id'])['archive_id']
 
 
+def test_a_core_stop_during_the_resolve_call_gives_the_request_back_uncharged(service, monkeypatch):
+    """The core's stop ends the model call of a resolution request (`Stopping`, as `stopping.py` promises): the
+    request goes back to pending with no attempt charged and no claim left, for the next start."""
+    from kelmo.daemon import tick
+    from kelmo.errors import Stopping
+    from kelmo.resolution import Resolution
+    pending(service)
+
+    def cut_by_the_stop(argv, payload, **kwargs):
+        raise Stopping()
+
+    monkeypatch.setattr('kelmo.daemon.execute', cut_by_the_stop)
+    with pytest.raises(Stopping):
+        tick(service, ['/synthetic/executor'], max_attempts=3)
+    job = Resolution(service).list()[0]
+    assert (job['state'], job['attempts']) == ('pending', 0), job
+
+
 def test_resolution_submit_rejects_symlinked_worker_lock(service, tmp_path):
     from kelmo.resolution import Resolution
     pending(service)

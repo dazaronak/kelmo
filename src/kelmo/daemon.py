@@ -530,6 +530,11 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
             reply = request['response'] if request['response'] is not None else quota.checked(
                 execute(argv, request['payload'], timeout=timeout))
             queue.submit(request['id'], request['token'], reply)
+        except Stopping:
+            # The core's stop ended the call: the request goes back unanswered, its attempt given back, for the next
+            # start (stopping.py); without this it stayed claimed until its lease ran out, charged.
+            queue.release_busy(request['id'], request['token'])
+            raise
         except Exception as error:  # noqa: BLE001 - One failed request must not stop the worker.
             from .core.baton import BatonError
             if isinstance(error, BatonError):

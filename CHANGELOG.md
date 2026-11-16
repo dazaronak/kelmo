@@ -6,6 +6,11 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A resolution request whose model call the core's stop ended is given back at once, without being
+  charged an attempt. It used to stay claimed until its lease ran out, with the attempt counted.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
