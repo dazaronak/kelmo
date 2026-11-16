@@ -510,8 +510,8 @@ def test_a_pass_given_a_step_but_no_boundary_is_refused_before_it_enters_one(wor
 
 
 def step_the_journal_clock_back(monkeypatch, seconds):
-    """From here on the journal's clock reads `seconds` earlier than real time, as after a backward NTP step:
-    the stamps of new records and the pass's own reading of the time both come from it."""
+    """From here on the journal's clock reads `seconds` earlier than real time, as after a backward NTP step: the
+    stamps of new records come from it. The apply pass itself reads no clock to pick its notes."""
     from datetime import datetime, timedelta
 
     from kelmo import journal
@@ -1080,3 +1080,35 @@ def test_an_invalid_priority_in_open_work_is_a_repair_not_a_failure(world):
     assert executor.jobs[1].payload['refusal']['code'] == 'E_PROPOSAL'
     assert 'H1, H2 or H3' in executor.jobs[1].payload['refusal']['reason']
     assert world.registry()['pages'][target]['priority'] == ''
+
+
+@pytest.mark.parametrize('stepped_back', [True, False], ids=['clock-stepped-back', 'clock-steady'])
+def test_a_usage_limit_wait_holds_the_next_pass_only_while_the_clock_can_tell(world, stepped_back):
+    """A usage limit defers Dreaming until its reset. After the clock stepped back below the moment the deferral was
+    recorded, the wait no longer holds the next pass: it starts, and a limit still in force defers it again. With a
+    steady clock the wait holds as before."""
+    import time
+
+    from kelmo.dreaming_cli import run_dream
+    nightly(world)
+    note = world.service.create('Exports run at 03:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    recorded = time.time()
+    dream = world.service.dreaming
+    dream._set_state('settings', {'executor_config': '/nonexistent/editor.json', 'max_sources': 10,
+                                  'max_pages': 10, 'budget_tokens': 100000})
+    dream._set_state('paused', False)
+    dream._set_state('next_attempt', recorded + 1800)
+    dream._set_state('deferred_at', recorded)
+
+    class Started(Exception):
+        pass
+
+    def started():
+        raise Started()
+    now = recorded + 2400 - 3600 if stepped_back else recorded + 600
+    try:
+        result = run_dream(world.service, 'apply', clock=lambda: now, on_start=started)
+    except Started:
+        result = {'state': 'started'}
+    assert result['state'] == ('started' if stepped_back else 'deferred'), result

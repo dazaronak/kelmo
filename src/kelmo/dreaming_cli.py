@@ -41,7 +41,8 @@ def status(root):
             "SELECT run_id,state,started_at,finished_at FROM dream_runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone() if "dream_runs" in tables else None
     answer = {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
-              "next_attempt": values.get("next_attempt", 0), "findings": counts,
+              "next_attempt": values.get("next_attempt", 0), "deferred_at": values.get("deferred_at", 0),
+              "findings": counts,
               "last_run": dict(recent) if recent else None}
     # What each executor command last said of the instructions it gives the model, once it was asked
     # (`creation.instructions_standing`): its name, `same`, `own`, `differs` or `unidentified`, when and why.
@@ -185,6 +186,18 @@ def dispatch(root, args):
             return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
 
 
+def deferred_until(state, now):
+    """The reset time a usage limit set, while it still holds a pass at `now`, else 0. A clock read below the moment
+    the deferral was recorded (`deferred_at`) cannot tell how much of the wait is over, so it holds nothing: a pass
+    that meets a limit still in force is deferred again by the executor's own answer."""
+    reset, since = state.get("next_attempt", 0), state.get("deferred_at")
+    if not isinstance(reset, (int, float)) or isinstance(reset, bool) or reset <= now:
+        return 0
+    if isinstance(since, (int, float)) and not isinstance(since, bool) and now < since:
+        return 0
+    return reset
+
+
 def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None,
               ready=False, boundary=None):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
@@ -211,8 +224,9 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
             return {"state": "unconfigured"}
         if dream._state("paused", True):
             return {"state": "paused"}
-        reset = dream._state("next_attempt", 0)
-        if reset > clock():
+        reset = deferred_until({"next_attempt": dream._state("next_attempt", 0),
+                                "deferred_at": dream._state("deferred_at")}, clock())
+        if reset:
             return {"state": "deferred", "reset_at": reset}
         service.archive_api.assert_writer()
     if on_start is not None:
@@ -244,5 +258,7 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
         result = dream.run(executor, origin=service.origin, contexts=contexts,
                            **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
         service.archive_api.assert_writer()
-        dream._set_state("next_attempt", result.get("reset_at", 0) if result["state"] == "deferred" else 0)
+        deferred = result["state"] == "deferred"
+        dream._set_state("next_attempt", result.get("reset_at", 0) if deferred else 0)
+        dream._set_state("deferred_at", clock() if deferred else 0)
     return dict(result, apply=applied)

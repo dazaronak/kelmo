@@ -531,3 +531,12 @@ def test_a_cut_apply_is_taken_up_again_below_the_note_count_and_a_complete_one_i
     jobs._record_apply_end()  # a complete pass that left a note: the count rule decides again
     now[0] += APPLY_MIN_INTERVAL_SECONDS
     assert jobs._dream_due() is None
+
+
+def test_a_usage_limit_wait_holds_no_pass_once_the_clock_stepped_back_below_its_record(tmp_path, monkeypatch):
+    # The deferral was recorded at 200; the clock now reads 100, so it cannot tell how much of the wait is over.
+    from kelmo import dreaming_cli
+    jobs = scheduler(tmp_path, [100], [])
+    monkeypatch.setattr(dreaming_cli, 'status',
+                        lambda root: {'paused': False, 'next_attempt': 1900, 'deferred_at': 200})
+    assert jobs._dream_hold() == (None, None)

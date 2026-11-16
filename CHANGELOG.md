@@ -12,7 +12,10 @@ entry here.
   it to the next pass. It used to compare capture times with its start time, so after the system clock
   stepped back every pass skipped a note captured before the step until the clock caught up again. Which
   notes are the pass's now follows the order the journal recorded them in, read before the daemon's pass
-  waits for the journal, so a clock step during that wait moves no note into or out of the pass.
+  waits for the journal, so a clock step during that wait moves no note into or out of the pass. A usage
+  limit's wait no longer holds Dreaming after the clock stepped back below the moment the limit was met: the
+  next pass starts, and a limit still in force defers it again. `kelmo dream status` shows that moment as
+  `deferred_at`.
 
 ## [0.3.1] - 2026-11-15
 

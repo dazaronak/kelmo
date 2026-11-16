@@ -420,12 +420,12 @@ class Jobs:
         return notes
 
     def _dream_hold(self):
-        from ..dreaming_cli import status
+        from ..dreaming_cli import deferred_until, status
         state = status(self.core.root)
         if state.get('paused'):
             return 'paused', None
-        reset = state.get('next_attempt')
-        if isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > self.clock():
+        reset = deferred_until(state, self.clock())
+        if reset:
             return 'deferred', reset
         return None, None
 
