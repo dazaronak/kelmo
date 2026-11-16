@@ -92,3 +92,54 @@ def test_the_held_line_names_a_dead_claim_and_never_the_refused_request(service,
     assert len(lines) == 1, lines
     assert held['id'] in lines[0]
     assert refused['id'] not in lines[0] and refused['operation_id'] not in lines[0]
+
+
+def test_the_held_line_never_names_an_operation_skipped_for_a_busy_journal(service, tmp_path, monkeypatch, capsys):
+    """A queued note skipped only because the journal was busy while its retry was charged is held by no other
+    attempt, so the line about held operations does not name it."""
+    import sqlite3
+    receipt = service.reconcile('A busy fact.', 'projects/fixture/fixture.md')
+    queued = service.capture(content({'result': 'not_found', 'search_id': receipt['search_id']},
+                                     text='A busy fact.', key='fixture.busy'), 'busy.md', 'lead', 'promote')
+    real = daemon.charge_retry
+
+    def busy(service, operation, max_attempts=3):
+        if operation['id'] == queued['id']:
+            raise sqlite3.OperationalError('database is locked')
+        return real(service, operation, max_attempts)
+
+    monkeypatch.setattr(daemon, 'charge_retry', busy)
+    capsys.readouterr()
+
+    passes, ended = two_passes(service, tmp_path, monkeypatch)
+
+    assert ended == {'stopped': True}, ended
+    assert {'operation_id': queued['id'], 'error_code': 'E_BUSY'}.items() <= passes[0]['skipped'][0].items(), passes
+    lines = [line for line in capsys.readouterr().err.splitlines()
+             if 'skipped operations held by another attempt' in line]
+    assert not any(queued['id'] in line for line in lines), lines
+
+
+def test_the_held_line_never_names_an_operation_whose_run_met_a_busy_journal(service, tmp_path, monkeypatch, capsys):
+    import sqlite3
+    receipt = service.reconcile('A locked fact.', 'projects/fixture/fixture.md')
+    queued = service.capture(content({'result': 'not_found', 'search_id': receipt['search_id']},
+                                     text='A locked fact.', key='fixture.locked'), 'locked.md', 'lead', 'promote')
+    real = service.run
+
+    def locked(operation_id, *args, **kwargs):
+        if operation_id == queued['id']:
+            raise sqlite3.OperationalError('database is locked')
+        return real(operation_id, *args, **kwargs)
+
+    monkeypatch.setattr(service, 'run', locked)
+    capsys.readouterr()
+
+    passes, ended = two_passes(service, tmp_path, monkeypatch)
+
+    assert ended == {'stopped': True}, ended
+    assert any(entry.get('operation_id') == queued['id'] and entry['error_code'] == 'E_BUSY'
+               for entry in passes[0]['skipped']), passes
+    lines = [line for line in capsys.readouterr().err.splitlines()
+             if 'skipped operations held by another attempt' in line]
+    assert not any(queued['id'] in line for line in lines), lines
