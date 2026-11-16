@@ -6,6 +6,8 @@ entry here.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-16
+
 ### Added
 
 - The owner is told when a Dreaming run fails, or when the findings pass keeps reading nothing while archived
