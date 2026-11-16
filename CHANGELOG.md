@@ -8,16 +8,17 @@ entry here.
 
 ### Changed
 
-- A shared client removes its old HOT sets. Each publication installed a new set of HOT files under the
-  client's `hot/` and none was ever removed, so the directory grew by every generation. When it installs a
-  set, the client now removes, at most once a day, the sets older than two days. It keeps the current set,
-  the eight newest whatever their age, and every set a cached context names; a set installed again counts as
-  new. A local vault that saves a copy for a cut context sweeps its sets the same way. An offline delivery
-  whose set was removed says that no cached generation is left. The same sweep removes a cached context no delivery, online
-  or from the cache, has used for 30 days, so a binding nobody uses any more no longer holds its set, and a
-  session's delivery record under `hub-sessions/` no delivery has written for 30
-  days. Each session left one small file there, about 86 a day on one machine. The sweep also removes a saved context reference
-  under `hub-context/` that no delivery has used for 30 days; a reference used again counts from that use.
+- A shared client cleans up its own files. Each publication installed a new set of HOT files under the
+  client's `hot/`, and nothing there, in `cache/`, `hub-sessions/` or `hub-context/` was ever removed, so
+  the state directory only grew. When it installs a HOT set, the client now sweeps them at most once a day:
+  - HOT sets older than two days go. The current set, the eight newest whatever their age, and every set
+    a cached context names stay. A local vault that saves a copy for a cut context sweeps its sets too.
+  - A cached context no delivery, online or from the cache, has used for 30 days goes, and with it the
+    hold on its set. That binding has no offline fallback until its next delivery.
+  - A session's delivery record no delivery has written for 30 days goes. Such a session, if it prompts
+    again, gets the whole context once, as a new session does.
+  - A saved context reference no delivery has used for 30 days goes. A reference used again counts from
+    that use.
 
 ## [0.3.1] - 2026-11-15
 
