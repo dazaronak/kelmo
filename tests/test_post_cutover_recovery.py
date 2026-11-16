@@ -177,6 +177,24 @@ def test_a_baseline_without_markers_refuses_when_a_record_is_forgotten(cutover_v
     assert code == 1 and answer['error']['code'] == 'E_TAIL', answer
 
 
+def test_a_baseline_without_markers_counts_a_forget_in_the_second_it_names(cutover_vault, capsys):
+    """A baseline written before markers were recorded names its cutover in whole seconds. A record forgotten in
+    that second cannot be told from one forgotten just after the cutover, so it counts: the check refuses and the
+    operator recovers forward, which loses nothing."""
+    ctl = cutover_vault['ctl_path']
+    [record] = only_record(ctl)
+    forget(capsys, ctl, record)
+    [[_, forgotten_at]] = snap.visibility_census(Config.load(ctl).archive)
+    baseline = json.loads((ctl / snap.CUTOVER).read_text(encoding='utf-8'))
+    baseline.pop('hidden', None)
+    baseline['marked_at'] = forgotten_at[:19] + forgotten_at[-6:]  # the same second, without its fraction
+    (ctl / snap.CUTOVER).write_text(json.dumps(baseline), encoding='utf-8')
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 1 and answer['error']['code'] == 'E_TAIL', answer
+    assert '1 forgotten records' in answer['error']['message'], answer
+
+
 def test_forward_recover_yields_vault_with_pre_and_post_cutover_records_and_head(tmp_path, cutover_vault):
     ctl = cutover_vault['ctl_path']
 
