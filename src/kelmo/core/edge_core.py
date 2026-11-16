@@ -76,6 +76,15 @@ class OwnerLock:
                 # A caller that gave up may have been the one whose turn it was.
                 self._condition.notify_all()
 
+    def acquire_if_idle(self):
+        """Takes the lock only when nobody holds it and nobody waits for it, without joining the waiters or changing
+        whose turn is next: a reader that must never stand in a caller's way. True when taken."""
+        with self._condition:
+            if self._holder is not None or any(self._waiting.values()):
+                return False
+            self._holder, self._count = threading.get_ident(), 1
+            return True
+
     def release(self):
         with self._condition:
             if self._holder != threading.get_ident():
@@ -352,12 +361,17 @@ class EdgeCore:
                 'edge.cli': (self.handle_cli, 'handler'), 'edge.ack': (self.handle_ack, 'hook')}
 
     def status(self):
-        try:
-            # Status runs on the frame reader: it never waits for the client, it reports it busy.
-            with self.owned(0):
+        # Status runs on the frame reader: it reads the outbox only while nobody holds or waits for it, so it never
+        # waits for the client and never goes ahead of a queued hook; otherwise it reports the outbox busy.
+        if not self._owner.acquire_if_idle():
+            outbox = {'busy': True}
+        else:
+            try:
                 outbox = self.client.outbox.summary()
-        except Exception as error:  # noqa: BLE001 - status reports, never fails
-            outbox = {'error': str(error)[:200]}
+            except Exception as error:  # noqa: BLE001 - status reports, never fails
+                outbox = {'error': str(error)[:200]}
+            finally:
+                self._owner.release()
         return {'authority_id': self.client.profile.authority_id, 'outbox': outbox, 'last_delivery': self._last}
 
     def trim(self):
