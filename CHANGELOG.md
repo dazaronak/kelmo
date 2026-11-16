@@ -11,8 +11,10 @@ entry here.
 - A daily Dreaming run that fails waits 15 minutes from the end of the run before the scheduler tries it
   again. The wait used to count from the start, so a run that took longer than that and failed was started
   again at once, and the three daily tries could go in about an hour. The same wait holds for a run that
-  started one day and failed the next, and for one that failed before it started, which costs no try. A run that answers a usage limit whose reset time has already passed
-  still costs no try, but now waits the same 15 minutes instead of starting again on every scheduler tick.
+  started one day and failed the next. A run that fails before it starts (its lock, Dreaming's settings) is
+  now one of the three tries and waits the same 15 minutes; it used to be started again on every scheduler
+  tick, all day. A run that answers a usage limit whose reset time has already passed still costs no try,
+  but now waits the same 15 minutes instead of starting again on every scheduler tick.
 
 ## [0.3.1] - 2026-11-15
 

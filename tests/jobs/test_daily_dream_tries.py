@@ -104,8 +104,8 @@ def test_a_usage_limit_leaves_the_day_all_three_tries(tmp_path, monkeypatch):
 
 
 def test_a_run_that_fails_before_it_starts_waits_the_delay(tmp_path, monkeypatch):
-    """A scheduled run that fails before it really starts (reading Dreaming's settings, say) is no try, but the
-    scheduler still waits DREAM_RETRY_SECONDS before it calls it again instead of calling it on every tick."""
+    """A scheduled run that fails before it really starts (reading Dreaming's settings, say): the scheduler waits
+    DREAM_RETRY_SECONDS before it calls it again instead of calling it on every tick."""
     from kelmo import dreaming_cli
     jobs, now, _ = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
     calls = []
@@ -128,3 +128,37 @@ def test_a_run_that_fails_after_midnight_waits_the_delay_on_the_new_day(tmp_path
     tick_until(jobs, now, day_at(23, 59) + 86400)
     assert len(starts) >= 2, starts
     assert starts[1] - (starts[0] + 86400) >= DREAM_RETRY_SECONDS, starts
+
+
+def test_a_run_that_fails_before_it_starts_counts_its_try(tmp_path, monkeypatch):
+    """A failed run is a try whether it failed before or after its start: three a day, as docs/DAEMON.md says."""
+    from kelmo import dreaming_cli
+    jobs, now, _ = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+    calls = []
+
+    def failing_before_the_start(*args, **kwargs):
+        calls.append(now[0])
+        raise RuntimeError('the settings could not be read')
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', failing_before_the_start)
+    tick_until(jobs, now, day_at(23, 59))
+    assert len(calls) == DREAM_TRIES, calls
+
+
+def test_a_run_whose_lock_cannot_be_opened_waits_the_delay_and_counts_its_try(tmp_path, monkeypatch):
+    """The Dreaming lock file cannot be opened (here a directory stands in its place): the run fails before
+    run_dream is reached, and the scheduler still waits the delay and stops after three tries."""
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+    (tmp_path / '.state' / 'dreaming.lock').mkdir()
+    attempts = []
+    opening = jobs._dreaming_lock
+
+    def counted_lock():
+        attempts.append(now[0])
+        return opening()
+
+    monkeypatch.setattr(jobs, '_dreaming_lock', counted_lock)
+    tick_until(jobs, now, day_at(23, 59))
+    assert starts == []
+    assert len(attempts) == DREAM_TRIES, attempts
+    assert all(later - earlier >= DREAM_RETRY_SECONDS for earlier, later in zip(attempts, attempts[1:])), attempts

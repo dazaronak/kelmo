@@ -45,9 +45,9 @@ APPLY_NO_PROGRESS_SECONDS = 7200
 # in a row; further cuts wait APPLY_MIN_INTERVAL_SECONDS, so a run of restarts cannot restart model calls at will.
 APPLY_RESUME_SECONDS = 60
 APPLY_QUICK_RESUMES = 2
-# A daily Dreaming run that did not complete (it failed, or the core died under it) is tried again after
-# DREAM_RETRY_SECONDS from its end, at most DREAM_TRIES times a day. One the core's stop ended, one that met a
-# usage limit and one that failed before it started cost no try; the last two still wait DREAM_RETRY_SECONDS.
+# A daily Dreaming run that did not complete (it failed, before or after its start, or the core died under it)
+# is tried again DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day. One the core's stop ended
+# and one that met a usage limit cost no try; a limit whose reset has passed still waits DREAM_RETRY_SECONDS.
 DREAM_TRIES = 3
 DREAM_RETRY_SECONDS = 900
 # Answers of a started daily run that complete the day; answers that give the try back.
@@ -240,12 +240,21 @@ class Jobs:
             raise KelmoError('E_INPUT', 'Only a Dreaming apply runs over ready projects; a run drains every project.')
         if scheduled and self._fenced():
             return {'state': 'fenced'}
-        with self._dreaming_lock() as free:
-            if not free:
-                # What the local run answers too; a scheduled job that meets it starts nothing and records
-                # no start, so the next tick asks again.
-                return {'state': 'busy'}
-            return self._dream_run(action, scheduled, ready)
+        self._dream_started = False
+        try:
+            with self._dreaming_lock() as free:
+                if not free:
+                    # What the local run answers too; a scheduled job that meets it starts nothing and records
+                    # no start, so the next tick asks again.
+                    return {'state': 'busy'}
+                return self._dream_run(action, scheduled, ready)
+        except Exception:
+            # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try too:
+            # it counts towards DREAM_TRIES and waits DREAM_RETRY_SECONDS. One that started is counted there.
+            if scheduled and action == 'run' and not self._dream_started:
+                self._record_dream_try()
+                self._record_dream_try_end()
+            raise
 
     @contextmanager
     def _dreaming_lock(self):
@@ -268,6 +277,7 @@ class Jobs:
         daily = []
 
         def started():
+            self._dream_started = True
             if scheduled and action == 'run':
                 daily.append(True)
                 self._record_dream_try()
@@ -288,8 +298,7 @@ class Jobs:
                 self._record_dream_try(undo=True)
             raise
         except Exception:
-            # A scheduled run that failed before it really started took no try, but waits the retry delay too.
-            if daily or scheduled and action == 'run':
+            if daily:  # one that failed before its start is counted by _dream
                 self._record_dream_try_end()
             raise
         finally:
