@@ -40,6 +40,11 @@ entry here.
   frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
   When the start context is too large for a Claude hook and the pending lines are left in the referenced
   context file instead, that file's `pending` field is not framed yet.
+- A flush no longer loads every queued entry into memory. It walks the entries that were queued when it
+  began, one at a time, and reads an entry's body only once a channel to the server is open. With 50
+  queued entries of 1 MiB each a flush used to hold about 50 MiB; it now stays under 8 MiB. The pending
+  count in a flush result and in `kelmo client status` reads a new index on the outbox and no entry bodies.
+  An entry queued while a flush runs is delivered by the next flush, as before.
 
 ## [0.3.1] - 2026-11-15
 
