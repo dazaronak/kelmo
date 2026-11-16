@@ -224,15 +224,31 @@ def test_nested_provider_group_is_cleaned_before_outer_timeout(tmp_path):
     assert not marker.exists()
 
 
+def gone(pid, seconds):
+    """Waits until process `pid` has ended, at most `seconds`; True when it has."""
+    import os
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def test_native_executor_sigterm_cleans_nested_provider_group(tmp_path):
+    import os
     import subprocess
     import time
     marker = tmp_path / 'signal-child-survived'
-    started = tmp_path / 'provider-started'
-    child = f"import pathlib,time;time.sleep(0.8);pathlib.Path({str(marker)!r}).write_text('alive')"
+    ready = tmp_path / 'child-ready'
+    # The child says it runs (with its pid) before anything else, then would write the marker if it outlived the stop.
+    child = (f"import os,pathlib,time;pathlib.Path({str(ready)!r}).write_text(str(os.getpid()));"
+             f"time.sleep(0.8);pathlib.Path({str(marker)!r}).write_text('alive')")
     provider = tmp_path / 'provider'
-    provider.write_text("#!/usr/bin/env python3\nimport pathlib,subprocess,sys,time\n"
-                        f"pathlib.Path({str(started)!r}).write_text('ready')\n"
+    provider.write_text("#!/usr/bin/env python3\nimport subprocess,sys,time\n"
                         f"subprocess.Popen([sys.executable,'-c',{child!r}])\n"
                         "time.sleep(30)\n")
     provider.chmod(0o755)
@@ -240,21 +256,28 @@ def test_native_executor_sigterm_cleans_nested_provider_group(tmp_path):
         [sys.executable, '-m', 'kelmo.cli', 'executor', '--provider', 'claude',
          '--model', 'synthetic', '--provider-executable', str(provider), '--timeout', '30', '--json'],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    child_pid = None
     try:
         process.stdin.write('{"task":"probe"}')
         process.stdin.close()
-        deadline = time.monotonic() + 2
-        while not started.exists() and time.monotonic() < deadline:
+        deadline = time.monotonic() + 10
+        while not (ready.exists() and ready.read_text()) and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert started.exists()
+        assert ready.exists() and ready.read_text(), 'the provider never started its child'
+        child_pid = int(ready.read_text())
         process.terminate()
         assert process.wait(timeout=2) != 0
-        time.sleep(1)
+        assert gone(child_pid, 5), 'the child outlived the executor stop'
         assert not marker.exists()
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, __import__('signal').SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 @pytest.mark.parametrize('signals', [('SIGHUP',), ('SIGTERM', 'SIGHUP')], ids=['hangup', 'term-then-hangup'])
