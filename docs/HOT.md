@@ -131,10 +131,9 @@ names, so offline delivery keeps working, and every set a session's delivery gav
 path into while that session's delivery record is younger than 30 days, so the
 session can still read the path. An online delivery points at the current set, an
 offline one at the set its cache names, and an offline delivery whose set is gone
-says that no cached generation is left. The same sweep removes a cached
-context no delivery, online or from the cache, has used for 30 days: nobody has
-used its binding since, and that binding then has no offline fallback until its
-next delivery.
+says that no cached generation is left. The same sweep removes a cached context no delivery,
+online or from the cache, has used for 30 days: nobody has used its binding since,
+and that binding then has no offline fallback until its next delivery.
 
 Codex managed blocks contain the published combined view. Bound work and pending
 notes travel through the hook and are not persisted into the repository's instruction file.

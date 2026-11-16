@@ -3,6 +3,7 @@
 The caller owns transport and must acknowledge a refresh only after its output succeeds.
 """
 import fcntl
+from contextlib import contextmanager
 import functools
 import hashlib
 import json
@@ -183,6 +184,19 @@ def _pointed_sets(sessions, now):
         if isinstance(name, str):
             names.add(name)
     return names
+
+
+@contextmanager
+def reading(root):
+    """Held around a stale delivery's read of its cache record and set: the set lock taken shared, so another
+    process's install and its daily sweep wait until the read is done instead of removing what it reads."""
+    root = Path(root)
+    if not root.is_dir():
+        yield
+        return
+    with (root / '.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        yield
 
 
 def install_set(root, snapshot, keep=None):

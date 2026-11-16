@@ -1309,7 +1309,8 @@ class SharedClient:
         return names
 
     def _stale(self, key, binding, error):
-        with self.files:
+        from .hub_delivery import reading
+        with self.files, reading(self.profile.state / 'hot'):
             return self._cached(key, binding, error)
 
     def _cached(self, key, binding, error):
