@@ -24,8 +24,10 @@ entry here.
   may try at once), a timer tries once in each of its runs. A run that completes after an alert that never
   went out says in its one message what was missed. An alert this process sent is not sent again the same day
   even when the state directory cannot keep the record. The findings pass's idle answer now carries `waiting`,
-  the number of archived notes behind the cursor, and with any waiting, `waiting_since`, when the first of
-  them reached the archive.
+  the number of archived notes behind the cursor that it has not read, and with any waiting, `waiting_since`,
+  when the first of them reached the archive. Since the findings pass now reads notes in the order they
+  reached the archive (see Changed), a note still on its way no longer holds its cursor and `waiting` stays 0;
+  that alert is a guard for notes left unread anyway.
 
 ### Fixed
 

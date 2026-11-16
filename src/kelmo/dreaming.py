@@ -207,8 +207,8 @@ class Dreaming:
     def _waiting_evidence(self, cursor):
         """How many archived operations after `cursor` the pass has not read, and when the first of them reached
         the archive. They are the ones `_changed_evidence` would take: Dreaming's own notes, the upgrade's `seen`
-        and records no longer readable (forgotten, withdrawn) are left out. The pass reads in archive order, so
-        an idle answer normally counts none; a count says notes stay unread behind the cursor anyway."""
+        and operations without an evidence receipt are left out. The pass reads in archive order and moves its
+        cursor past what it scanned, so an idle answer counts none unless a note was archived in between."""
         notes = {row[0] for row in self.journal.conn.execute(
             'SELECT note_operation_id FROM dream_findings WHERE note_operation_id IS NOT NULL')}
         seen = set(cursor.get('seen', ()))
