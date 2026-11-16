@@ -701,6 +701,13 @@ class Service:
             operation = self.journal.get(operation_id)
             if operation['durable_stage'] != 'archived' or not operation['archive_id']:
                 raise KelmoError('E_PERMISSION', 'A completed archive receipt is required before wiki changes.')
+            # A note forgotten before its publication started is never published. One whose editor request
+            # already exists goes on, so a prepared publication is finished and a finished one replays.
+            from .publication import StateCoordinator
+            started = self.journal.action_request(
+                StateCoordinator._request_key('semantic', self._operation_origin(operation_id), application_id))
+            if started is None and self.archive_api.hidden_at(operation['archive_id']) is not None:
+                return {'applied': False, 'replayed': False}
             source = self.source_path(operation).read_bytes().decode('utf-8')
             archived = self.archive_record(operation['archive_id'], operation_id=operation_id)
             if engine.digest(source) != operation['source_hash'] or archived['content'] != source:
