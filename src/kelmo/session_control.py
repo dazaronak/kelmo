@@ -95,9 +95,9 @@ def inspect(root):
     return result
 
 
-def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
+def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,deadline=None):
     """`internal_job` is what the hook's own process saw (None: this process's environment); `journal` lends the
-    state core's writer journal."""
+    state core's writer journal; `deadline` (monotonic) is when the hook's caller stops waiting for it."""
     if internal_job is None:
         internal_job=os.environ.get('KELMO_INTERNAL_JOB')=='1'
     if internal_job:
@@ -117,15 +117,44 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
         _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET)
         return {}
     until=time.monotonic()+SESSION_END_SECONDS
+    if deadline is not None:
+        until=min(until,deadline)
     while True:
+        left=until-time.monotonic()
+        if left<SESSION_END_PAUSE:
+            raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
         try:
-            _capture_once(config,journal,provider,native_id,source,selected,event,
-                          min(CAPTURE_BUDGET,until-time.monotonic()))
+            _bounded_attempt(config,journal,provider,native_id,source,selected,event,left)
             return {}
         except KelmoError as error:
-            if error.code!='E_BUSY' or until-time.monotonic()<2*SESSION_END_PAUSE:
+            if error.code!='E_BUSY':
                 raise
         time.sleep(SESSION_END_PAUSE)
+
+
+def _bounded_attempt(config,journal,provider,native_id,source,selected,event,left):
+    """One SessionEnd attempt whose every wait for the journal, opening and schema reads included, ends within
+    `left` seconds; a lock still held then is `E_BUSY`."""
+    from .journal import Journal
+    try:
+        if journal is None:
+            own=Journal(config.internal('.state/journal.sqlite3'),wait_seconds=left)
+            try:
+                _capture_once(config,own,provider,native_id,source,selected,event,min(CAPTURE_BUDGET,left))
+            finally:
+                own.close()
+            return
+        previous=journal.conn.execute('PRAGMA busy_timeout').fetchone()[0]
+        journal.conn.execute(f'PRAGMA busy_timeout={max(1,int(left*1000))}')
+        try:
+            _capture_once(config,journal,provider,native_id,source,selected,event,min(CAPTURE_BUDGET,left))
+        finally:
+            journal.conn.execute(f'PRAGMA busy_timeout={previous}')
+    except sqlite3.OperationalError as error:
+        from .errors import sqlite_busy
+        if not sqlite_busy(error):
+            raise
+        raise KelmoError('E_BUSY','Session journal is busy; retry capture.') from error
 
 
 def _capture_once(config,journal,provider,native_id,source,selected,event,budget):

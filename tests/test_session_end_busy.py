@@ -199,6 +199,21 @@ def test_a_session_end_under_a_journal_that_stays_busy_ends_inside_its_deadline(
     assert final_jobs(root) == []
 
 
+def test_a_session_end_under_an_exclusive_lock_ends_inside_its_deadline(tmp_path, monkeypatch, capsys):
+    """An exclusive lock blocks reads too, so the hook waits already while it opens the journal and reads the
+    session schema, before any capture budget runs."""
+    root, source = prepared(tmp_path)
+    with lent(root) as journal:
+        assert journal.conn.execute('PRAGMA journal_mode').fetchone()[0] != 'wal'
+
+    with held(root, HOOK_DEADLINE + 5, ['BEGIN EXCLUSIVE']):
+        code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+
+    assert code != 0, printed
+    assert printed['error']['code'] == 'E_BUSY', printed
+    assert seconds < HOOK_DEADLINE, seconds
+
+
 def test_stop_and_precompact_still_make_one_attempt(tmp_path, monkeypatch, capsys):
     root, source = prepared(tmp_path)
 
