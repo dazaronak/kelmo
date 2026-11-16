@@ -1166,16 +1166,32 @@ class Service:
     def _forget(self, memory_id, origin, *, reason=None, idempotency_key=None):
         if self.journal.conn.in_transaction:
             raise KelmoError('E_STATE', 'Journal event reconciliation requires an idle connection.')
+        # A note still waiting for the editor is withdrawn before the record is hidden, in the journal every
+        # reader of waiting notes reads: a failure after this point leaves it hidden from no one yet, but never
+        # published. A note the editor holds now is refused, so it is never forgotten halfway through an edit.
+        for row in self.journal.conn.execute(
+                "SELECT id FROM operations WHERE archive_id=? AND intent='create' AND terminal=0 ORDER BY created_at",
+                (memory_id,)).fetchall():
+            try:
+                self.journal.stage(row['id'], 'forgotten', terminal=True)
+            except KelmoError as error:
+                if error.code != 'E_CLAIM':
+                    raise
+                raise KelmoError('E_BUSY', f'Note {row["id"]} is being edited now; forget it again once that '
+                                           'pass has ended.') from error
         # Each CLI call has a fresh identity; archive idempotency remains available to transports.
         receipt = self.archive_api.hide(memory_id, origin, idempotency_key or str(uuid.uuid4()), reason=reason)
         hidden = receipt.outcome == 'hidden'
         stamp = self.archive_api.hidden_at(memory_id)
         if stamp is None:
             raise KelmoError('E_RECEIPT', 'Archive hide has no durable visibility marker.')
-        operations = [row['id'] for row in self.journal.conn.execute(
-            'SELECT id FROM operations WHERE archive_id=? ORDER BY created_at', (memory_id,))]
-        for operation_id in operations:
-            self.journal.event_once(operation_id, 'forgotten', check_writer=self.archive_api.assert_writer,
+        rows = self.journal.conn.execute(
+            'SELECT id, state FROM operations WHERE archive_id=? ORDER BY created_at', (memory_id,)).fetchall()
+        operations = [row['id'] for row in rows]
+        for row in rows:
+            if row['state'] == 'forgotten':
+                continue  # withdrawn above or by an earlier call: its stage already wrote the event
+            self.journal.event_once(row['id'], 'forgotten', check_writer=self.archive_api.assert_writer,
                                     record_id=memory_id, forgotten_at=stamp)
         return {'id': memory_id, 'forgotten': hidden, 'forgotten_at': stamp, 'operations': operations}
 

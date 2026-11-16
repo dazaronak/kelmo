@@ -6,6 +6,14 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `kelmo forget` on a note that still waits for the editor now withdraws it. `kelmo dream apply` and the worker
+  never publish it, and it drops out of the pending block a session gets at start and out of the waiting count
+  of `kelmo dream status`. Its operation ends in the new terminal state `forgotten`; the archived record keeps
+  every byte, as before. A note the editor is working on at that moment is refused with `E_BUSY`: forget it
+  again once that pass has ended.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
