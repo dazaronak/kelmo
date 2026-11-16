@@ -191,3 +191,67 @@ def test_passes_started_by_the_users_timer_are_watched_too(tmp_path, monkeypatch
     jobs._dream({'action': 'run'})
     assert len(messages(tmp_path)) == 2, messages(tmp_path)
     assert 'E_EXECUTOR' in messages(tmp_path)[1]
+
+
+def direct(tmp_path, monkeypatch, now, *outcomes):
+    """`dreaming_cli.dispatch` for `kelmo dream run`, as a `--server-profile` timer runs it outside the daemon,
+    over a stand-in Service whose Dreaming is configured; run_dream answers the outcomes in turn."""
+    from kelmo import dreaming_cli
+    from kelmo.interface import build_parser
+    state = tmp_path / '.state'
+    state.mkdir(exist_ok=True)
+    config = SimpleNamespace(state=state, alerts={'command': recorder(tmp_path), 'label': 'Server Kelmo'},
+                             internal=lambda relative: tmp_path / relative)
+
+    class Configured:
+        dreaming = SimpleNamespace(_state=lambda name, default=None: {'executor_config': 'x'}
+                                   if name == 'settings' else default)
+
+        def __init__(self, root):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(dreaming_cli, 'Service', Configured)
+    from kelmo import alerts
+    queue = list(outcomes)
+
+    def answer(*args, **kwargs):
+        outcome = queue.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', answer)
+    monkeypatch.setattr(alerts.time, 'time', lambda: now[0])
+    parser, _commands = build_parser('0')
+    args = parser.parse_args(['dream', 'run', '--vault', str(tmp_path)])
+
+    def run():
+        try:
+            return dreaming_cli.dispatch(tmp_path, args)
+        except RuntimeError as error:
+            return error
+    return run
+
+
+def test_a_pass_the_cli_runs_outside_the_daemon_is_watched_too(tmp_path, monkeypatch):
+    from kelmo.alerts import DREAM_IDLE_SECONDS
+    now = [START]
+    stuck = {'state': 'idle', 'waiting': 2}
+    run = direct(tmp_path, monkeypatch, now, stuck, stuck, RuntimeError('the executor crashed'),
+                 {'state': 'finished'})
+    run()
+    now[0] = START + DREAM_IDLE_SECONDS
+    run()
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    now[0] += DAY
+    assert isinstance(run(), RuntimeError)
+    assert len(messages(tmp_path)) == 2 and 'RuntimeError' in messages(tmp_path)[1], messages(tmp_path)
+    run()
+    assert len(messages(tmp_path)) == 3, 'one recovery message'
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists()

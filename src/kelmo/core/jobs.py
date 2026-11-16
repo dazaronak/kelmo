@@ -248,9 +248,8 @@ class Jobs:
                 return self._dream_run(action, scheduled, ready)
         except Exception as error:  # the lock, the settings or the run itself: the owner hears of it
             if action == 'run':
-                self._tell_dream_watch({'state': 'failed',
-                                        'code': getattr(error, 'code', None) or type(error).__name__,
-                                        'reason': str(error) or type(error).__name__})
+                from ..dreaming_cli import failure_outcome
+                self._tell_dream_watch(failure_outcome(error))
             raise
 
     @contextmanager
@@ -311,22 +310,8 @@ class Jobs:
         return result
 
     def _tell_dream_watch(self, result):
-        """What the owner hears of a findings pass (`alerts.DreamWatch`). `blocked` (an executor on another
-        build's instructions) is told by `ExecutorWatch`; `deferred` and `paused` are holds, not failures.
-        Alerting never changes the run's answer or its tries."""
-        from ..alerts import DreamWatch
-        state = result.get('state') if isinstance(result, dict) else None
-        try:
-            watch = DreamWatch.for_config(self.storage.writer.config)
-            if state == 'finished':
-                watch.ran()
-            elif state == 'idle':
-                watch.idle(result.get('waiting', 0), since=result.get('waiting_since'))
-            elif state == 'failed':
-                watch.failed(result.get('code') or 'E_FAILED', result.get('reason') or 'no reason given')
-        except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
-            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
-                  flush=True)
+        from ..dreaming_cli import tell_dream_watch
+        tell_dream_watch(self.storage.writer.config, result)
 
     def _admin(self):
         from ..archive_admin import ArchiveAdmin, operator_grant

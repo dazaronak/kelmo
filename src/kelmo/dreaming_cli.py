@@ -182,7 +182,41 @@ def dispatch(root, args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            if args.action != "run":
+                return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            # A run outside the daemon (a `--server-profile` timer) is told to the owner as the daemon's are.
+            try:
+                result = run_dream(service, args.action, contexts=contexts)
+            except Exception as error:
+                tell_dream_watch(service.config, failure_outcome(error))
+                raise
+            tell_dream_watch(service.config, result)
+            return result
+
+
+def failure_outcome(error):
+    """A Dreaming run that raised, as the failed answer the owner hears of."""
+    return {"state": "failed", "code": getattr(error, "code", None) or type(error).__name__,
+            "reason": str(error) or type(error).__name__}
+
+
+def tell_dream_watch(config, result):
+    """What the owner hears of a findings pass (`alerts.DreamWatch`), from the daemon's runs and the CLI's own.
+    `blocked` (an executor on another build's instructions) is told by `ExecutorWatch`; `deferred` and `paused`
+    are holds, not failures. Alerting never changes the run's answer or its tries."""
+    from .alerts import DreamWatch
+    state = result.get("state") if isinstance(result, dict) else None
+    try:
+        watch = DreamWatch.for_config(config)
+        if state == "finished":
+            watch.ran()
+        elif state == "idle":
+            watch.idle(result.get("waiting", 0), since=result.get("waiting_since"))
+        elif state == "failed":
+            watch.failed(result.get("code") or "E_FAILED", result.get("reason") or "no reason given")
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
 
 
 def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None,
