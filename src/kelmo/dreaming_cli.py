@@ -263,14 +263,15 @@ def tell_dream_watch(config, result, run_ended=True):
     state = result.get("state") if isinstance(result, dict) else None
     try:
         watch = DreamWatch.for_config(config)
-        if run_ended:
-            watch.ended()
         if state == "finished":
             watch.ran()
         elif state == "idle":
             watch.idle(result.get("waiting", 0), since=result.get("waiting_since"))
         elif state == "failed":
             watch.failed(result.get("code") or "E_FAILED", result.get("reason") or "no reason given")
+        # The start mark goes last: a process killed before the outcome is recorded leaves it for the next run.
+        if run_ended:
+            watch.ended()
     except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
         print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
               flush=True)

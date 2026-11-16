@@ -415,3 +415,51 @@ def test_a_run_the_core_stop_ended_is_not_told_as_died(tmp_path, monkeypatch):
     now[0] += DREAM_RETRY_SECONDS
     scheduled_run(jobs)
     assert messages(tmp_path) == [], messages(tmp_path)
+
+
+def test_a_failure_whose_telling_died_is_told_when_the_next_run_starts(tmp_path, monkeypatch):
+    # The pass raised and its process was killed while the failure was being recorded: the start mark is still
+    # there, so the next run tells it.
+    from kelmo import alerts
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, RuntimeError('the pass broke'), {'state': 'finished'})
+    original = alerts.DreamWatch.failed
+    calls = []
+
+    def dies_once(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise _Died()
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(alerts.DreamWatch, 'failed', dies_once)
+    with pytest.raises(_Died):
+        jobs._dream({'scheduled': True, 'action': 'run'})
+    assert messages(tmp_path) == []
+    now[0] += DREAM_RETRY_SECONDS
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) >= 1, messages(tmp_path)
+    assert 'without an answer' in messages(tmp_path)[0], messages(tmp_path)
+
+
+def test_a_schedule_probe_that_fails_while_a_run_holds_the_dreaming_lock_tells_nothing(tmp_path, monkeypatch):
+    # A pass is under way (the daemon's own job or a timer's run in its own process) when a later tick's probe
+    # fails: that pass is not a failed run, and the owner hears nothing of the probe.
+    import fcntl
+    import time
+
+    from kelmo.core.jobs import DREAM_HOUR
+    now = [time.mktime((2027, 1, 15, DREAM_HOUR, 5, 0, 0, 0, -1))]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now)
+
+    def broken():
+        raise RuntimeError('the journal is busy')
+    monkeypatch.setattr(jobs, '_dream_hold', broken)
+    monkeypatch.setattr(jobs, '_background', lambda kind, options: False)
+    with jobs._state_path.with_name('dreaming.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        jobs._tick()
+        now[0] += 5
+        jobs._tick()
+    assert messages(tmp_path) == [], messages(tmp_path)

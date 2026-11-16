@@ -333,9 +333,16 @@ class Jobs:
                     and self._last_dream_day() != self._today())
         except Exception:  # noqa: BLE001 - the state file the day is kept in is unreadable too: the pass is owed
             owed = True
-        if owed:
-            from ..dreaming_cli import failure_outcome, tell_dream_watch
-            # No run is under way here, so the start mark of one (a timer's run in its own process) stays.
+        if not owed:
+            return
+        from ..dreaming_cli import failure_outcome, tell_dream_watch
+        try:
+            with self._dreaming_lock() as free:
+                # A pass holds the lock (this daemon's job or a timer's run in its own process): it is under way,
+                # not failed, and it tells its own outcome.
+                if free:
+                    tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
+        except Exception:  # noqa: BLE001 - the lock file cannot be opened: the pass is owed all the same
             tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
 
     def _tell_dream_watch(self, result):
