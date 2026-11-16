@@ -8,9 +8,18 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
+import time
 
 from .errors import KelmoError
+
+# Installed HOT sets kept besides the current one: every set younger than RETAIN_SECONDS (a session's context
+# can point at the set it was given) and the RETAIN_SETS newest whatever their age. Older ones are removed at
+# most once per SWEEP_SECONDS, when a new set is installed.
+RETAIN_SECONDS = 2 * 86400
+RETAIN_SETS = 8
+SWEEP_SECONDS = 86400
 
 
 def _hash(raw):
@@ -121,7 +130,34 @@ def _metadata(snapshot):
     return result
 
 
-def install_set(root, snapshot):
+def prune_sets(root, keep=()):
+    """Remove installed sets past their retention (RETAIN_SECONDS, RETAIN_SETS), never the current one or a
+    set named in `keep`; at most once per SWEEP_SECONDS. Called under the set lock. Returns the removed names."""
+    root = Path(root)
+    marker = root / '.pruned'
+    now = time.time()
+    try:
+        if now - marker.stat().st_mtime < SWEEP_SECONDS:
+            return []
+    except FileNotFoundError:
+        pass
+    current = os.readlink(root / 'current') if (root / 'current').is_symlink() else None
+    sets = sorted((path for path in root.iterdir()
+                   if path.name.startswith('.set-') and path.is_dir() and not path.is_symlink()),
+                  key=lambda path: path.stat().st_mtime, reverse=True)
+    protected = {current, *keep, *(path.name for path in sets[:RETAIN_SETS])}
+    removed = []
+    for path in sets:
+        if path.name not in protected and now - path.stat().st_mtime > RETAIN_SECONDS:
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(path.name)
+    marker.touch()
+    return removed
+
+
+def install_set(root, snapshot, keep=None):
+    """Install a verified set and make it current. `keep` returns the names of sets that must outlive the
+    retention sweep (the client's cached contexts name the sets they were delivered with)."""
     snapshot = _validate(snapshot)
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -186,6 +222,10 @@ def install_set(root, snapshot):
             os.replace(temporary, root / 'current')
         finally:
             temporary.unlink(missing_ok=True)
+        try:
+            prune_sets(root, set(keep()) if keep is not None else ())
+        except OSError:
+            pass  # the sweep never fails a delivery; the next install tries again
     return destination
 
 

@@ -1283,11 +1283,23 @@ class SharedClient:
                                        'was cached.') from failure
         if hub_set is not None:
             from .hub_delivery import install_set
-            directory = install_set(self.profile.state / 'hot', hub_set)
+            directory = install_set(self.profile.state / 'hot', hub_set, keep=self._cached_set_names)
             record['hub_set_name'] = directory.name
             result['hub_directory'] = str(directory)
         _atomic_write(self._cache_path(key), canonical(record).encode('utf-8'))
         return result
+
+    def _cached_set_names(self):
+        """The HOT sets the cached contexts were delivered with: a stale delivery reads its set by name."""
+        names = set()
+        for path in (self.profile.state / 'cache').glob('context-*.json'):
+            try:
+                name = json.loads(path.read_bytes()).get('hub_set_name')
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(name, str):
+                names.add(name)
+        return names
 
     def _stale(self, key, binding, error):
         with self.files:

@@ -6,6 +6,13 @@ entry here.
 
 ## [Unreleased]
 
+### Changed
+
+- A shared client removes its old HOT sets. Each publication installed a new set of HOT files under the
+  client's `hot/` and none was ever removed, so the directory grew by every generation. When it installs a
+  set, the client now removes, at most once a day, the sets older than two days. It keeps the current set,
+  the eight newest whatever their age, and every set a cached context names.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
