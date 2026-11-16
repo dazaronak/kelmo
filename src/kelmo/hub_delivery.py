@@ -25,6 +25,9 @@ SWEEP_SECONDS = 86400
 # A set a session's delivery pointed at stays while that session's delivery record is younger than this: the
 # session may read the path days later.
 POINTED_RETAIN_SECONDS = 30 * 86400
+# The same sweep removes a session's delivery record (`hub-sessions/`, beside `hot/`) no delivery has written for
+# this long; that session, if it ever prompts again, gets the whole context once.
+SESSION_RETAIN_SECONDS = 30 * 86400
 
 
 def _hash(raw):
@@ -168,6 +171,12 @@ def prune_sets(root, keep=None):
             os.rename(path, trash)
             shutil.rmtree(trash, ignore_errors=True)
             removed.append(path.name)
+    for record in (root.parent / 'hub-sessions').glob('*.json'):
+        try:
+            if now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
+                record.unlink()
+        except OSError:
+            continue
     return removed
 
 
