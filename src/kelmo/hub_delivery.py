@@ -26,7 +26,8 @@ SWEEP_SECONDS = 86400
 # session may read the path days later.
 POINTED_RETAIN_SECONDS = 30 * 86400
 # The same sweep removes a session's delivery record (`hub-sessions/`, beside `hot/`) no delivery has written for
-# this long; that session, if it ever prompts again, gets the whole context once.
+# this long, and a context reference (`hub-context/`) no delivery has used for this long; that session, if it ever
+# prompts again, gets the whole context once.
 SESSION_RETAIN_SECONDS = 30 * 86400
 
 
@@ -171,14 +172,14 @@ def prune_sets(root, keep=None):
             os.rename(path, trash)
             shutil.rmtree(trash, ignore_errors=True)
             removed.append(path.name)
-    folder = root.parent / 'hub-sessions'
-    # Kelmo makes this folder itself; behind a link, or as a link, a file is not its own to remove.
-    for record in (() if folder.is_symlink() else folder.glob('*.json')):
-        try:
-            if not record.is_symlink() and now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
-                record.unlink()
-        except OSError:
-            continue
+    for folder in (root.parent / 'hub-sessions', root.parent / 'hub-context'):
+        # Kelmo makes these folders itself; behind a link, or as a link, a file is not its own to remove.
+        for record in (() if folder.is_symlink() else folder.glob('*.json')):
+            try:
+                if not record.is_symlink() and now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
+                    record.unlink()
+            except OSError:
+                continue
     return removed
 
 
@@ -297,6 +298,8 @@ def context_reference(root, data):
     if path.is_symlink():
         raise KelmoError('E_CACHE', 'Context reference file is unsafe.')
     if path.is_file() and path.read_bytes() == raw:
+        # Used again: the sweep (prune_sets) counts a reference's age from its last use.
+        os.utime(path)
         return path
     fd, name = tempfile.mkstemp(prefix='.context-', dir=directory)
     try:
