@@ -68,6 +68,9 @@ def utc_now():
     return datetime.now(UTC).isoformat(timespec='microseconds')
 
 
+_RLOCK = type(threading.RLock())
+
+
 class Unbound(KelmoError):
     """No server verdict on this request: the launcher, the channel, hello, the authority pin, or a reply
     bound to no request. A queued write is never settled by one; it stays pending under its key."""
@@ -1131,15 +1134,23 @@ class SharedClient:
                 self.pause(pause)
                 pause = min(pause * 2, RECONNECT_LAST_PAUSE)
         with self.deadline(limit - time.monotonic()):
-            return self._read_once(op, args)
+            return self._read_once(op, args, resend=True)
 
-    def _read_once(self, op, args):
+    def _read_once(self, op, args, resend=False):
         if self._multiplex:
             channel = self._connect()
             if getattr(channel, 'concurrent', False):
                 return self._read(op, args, channel)
-        with self._lock:
+        if not resend or not isinstance(self._lock, _RLOCK):  # the edge core's gate bounds its own wait
+            with self._lock:
+                return self._read(op, args)
+        # The resend waits for another request only until the deadline the first try left it.
+        if not self._lock.acquire(timeout=self.remaining()):
+            raise Unsent('E_TRANSPORT', 'The deadline passed while another request held the shared client.')
+        try:
             return self._read(op, args)
+        finally:
+            self._lock.release()
 
     def _read(self, op, args, channel=None):
         try:

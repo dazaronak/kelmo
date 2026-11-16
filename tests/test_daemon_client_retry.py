@@ -5,8 +5,10 @@ or a write under an idempotency key (sent again under the same key). A keyless w
 its effect is unknown, and the caller is told so. Whatever happens, the caller hears back inside its
 deadline. The daemon is `scripted_daemon.ScriptedDaemon`, which records every call frame it reads.
 """
+import socket
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -168,3 +170,45 @@ def test_a_hello_that_never_comes_is_a_transport_error_with_nothing_sent(daemon)
     assert got[1] == 'E_TRANSPORT' and got[2] is True, got
     assert 'nothing was sent' in got[3], got
     assert peer.calls == []
+
+
+STALL = 8.0
+
+
+class _Stalling(socket.socket):
+    """A connect that does not complete, as against a daemon whose listen queue is full: it waits out its
+    timeout (or STALL with none) and fails."""
+
+    def connect(self, target):
+        timeout = self.gettimeout()
+        time.sleep(STALL if timeout is None else min(timeout, STALL))
+        raise TimeoutError('timed out')
+
+
+def _stall_after(monkeypatch, real):
+    """daemon_client's sockets: the first `real` connect for real, every later one stalls."""
+    made = []
+
+    def make(*args):
+        made.append(1)
+        return (socket.socket if len(made) <= real else _Stalling)(*args)
+    monkeypatch.setattr(daemon_client, 'socket', types.SimpleNamespace(
+        socket=make, AF_UNIX=socket.AF_UNIX, SOCK_STREAM=socket.SOCK_STREAM))
+
+
+def test_a_connect_that_never_completes_ends_inside_the_deadline_and_its_grace(daemon, monkeypatch):
+    peer = daemon(Connection(ANSWER))
+    _stall_after(monkeypatch, 0)
+    got = outcome(peer, 'state.scheduler_status', {}, seconds=1.0)
+    assert got[0] == 'error', got
+    assert got[-1] < 1.0 + daemon_client.GRACE_SECONDS + 0.5, got
+    assert peer.calls == []
+
+
+def test_a_resend_whose_connect_never_completes_ends_at_the_deadline(daemon, monkeypatch):
+    peer = daemon(Connection(hold(0.2, CLOSE)), Connection(ANSWER))
+    _stall_after(monkeypatch, 1)
+    got = outcome(peer, 'state.scheduler_status', {}, seconds=2.0)
+    assert got[:2] == ('error', 'E_DEADLINE'), got
+    assert got[-1] < 2.5, got
+    assert len(peer.calls) == 1

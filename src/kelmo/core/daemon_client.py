@@ -101,16 +101,21 @@ def _resendable(op, key):
     return replay == REPLAY_READ or (replay == REPLAY_KEYED and key is not None)
 
 
-def _connect(target, limit=None):
-    """A connected socket. Without `limit` one try; with it, a try every RECONNECT_PAUSE until `limit`."""
+def _connect(target, until, limit=None):
+    """A connected socket, each connect bounded by the absolute `until` (a daemon whose listen queue is full
+    leaves a connect waiting). Without `limit` one try; with it, a try every RECONNECT_PAUSE until `limit`."""
     while True:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            _budget(sock, until)
             sock.connect(target)
             return sock
         except OSError as error:
             sock.close()
-            if limit is None or time.monotonic() + RECONNECT_PAUSE >= limit:
+            now = time.monotonic()
+            if now + RECONNECT_PAUSE >= until:
+                raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from error
+            if limit is None or now + RECONNECT_PAUSE >= limit:
                 raise KelmoError('E_TRANSPORT', f'No daemon answers at {target}.') from error
             time.sleep(RECONNECT_PAUSE)
 
@@ -156,7 +161,8 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
         raise KelmoError('E_TRANSPORT', f'The daemon directory of {target} is not private to this user.')
     limit = time.monotonic() + seconds
     try:
-        reply, result = _attempt(_connect(target), op, body, key, limit + GRACE_SECONDS, int(seconds * 1000))
+        until = limit + GRACE_SECONDS
+        reply, result = _attempt(_connect(target, until), op, body, key, until, int(seconds * 1000))
     except _Cut as cut:
         if cut.sent and not _resendable(op, key):
             error = KelmoError('E_TRANSPORT', 'The daemon closed the connection after the call was sent; '
@@ -165,7 +171,7 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
             raise error from cut
         if limit - time.monotonic() <= 0:
             raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
-        sock = _connect(target, min(limit, time.monotonic() + RECONNECT_SECONDS))
+        sock = _connect(target, limit, min(limit, time.monotonic() + RECONNECT_SECONDS))
         left = limit - time.monotonic()
         if left <= 0:
             sock.close()

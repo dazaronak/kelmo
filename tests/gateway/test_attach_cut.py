@@ -12,6 +12,7 @@ cut after it was sent is refused as having an unknown effect.
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -160,3 +161,34 @@ def test_a_keyless_request_cut_after_it_was_sent_is_refused_as_unknown(bridge):
     assert reply['error']['code'] == 'E_TRANSPORT' and reply['error']['retryable'] is False, reply
     assert 'unknown' in reply['error']['message'], reply
     assert daemon.connections == 1 and len(daemon.calls) == 1
+
+
+def test_a_resend_that_waits_for_the_client_lock_ends_inside_its_deadline(bridge):
+    # The read is cut after it was sent; before its resend another request takes the client (a write's flush
+    # waiting on a silent server). The resend gives up at the read's deadline instead of waiting for the writer.
+    daemon, client = bridge(Connection(ANSWER, CLOSE), Connection(ANSWER, ANSWER))
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with client._lock:
+            held.set()
+            release.wait(8)
+    real_drop = client._drop
+
+    def drop(*args):
+        real_drop(*args)
+        if not held.is_set():
+            threading.Thread(target=holder, daemon=True).start()
+            assert held.wait(2)
+    client._drop = drop
+    started = time.monotonic()
+    try:
+        with client.deadline(3):
+            result = client.call('search', {'query': 'q'})
+    except KelmoError as error:
+        result = {'refused': error.code}
+    ended = time.monotonic() - started
+    release.set()
+    assert result == {'refused': 'E_TRANSPORT'}, result
+    assert ended < 3.5, ended
+    assert requests(daemon) == [('search', None, None)]
