@@ -6,6 +6,15 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- The owner is told when the scheduled Dreaming run fails, or when the findings pass keeps reading nothing
+  while archived notes wait behind its cursor. Such a cursor is held by an operation that never reached the
+  archive, and nothing behind it was ever read; before, both went to the worker log only. The message goes
+  to the `[alerts]` command once when it starts (for a held cursor, after a day), once a day while it lasts,
+  and once when a run completes again. The findings pass's idle answer now carries `waiting`, the number of
+  archived notes behind the cursor.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added

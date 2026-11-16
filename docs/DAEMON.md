@@ -117,6 +117,16 @@ command = ["/usr/bin/python3", "-I", "/opt/kelmo/telegram-alert.py", "/etc/kelmo
 label = "Server Kelmo"
 ```
 
+The same command hears of the scheduled Dreaming run. A run that fails (the findings
+pass answers `failed`, or the run raises) is told once when it fails and once a day
+for each error code while it keeps failing; the run is still tried again as before.
+A findings pass that answers idle while archived notes wait behind its cursor means
+an operation that never reached the archive holds the cursor, and nothing behind it
+is read: once that has lasted a day it is told, then once a day. An idle pass with
+nothing waiting is a quiet vault and tells nothing. The first run that completes
+after an alert sends one message that it is over. The marker is `dream-watch.json`
+in the state directory.
+
 Wiki/Git persistence errors use the same bounded retry path as other resolution
 failures. A dirty managed page stays untouched, the operation remains visible,
 and the daemon continues processing unrelated work. An invalid proposal is not

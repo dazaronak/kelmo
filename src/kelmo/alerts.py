@@ -19,6 +19,10 @@ REMINDER_SECONDS = 86400
 MARKER = 'login-outage.json'
 VAULT_MARKER = 'vault-outage.json'
 EXECUTOR_MARKER = 'executor-identity.json'
+DREAM_MARKER = 'dream-watch.json'
+# How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
+# of it: the scheduled run is daily, so two runs a day apart.
+DREAM_IDLE_SECONDS = 86400
 # Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
 _REFUSALS_TOLD = {}
 
@@ -169,6 +173,131 @@ class VaultWatch(LoginWatch):
         except Exception as failure:  # noqa: BLE001 - Alerting must not turn a publication into a failure.
             print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
                   flush=True)
+
+
+class DreamWatch(LoginWatch):
+    """What the owner hears of the scheduled Dreaming run (`core.jobs`).
+
+    - `idle(waiting)`: the findings pass found nothing to read. With archived notes waiting behind its cursor
+      (`waiting` > 0) an operation that never reached the archive holds the cursor, and nothing behind it is ever
+      read: once that has lasted DREAM_IDLE_SECONDS the owner is told, then once a day while it lasts. With none
+      waiting the vault is only quiet, and the run completed.
+    - `failed(code, reason)`: a scheduled run failed. Told at once, then once a day for each code.
+    - `ran()`: a run completed. Both records end; one recovery message goes out when anything was told.
+
+    The marker keeps both records, so a restart neither repeats an alert nor drops one. As in `VaultWatch`, with
+    no `[alerts]` command the journal line is the delivery, so it too comes once a day.
+    """
+
+    @classmethod
+    def for_config(cls, config):
+        settings = config.alerts or {}
+        return cls(config.state / DREAM_MARKER, settings.get('command'), settings.get('label', 'Kelmo'))
+
+    def saw(self, wait, now=None):
+        raise TypeError('DreamWatch reads Dreaming run outcomes: use idle, failed or ran.')
+
+    def _records(self):
+        """{'stuck': {...} | None, 'failed': {...} | None}. A marker that cannot be read starts afresh: keeping it
+        would make every later alert fail, which is the silence the watch exists to prevent."""
+        empty = {'stuck': None, 'failed': None}
+        if not self.marker.exists():
+            return empty
+        try:
+            data = json.loads(self.marker.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        stuck, failed = data.get('stuck'), data.get('failed')
+        if not (isinstance(stuck, dict) and isinstance(stuck.get('since'), (int, float))
+                and (stuck.get('told') is None or isinstance(stuck.get('told'), (int, float)))):
+            stuck = None
+        if isinstance(failed, dict) and isinstance(failed.get('since'), (int, float)):
+            told = failed.get('told') if isinstance(failed.get('told'), dict) else {}
+            failed = {'since': failed['since'],
+                      'told': {code: at for code, at in told.items()
+                               if isinstance(code, str) and isinstance(at, (int, float))}}
+        else:
+            failed = None
+        return {'stuck': stuck, 'failed': failed}
+
+    def _keep(self, records):
+        if records['stuck'] is None and records['failed'] is None:
+            if self.marker.exists():
+                self.marker.unlink()
+            return
+        self._save(records)
+
+    def _guarded(self, work):
+        try:
+            work()
+        except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
+
+    def idle(self, waiting, now=None):
+        now = time.time() if now is None else now
+        if not waiting:
+            self.ran(now)
+            return
+
+        def work():
+            records = self._records()
+            told_failure = records['failed'] is not None and bool(records['failed']['told'])
+            records['failed'] = None  # the run completed
+            stuck = records['stuck'] or {'since': now, 'told': None}
+            records['stuck'] = stuck
+            last = stuck['told']
+            if now - stuck['since'] >= DREAM_IDLE_SECONDS and (last is None or now - last >= REMINDER_SECONDS):
+                text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
+                        f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
+                        'archive holds it. kelmo dream status shows the cursor.')
+                if last is not None:
+                    text += f' Day {int((now - stuck["since"]) // REMINDER_SECONDS) + 1}.'
+                if self.send(text) or not self.argv:
+                    stuck['told'] = now
+            self._keep(records)
+            if told_failure:
+                self.send(f'{self.label}: the scheduled Dreaming run completes again.')
+        self._guarded(work)
+
+    def failed(self, code, reason, now=None):
+        now = time.time() if now is None else now
+
+        def work():
+            records = self._records()
+            failed = records['failed'] or {'since': now, 'told': {}}
+            records['failed'] = failed
+            last = failed['told'].get(code)
+            if last is not None and now - last < REMINDER_SECONDS:
+                self._keep(records)
+                return
+            text = (f'{self.label}: the scheduled Dreaming run failed with {code}: '
+                    + ' '.join(str(reason).split())[:300] + '. It is tried again later.')
+            if last is not None:
+                text += f' Failing since {_when(failed["since"])}.'
+            # The alert goes before its record, so a state directory that cannot be written does not silence it.
+            if self.send(text) or not self.argv:
+                failed['told'] = {**failed['told'], code: now}
+            self._keep(records)
+        self._guarded(work)
+
+    def ran(self, now=None):
+        now = time.time() if now is None else now
+
+        def work():
+            if not self.marker.exists():
+                return
+            records = self._records()
+            told = ((records['stuck'] is not None and records['stuck']['told'] is not None)
+                    or (records['failed'] is not None and bool(records['failed']['told'])))
+            # The marker goes first: one recovery message, even if its delivery fails.
+            self.marker.unlink()
+            if told:
+                self.send(f'{self.label}: the scheduled Dreaming run completes again; the findings pass reads '
+                          'new evidence.')
+        self._guarded(work)
 
 
 class ExecutorWatch(LoginWatch):

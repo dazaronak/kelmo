@@ -1,0 +1,146 @@
+"""The owner hears of a scheduled Dreaming run that stays idle while notes wait behind the findings pass's cursor,
+and of a scheduled run that fails: once when it starts, once a day while it lasts, and once when a run completes.
+
+The scheduler (`Jobs`) is real and `run_dream` is a stand-in that answers what the test names. The alert command
+appends each message to a file, as in tests/test_alerts.py.
+"""
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from kelmo.core.jobs import DREAM_RETRY_SECONDS, Jobs
+
+START = 1_800_000_000
+DAY = 86400
+
+
+def recorder(tmp_path):
+    script = tmp_path / 'alert.py'
+    script.write_text('import sys\nwith open(sys.argv[1], "a") as out:\n    out.write(sys.stdin.read() + "\\n")\n')
+    return [sys.executable, str(script), str(tmp_path / 'messages.txt')]
+
+
+def messages(tmp_path):
+    path = tmp_path / 'messages.txt'
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def scheduler(tmp_path, now):
+    state = tmp_path / '.state'
+    state.mkdir(exist_ok=True)
+    reader = SimpleNamespace(journal=SimpleNamespace(conn=SimpleNamespace(
+        execute=lambda _sql, *args: SimpleNamespace(fetchall=lambda: [], fetchone=lambda: (0,)))))
+    config = SimpleNamespace(embedding={}, batch_apply=False, batch_ready_sources=8, state=state,
+                             alerts={'command': recorder(tmp_path), 'label': 'Server Kelmo'})
+    writer = SimpleNamespace(config=config)
+    storage = SimpleNamespace(writer=writer, read=lambda fn: fn(reader))
+    core = SimpleNamespace(root=tmp_path, storage=storage, profile=None, profile_path=None)
+    return Jobs(core, clock=lambda: now[0])
+
+
+def answering(monkeypatch, now, *outcomes):
+    """run_dream starts (on_start) and answers the next outcome, or raises it; the wall clock reads now[0]."""
+    from kelmo import alerts, dreaming_cli
+    queue = list(outcomes)
+
+    def run(*args, **kwargs):
+        kwargs['on_start']()
+        outcome = queue.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', run)
+    monkeypatch.setattr(alerts.time, 'time', lambda: now[0])
+
+
+def scheduled_run(jobs):
+    try:
+        return jobs._dream({'scheduled': True, 'action': 'run'})
+    except RuntimeError as error:
+        return error
+
+
+def test_a_findings_pass_that_stays_idle_with_notes_waiting_alerts_after_the_interval(tmp_path, monkeypatch):
+    from kelmo.alerts import DREAM_IDLE_SECONDS
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    stuck = {'state': 'idle', 'waiting': 2}
+    answering(monkeypatch, now, stuck, stuck, stuck, stuck)
+    scheduled_run(jobs)
+    assert messages(tmp_path) == [], 'a first idle answer is no alert yet'
+    now[0] = START + DREAM_IDLE_SECONDS
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    assert messages(tmp_path)[0].startswith('Server Kelmo: ') and '2' in messages(tmp_path)[0]
+    now[0] += DREAM_RETRY_SECONDS
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, 'told once a day, not on every run'
+    now[0] = START + DREAM_IDLE_SECONDS + DAY
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_quiet_findings_pass_never_alerts(tmp_path, monkeypatch):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, *[{'state': 'idle', 'waiting': 0} for _ in range(4)])
+    for day in range(4):
+        now[0] = START + day * DAY
+        scheduled_run(jobs)
+    assert messages(tmp_path) == []
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists()
+
+
+@pytest.mark.parametrize('failure', [{'state': 'failed', 'code': 'E_EXECUTOR', 'reason': 'no findings answer'},
+                                     RuntimeError('the executor crashed')],
+                         ids=['failed-answer', 'exception'])
+def test_a_failed_scheduled_run_is_told_to_the_owner_once_a_day(tmp_path, monkeypatch, failure):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, failure, failure, failure)
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    code = 'E_EXECUTOR' if isinstance(failure, dict) else 'RuntimeError'
+    assert code in messages(tmp_path)[0]
+    now[0] += DREAM_RETRY_SECONDS
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, 'the retry 15 minutes later tells nothing new'
+    now[0] = START + DAY
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+@pytest.mark.parametrize('trouble', ['stuck', 'failed'])
+def test_a_run_that_completes_after_an_alert_sends_one_recovery_message(tmp_path, monkeypatch, trouble):
+    from kelmo.alerts import DREAM_IDLE_SECONDS
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    if trouble == 'stuck':
+        bad = [{'state': 'idle', 'waiting': 3}, {'state': 'idle', 'waiting': 3}]
+    else:
+        bad = [{'state': 'failed', 'code': 'E_EXECUTOR', 'reason': 'timeout'}]
+    answering(monkeypatch, now, *bad, {'state': 'finished'}, {'state': 'finished'})
+    for outcome in bad:
+        scheduled_run(jobs)
+        now[0] += DREAM_IDLE_SECONDS
+    told = len(messages(tmp_path))
+    assert told == 1, messages(tmp_path)
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == told + 1, 'one recovery message'
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists()
+    now[0] += DAY
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == told + 1, 'no second recovery message'
+
+
+def test_a_run_that_completes_before_anything_was_told_sends_nothing(tmp_path, monkeypatch):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, {'state': 'idle', 'waiting': 1}, {'state': 'finished'})
+    scheduled_run(jobs)
+    now[0] += DAY // 2
+    scheduled_run(jobs)
+    assert messages(tmp_path) == []
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists()

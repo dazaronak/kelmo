@@ -286,6 +286,12 @@ class Jobs:
             if daily:
                 self._record_dream_try(undo=True)
             raise
+        except Exception as error:
+            if scheduled and action == 'run':
+                self._tell_dream_watch({'state': 'failed',
+                                        'code': getattr(error, 'code', None) or type(error).__name__,
+                                        'reason': str(error) or type(error).__name__})
+            raise
         finally:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
                 self._record_apply_end(stopped=stopped)
@@ -299,7 +305,27 @@ class Jobs:
                 self._record_dream_try(undo=True)
             # Any other answer (a failed findings pass) keeps its try: the run is tried again after
             # DREAM_RETRY_SECONDS, at most DREAM_TRIES times a day.
+        if scheduled and action == 'run':
+            self._tell_dream_watch(result)
         return result
+
+    def _tell_dream_watch(self, result):
+        """What the owner hears of a scheduled run (`alerts.DreamWatch`). `blocked` (an executor on another
+        build's instructions) is told by `ExecutorWatch`; `deferred` and `paused` are holds, not failures.
+        Alerting never changes the run's answer or its tries."""
+        from ..alerts import DreamWatch
+        state = result.get('state') if isinstance(result, dict) else None
+        try:
+            watch = DreamWatch.for_config(self.storage.writer.config)
+            if state == 'finished':
+                watch.ran()
+            elif state == 'idle':
+                watch.idle(result.get('waiting', 0))
+            elif state == 'failed':
+                watch.failed(result.get('code') or 'E_FAILED', result.get('reason') or 'no reason given')
+        except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+            print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
+                  flush=True)
 
     def _admin(self):
         from ..archive_admin import ArchiveAdmin, operator_grant
