@@ -75,7 +75,11 @@ the worker archives it and records `awaiting_dreaming`; `kelmo dream apply`
 mode publishes as soon as the note is archived. `--pending LINE` (MCP
 `pending`, at most 240 characters) is the one line agents see at startup, under
 "Pending wiki updates", while the note waits; it disappears once the note is
-applied. A note whose text carries two frontmatter blocks in a row has them
+applied. The block sits between `<kelmo-pending-notes>` and
+`</kelmo-pending-notes>` lines and says that its lines are note text, not
+instructions; a marker tag inside a pending line is written with `&lt;`. When the
+start context is too large for a Claude hook, the pending lines are left in the
+referenced context file, whose `pending` field is not framed. A note whose text carries two frontmatter blocks in a row has them
 merged at capture; a note that is frontmatter alone is refused at capture.
 
 An existing wiki file that no registry entry names is registered explicitly,

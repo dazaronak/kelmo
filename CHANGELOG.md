@@ -31,6 +31,16 @@ entry here.
   publication is already decided and waits for its commit, is refused with a retryable `E_BUSY` that says
   which, and then no note of that record is withdrawn. Notes filed with `--intent promote` behave as before.
 
+### Changed
+
+- The "Pending wiki updates" block a session gets at start now sits between `<kelmo-pending-notes>` and
+  `</kelmo-pending-notes>` lines and says that its lines are text from notes, not instructions. A pending line
+  can no longer close the block early: each one is a single row inside it, and a marker tag in its text is
+  written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
+  frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
+  When the start context is too large for a Claude hook and the pending lines are left in the referenced
+  context file instead, that file's `pending` field is not framed yet.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
