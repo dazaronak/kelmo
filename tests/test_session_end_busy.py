@@ -1,0 +1,211 @@
+"""A `SessionEnd` hook in a local vault tries a busy journal again, so the session's last capture is not lost to
+one moment of contention; `Stop` and `PreCompact` still make one attempt.
+
+Two callers reach `capture_hook`: the CLI (`kelmo hook session-end`, its own journal) and the state core
+(`serve_hook`, which lends its writer journal). Both are driven here. Contention is real: another connection holds
+a write transaction or a read on the vault's journal, or another process holds the session intake lock, and a
+timer gives it up.
+"""
+
+import fcntl
+import io
+import json
+import sqlite3
+import sys
+import threading
+import time
+from contextlib import contextmanager
+
+from kelmo.cli import main
+from kelmo.config import Config
+from kelmo.errors import KelmoError
+from kelmo.journal import Journal
+from kelmo.session_control import capture_hook, inspect
+from kelmo.sessions import Sessions
+from test_session_control import configured
+
+# What `kelmod hook` gives a capture hook (`CAPTURE_DEADLINE` in rust/crates/kelmod/src/hook.rs).
+HOOK_DEADLINE = 7.0
+
+
+def prepared(tmp_path):
+    root, source = configured(tmp_path)
+    Sessions(Config.load(root)).close()  # the session tables exist before the journal is held
+    return root, source
+
+
+def journal_path(root):
+    return Config.load(root).internal('.state/journal.sqlite3')
+
+
+@contextmanager
+def held(root, seconds, statement):
+    """Another connection runs `statement` on the vault's journal and keeps its lock for `seconds`."""
+    connection = sqlite3.connect(journal_path(root), isolation_level=None, check_same_thread=False)
+    for part in statement:
+        connection.execute(part)
+    released = threading.Event()
+
+    def release():
+        if not released.is_set():
+            released.set()
+            connection.execute('ROLLBACK')
+
+    timer = threading.Timer(seconds, release)
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        release()
+        connection.close()
+
+
+def journal_held(root, seconds):
+    """A write transaction from another connection."""
+    return held(root, seconds, ['BEGIN IMMEDIATE'])
+
+
+def journal_read(root, seconds):
+    """A read transaction from another connection: a commit cannot finish while it lasts."""
+    return held(root, seconds, ['BEGIN', 'SELECT count(*) FROM sessions'])
+
+
+@contextmanager
+def intake_held(root, seconds):
+    """Holds the session intake lock, as a capture in another process does, for `seconds`."""
+    stream = open(Config.load(root).internal('.state/sessions.lock'), 'a')
+    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    timer = threading.Timer(seconds, lambda: fcntl.flock(stream, fcntl.LOCK_UN))
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        fcntl.flock(stream, fcntl.LOCK_UN)
+        stream.close()
+
+
+@contextmanager
+def lent(root):
+    """The writer journal the state core lends to `capture_hook`."""
+    journal = Journal(journal_path(root))
+    try:
+        yield journal
+    finally:
+        journal.close()
+
+
+def payload(source):
+    return {'session_id': 'native', 'transcript_path': str(source)}
+
+
+def state_core_hook(root, source, action, journal):
+    """`capture_hook` as `serve_hook` calls it; returns its result, or the refusal it raised."""
+    try:
+        return capture_hook(root, 'claude', action, payload(source), internal_job=False, journal=journal)
+    except KelmoError as error:
+        return error
+
+
+def answers(journal):
+    """Whether the journal's connection still runs a query."""
+    try:
+        return journal.conn.execute('SELECT 1').fetchone()[0] == 1
+    except sqlite3.ProgrammingError:
+        return False
+
+
+def hook(root, source, action, monkeypatch, capsys):
+    """Runs `kelmo hook ACTION --json`; returns its exit code, what it printed and how long it took."""
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps(payload(source))))
+    capsys.readouterr()
+    began = time.monotonic()
+    code = main(['hook', action, '--provider', 'claude', '--vault', str(root), '--json'])
+    seconds = time.monotonic() - began
+    return code, json.loads(capsys.readouterr().out), seconds
+
+
+def final_jobs(root):
+    return [job for job in inspect(root)['jobs'] if job['task'] == 'final']
+
+
+def test_a_session_end_that_meets_a_busy_journal_once_is_captured(tmp_path, monkeypatch, capsys):
+    root, source = prepared(tmp_path)
+
+    with journal_held(root, 2.0):  # longer than one capture attempt's 1.5 s budget
+        code, printed, _ = hook(root, source, 'session-end', monkeypatch, capsys)
+
+    assert (code, printed) == (0, {}), printed
+    assert len(final_jobs(root)) == 1
+
+
+def test_a_session_end_in_the_state_core_that_meets_a_busy_journal_once_is_captured(tmp_path):
+    root, source = prepared(tmp_path)
+
+    with lent(root) as journal, journal_held(root, 2.0):
+        result = state_core_hook(root, source, 'session-end', journal)
+
+    assert result == {}, result
+    assert len(final_jobs(root)) == 1
+
+
+def test_a_session_end_tried_again_is_captured_once(tmp_path, monkeypatch, capsys):
+    root, source = prepared(tmp_path)
+
+    with intake_held(root, 0.3):
+        code, printed, _ = hook(root, source, 'session-end', monkeypatch, capsys)
+    assert (code, printed) == (0, {}), printed
+    again, _, _ = hook(root, source, 'session-end', monkeypatch, capsys)
+
+    assert again == 0
+    jobs = final_jobs(root)
+    assert len(jobs) == 1
+    assert len({(job['session_key'], job['end_record']) for job in jobs}) == 1
+
+
+def test_a_session_end_whose_commit_meets_a_reader_is_captured_once(tmp_path):
+    root, source = prepared(tmp_path)
+    with lent(root) as journal:
+        mode = journal.conn.execute('PRAGMA journal_mode').fetchone()[0]
+        assert mode != 'wal', 'a reader blocks a commit only outside WAL mode'
+
+        with journal_read(root, 2.0):  # the first attempt's commit waits out its budget
+            result = state_core_hook(root, source, 'session-end', journal)
+
+        assert result == {}, result
+        assert not journal.conn.in_transaction
+    assert len(final_jobs(root)) == 1
+
+
+def test_a_busy_intake_leaves_the_state_cores_journal_open(tmp_path):
+    root, source = prepared(tmp_path)
+    with lent(root) as journal, intake_held(root, 30.0):
+        refused = state_core_hook(root, source, 'session-stop', journal)
+
+        assert isinstance(refused, KelmoError) and refused.code == 'E_BUSY', refused
+        assert answers(journal)
+
+
+def test_a_session_end_under_a_journal_that_stays_busy_ends_inside_its_deadline(tmp_path, monkeypatch, capsys):
+    root, source = prepared(tmp_path)
+
+    with journal_held(root, HOOK_DEADLINE + 3):
+        code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+
+    assert code != 0
+    assert printed['ok'] is False and printed['error']['code'] == 'E_BUSY', printed
+    assert seconds < HOOK_DEADLINE, seconds
+    assert final_jobs(root) == []
+
+
+def test_stop_and_precompact_still_make_one_attempt(tmp_path, monkeypatch, capsys):
+    root, source = prepared(tmp_path)
+
+    for action in ('session-stop', 'session-checkpoint'):
+        with journal_held(root, 2.5):
+            code, printed, seconds = hook(root, source, action, monkeypatch, capsys)
+        assert code != 0, action
+        assert printed['error']['code'] == 'E_BUSY', (action, printed)
+        assert seconds < 2.5, (action, seconds)  # gave up before the journal was free: no second attempt
+    assert inspect(root)['jobs'] == []

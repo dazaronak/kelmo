@@ -5,11 +5,18 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 import tomllib
 
 from .config import Config
 from .errors import KelmoError
 from .session_settings import validate
+
+# A SessionEnd capture is the session's last, so a busy journal or intake lock is tried again for this long. It
+# stays under the 7 s `kelmod hook` gives a capture hook, itself under the provider's 10 s hook timeout.
+SESSION_END_SECONDS = 5.0
+SESSION_END_PAUSE = 0.1
+CAPTURE_BUDGET = 1.5  # one attempt, as Sessions.capture bounds a capture inside a provider hook
 
 
 def configure(root, changes):
@@ -104,17 +111,34 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
     roots=config.sessions['sources'].get(provider,[])
     source=enrolled_transcript(payload['transcript_path'],roots,'Native transcript is outside enrolled provider locations.')
     selected=next(real for real in (Path(r).expanduser().resolve() for r in roots) if source.is_relative_to(real))
+    event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
+    native_id=payload.get('session_id') or payload.get('thread_id')
+    if event!='SessionEnd':
+        _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET)
+        return {}
+    until=time.monotonic()+SESSION_END_SECONDS
+    while True:
+        try:
+            _capture_once(config,journal,provider,native_id,source,selected,event,
+                          min(CAPTURE_BUDGET,until-time.monotonic()))
+            return {}
+        except KelmoError as error:
+            if error.code!='E_BUSY' or until-time.monotonic()<2*SESSION_END_PAUSE:
+                raise
+        time.sleep(SESSION_END_PAUSE)
+
+
+def _capture_once(config,journal,provider,native_id,source,selected,event,budget):
+    """One attempt: open the session intake, capture the transcript, record the native event."""
     from .sessions import Sessions
     from .journal import now
     sessions=Sessions(config,journal=journal)
-    event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
     try:
-        sessions.capture(provider,payload.get('session_id') or payload.get('thread_id'),source,selected,event,
-                         checkpoint_turns=config.sessions['checkpoint_turns'])
+        sessions.capture(provider,native_id,source,selected,event,
+                         checkpoint_turns=config.sessions['checkpoint_turns'],time_budget=budget)
         with sessions.journal.conn as db:
             db.execute('''CREATE TABLE IF NOT EXISTS session_native_events (
                 provider TEXT NOT NULL,event TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(provider,event))''')
             db.execute('INSERT OR REPLACE INTO session_native_events VALUES (?,?,?)',(provider,event,now()))
     finally:
         sessions.close()
-    return {}
