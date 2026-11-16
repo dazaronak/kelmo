@@ -78,14 +78,35 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
                 socket.display()
             )));
         }
-        crate::ipc::trusted_directory(directory).map_err(|message| CallError {
-            message: format!("E_RUNTIME: {message}"),
-            retryable: false,
+        crate::ipc::trusted_directory(directory).map_err(|message| {
+            if std::fs::symlink_metadata(directory).is_err() {
+                // Gone since the look above: no daemon, as when it was never there.
+                unsent(format!(
+                    "E_TRANSPORT: {}: no such directory",
+                    socket.display()
+                ))
+            } else {
+                CallError {
+                    message: format!("E_RUNTIME: {message}"),
+                    retryable: false,
+                }
+            }
         })?;
     }
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;
+    // The path is looked up again by the connect, so a directory swapped in after the check could hold another
+    // user's socket: the listener must run under this user before anything is sent.
+    if !crate::ipc::same_user(&stream) {
+        return Err(CallError {
+            message: format!(
+                "E_RUNTIME: {}: the socket belongs to another user",
+                socket.display()
+            ),
+            retryable: false,
+        });
+    }
     let mut reader = kelmo_wire::FrameReader::new();
     let hello = json!({"v": 2, "kind": "hello", "id": random_id(), "body_type": "json",
                        "protocols": ["kelmo/2"], "operations": []});

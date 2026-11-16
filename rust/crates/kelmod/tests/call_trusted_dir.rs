@@ -113,3 +113,20 @@ fn an_empty_runtime_directory_never_reaches_a_socket_in_the_working_directory() 
         "kelmod connected to a socket in the working directory"
     );
 }
+
+#[test]
+fn a_symlinked_runtime_directory_named_with_a_trailing_dot_is_refused_before_connecting() {
+    // `link/.` resolves through the link; the check must look at the link itself.
+    let real = fresh(0o700);
+    let listener = listening(&real);
+    let link = real.with_extension("dotlink");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let error = call_through(&link.join("."));
+    assert_eq!(error["code"], "E_RUNTIME", "{error}");
+    assert_eq!(error["retryable"], Value::Bool(false), "{error}");
+    assert!(
+        !connected(&listener),
+        "kelmod connected through a symlinked directory"
+    );
+}
