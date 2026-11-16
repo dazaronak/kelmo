@@ -361,12 +361,16 @@ Bounded, source-backed discovery over newly archived evidence and the committed 
 Journal tables `dream_state`, `dream_findings` and `dream_runs` are initialized on first use,
 preserving the journal schema for vaults that never dream.
 
-- Bounded evidence intake: `Dreaming._changed_evidence` reads operations strictly after a durable
-  cursor (`dream_state.cursor`), ordered by `created_at` and `id`. Only operations in durable stage
-  `archived` or `applied` are admitted. In-flight operations that are neither archived nor applied
-  stop the cursor scan; the cursor never passes incomplete intake. Dreaming's own notes (filename
-  starting with `dreaming-` or recorded in `dream_findings.note_operation_id`) are skipped and never
-  treated as evidence.
+- Bounded evidence intake: `Dreaming._changed_evidence` reads operations in the order of their
+  first `archived` or `applied` journal event (`events.sequence`), strictly after a durable cursor
+  (`dream_state.cursor`, `{"sequence": N}`). An operation without such an event has no place in that
+  order, so in-flight or resting intake never holds the cursor; it is read once it is archived.
+  Purged operations (a `purged` event) are left out, and `_packet` passes a forgotten or purged
+  record. Dreaming's own notes (filename starting with `dreaming-` or recorded in
+  `dream_findings.note_operation_id`) are skipped and never treated as evidence. A 0.3.1 cursor
+  `[created_at, id]` is converted once, with a `seen` list of operations that build already read; an
+  operation at or before it with a `failed` event before its first durable event is not in `seen` and is
+  read again, since 0.3.1 may have passed it unread.
 - Pinned context and budget: `Dreaming._packet` gathers evidence text via `Service.show` and calls
   `Dreaming._related` to find related non-person pages citing the evidence archive IDs, followed
   by their graph neighbours. Evidence items whose cost exceeds `budget_tokens` are recorded in
@@ -587,7 +591,6 @@ here retain the reviewed proposal names. StateAPI publication,
 full retrieval/backfill, scoped semantic publication and shared transport are
 implemented. Native isolation, installed-client delivery and deployment acceptance
 need their own target-environment receipts.
-
 
 Chunk-index maintenance is exposed through `kelmo admin backfill` and `reembed`;
 it is not run implicitly after model selection. A broker service must report

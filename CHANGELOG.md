@@ -112,6 +112,17 @@ entry here.
   limit's wait no longer holds Dreaming after the clock stepped back below the moment the limit was met: the
   next pass starts, and a limit still in force defers it again. `kelmo dream status` shows that moment as
   `deferred_at`.
+- The findings pass of `kelmo dream run` reads evidence again when a capture rests in `captured`. Its cursor
+  followed capture time and stopped at the first note not yet archived, so one collector capture that is never
+  archived held it for good and every pass answered `idle`. The pass now reads notes in the order they reached
+  the archive, so a note still on its way holds nothing back and is read in its turn once it is archived,
+  `--max-sources` notes a pass. A finished pass never reads a note twice. A forgotten or purged record no
+  longer fails the pass: it is passed. A cursor written by 0.3.1 is converted on the first pass: the notes
+  0.3.1 had not reached are read, one window of `--max-sources` per pass, and what it read is not read again,
+  with one exception. A note at or before the old cursor that failed (a moment's `E_BUSY` included) and was
+  archived after a retry is read once more unless a finding already cites it, because the journal of 0.3.1
+  cannot show whether that build read it, and reading it twice is better than never reading it. After that
+  pass a 0.3.1 build cannot read the cursor.
 
 ## [0.3.1] - 2026-11-15
 
