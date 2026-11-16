@@ -49,13 +49,23 @@ class OwnerLock:
         self._holder = None
         self._count = 0
         self._waiting = {True: collections.deque(), False: collections.deque()}
+        self._ends = {}
         self._last_urgent = False
 
+    def _live(self, urgent, now, me):
+        """The waiters of one kind that can still take the lock, the asking caller always among them: another
+        whose timeout passed stays queued until its thread gets the condition back, and holds nobody up meanwhile."""
+        return [ticket for ticket in self._waiting[urgent]
+                if ticket is me or self._ends.get(ticket) is None or self._ends[ticket] > now]
+
     def _turn(self, urgent, ticket):
-        if self._holder is not None or self._waiting[urgent][0] is not ticket:
+        if self._holder is not None:
             return False
-        other = self._waiting[not urgent]
-        return not other or (urgent != self._last_urgent)
+        now = time.monotonic()
+        mine = self._live(urgent, now, ticket)
+        if mine[0] is not ticket:
+            return False
+        return not self._live(not urgent, now, ticket) or (urgent != self._last_urgent)
 
     def acquire(self, timeout=None, urgent=False):
         me = threading.get_ident()
@@ -66,6 +76,7 @@ class OwnerLock:
                 return True
             ticket = object()
             self._waiting[urgent].append(ticket)
+            self._ends[ticket] = end
             try:
                 while not self._turn(urgent, ticket):
                     left = None if end is None else end - time.monotonic()
@@ -76,6 +87,7 @@ class OwnerLock:
                 return True
             finally:
                 self._waiting[urgent].remove(ticket)
+                self._ends.pop(ticket, None)
                 # A caller that gave up may have been the one whose turn it was.
                 self._condition.notify_all()
 

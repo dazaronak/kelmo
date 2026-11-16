@@ -16,7 +16,8 @@ entry here.
   `{"error": ...}`.
 - Tool calls that write through the edge core now take the outbox in the order they came. A new call could
   take it ahead of an earlier one that had just been woken, and a busy session could keep another session's
-  write waiting until its deadline. Hooks keep their turn ahead of tool calls, also in arrival order.
+  write waiting until its deadline. Hooks keep their turn ahead of tool calls, also in arrival order. A
+  caller whose wait ran out holds nobody back, even in the moment before it leaves the queue.
 
 ## [0.3.1] - 2026-11-15
 

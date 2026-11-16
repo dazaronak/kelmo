@@ -246,3 +246,19 @@ def test_a_write_that_cannot_get_the_outbox_in_time_is_refused_as_busy(edge, mon
 
     assert isinstance(refused, KelmoError)
     assert (refused.code, refused.retryable) == ('E_BUSY', True)
+
+
+def test_a_waiter_whose_time_ran_out_does_not_hold_back_a_newcomer_before_it_leaves():
+    """A waiter whose timeout passed stays queued until its thread gets the condition back and leaves; a newcomer
+    that comes to the free lock in that moment takes it, since the waiter can no longer."""
+    import time
+    lock = OwnerLock()
+    expired = object()
+    with lock._condition:
+        lock._waiting[False].append(expired)
+        lock._ends[expired] = time.monotonic() - 1
+    try:
+        assert take(lock, timeout=0) is True
+    finally:
+        with lock._condition:
+            lock._waiting[False].remove(expired)
