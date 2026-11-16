@@ -24,8 +24,8 @@ DREAM_MARKER = 'dream-watch.json'
 # Set while a Dreaming run is under way; a run that finds it left over tells the owner the last one died.
 DREAM_RUNNING = 'dream-running.json'
 # How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
-# of it: the daemon's run is daily, so two runs a day apart. A hold the daemon's daily run saw on an earlier day is
-# told by today's daily run whatever minute either started.
+# of it: the daemon's run is daily, so two runs a day apart. Never sooner: a run that comes a few minutes short of a
+# day after the first sighting leaves it to the next one.
 DREAM_IDLE_SECONDS = 86400
 # The lock every change of the watch file is made under: a failure told before the Dreaming lock was taken and a
 # pass's own outcome may change the file at the same time.
@@ -319,8 +319,7 @@ class DreamWatch(LoginWatch):
         stuck, failed = data.get('stuck'), data.get('failed')
         stamp = (int, float)
         if not (isinstance(stuck, dict) and isinstance(stuck.get('since'), stamp)
-                and (stuck.get('told') is None or isinstance(stuck.get('told'), stamp))
-                and (stuck.get('daily_seen') is None or isinstance(stuck.get('daily_seen'), stamp))):
+                and (stuck.get('told') is None or isinstance(stuck.get('told'), stamp))):
             stuck = None
         if isinstance(failed, dict) and isinstance(failed.get('since'), stamp):
             told = failed.get('told') if isinstance(failed.get('told'), dict) else {}
@@ -345,9 +344,9 @@ class DreamWatch(LoginWatch):
             print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
                   flush=True)
 
-    def idle(self, waiting, now=None, since=None, daily=False):
+    def idle(self, waiting, now=None, since=None):
         """`since` (ISO 8601) is when the first waiting note reached the archive: the hold is at least that
-        old, even when this is the first run to see it. `daily` marks the daemon's scheduled daily run."""
+        old, even when this is the first run to see it."""
         now = time.time() if now is None else now
         try:
             held = datetime.fromisoformat(since).timestamp() if since else now
@@ -362,14 +361,9 @@ class DreamWatch(LoginWatch):
             told_failure = records['failed'] is not None and bool(records['failed']['told'])
             records['failed'] = None  # the run completed
             stuck = records['stuck'] or {'since': min(held, now), 'told': None}
-            if daily and stuck.get('daily_seen') is None:
-                stuck['daily_seen'] = now
             records['stuck'] = stuck
             last = stuck['told']
-            seen = stuck.get('daily_seen')
-            lasted = (now - stuck['since'] >= DREAM_IDLE_SECONDS
-                      or (daily and seen is not None and self._day(seen) < self._day(now)))
-            if ((last is not None or lasted) and self._due_today(last, now)
+            if ((last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due_today(last, now)
                     and not self._retry_waits(('stuck',))):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
                         f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
@@ -378,9 +372,10 @@ class DreamWatch(LoginWatch):
                     text += f' Day {max(0, int((now - stuck["since"]) // REMINDER_SECONDS)) + 1}.'
                 if self._send_kind(('stuck',), text):
                     stuck['told'] = now
-            self._write(records)
+            # The run completed: its recovery goes before the record, so a file that takes no write keeps it too.
             if told_failure:
                 self.send(f'{self.label}: the Dreaming run completes again.')
+            self._write(records)
         self._guarded(self._exclusive(work))
 
     def failed(self, code, reason, now=None):

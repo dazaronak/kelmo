@@ -530,16 +530,19 @@ def test_a_daemon_failure_before_the_lock_leaves_the_start_mark_of_a_pass_that_h
     assert running.exists()
 
 
-def test_the_next_daily_run_tells_a_hold_although_it_starts_a_few_minutes_earlier(tmp_path, monkeypatch):
-    # Day one's idle answer came at 03:04 (the apply before it took four minutes), day two's at 03:00:40: the
-    # hold has lasted the two daily runs the interval stands for, and day two tells it.
+def test_a_hold_is_not_told_before_the_interval_even_on_the_next_days_daily_run(tmp_path, monkeypatch):
+    # The hold was first seen by a run late on day one (a catch-up, say); day two's daily run comes a few hours or
+    # a few minutes short of a day later. The interval is the spec's day: day two tells nothing, the first run
+    # after a full day does.
     now = [START]
     stuck = {'state': 'idle', 'waiting': 2}
     jobs = scheduler(tmp_path, now)
-    answering(monkeypatch, now, stuck, stuck)
+    answering(monkeypatch, now, stuck, stuck, stuck)
     scheduled_run(jobs)
-    assert messages(tmp_path) == []
     now[0] += DAY - 210
+    scheduled_run(jobs)
+    assert messages(tmp_path) == [], messages(tmp_path)
+    now[0] += DAY
     scheduled_run(jobs)
     assert len(messages(tmp_path)) == 1, messages(tmp_path)
 
@@ -633,3 +636,13 @@ def test_a_told_alert_whose_record_never_reached_the_file_still_gets_its_recover
     watch.ran(START + 10)
     assert len(messages(tmp_path)) == 2, messages(tmp_path)
     assert 'completes again' in messages(tmp_path)[-1], messages(tmp_path)
+
+
+def test_an_idle_answer_after_a_failure_alert_tells_the_recovery_though_the_file_takes_no_write(tmp_path):
+    from datetime import UTC, datetime
+    watch = _watch(tmp_path)
+    watch.marker.mkdir()
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    since = datetime.fromtimestamp(START - 2 * DAY, UTC).isoformat()
+    watch.idle(2, now=START + 10, since=since)
+    assert any(line.endswith('the Dreaming run completes again.') for line in messages(tmp_path)), messages(tmp_path)

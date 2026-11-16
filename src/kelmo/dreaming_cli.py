@@ -256,7 +256,7 @@ def failure_outcome(error):
             "reason": str(error) or type(error).__name__}
 
 
-def tell_dream_watch(config, result, run_ended=True, daily=False):
+def tell_dream_watch(config, result, run_ended=True):
     """What the owner hears of a findings pass (`alerts.DreamWatch`), from the daemon's runs and the CLI's own.
     `blocked` (an executor on another build's instructions) is told by `ExecutorWatch`; `deferred` and `paused`
     are holds, not failures. Alerting never changes the run's answer or its tries."""
@@ -267,7 +267,7 @@ def tell_dream_watch(config, result, run_ended=True, daily=False):
         if state == "finished":
             watch.ran()
         elif state == "idle":
-            watch.idle(result.get("waiting", 0), since=result.get("waiting_since"), daily=daily)
+            watch.idle(result.get("waiting", 0), since=result.get("waiting_since"))
         elif state == "failed":
             watch.failed(result.get("code") or "E_FAILED", result.get("reason") or "no reason given")
         # The start mark goes last: a process killed before the outcome is recorded leaves it for the next run.
