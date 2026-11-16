@@ -24,8 +24,9 @@ entry here.
   This counting covers a shared client that reaches the server without the edge daemon; through the edge
   daemon a cut note was already sent again, and its cuts are not counted yet, nor is a bridge process that
   dies or times out under a note. Only a cut counts: a retryable refusal the server
-  itself gives leaves the note pending however often it comes. A client from before this release does not
-  read the mark and refuses a cut note at once, as it did. A request without a key is still refused, with its
+  itself gives leaves the note pending however often it comes. The mark comes from the server's `kelmod
+  attach`, so the server needs this release too: with an older server a cut note is refused at once, as before,
+  and so it is for a client from before this release, which does not read the mark. A request without a key is still refused, with its
   effect reported as unknown.
 - A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
   server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
