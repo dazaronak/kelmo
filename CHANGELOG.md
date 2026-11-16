@@ -11,11 +11,12 @@ entry here.
 - The owner is told when a Dreaming run fails, or when the findings pass keeps reading nothing while archived
   notes wait behind its cursor. Such a cursor is held by an operation that never reached the archive, and
   nothing behind it was ever read; before, both went to the worker log only. This covers the daemon's daily
-  run and the runs of the timer `kelmo dream schedule` writes. The message goes to the `[alerts]` command once
-  when it starts (for a held cursor, once the first waiting note has waited a day), once a day while it lasts,
-  and once when a run completes again. The findings pass's idle answer now carries `waiting`, the number of
-  archived notes behind the cursor, and with any waiting, `waiting_since`, when the first of them reached the
-  archive.
+  run and the runs of the timer `kelmo dream schedule` writes, and a daily run that cannot start because the
+  scheduler's check before it fails (an unreadable `kelmo.toml`, say). The message goes to the `[alerts]`
+  command once when it starts (for a held cursor, once the first waiting note has waited a day), once a day
+  while it lasts, and once when a run completes again. The findings pass's idle answer now carries `waiting`,
+  the number of archived notes behind the cursor, and with any waiting, `waiting_since`, when the first of
+  them reached the archive.
 
 ## [0.3.1] - 2026-11-15
 

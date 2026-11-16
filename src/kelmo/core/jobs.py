@@ -239,16 +239,24 @@ class Jobs:
             raise KelmoError('E_INPUT', 'Only a Dreaming apply runs over ready projects; a run drains every project.')
         if scheduled and self._fenced():
             return {'state': 'fenced'}
+        from ..dreaming_cli import failure_outcome
+        told = []
         try:
             with self._dreaming_lock() as free:
                 if not free:
                     # What the local run answers too; a scheduled job that meets it starts nothing and records
                     # no start, so the next tick asks again.
                     return {'state': 'busy'}
-                return self._dream_run(action, scheduled, ready)
-        except Exception as error:  # the lock, the settings or the run itself: the owner hears of it
-            if action == 'run':
-                from ..dreaming_cli import failure_outcome
+                try:
+                    return self._dream_run(action, scheduled, ready)
+                except Exception as error:
+                    # Told before the lock goes, as an answer is: a CLI run that takes it next is told after.
+                    if action == 'run':
+                        told.append(True)
+                        self._tell_dream_watch(failure_outcome(error))
+                    raise
+        except Exception as error:  # the lock file itself, before any run: the owner hears of it too
+            if action == 'run' and not told:
                 self._tell_dream_watch(failure_outcome(error))
             raise
 
@@ -308,6 +316,18 @@ class Jobs:
         if action == 'run':  # the daemon's own runs and those of the timer `kelmo dream schedule` writes
             self._tell_dream_watch(result)
         return result
+
+    def _tell_probe_failure(self, error):
+        """A probe that fails while today's daily pass is owed keeps that pass from starting: the owner hears of it
+        as of a failed run, which DreamWatch tells at once and then once a day."""
+        try:
+            owed = (time.localtime(self.clock()).tm_hour >= DREAM_HOUR
+                    and self._last_dream_day() != self._today())
+        except Exception:  # noqa: BLE001 - the state file the day is kept in is unreadable too: the pass is owed
+            owed = True
+        if owed:
+            from ..dreaming_cli import failure_outcome
+            self._tell_dream_watch(failure_outcome(error))
 
     def _tell_dream_watch(self, result):
         from ..dreaming_cli import tell_dream_watch
@@ -574,6 +594,7 @@ class Jobs:
         except Exception as error:  # noqa: BLE001 - a failed probe must not stop other scheduled jobs
             print(f'kelmo: Dreaming schedule probe failed: {type(error).__name__}', file=sys.stderr, flush=True)
             action = None
+            self._tell_probe_failure(error)
         if action is not None:
             options = {'action': action, 'scheduled': True}
             if action == 'apply' and self._ready_apply():

@@ -325,3 +325,48 @@ def test_a_cli_failure_inside_its_lock_is_told_before_the_lock_is_released(tmp_p
     assert isinstance(run(), RuntimeError)
     assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
     assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)
+
+
+def test_a_daemon_failure_is_told_before_its_lock_is_released(tmp_path, monkeypatch):
+    # The daemon's run raises; a CLI run may take the lock the moment the daemon lets it go and complete. The
+    # daemon's failure must be told by then, so the recovery that run announces is the last word.
+    from contextlib import contextmanager
+
+    from kelmo.alerts import DreamWatch
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, RuntimeError('the executor crashed'))
+    held = jobs._dreaming_lock
+
+    @contextmanager
+    def then_a_cli_run_completes():
+        try:
+            with held() as free:
+                yield free
+        finally:
+            DreamWatch.for_config(jobs.storage.writer.config).ran(now[0])
+    monkeypatch.setattr(jobs, '_dreaming_lock', then_a_cli_run_completes)
+    assert isinstance(scheduled_run(jobs), RuntimeError)
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
+    assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)
+
+
+def test_a_schedule_probe_that_fails_while_the_daily_run_is_owed_is_told_to_the_owner(tmp_path, monkeypatch):
+    # A broken kelmo.toml or journal makes the probe raise on every tick: no daily pass starts, and the owner hears
+    # of it as of a failed run, once a day.
+    import time
+
+    from kelmo.core.jobs import DREAM_HOUR
+    now = [time.mktime((2027, 1, 15, DREAM_HOUR, 5, 0, 0, 0, -1))]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now)
+
+    def broken():
+        raise RuntimeError('kelmo.toml cannot be read')
+    monkeypatch.setattr(jobs, '_dream_hold', broken)
+    monkeypatch.setattr(jobs, '_background', lambda kind, options: False)
+    jobs._tick()
+    now[0] += 5
+    jobs._tick()
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    assert 'RuntimeError' in messages(tmp_path)[0], messages(tmp_path)
