@@ -1217,6 +1217,14 @@ class SharedClient:
                 'stopped': stopped, 'reached': reached}
 
     def _entry_result(self, entry):
+        # A resent refusal is answered as the note it went out as (`client resend`), down a chain of resends.
+        seen = set()
+        while entry['state'] == 'resent' and entry['idempotency_key'] not in seen:
+            seen.add(entry['idempotency_key'])
+            successor = self.outbox.get(json.loads(entry['outcome'] or '{}').get('resent_as') or '')
+            if successor is None:
+                break
+            entry = successor
         if entry['state'] == 'delivered':
             return json.loads(entry['outcome'])
         if entry['state'] in ('refused', 'dismissed'):

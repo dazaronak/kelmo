@@ -15,6 +15,13 @@ entry here.
   `dismissed`. `kelmo client resend` no longer selects them, and the same request under its key is still
   answered with its refusal. Nothing is deleted.
 
+### Changed
+
+- A request submitted again under the key of a refusal that `kelmo client resend` sent again is answered as
+  the note it went out as: with that note's outcome, its refusal, or as queued under its new key. Before, the
+  old key always answered that the request was queued and would be delivered on the next contact, even after
+  the resent note had been delivered or refused.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
