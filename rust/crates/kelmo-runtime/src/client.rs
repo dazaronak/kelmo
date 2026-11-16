@@ -15,6 +15,16 @@ pub struct Request<'a> {
     pub key: Option<&'a str>,
 }
 
+/// A call that failed: its message (`CODE: text`) and whether the caller may send it again. Nothing reached the
+/// daemon before the call frame was written, so such a call is retryable; from that write on an unkeyed call
+/// may have run and is not. A keyed call stays retryable, as the router answers for it: the key keeps an
+/// operation that replays by key from running twice, while an operation the cores never replay ignores it.
+#[derive(Debug)]
+pub struct CallError {
+    pub message: String,
+    pub retryable: bool,
+}
+
 fn random_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -44,19 +54,28 @@ async fn next_frame(
 }
 
 /// Sends one call and returns (reply header, reply body).
-pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), String> {
+pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), CallError> {
+    let keyed = request.key.is_some();
+    let unsent = |message: String| CallError {
+        message,
+        retryable: true,
+    };
+    let sent = |message: String| CallError {
+        message,
+        retryable: keyed,
+    };
     let mut stream = UnixStream::connect(socket)
         .await
-        .map_err(|e| format!("E_TRANSPORT: {}: {e}", socket.display()))?;
+        .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;
     let mut reader = kelmo_wire::FrameReader::new();
     let hello = json!({"v": 2, "kind": "hello", "id": random_id(), "body_type": "json",
                        "protocols": ["kelmo/2"], "operations": []});
-    let bytes = kelmo_wire::encode(&hello, &Value::Null).map_err(|e| e.to_string())?;
+    let bytes = kelmo_wire::encode(&hello, &Value::Null).map_err(|e| unsent(e.to_string()))?;
     stream
         .write_all(&bytes)
         .await
-        .map_err(|e| format!("E_TRANSPORT: {e}"))?;
-    next_frame(&mut stream, &mut reader).await?;
+        .map_err(|e| unsent(format!("E_TRANSPORT: {e}")))?;
+    next_frame(&mut stream, &mut reader).await.map_err(unsent)?;
     let mut header = json!({"v": 2, "kind": "call", "id": random_id(), "op": request.op,
                             "deadline_ms": request.deadline.as_millis() as u64, "body_type": "json"});
     if let Some(lane) = request.lane {
@@ -65,15 +84,17 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
     if let Some(key) = request.key {
         header["key"] = key.into();
     }
-    let bytes = kelmo_wire::encode(&header, &request.body).map_err(|e| e.to_string())?;
+    let bytes = kelmo_wire::encode(&header, &request.body).map_err(|e| unsent(e.to_string()))?;
+    // From here the daemon may have the call: part of a frame may have reached it even if the write fails.
     stream
         .write_all(&bytes)
         .await
-        .map_err(|e| format!("E_TRANSPORT: {e}"))?;
+        .map_err(|e| sent(format!("E_TRANSPORT: {e}")))?;
     tokio::time::timeout(
         request.deadline + Duration::from_secs(5),
         next_frame(&mut stream, &mut reader),
     )
     .await
-    .map_err(|_| "E_DEADLINE: no reply".to_owned())?
+    .map_err(|_| sent("E_DEADLINE: no reply".to_owned()))?
+    .map_err(sent)
 }

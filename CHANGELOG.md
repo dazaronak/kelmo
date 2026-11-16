@@ -45,6 +45,12 @@ entry here.
   queued entries of 1 MiB each a flush used to hold about 50 MiB; it now stays under 8 MiB. The pending
   count in a flush result and in `kelmo client status` reads a new index on the outbox and no entry bodies.
   An entry queued while a flush runs is delivered by the next flush, as before.
+- `kelmod call` and `kelmod status` no longer call every client error retryable. When the call reached
+  the daemon and the connection then closed without a reply, or no reply came before the deadline
+  (`E_DEADLINE`), a call without `--key` may already have run, so the error now says
+  `"retryable": false`. An error before the call was sent, such as no daemon socket, stays retryable.
+  So does a call with `--key`, as the daemon answers for it, but the key only stops a second run of an
+  operation that replays by key; tool, hook and CLI calls ignore it.
 
 ## [0.3.1] - 2026-11-15
 

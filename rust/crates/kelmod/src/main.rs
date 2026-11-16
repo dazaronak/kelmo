@@ -103,7 +103,7 @@ fn socket(options: &Options) -> Result<PathBuf, String> {
     Ok(ipc::socket_path(&runtime_dir(options)?))
 }
 
-fn print_reply(result: Result<(Value, Value), String>) -> ExitCode {
+fn print_reply(result: Result<(Value, Value), client::CallError>) -> ExitCode {
     match result {
         Ok((header, body)) if header["ok"] == Value::Bool(true) => {
             println!("{body}");
@@ -113,13 +113,14 @@ fn print_reply(result: Result<(Value, Value), String>) -> ExitCode {
             println!("{}", json!({"error": header["error"]}));
             ExitCode::from(1)
         }
-        Err(message) => {
-            let (code, text) = message
+        Err(error) => {
+            let (code, text) = error
+                .message
                 .split_once(": ")
-                .unwrap_or(("E_TRANSPORT", &message));
+                .unwrap_or(("E_TRANSPORT", &error.message));
             println!(
                 "{}",
-                json!({"error": {"code": code, "message": text, "retryable": true}})
+                json!({"error": {"code": code, "message": text, "retryable": error.retryable}})
             );
             ExitCode::from(1)
         }
