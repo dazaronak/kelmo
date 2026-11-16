@@ -144,6 +144,9 @@ class Sessions:
                 db.execute('BEGIN IMMEDIATE')
                 yield
                 _check_deadline(deadline)
+                if deadline is not None:
+                    # The commit may wait for a reader: only for what is left, not a fresh budget.
+                    db.execute(f'PRAGMA busy_timeout={max(1, int((deadline - time.monotonic()) * 1000))}')
         except sqlite3.OperationalError as error:
             if getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                 raise KelmoError('E_BUSY', 'Session journal is busy; retry capture.') from error

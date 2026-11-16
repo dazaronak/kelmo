@@ -122,7 +122,8 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
     last=None
     while True:
         left=until-time.monotonic()
-        if left<SESSION_END_PAUSE:
+        # The first attempt runs whenever any time is left; another one only when a pause still fits.
+        if left<=0 or last is not None and left<SESSION_END_PAUSE:
             if last is not None and last.code!='E_BUSY':
                 raise last
             raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')

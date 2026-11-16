@@ -339,3 +339,42 @@ def test_a_lent_journal_whose_commit_never_meets_a_free_reader_is_left_without_a
         assert not journal.conn.in_transaction
         assert answers(journal)
     assert final_jobs(root) == []
+
+
+def test_a_session_end_with_little_time_left_still_makes_one_attempt(tmp_path, monkeypatch):
+    """A session end that reaches the journal with less time left than one pause (in the state core, after a long
+    wait for the baton) still tries once; a free journal captures it."""
+    from kelmo import session_control
+    root, source = prepared(tmp_path)
+    monkeypatch.setattr(session_control, 'SESSION_END_PAUSE', 1.0)
+
+    with lent(root) as journal:
+        try:
+            result = capture_hook(root, 'claude', 'session-end', payload(source), internal_job=False,
+                                  journal=journal, deadline=time.monotonic() + 0.6)
+        except KelmoError as error:
+            result = error
+
+    assert result == {}, result
+    assert len(final_jobs(root)) == 1
+
+
+def test_a_commit_that_meets_a_reader_late_in_an_attempt_ends_inside_its_deadline(tmp_path):
+    """The capture transaction opens late (a writer holds the journal) and its commit then meets a reader: the
+    commit waits only for what is left of the attempt, so the hook still answers by its deadline."""
+    root, source = prepared(tmp_path)
+    deadline = 1.2
+
+    with lent(root) as journal, journal_read(root, 5.0), journal_held(root, 0.6):
+        began = time.monotonic()
+        try:
+            outcome = capture_hook(root, 'claude', 'session-end', payload(source), internal_job=False,
+                                   journal=journal, deadline=began + deadline)
+        except KelmoError as error:
+            outcome = error
+        seconds = time.monotonic() - began
+        assert not journal.conn.in_transaction
+
+    assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
+    assert seconds < deadline + 0.25, seconds
+    assert final_jobs(root) == []
