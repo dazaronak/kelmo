@@ -195,10 +195,46 @@ def test_forget_on_a_note_being_edited_answers_busy_and_changes_nothing(world):
     finally:
         world.service.journal.release(note['id'], token)
 
-    from kelmo.server import RETRYABLE
-    assert refused.value.code == 'E_BUSY' and refused.value.code in RETRYABLE
+    assert (refused.value.code, refused.value.retryable) == ('E_BUSY', True)
     assert note['id'] in str(refused.value)
     assert world.service.archive_api.hidden_at(note['archive_id']) is None
     trace = world.service.trace(note['id'])
     assert trace['operation']['state'] == 'archived' and not trace['operation']['terminal']
     assert 'forgotten' not in [event['stage'] for event in trace['events']]
+
+
+def test_the_trace_of_a_forgotten_waiting_note_names_its_record_and_time(world):
+    nightly(world)
+    note = waiting(world, 'Exports moved to 23:45.')
+    result = world.service.forget(note['archive_id'])
+
+    events = [event for event in world.service.trace(note['id'])['events'] if event['stage'] == 'forgotten']
+    assert [event['details'] for event in events] == [
+        {'record_id': note['archive_id'], 'forgotten_at': result['forgotten_at']}]
+
+
+def test_forget_on_a_note_whose_publication_is_decided_answers_busy(world, monkeypatch):
+    """The editor decided the note's publication and its commit failed: the next pass's recovery publishes it
+    whatever forget does, so forget says so instead of claiming the note is withdrawn."""
+    from kelmo.creation import apply_pending
+    from kelmo.errors import KelmoError
+    from kelmo.wiki import engine
+    nightly(world)
+    note = waiting(world, 'Exports moved to 23:50.')
+    executor = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run at 23:50.')]))
+    with monkeypatch.context() as broken:
+        broken.setattr(engine, 'publish_semantic', lambda root, operation_id: (_ for _ in ()).throw(
+            KelmoError('E_IO', 'the wiki repository could not be written')))
+        try:
+            apply_pending(world.service, executor)
+        except KelmoError:
+            pass
+    assert note['id'] in world.service.editor.awaiting_publication()
+
+    with pytest.raises(KelmoError) as refused:
+        world.service.forget(note['archive_id'])
+
+    assert (refused.value.code, refused.value.retryable) == ('E_BUSY', True)
+    assert note['id'] in str(refused.value)
+    assert world.service.archive_api.hidden_at(note['archive_id']) is None
+    assert not world.service.trace(note['id'])['operation']['terminal']
