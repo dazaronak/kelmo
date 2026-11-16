@@ -6,6 +6,14 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- `kelmod call` and `kelmod status` no longer call every client error retryable. When the call reached
+  the daemon and the connection then closed without a reply, or no reply came before the deadline
+  (`E_DEADLINE`), a call without `--key` may already have run, so the error now says
+  `"retryable": false`. A call with `--key` stays retryable, and so does an error before the call was
+  sent, such as no daemon socket.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
