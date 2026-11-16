@@ -5,11 +5,18 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 import tomllib
 
 from .config import Config
 from .errors import KelmoError
 from .session_settings import validate
+
+# A SessionEnd capture is the session's last, so a busy journal or intake lock is tried again for this long. It
+# stays under the 7 s `kelmod hook` gives a capture hook, itself under the provider's 10 s hook timeout.
+SESSION_END_SECONDS = 5.0
+SESSION_END_PAUSE = 0.1
+CAPTURE_BUDGET = 1.5  # one attempt, as Sessions.capture bounds a capture inside a provider hook
 
 
 def configure(root, changes):
@@ -88,9 +95,9 @@ def inspect(root):
     return result
 
 
-def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
+def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,deadline=None):
     """`internal_job` is what the hook's own process saw (None: this process's environment); `journal` lends the
-    state core's writer journal."""
+    state core's writer journal; `deadline` (monotonic) is when the hook's caller stops waiting for it."""
     if internal_job is None:
         internal_job=os.environ.get('KELMO_INTERNAL_JOB')=='1'
     if internal_job:
@@ -104,17 +111,81 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
     roots=config.sessions['sources'].get(provider,[])
     source=enrolled_transcript(payload['transcript_path'],roots,'Native transcript is outside enrolled provider locations.')
     selected=next(real for real in (Path(r).expanduser().resolve() for r in roots) if source.is_relative_to(real))
+    event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
+    native_id=payload.get('session_id') or payload.get('thread_id')
+    if event!='SessionEnd':
+        _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET)
+        return {}
+    until=time.monotonic()+SESSION_END_SECONDS
+    if deadline is not None:
+        until=min(until,deadline)
+    last,took=None,0.0
+    while True:
+        left=until-time.monotonic()
+        # The first attempt runs whenever any time is left; another one only when a pause still fits and the time
+        # left is not shorter than the last attempt took, which may have overrun its budget on work, not a lock.
+        if left<=0 or last is not None and left<max(SESSION_END_PAUSE,took):
+            if last is not None and last.code!='E_BUSY':
+                raise last
+            raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
+        began=time.monotonic()
+        try:
+            _bounded_attempt(config,journal,provider,native_id,source,selected,event,left)
+            return {}
+        except KelmoError as error:
+            took=time.monotonic()-began
+            # An attempt that ran out of its own budget (E_CAPTURE_RETRY) is tried again like one the journal
+            # refused (E_BUSY), as long as the time left is not shorter than the attempt took (checked above).
+            if error.code not in ('E_BUSY','E_CAPTURE_RETRY'):
+                raise
+            last=error
+        time.sleep(SESSION_END_PAUSE)
+
+
+def _bounded_attempt(config,journal,provider,native_id,source,selected,event,left):
+    """One SessionEnd attempt whose every wait for the journal, opening and schema reads included, ends within
+    `left` seconds; a lock still held then is `E_BUSY`."""
+    from .journal import Journal
+    until=time.monotonic()+left
+    # No statement of the attempt waits for a lock (each would wait anew): a lock refuses it at once, and the
+    # loop above is what waits. Only the capture's own transaction waits, bounded by the attempt's deadline.
+    try:
+        if journal is None:
+            own=Journal(config.internal('.state/journal.sqlite3'),wait_seconds=0)
+            try:
+                _capture_once(config,own,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
+            finally:
+                own.close()
+            return
+        previous=journal.conn.execute('PRAGMA busy_timeout').fetchone()[0]
+        journal.conn.execute('PRAGMA busy_timeout=0')
+        try:
+            _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
+        finally:
+            journal.conn.execute(f'PRAGMA busy_timeout={previous}')
+    except sqlite3.OperationalError as error:
+        from .errors import sqlite_busy
+        if not sqlite_busy(error):
+            raise
+        raise KelmoError('E_BUSY','Session journal is busy; retry capture.') from error
+
+
+def _capture_once(config,journal,provider,native_id,source,selected,event,budget,*,until=None):
+    """One attempt: open the session intake, capture the transcript, record the native event. With `until`
+    (monotonic), the capture gets at most the time left after the intake opened."""
     from .sessions import Sessions
     from .journal import now
-    sessions=Sessions(config,journal=journal)
-    event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
+    sessions=Sessions(config,journal=journal,deadline=until)
     try:
-        sessions.capture(provider,payload.get('session_id') or payload.get('thread_id'),source,selected,event,
-                         checkpoint_turns=config.sessions['checkpoint_turns'])
+        if until is not None:
+            budget=min(budget,until-time.monotonic())
+            if budget<=0:
+                raise KelmoError('E_BUSY','Session journal is busy; retry capture.')
+        sessions.capture(provider,native_id,source,selected,event,
+                         checkpoint_turns=config.sessions['checkpoint_turns'],time_budget=budget)
         with sessions.journal.conn as db:
             db.execute('''CREATE TABLE IF NOT EXISTS session_native_events (
                 provider TEXT NOT NULL,event TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(provider,event))''')
             db.execute('INSERT OR REPLACE INTO session_native_events VALUES (?,?,?)',(provider,event,now()))
     finally:
         sessions.close()
-    return {}

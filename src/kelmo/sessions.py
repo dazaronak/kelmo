@@ -95,10 +95,16 @@ def read_snapshot(config, connection, checksum):
     return bytes(data)
 
 
+# Pages a migration backup copies per step: each step ends where the intake's deadline is checked.
+BACKUP_PAGES = 256
+
+
 class Sessions:
-    def __init__(self, config, journal=None):
-        """`journal` lends an open journal (the state core's writer); it is then left open by `close`."""
+    def __init__(self, config, journal=None, deadline=None):
+        """`journal` lends an open journal (the state core's writer); it is then left open by `close`.
+        `deadline` (monotonic) bounds a schema migration's backup: past it the intake is refused as busy."""
         self.config = config
+        self._deadline = deadline
         self._owns_journal = journal is None
         self.journal = journal if journal is not None else Journal(config.internal('.state/journal.sqlite3'))
         try:
@@ -111,7 +117,7 @@ class Sessions:
                         client_id TEXT NOT NULL)''')
                     db.execute(SNAPSHOT_STORAGE)
         except BaseException:
-            self.journal.close()
+            self.close()  # a lent journal stays open for its owner
             raise
 
     def close(self):
@@ -144,12 +150,35 @@ class Sessions:
                 db.execute('BEGIN IMMEDIATE')
                 yield
                 _check_deadline(deadline)
+                if deadline is not None:
+                    # The commit may wait for a reader: only for what is left, not a fresh budget.
+                    db.execute(f'PRAGMA busy_timeout={max(1, int((deadline - time.monotonic()) * 1000))}')
         except sqlite3.OperationalError as error:
             if getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                 raise KelmoError('E_BUSY', 'Session journal is busy; retry capture.') from error
             raise
         finally:
             db.execute(f'PRAGMA busy_timeout={previous_timeout}')
+
+    def _backup(self, source, path):
+        """Copies the journal into `path` before a migration, BACKUP_PAGES at a time. A lock held on the journal
+        makes a step wait; past the deadline the copy stops with E_BUSY and the unfinished file is removed."""
+        stopped = []
+
+        def progress(_status, _remaining, _total):
+            if self._deadline is not None and time.monotonic() >= self._deadline:
+                stopped.append(True)
+                raise KelmoError('E_BUSY', 'Session journal is busy; retry capture.')
+
+        target = sqlite3.connect(path)
+        try:
+            source.backup(target, pages=BACKUP_PAGES, progress=progress, sleep=0.05)
+            if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                raise KelmoError('E_STATE', 'Session migration backup failed integrity checking.')
+        finally:
+            target.close()
+            if stopped:
+                path.unlink(missing_ok=True)
 
     def _migrate(self):
         connection = self.journal.conn
@@ -168,13 +197,7 @@ class Sessions:
         backup = self.config.internal('.state/backups/sessions-v1-' + uuid.uuid4().hex + '.sqlite3')
         fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
-        target = sqlite3.connect(backup)
-        try:
-            connection.backup(target)
-            if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
-                raise KelmoError('E_STATE', 'Session migration backup failed integrity checking.')
-        finally:
-            target.close()
+        self._backup(connection, backup)
         engine.sync_file(backup)
         engine.sync_directory(backups)
         with connection:
@@ -207,13 +230,7 @@ class Sessions:
         backup.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
-        target = sqlite3.connect(backup)
-        try:
-            db.backup(target)
-            if target.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
-                raise KelmoError('E_STATE', 'Session migration backup failed.')
-        finally:
-            target.close()
+        self._backup(db, backup)
         engine.sync_file(backup)
         engine.sync_directory(backup.parent)
         with db:

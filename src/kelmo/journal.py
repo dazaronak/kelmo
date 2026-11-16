@@ -89,10 +89,12 @@ class Journal:
             self.guard()
         return self._conn
 
-    def __init__(self, path, *, create=False, read_only=False, check_same_thread=True):
+    def __init__(self, path, *, create=False, read_only=False, check_same_thread=True,
+                 wait_seconds=JOURNAL_WAIT_SECONDS):
         """`read_only`: a reader's connection (SQLite `mode=ro`) that runs no schema work and sees committed
         rows only; a write through it fails. `check_same_thread=False` is for the one writer connection the
-        state core's baton hands between threads."""
+        state core's baton hands between threads. `wait_seconds` bounds each wait for a lock the file's other
+        users hold, opening included."""
         if not create and not path.is_file():
             raise KelmoError('E_STATE', 'Operation journal is missing; run kelmo doctor.')
         if read_only and create:
@@ -103,9 +105,9 @@ class Journal:
         if read_only:
             from urllib.parse import quote
             self._conn = sqlite3.connect(f'file:{quote(str(path))}?mode=ro', uri=True,
-                                        timeout=JOURNAL_WAIT_SECONDS, check_same_thread=check_same_thread)
+                                        timeout=wait_seconds, check_same_thread=check_same_thread)
         else:
-            self._conn = sqlite3.connect(path, timeout=JOURNAL_WAIT_SECONDS, check_same_thread=check_same_thread)
+            self._conn = sqlite3.connect(path, timeout=wait_seconds, check_same_thread=check_same_thread)
         # Called on every use of the connection when set: the state core's baton check in a debug build.
         self.guard = None
         self.conn.row_factory = sqlite3.Row

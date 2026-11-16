@@ -94,6 +94,16 @@ entry here.
   no connection in that time ends the call with `E_TRANSPORT`.
   A connection the daemon does not take in time, and a hello it never answers, are now `E_TRANSPORT` with
   nothing sent, not `E_DEADLINE`, so `kelmo dream` no longer reports a pass running that was never asked for.
+- The last capture of a session in a local vault is no longer lost to a moment of contention. A `SessionEnd`
+  hook captured once, and a busy journal or another capture holding the session intake ended it. It now tries
+  again for up to 5 seconds. Every wait for the journal counts against that time, opening it included, and so
+  does the backup a session end takes before it upgrades an older session schema (an unfinished backup is
+  removed). The time the hook waits for the daemon's writer counts too, so a session end that stays busy fails
+  within the 7 seconds `kelmod hook` gives a capture hook, even while another write holds that writer. Before,
+  an exclusive lock on the journal could hold the hook for up to 30 seconds. `Stop` and `PreCompact` still
+  make one attempt, as before.
+- A capture hook that found the session intake busy no longer closes the state core's journal. Until the
+  daemon restarted, every write it served afterwards failed.
 
 ## [0.3.1] - 2026-11-15
 

@@ -42,6 +42,8 @@ SHARED_ATTRIBUTES = frozenset({'root', 'config', 'bindings', 'context_bindings'}
 DEFAULT_READERS = 4
 HANDLER_LANE = 32
 HOOK_LANE = 4
+# Kept back from a hook's deadline so its answer still reaches `kelmod hook` before it stops waiting.
+HOOK_REPLY_SECONDS = 0.5
 
 _FACADE = contextvars.ContextVar('kelmo_state_facade', default=None)
 
@@ -412,9 +414,10 @@ class StateCore:
         Services: context hooks on a reader, capture on the writer under the baton."""
         if self._enrolled(context.origin) is not None:
             raise KelmoError('E_FORBIDDEN', 'Hooks are served to local callers only.')
-        return self.serve_hook(body)
+        # Measured from the call: a wait for the baton leaves a capture less time to try a busy journal again.
+        return self.serve_hook(body, deadline=time.monotonic() + context.remaining() - HOOK_REPLY_SECONDS)
 
-    def serve_hook(self, body):
+    def serve_hook(self, body, deadline=None):
         from ..integration import hook
         from ..session_control import capture_hook
         if not isinstance(body, dict) or not isinstance(body.get('action'), str):
@@ -428,10 +431,12 @@ class StateCore:
         if isinstance(frame.get('cwd'), str) and not payload.get('cwd'):
             payload['cwd'] = frame['cwd']
         if action.startswith('session-'):
-            with self.storage.baton.hold():
+            # A session end waits for another writer only until its deadline (`capture_hook`); Stop and
+            # PreCompact wait as before.
+            with self.storage.baton.hold(until=deadline if action == 'session-end' else None):
                 result = capture_hook(self.root, provider, action, payload,
                                       internal_job=frame.get('internal_job') is True,
-                                      journal=self.storage.writer.journal)
+                                      journal=self.storage.writer.journal, deadline=deadline)
         elif action in ('start', 'prompt'):
             if provider:
                 payload['kelmo_provider'] = provider
