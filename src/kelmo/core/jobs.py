@@ -254,12 +254,7 @@ class Jobs:
                     # The tick read the gate before this job started: a failing run may have ended meanwhile and
                     # started the delay, and a local client may send `scheduled` itself. Read it again here.
                     return {'state': 'not_due'}
-                result = self._dream_run(action, scheduled, ready)
-                if daily and self._dream_stop_cut:
-                    # Cut by the stop and answered rather than raised (a `failed` pass whose executor the stop
-                    # ended): like a stop, it costs nothing.
-                    self._write_state(dream_tries=found)
-                return result
+                return self._dream_run(action, scheduled, ready)
         except Stopping:
             if daily:
                 self._write_state(dream_tries=found)  # a stop costs no try and keeps the wait it found
@@ -335,9 +330,9 @@ class Jobs:
                 self._record_apply_end(stopped=stopped)
         if daily:
             state = result.get('state') if isinstance(result, dict) else None
-            if state not in DREAM_DAY_STATES and self.should_stop():
-                self._dream_stop_cut = True  # an answer short of the day while the core stops: _dream undoes it
-                return result
+            # An answer is the run's own, whatever the stop flag reads now: a stopped executor raises Stopping
+            # (daemon.py checks the stop while it waits), and a `failed` answer comes from a provider that ended on
+            # its own, so it keeps its try and its wait.
             if state in DREAM_DAY_STATES:
                 self._record_dream_day()
             elif state in DREAM_HELD_STATES:
