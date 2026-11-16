@@ -167,12 +167,13 @@ def visibility_census(path):
 
 def _added_markers(baseline, current):
     """Ids of markers written after the cutover. A baseline from before markers were recorded has no `hidden`
-    and is never rewritten, so a marker counts there when it is later than the baseline itself."""
+    and is never rewritten, so a marker counts there unless it is earlier than the baseline itself: the baseline
+    has whole seconds, so a marker in the second it names counts."""
     if 'hidden' in baseline:
         known = {tuple(row) for row in baseline['hidden']}
         return sorted(row[0] for row in current if tuple(row) not in known)
     marked = datetime.fromisoformat(baseline['marked_at'])
-    return sorted(row[0] for row in current if datetime.fromisoformat(row[1]) > marked)
+    return sorted(row[0] for row in current if datetime.fromisoformat(row[1]) >= marked)
 
 
 def journal_census(path):

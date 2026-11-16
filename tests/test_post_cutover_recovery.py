@@ -242,3 +242,20 @@ def test_forward_recover_yields_vault_with_pre_and_post_cutover_records_and_head
 
     # Verify step completed cleanly
     assert 'verify' in result['state']['steps']
+
+
+def test_a_baseline_without_markers_counts_a_forget_at_its_exact_moment(cutover_vault, capsys):
+    """A stamp written when the microseconds were zero has no fraction, so a marker can carry exactly the
+    baseline's `marked_at`. It is in the second the baseline names, so it counts."""
+    ctl = cutover_vault['ctl_path']
+    [record] = only_record(ctl)
+    forget(capsys, ctl, record)
+    [[_, forgotten_at]] = snap.visibility_census(Config.load(ctl).archive)
+    baseline = json.loads((ctl / snap.CUTOVER).read_text(encoding='utf-8'))
+    baseline.pop('hidden', None)
+    baseline['marked_at'] = forgotten_at
+    (ctl / snap.CUTOVER).write_text(json.dumps(baseline), encoding='utf-8')
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 1 and answer['error']['code'] == 'E_TAIL', answer
+    assert '1 forgotten records' in answer['error']['message'], answer
