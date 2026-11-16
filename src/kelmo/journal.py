@@ -308,6 +308,23 @@ class Journal:
             if terminal:
                 self.conn.execute('DELETE FROM claims WHERE operation_id=?', (operation_id,))
 
+    def withdraw(self, operation_ids):
+        """Stage every listed operation `withdrawn` (terminal) in one transaction, or none of them: any claim on
+        one of them refuses the whole call with E_CLAIM."""
+        if self.conn.in_transaction:
+            raise KelmoError('E_STATE', 'Journal stage transition requires an idle connection.')
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            if self.writer_check is not None:
+                self.writer_check()
+            for operation_id in operation_ids:
+                if self.conn.execute('SELECT 1 FROM claims WHERE operation_id=?', (operation_id,)).fetchone():
+                    raise KelmoError('E_CLAIM', f'Operation {operation_id} is claimed by an attempt.')
+            for operation_id in operation_ids:
+                self.conn.execute("UPDATE operations SET state='withdrawn', terminal=1, error_code=NULL WHERE id=?",
+                                  (operation_id,))
+                self.event(operation_id, 'withdrawn')
+
     def event(self, operation_id, stage, **details):
         details = {key: value for key, value in details.items() if value is not None}
         self.conn.execute('INSERT INTO events(operation_id,stage,details,created_at) VALUES (?,?,?,?)',
