@@ -20,10 +20,12 @@ entry here.
   that was sent and then cut as final, even when it carried an idempotency key, so the client's outbox
   settled the note as refused for good. The refusal now marks a keyed request as cut: the note stays pending
   and the next flush sends it again under the same key. On its third cut it is refused with its effect
-  unknown, so a note that ends the channel every time cannot hold the notes behind it. Only a cut counts: a
-  retryable refusal the server itself gives leaves the note pending however often it comes. A client from
-  before this release does not read the mark and refuses a cut note at once, as it did. A request without a
-  key is still refused, with its effect reported as unknown.
+  unknown, so a note that ends the channel every time cannot hold the notes behind it. This counting covers a
+  shared client that reaches the server without the edge daemon; through the edge daemon a cut note was
+  already sent again, and its cuts are not counted yet. Only a cut counts: a retryable refusal the server
+  itself gives leaves the note pending however often it comes. A client from before this release does not
+  read the mark and refuses a cut note at once, as it did. A request without a key is still refused, with its
+  effect reported as unknown.
 - A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
   server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
   doubling the pause up to 2 seconds.
@@ -34,7 +36,8 @@ entry here.
   such as `search`, `show` or `status`) or carries `--idempotency-key`. Any other command cut after it was
   sent fails at once with `E_TRANSPORT` and its effect reported as unknown, on the second attempt as on the
   first. The resend tries to reconnect for at most 15 seconds, and the whole call stays inside its deadline.
-  A hello the daemon never answers is now `E_TRANSPORT` with nothing sent, not `E_DEADLINE`.
+  A connection the daemon does not take in time, and a hello it never answers, are now `E_TRANSPORT` with
+  nothing sent, not `E_DEADLINE`, so `kelmo dream` no longer reports a pass running that was never asked for.
 
 ## [0.3.1] - 2026-11-15
 

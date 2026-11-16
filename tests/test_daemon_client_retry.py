@@ -206,6 +206,17 @@ def test_a_connect_that_never_completes_ends_inside_the_deadline_and_its_grace(d
     assert peer.calls == []
 
 
+def test_a_connect_that_never_completes_sends_nothing_and_says_so(daemon, monkeypatch):
+    # No attempt reached the daemon, so no pass or write runs for this call: E_DEADLINE would tell `kelmo dream`
+    # that the pass is still running in a service daemon. It is a transport error that may be tried again.
+    peer = daemon(Connection(ANSWER))
+    _stall_after(monkeypatch, 0)
+    got = outcome(peer, 'state.job_run', {'job': 'dream', 'options': {}}, seconds=0.5)
+    assert got[:3] == ('error', 'E_TRANSPORT', True), got
+    assert 'nothing was sent' in got[3], got
+    assert peer.calls == []
+
+
 def test_a_resend_whose_connect_never_completes_ends_at_the_deadline(daemon, monkeypatch):
     peer = daemon(Connection(hold(0.2, CLOSE)), Connection(ANSWER))
     _stall_after(monkeypatch, 1)

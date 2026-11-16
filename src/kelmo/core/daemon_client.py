@@ -151,6 +151,13 @@ def _attempt(sock, op, body, key, until, deadline_ms):
             raise _Cut(sent) from error
 
 
+def _unsent(cause):
+    """No attempt reached kelmod: nothing runs for this call, and it may be sent again."""
+    error = KelmoError('E_TRANSPORT', 'The daemon did not take the connection in time; nothing was sent.')
+    error.retryable = True
+    return error
+
+
 def _unknown(cause):
     error = KelmoError('E_TRANSPORT', 'The daemon closed the connection after the call was sent; its effect is '
                                       'unknown.')
@@ -172,13 +179,24 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None, resend=False
     limit = time.monotonic() + seconds
     try:
         until = limit + GRACE_SECONDS
-        reply, result = _attempt(_connect(target, until), op, body, key, until, int(seconds * 1000))
+        try:
+            sock = _connect(target, until)
+        except KelmoError as error:
+            if error.code == 'E_DEADLINE':  # the connect itself ran out of time: nothing was sent
+                raise _unsent(error) from error
+            raise
+        reply, result = _attempt(sock, op, body, key, until, int(seconds * 1000))
     except _Cut as cut:
         if cut.sent and not _resendable(op, key, resend):
             raise _unknown(cut) from cut
         if limit - time.monotonic() <= 0:
             raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
-        sock = _connect(target, limit, min(limit, time.monotonic() + RECONNECT_SECONDS))
+        try:
+            sock = _connect(target, limit, min(limit, time.monotonic() + RECONNECT_SECONDS))
+        except KelmoError as error:
+            if error.code == 'E_DEADLINE' and not cut.sent:  # neither attempt reached kelmod
+                raise _unsent(error) from error
+            raise
         left = limit - time.monotonic()
         if left <= 0:
             sock.close()
