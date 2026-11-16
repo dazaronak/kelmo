@@ -218,13 +218,35 @@ def _dispatch(root, args):
             if args.action != "run":
                 return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
             # Told before the lock goes, answer or failure: a daemon pass that takes it next is told after this.
+            _dream_watch_starting(service.config)
             try:
                 result = run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            except KeyboardInterrupt:
+                _dream_watch_ended(service.config)  # stopped at the terminal on purpose: nothing died
+                raise
             except Exception as error:
                 tell_dream_watch(service.config, failure_outcome(error))
                 raise _ToldUnderLock(error) from error
             tell_dream_watch(service.config, result)
             return result
+
+
+def _dream_watch_starting(config):
+    from .alerts import DreamWatch
+    try:
+        DreamWatch.for_config(config).starting()
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
+
+
+def _dream_watch_ended(config):
+    from .alerts import DreamWatch
+    try:
+        DreamWatch.for_config(config).ended()
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
 
 
 def failure_outcome(error):
@@ -233,7 +255,7 @@ def failure_outcome(error):
             "reason": str(error) or type(error).__name__}
 
 
-def tell_dream_watch(config, result):
+def tell_dream_watch(config, result, run_ended=True):
     """What the owner hears of a findings pass (`alerts.DreamWatch`), from the daemon's runs and the CLI's own.
     `blocked` (an executor on another build's instructions) is told by `ExecutorWatch`; `deferred` and `paused`
     are holds, not failures. Alerting never changes the run's answer or its tries."""
@@ -241,6 +263,8 @@ def tell_dream_watch(config, result):
     state = result.get("state") if isinstance(result, dict) else None
     try:
         watch = DreamWatch.for_config(config)
+        if run_ended:
+            watch.ended()
         if state == "finished":
             watch.ran()
         elif state == "idle":

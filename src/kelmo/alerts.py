@@ -21,6 +21,8 @@ MARKER = 'login-outage.json'
 VAULT_MARKER = 'vault-outage.json'
 EXECUTOR_MARKER = 'executor-identity.json'
 DREAM_MARKER = 'dream-watch.json'
+# Set while a Dreaming run is under way; a run that finds it left over tells the owner the last one died.
+DREAM_RUNNING = 'dream-running.json'
 # How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
 # of it: the daemon's run is daily, so two runs a day apart.
 DREAM_IDLE_SECONDS = 86400
@@ -204,6 +206,29 @@ class DreamWatch(LoginWatch):
     def saw(self, wait, now=None):
         raise TypeError('DreamWatch reads Dreaming run outcomes: use idle, failed or ran.')
 
+    @property
+    def _running(self):
+        return self.marker.with_name(DREAM_RUNNING)
+
+    def starting(self, now=None):
+        """A run begins (under the Dreaming lock). A mark left by the previous run means it ended with nothing
+        told, its process killed or crashed: that is told as a failed run before the new mark is set."""
+        now = time.time() if now is None else now
+        if self._running.exists():
+            self.failed('E_INTERRUPTED', 'the previous Dreaming run ended without an answer: its process was '
+                        'killed or crashed', now)
+
+        def work():
+            self._running.write_text(json.dumps({'since': now}), encoding='utf-8')
+        self._guarded(work)
+
+    def ended(self):
+        """The run under way ended with something to tell (its answer, a failure, the core's stop)."""
+        def work():
+            if self._running.exists():
+                self._running.unlink()
+        self._guarded(work)
+
     def _records(self):
         """{'stuck': {...} | None, 'failed': {...} | None}. A marker that cannot be read starts afresh: keeping it
         would make every later alert fail, which is the silence the watch exists to prevent."""
@@ -259,12 +284,14 @@ class DreamWatch(LoginWatch):
             stuck = records['stuck'] or {'since': min(held, now), 'told': None}
             records['stuck'] = stuck
             last = stuck['told']
-            if now - stuck['since'] >= DREAM_IDLE_SECONDS and self._due(last, now):
+            # The hold's age decides the first message only; reminders follow _due, which a clock set back does
+            # not silence.
+            if (last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due(last, now):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
                         f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
                         'archive holds it.')
                 if last is not None:
-                    text += f' Day {int((now - stuck["since"]) // REMINDER_SECONDS) + 1}.'
+                    text += f' Day {max(0, int((now - stuck["since"]) // REMINDER_SECONDS)) + 1}.'
                 if self.send(text) or not self.argv:
                     stuck['told'] = now
             self._keep(records)

@@ -370,3 +370,48 @@ def test_a_schedule_probe_that_fails_while_the_daily_run_is_owed_is_told_to_the_
     jobs._tick()
     assert len(messages(tmp_path)) == 1, messages(tmp_path)
     assert 'RuntimeError' in messages(tmp_path)[0], messages(tmp_path)
+
+
+def test_a_clock_set_back_does_not_silence_the_stuck_reminder(tmp_path, monkeypatch):
+    # The stuck cursor was told; then the clock is set back to an hour after the hold began. The reminder follows
+    # the same rule as a failure's: a told time ahead of the clock makes it due, whatever the hold's age reads now.
+    from datetime import UTC, datetime
+    now = [START]
+    since = datetime.fromtimestamp(START - DAY - 10, UTC).isoformat()
+    stuck = {'state': 'idle', 'waiting': 2, 'waiting_since': since}
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, stuck, stuck)
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    now[0] = START - DAY + 3600
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+class _Died(BaseException):
+    """Stands in for a process killed under the run: nothing after it runs, nothing is told."""
+
+
+def test_a_run_whose_process_died_is_told_when_the_next_run_starts(tmp_path, monkeypatch):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, _Died(), {'state': 'finished'})
+    with pytest.raises(_Died):
+        jobs._dream({'scheduled': True, 'action': 'run'})
+    assert messages(tmp_path) == []
+    now[0] += DREAM_RETRY_SECONDS
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) >= 1, messages(tmp_path)
+    assert 'without an answer' in messages(tmp_path)[0], messages(tmp_path)
+
+
+def test_a_run_the_core_stop_ended_is_not_told_as_died(tmp_path, monkeypatch):
+    from kelmo.errors import Stopping
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, Stopping(), {'state': 'finished'})
+    with pytest.raises(Stopping):
+        jobs._dream({'scheduled': True, 'action': 'run'})
+    now[0] += DREAM_RETRY_SECONDS
+    scheduled_run(jobs)
+    assert messages(tmp_path) == [], messages(tmp_path)

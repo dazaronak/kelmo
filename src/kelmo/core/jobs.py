@@ -247,8 +247,16 @@ class Jobs:
                     # What the local run answers too; a scheduled job that meets it starts nothing and records
                     # no start, so the next tick asks again.
                     return {'state': 'busy'}
+                if action == 'run':
+                    from ..dreaming_cli import _dream_watch_starting
+                    _dream_watch_starting(self.storage.writer.config)
                 try:
                     return self._dream_run(action, scheduled, ready)
+                except Stopping:
+                    if action == 'run':  # the core's stop ended it: an answer of sorts, nothing died
+                        from ..dreaming_cli import _dream_watch_ended
+                        _dream_watch_ended(self.storage.writer.config)
+                    raise
                 except Exception as error:
                     # Told before the lock goes, as an answer is: a CLI run that takes it next is told after.
                     if action == 'run':
@@ -326,8 +334,9 @@ class Jobs:
         except Exception:  # noqa: BLE001 - the state file the day is kept in is unreadable too: the pass is owed
             owed = True
         if owed:
-            from ..dreaming_cli import failure_outcome
-            self._tell_dream_watch(failure_outcome(error))
+            from ..dreaming_cli import failure_outcome, tell_dream_watch
+            # No run is under way here, so the start mark of one (a timer's run in its own process) stays.
+            tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
 
     def _tell_dream_watch(self, result):
         from ..dreaming_cli import tell_dream_watch
