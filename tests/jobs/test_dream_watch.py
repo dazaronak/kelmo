@@ -277,3 +277,30 @@ def test_a_clock_set_back_does_not_silence_the_daily_reminder(tmp_path, monkeypa
     now[0] = START - 3 * DAY  # the clock was set back three days; the run fails again
     scheduled_run(jobs)
     assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_cli_result_is_told_before_its_lock_is_released(tmp_path, monkeypatch):
+    # A daemon pass may take the lock the moment the CLI lets it go, complete and announce the recovery. The CLI's
+    # own answer must already be told by then, so an idle answer it got before cannot reopen the alert afterwards.
+    from datetime import UTC, datetime
+
+    from kelmo import dreaming_cli
+    from kelmo.alerts import DreamWatch
+    now = [START]
+    since = datetime.fromtimestamp(START - 3 * DAY, UTC).isoformat()
+    stuck = {'state': 'idle', 'waiting': 2, 'waiting_since': since}
+    run = direct(tmp_path, monkeypatch, now, stuck, stuck)
+    run()
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)  # the hold is three days old: told at once
+    inner = dreaming_cli._dispatch
+
+    def then_the_daemon_recovers(root, args):
+        result = inner(root, args)
+        DreamWatch.for_config(dreaming_cli.Config.load(root)).ran(now[0])
+        return result
+
+    monkeypatch.setattr(dreaming_cli, '_dispatch', then_the_daemon_recovers)
+    now[0] += DAY
+    run()
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
+    assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)

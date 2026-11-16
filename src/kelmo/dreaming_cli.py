@@ -132,13 +132,11 @@ def dispatch(root, args):
     if args.action != "run":
         return _dispatch(root, args)
     try:
-        result = _dispatch(root, args)
+        return _dispatch(root, args)  # its answer is told under the Dreaming lock
     except Exception as error:
         if not (isinstance(error, KelmoError) and error.code == "E_CONFIG" and str(error) == UNCONFIGURED):
             tell_dream_watch(_alert_config(root), failure_outcome(error))
         raise
-    tell_dream_watch(_alert_config(root), result)
-    return result
 
 
 def _alert_config(root):
@@ -207,7 +205,11 @@ def _dispatch(root, args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            result = run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            if args.action == "run":
+                # Told before the lock goes: a daemon pass that takes it next and completes is told after this.
+                tell_dream_watch(service.config, result)
+            return result
 
 
 def failure_outcome(error):
