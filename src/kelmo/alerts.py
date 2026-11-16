@@ -74,6 +74,12 @@ class LoginWatch:
         hours = round((now - outage['since']) / 3600, 1)
         self.send(f'{self.label}: the executor login works again after {hours} h; waiting work resumes.')
 
+    @staticmethod
+    def _due(last, now):
+        """Whether a reminder is due: never told, a day ago or more, or told at a time still ahead of the
+        clock (a clock that was set back must not silence a reminder)."""
+        return not isinstance(last, (int, float)) or not 0 <= now - last < REMINDER_SECONDS
+
     def _save(self, outage):
         partial = self.marker.with_name(self.marker.name + '.partial')
         partial.write_text(json.dumps(outage), encoding='utf-8')
@@ -253,7 +259,7 @@ class DreamWatch(LoginWatch):
             stuck = records['stuck'] or {'since': min(held, now), 'told': None}
             records['stuck'] = stuck
             last = stuck['told']
-            if now - stuck['since'] >= DREAM_IDLE_SECONDS and (last is None or now - last >= REMINDER_SECONDS):
+            if now - stuck['since'] >= DREAM_IDLE_SECONDS and self._due(last, now):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
                         f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
                         'archive holds it.')
@@ -274,7 +280,7 @@ class DreamWatch(LoginWatch):
             failed = records['failed'] or {'since': now, 'told': {}}
             records['failed'] = failed
             last = failed['told'].get(code)
-            if last is not None and now - last < REMINDER_SECONDS:
+            if not self._due(last, now):
                 self._keep(records)
                 return
             text = (f'{self.label}: the Dreaming run failed with {code}: '
@@ -378,12 +384,6 @@ class ExecutorWatch(LoginWatch):
         except OSError as failure:
             print(json.dumps({'executor_record': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
                   flush=True)
-
-    @staticmethod
-    def _due(last, now):
-        """Whether a reminder is due: never told, a day ago or more, or told at a time still ahead of the
-        clock (a clock that was set back must not silence a reminder)."""
-        return not isinstance(last, (int, float)) or not 0 <= now - last < REMINDER_SECONDS
 
     def _over(self, before, name):
         """The message that ends an earlier trouble with this command, when the owner was told of one."""

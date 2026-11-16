@@ -217,6 +217,7 @@ def direct(tmp_path, monkeypatch, now, *outcomes):
             return False
 
     monkeypatch.setattr(dreaming_cli, 'Service', Configured)
+    monkeypatch.setattr(dreaming_cli.Config, 'load', staticmethod(lambda root: config))
     from kelmo import alerts
     queue = list(outcomes)
 
@@ -234,7 +235,7 @@ def direct(tmp_path, monkeypatch, now, *outcomes):
     def run():
         try:
             return dreaming_cli.dispatch(tmp_path, args)
-        except RuntimeError as error:
+        except (RuntimeError, OSError) as error:
             return error
     return run
 
@@ -255,3 +256,24 @@ def test_a_pass_the_cli_runs_outside_the_daemon_is_watched_too(tmp_path, monkeyp
     run()
     assert len(messages(tmp_path)) == 3, 'one recovery message'
     assert not (tmp_path / '.state' / 'dream-watch.json').exists()
+
+
+def test_a_pass_the_cli_cannot_even_start_is_told_to_the_owner(tmp_path, monkeypatch):
+    # The timer's run fails before Dreaming starts (here its lock file cannot be opened): the owner hears of it,
+    # as of a failure in the daemon's dream job.
+    now = [START]
+    run = direct(tmp_path, monkeypatch, now, {'state': 'finished'})
+    (tmp_path / '.state' / 'dreaming.lock').mkdir()
+    assert isinstance(run(), OSError)
+    assert len(messages(tmp_path)) == 1 and 'IsADirectoryError' in messages(tmp_path)[0], messages(tmp_path)
+
+
+def test_a_clock_set_back_does_not_silence_the_daily_reminder(tmp_path, monkeypatch):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    failure = {'state': 'failed', 'code': 'E_EXECUTOR', 'reason': 'no findings answer'}
+    answering(monkeypatch, now, failure, failure)
+    scheduled_run(jobs)
+    now[0] = START - 3 * DAY  # the clock was set back three days; the run fails again
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)

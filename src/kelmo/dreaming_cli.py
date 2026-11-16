@@ -123,7 +123,32 @@ def prepare_schedule(root, args):
             "scheduler_started": False}
 
 
+UNCONFIGURED = "Configure Dreaming before running it."
+
+
 def dispatch(root, args):
+    """A `kelmo dream` call the CLI runs itself. A `run` here is a pass outside the daemon (a `--server-profile`
+    timer), told to the owner as the daemon's are: whatever ends it, from its service and lock to the pass."""
+    if args.action != "run":
+        return _dispatch(root, args)
+    try:
+        result = _dispatch(root, args)
+    except Exception as error:
+        if not (isinstance(error, KelmoError) and error.code == "E_CONFIG" and str(error) == UNCONFIGURED):
+            tell_dream_watch(_alert_config(root), failure_outcome(error))
+        raise
+    tell_dream_watch(_alert_config(root), result)
+    return result
+
+
+def _alert_config(root):
+    try:
+        return Config.load(root)
+    except Exception:  # noqa: BLE001 - tell_dream_watch then reports the delivery as failed
+        return None
+
+
+def _dispatch(root, args):
     configured = None
     if args.action == "configure":
         for name in ("max_sources", "max_pages", "budget_tokens"):
@@ -176,22 +201,13 @@ def dispatch(root, args):
         if args.action == "findings":
             return {"findings": dream.findings(args.state)}
         if not settings:
-            raise KelmoError("E_CONFIG", "Configure Dreaming before running it.")
+            raise KelmoError("E_CONFIG", UNCONFIGURED)
         with service.config.internal(".state/dreaming.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            if args.action != "run":
-                return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
-            # A run outside the daemon (a `--server-profile` timer) is told to the owner as the daemon's are.
-            try:
-                result = run_dream(service, args.action, contexts=contexts)
-            except Exception as error:
-                tell_dream_watch(service.config, failure_outcome(error))
-                raise
-            tell_dream_watch(service.config, result)
-            return result
+            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
 
 
 def failure_outcome(error):
