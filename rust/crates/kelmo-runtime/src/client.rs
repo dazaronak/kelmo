@@ -67,6 +67,17 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
         message,
         retryable: keyed,
     };
+    // The socket is reached only through a directory this user owns and nobody else can write into, as the
+    // gateway checks it: another user could otherwise plant the socket and read the call. A directory that is
+    // not there yet means no daemon, which the connect below reports as before.
+    if let Some(directory) = socket.parent()
+        && std::fs::symlink_metadata(directory).is_ok()
+    {
+        crate::ipc::trusted_directory(directory).map_err(|message| CallError {
+            message: format!("E_RUNTIME: {message}"),
+            retryable: false,
+        })?;
+    }
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;

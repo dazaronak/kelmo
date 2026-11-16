@@ -21,6 +21,8 @@ fn runtime_dir() -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("runtime dir");
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("runtime dir mode");
     dir
 }
 
