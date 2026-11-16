@@ -304,3 +304,24 @@ def test_a_cli_result_is_told_before_its_lock_is_released(tmp_path, monkeypatch)
     run()
     assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
     assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)
+
+
+def test_a_cli_failure_inside_its_lock_is_told_before_the_lock_is_released(tmp_path, monkeypatch):
+    # The same race for a run that raises: a daemon pass that takes the lock next and completes must come after the
+    # CLI's failure, so the recovery it announces is the last word.
+    from kelmo import dreaming_cli
+    from kelmo.alerts import DreamWatch
+    now = [START]
+    run = direct(tmp_path, monkeypatch, now, RuntimeError('executor ended'))
+    inner = dreaming_cli._dispatch
+
+    def then_the_daemon_recovers(root, args):
+        try:
+            return inner(root, args)
+        finally:
+            DreamWatch.for_config(dreaming_cli.Config.load(root)).ran(now[0])
+
+    monkeypatch.setattr(dreaming_cli, '_dispatch', then_the_daemon_recovers)
+    assert isinstance(run(), RuntimeError)
+    assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
+    assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)

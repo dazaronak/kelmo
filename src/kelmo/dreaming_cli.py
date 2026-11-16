@@ -132,11 +132,21 @@ def dispatch(root, args):
     if args.action != "run":
         return _dispatch(root, args)
     try:
-        return _dispatch(root, args)  # its answer is told under the Dreaming lock
+        return _dispatch(root, args)  # what the pass ends with is told under the Dreaming lock
+    except _ToldUnderLock as told:
+        raise told.error from None
     except Exception as error:
         if not (isinstance(error, KelmoError) and error.code == "E_CONFIG" and str(error) == UNCONFIGURED):
             tell_dream_watch(_alert_config(root), failure_outcome(error))
         raise
+
+
+class _ToldUnderLock(Exception):
+    """A pass that raised under the Dreaming lock, already told to the owner; `dispatch` re-raises its error."""
+
+    def __init__(self, error):
+        super().__init__(error)
+        self.error = error
 
 
 def _alert_config(root):
@@ -205,10 +215,15 @@ def _dispatch(root, args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            result = run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
-            if args.action == "run":
-                # Told before the lock goes: a daemon pass that takes it next and completes is told after this.
-                tell_dream_watch(service.config, result)
+            if args.action != "run":
+                return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            # Told before the lock goes, answer or failure: a daemon pass that takes it next is told after this.
+            try:
+                result = run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            except Exception as error:
+                tell_dream_watch(service.config, failure_outcome(error))
+                raise _ToldUnderLock(error) from error
+            tell_dream_watch(service.config, result)
             return result
 
 
