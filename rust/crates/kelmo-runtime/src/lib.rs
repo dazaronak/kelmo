@@ -11,22 +11,43 @@ pub mod supervisor;
 pub mod sys;
 
 /// Writes one line to the daemon's log (its standard error), led by the UTC time, so that a restart or a
-/// recycle can be dated from the log. A line break inside the message is written escaped, so one entry is
-/// always one line and every line of the log starts with its time.
+/// recycle can be dated from the log. A line separator inside the message is written escaped, and the whole
+/// line goes out in one write, so a core writing to the same log cannot split it: every line of the log that
+/// kelmod writes starts with its time. A failed write is dropped; logging never stops the daemon.
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {
-        eprintln!(
-            "{} {}",
-            $crate::stamp(std::time::SystemTime::now()),
-            $crate::one_line(&format!($($arg)*))
-        )
+        $crate::write_log_line(&format!($($arg)*))
     };
 }
 
-/// `text` with every carriage return and line feed written as `\r` and `\n`.
+/// The line `logln!` writes: the time, a space, the message on one line, a line feed; one `write_all`.
+pub fn write_log_line(message: &str) {
+    use std::io::Write;
+    let line = format!(
+        "{} {}\n",
+        stamp(std::time::SystemTime::now()),
+        one_line(message)
+    );
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+}
+
+/// `text` with every character a reader may take for a line break (CR, LF, vertical tab, form feed, the
+/// separators 0x1C-0x1E, NEL, U+2028, U+2029) written as its escape, such as `\n` or `\u{2028}`.
 pub fn one_line(text: &str) -> String {
-    text.replace('\r', "\\r").replace('\n', "\\n")
+    text.chars()
+        .map(|c| match c {
+            '\r'
+            | '\n'
+            | '\u{b}'
+            | '\u{c}'
+            | '\u{1c}'..='\u{1e}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}' => c.escape_default().to_string(),
+            _ => c.to_string(),
+        })
+        .collect()
 }
 
 /// `at` as `YYYY-MM-DDTHH:MM:SS.mmmZ`, in UTC. A time before 1970 is written as the epoch.
@@ -86,5 +107,14 @@ mod stamp_tests {
             one_line("core state uses 279 MiB"),
             "core state uses 279 MiB"
         );
+        for separator in ['\u{b}', '\u{c}', '\u{1c}', '\u{85}', '\u{2028}', '\u{2029}'] {
+            let escaped = one_line(&format!("core{separator}state"));
+            assert!(
+                !escaped.contains(separator)
+                    && escaped.starts_with("core")
+                    && escaped.ends_with("state"),
+                "{escaped:?}"
+            );
+        }
     }
 }

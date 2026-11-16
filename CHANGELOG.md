@@ -11,8 +11,9 @@ entry here.
 - Each line `kelmod` itself writes to its log while it serves (core starts, restarts, recycles, memory budgets,
   stops, the HTTP endpoint) now begins with the UTC time, as in
   `2026-11-16T07:40:00.250Z kelmod: core state uses 279 MiB ...`, so a recycle can be dated from the log. A line
-  break inside such a message is written as `\n`, so every line of it starts with its time. Lines the cores write
-  to the same log, and an error that stops `kelmod` before it serves, are written as before.
+  break inside such a message is written as `\n`, and the line goes out in one write, so every line of it
+  starts with its time. Lines the cores write to the same log, and an error that stops `kelmod` before it
+  serves (the client quotes those to the user), are written as before.
 
 ## [0.3.1] - 2026-11-15
 

@@ -105,13 +105,13 @@ pub async fn serve(spec: Spec, ephemeral: bool) -> i32 {
 pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> i32 {
     if ephemeral && front.is_some() {
         // An ephemeral daemon counts socket clients only and would stop under live HTTP sessions.
-        crate::logln!("E_CONFIG: an ephemeral daemon serves no HTTP endpoint");
+        eprintln!("E_CONFIG: an ephemeral daemon serves no HTTP endpoint");
         return EXIT_CONFIG;
     }
     let _lock = match ipc::InstanceLock::acquire(&spec.state_dir.join("daemon.lock")) {
         Ok(lock) => lock,
         Err(message) => {
-            crate::logln!("E_BUSY: {message}");
+            eprintln!("E_BUSY: {message}");
             return EXIT_BUSY;
         }
     };
@@ -129,21 +129,21 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
     {
         Ok(path) => path,
         Err(error) => {
-            crate::logln!("E_RUNTIME: {error}");
+            eprintln!("E_RUNTIME: {error}");
             return 1;
         }
     };
     let listener = match ipc::bind(&runtime) {
         Ok(listener) => listener,
         Err(error) => {
-            crate::logln!("E_RUNTIME: {}: {error}", runtime.display());
+            eprintln!("E_RUNTIME: {}: {error}", runtime.display());
             return 1;
         }
     };
     let front = match front.map(|prepare| prepare()).transpose() {
         Ok(front) => front,
         Err(message) => {
-            crate::logln!("E_CONFIG: {message}");
+            eprintln!("E_CONFIG: {message}");
             let _ = std::fs::remove_file(ipc::socket_path(&runtime));
             return EXIT_CONFIG;
         }
