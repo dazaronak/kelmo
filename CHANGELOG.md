@@ -15,7 +15,7 @@ entry here.
   index on a large journal takes a moment once; nothing else changes.
 - `memory_search` and `memory_list` no longer scan every operation for each record they return. Each row looks up
   the record's operations by its archive id, and the journal now indexes that column too; on 20,000 operations
-  one lookup went from about 0.79 ms to 0.006 ms, about 0.4 s saved on a 500-item `memory_list` page.
+  one lookup went from about 1 ms to 0.006 ms, about 0.5 s saved on a 500-item `memory_list` page.
 
 ## [0.3.1] - 2026-11-15
 
