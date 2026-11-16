@@ -1,6 +1,6 @@
-//! `kelmod call` against a fake daemon socket: a client error says it is retryable only when sending the call
-//! again is safe. Nothing reached the daemon before the call frame was written; after it, an unkeyed call may
-//! have run, and only a keyed call is answered from the daemon's record instead of running twice.
+//! `kelmod call` against a fake daemon socket: a client error says it is retryable when nothing reached the
+//! daemon before the call frame was written, or when the call carried a key; after that write an unkeyed call
+//! may have run, and its error is not retryable.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;

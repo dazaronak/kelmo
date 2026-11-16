@@ -15,9 +15,10 @@ pub struct Request<'a> {
     pub key: Option<&'a str>,
 }
 
-/// A call that failed: its message (`CODE: text`) and whether sending it again is safe. Nothing reached the
-/// daemon before the call frame was written; from that write on an unkeyed call may have run, and only a
-/// keyed call is answered from the daemon's record instead of running twice.
+/// A call that failed: its message (`CODE: text`) and whether the caller may send it again. Nothing reached the
+/// daemon before the call frame was written, so such a call is retryable; from that write on an unkeyed call
+/// may have run and is not. A keyed call stays retryable, as the router answers for it: the key keeps an
+/// operation that replays by key from running twice, while an operation the cores never replay ignores it.
 #[derive(Debug)]
 pub struct CallError {
     pub message: String,
