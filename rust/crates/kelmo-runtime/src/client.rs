@@ -53,9 +53,10 @@ async fn next_frame(
     }
 }
 
-/// Sends one call and returns (reply header, reply body). The call's deadline plus five seconds bounds all of
-/// it, the connection, the hello and the write of the call frame included, so a daemon that accepts the
-/// connection and then stalls ends the call with `E_DEADLINE`.
+/// Sends one call and returns (reply header, reply body). The call's deadline plus five seconds bounds the
+/// connection, the hello and the write of the call frame together, so a daemon that accepts the connection and
+/// then stalls ends the call with `E_DEADLINE`. The reply then gets the same window again, counted from the
+/// write.
 pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), CallError> {
     let end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
     let keyed = request.key.is_some();
@@ -97,7 +98,10 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
         .await
         .map_err(|_| sent("E_DEADLINE: the daemon did not take the call".to_owned()))?
         .map_err(|e| sent(format!("E_TRANSPORT: {e}")))?;
-    tokio::time::timeout_at(end, next_frame(&mut stream, &mut reader))
+    // The daemon counts the deadline from the moment it has the call, so the reply gets its own window from
+    // the write: a slow connect or hello does not eat the time the daemon was given.
+    let reply_end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
+    tokio::time::timeout_at(reply_end, next_frame(&mut stream, &mut reader))
         .await
         .map_err(|_| sent("E_DEADLINE: no reply".to_owned()))?
         .map_err(sent)

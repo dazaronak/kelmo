@@ -14,10 +14,11 @@ entry here.
   `"retryable": false`. An error before the call was sent, such as no daemon socket, stays retryable.
   So does a call with `--key`, as the daemon answers for it, but the key only stops a second run of an
   operation that replays by key; tool, hook and CLI calls ignore it.
-- `kelmod call --deadline-ms` now bounds the whole call, the connection included. A daemon that accepted
-  the connection and then never answered the hello, or never read the call, left `kelmod` waiting with no
-  output; it now ends with `E_DEADLINE` five seconds after the deadline, retryable when the call was never
-  sent or carries a key.
+- `kelmod call --deadline-ms` now also bounds the part before the call is sent. A daemon that accepted the
+  connection and then never answered the hello, or never read the call, left `kelmod` waiting with no
+  output; the connection, the hello and the write of the call now end with `E_DEADLINE` five seconds after
+  the deadline, retryable when the call was never sent or carries a key. The wait for the reply is
+  unchanged: the deadline plus five seconds, counted from the moment the call was written.
 
 ## [0.3.1] - 2026-11-15
 

@@ -106,3 +106,68 @@ fn a_daemon_that_never_reads_the_call_ends_it_at_its_deadline() {
     assert_eq!(error["code"], "E_DEADLINE", "{error}");
     assert_eq!(error["retryable"], Value::Bool(false), "{error}");
 }
+
+#[test]
+fn the_largest_deadline_is_an_answer_not_a_panic() {
+    // `--deadline-ms` takes any u64; a deadline past what the clock can hold must not crash kelmod.
+    let dir = runtime_dir().join("absent");
+    let output = Command::new(env!("CARGO_BIN_EXE_kelmod"))
+        .args(["call", "archive.echo", "--runtime-dir"])
+        .arg(&dir)
+        .args(["--deadline-ms", "18446744073709551615"])
+        .output()
+        .expect("kelmod runs");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let answer: Value = serde_json::from_slice(&output.stdout).expect("JSON on stdout");
+    assert_eq!(answer["error"]["code"], "E_TRANSPORT", "{answer}");
+}
+
+#[test]
+fn a_slow_hello_does_not_take_the_time_the_reply_was_given() {
+    // The window is 10 ms + 5 s. The hello takes 3 s and the reply 3 s more: 6 s from the start, 3 s from the
+    // write of the call, which is where the daemon starts counting its deadline.
+    let dir = runtime_dir();
+    let listener = UnixListener::bind(dir.join("d.sock")).expect("bind");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut reader = kelmo_wire::FrameReader::new();
+        let mut buffer = [0u8; 65536];
+        let mut frames: Vec<(Value, Value)> = Vec::new();
+        let mut greeted = false;
+        loop {
+            let read = stream.read(&mut buffer).expect("read");
+            if read == 0 {
+                return;
+            }
+            frames.extend(reader.feed(&buffer[..read]).expect("frame"));
+            if !greeted && !frames.is_empty() {
+                thread::sleep(Duration::from_secs(3));
+                let hello = json!({"v": 2, "kind": "hello", "id": "0123456789abcdef0123456789abcdef",
+                                   "body_type": "json", "protocols": ["kelmo/2"], "operations": []});
+                stream
+                    .write_all(&kelmo_wire::encode(&hello, &Value::Null).expect("encode"))
+                    .expect("write");
+                greeted = true;
+            }
+            if frames.len() >= 2 {
+                thread::sleep(Duration::from_secs(3));
+                let id = frames[1].0["id"].as_str().expect("call id").to_owned();
+                let reply = kelmo_wire::header::reply(&id, None);
+                stream
+                    .write_all(&kelmo_wire::encode(&reply, &json!({"echo": 1})).expect("encode"))
+                    .expect("write");
+                thread::sleep(Duration::from_secs(1));
+                return;
+            }
+        }
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_kelmod"))
+        .args(["call", "archive.echo", "--runtime-dir"])
+        .arg(&dir)
+        .args(["--deadline-ms", "10"])
+        .output()
+        .expect("kelmod runs");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let answer: Value = serde_json::from_slice(&output.stdout).expect("JSON on stdout");
+    assert_eq!(answer, json!({"echo": 1}), "{answer}");
+}
