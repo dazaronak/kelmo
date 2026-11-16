@@ -189,6 +189,7 @@ class StateCore:
         from ..service import Service
         self.root = Path(root).expanduser().resolve()
         self._spool = None
+        self._spool_lock = threading.Lock()
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.profile_path = Path(profile_path) if profile_path is not None else None
@@ -412,7 +413,11 @@ class StateCore:
         Services: context hooks on a reader, capture on the writer under the baton."""
         if self._enrolled(context.origin) is not None:
             raise KelmoError('E_FORBIDDEN', 'Hooks are served to local callers only.')
-        return self.serve_hook(body)
+        result = self.serve_hook(body)
+        # A hook served means the daemon answers again: captures `kelmod hook` spooled since the start, when no
+        # daemon answered in time, are taken now instead of at the next start.
+        self._spool_waiting()
+        return result
 
     def serve_hook(self, body):
         from ..integration import hook
@@ -473,7 +478,7 @@ class StateCore:
     def ingest_spool(self):
         """Runs every capture `kelmod hook` spooled while no daemon answered (`.state/hook-spool/`), oldest
         first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`;
-        a hook that fails otherwise stays for the next start."""
+        a hook that fails otherwise stays for the next pass (the next start, or the next hook served)."""
         from . import spool
         from .instance import state_dir
         from .. import stopping
@@ -494,14 +499,14 @@ class StateCore:
                 self.serve_hook(body)
             except KelmoError as error:
                 if stopping.requested():
-                    # The stop caused it (the archive no longer answers): the capture stays for the next start.
+                    # The stop caused it (the archive no longer answers): the capture stays for the next pass.
                     return {'ingested': ingested, 'stopped': 'stopping'}
                 if not getattr(error, 'retryable', False) and error.code not in ('E_BUSY',):
                     spool.reject(path)
                     continue
                 return {'ingested': ingested, 'stopped': error.code}
-            except Exception as error:  # noqa: BLE001 - kept in the spool for the next start; the core serves on
-                print(f'kelmo state core: a spooled hook failed ({type(error).__name__}); kept for the next start',
+            except Exception as error:  # noqa: BLE001 - kept in the spool for the next pass; the core serves on
+                print(f'kelmo state core: a spooled hook failed ({type(error).__name__}); kept for the next pass',
                       file=sys.stderr)
                 return {'ingested': ingested, 'stopped': type(error).__name__}
             path.unlink(missing_ok=True)
@@ -594,9 +599,20 @@ class StateCore:
             self._spool.join()
 
     def start_spool(self):
-        """Applies the captures spooled while no daemon ran, beside serving."""
-        self._spool = threading.Thread(target=self.ingest_spool, name='hook-spool', daemon=True)
-        self._spool.start()
+        """Applies the captures spooled while no daemon ran, beside serving. One pass at a time, none once the
+        core is stopping."""
+        from .. import stopping
+        with self._spool_lock:
+            if stopping.requested() or (self._spool is not None and self._spool.is_alive()):
+                return
+            self._spool = threading.Thread(target=self.ingest_spool, name='hook-spool', daemon=True)
+            self._spool.start()
+
+    def _spool_waiting(self):
+        from . import spool
+        from .instance import state_dir
+        if spool.entries(state_dir(self.root) / 'hook-spool'):
+            self.start_spool()
 
     def close(self):
         from .baton import install

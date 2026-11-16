@@ -130,3 +130,48 @@ def test_spooled_hooks_are_ingested_oldest_first_and_unreadable_frames_are_renam
     assert served == ['first', 'second']
     assert sorted(path.name for path in spool.iterdir()) == [
         '00000000000000000002-101.bad', '00000000000000000003-101.bad']
+
+
+def test_a_capture_spooled_after_the_start_is_ingested_once_a_hook_is_served(world_factory, core_factory):
+    """`kelmod hook` spooled a capture while the core was running (no daemon answered in time): the next hook the
+    core serves starts a pass over the spool, so the capture does not wait for the next start."""
+    import time
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    served = []
+    serve_hook = core.serve_hook
+
+    def record(body):
+        served.append(body['payload'].get('order'))
+        return serve_hook(body)
+
+    core.serve_hook = record
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    limit = time.monotonic() + 10
+    while list(spool.iterdir()) and time.monotonic() < limit:
+        time.sleep(0.05)
+    assert list(spool.iterdir()) == [], 'the spooled capture still waits for the next start'
+    assert served == ['live', 'late'], served
+
+
+def test_a_stopping_core_starts_no_spool_pass_after_a_hook(world_factory, core_factory):
+    """Once the core is told to stop, a hook it still serves starts no pass over the spool: the capture stays for
+    the next start, and the stop waits for no new thread."""
+    from kelmo import stopping
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    stopping.request()
+    try:
+        assert core.handle_hook(Context.local('hook', 30), live) == {}
+        assert core._spool is None
+    finally:
+        stopping.reset()
+    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']

@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A session capture that `kelmod hook` spooled while the daemon was running, because no reply came in time, no
+  longer waits for the next start of the state core. The next hook the core serves starts a pass over the spool,
+  one pass at a time, and none once the core is stopping.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
