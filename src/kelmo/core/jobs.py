@@ -297,13 +297,14 @@ class Jobs:
             state = result.get('state') if isinstance(result, dict) else None
             if state in DREAM_DAY_STATES:
                 self._record_dream_day()
-            elif state in DREAM_HELD_STATES and self._held_after(result):
-                # A usage limit or a pause met after the start: Dreaming's own hold brings the run back, and the
-                # try is not the run's failure.
-                self._record_dream_try(undo=True)
+            elif state in DREAM_HELD_STATES:
+                # A usage limit or a pause met after the start costs no try. While Dreaming's own hold is on it
+                # brings the run back; a limit whose reset has passed holds nothing, so the run waits the retry
+                # delay instead of starting again on every tick.
+                self._record_dream_try(undo=True, delay=not self._held_after(result))
             else:
-                # Any other answer (a failed findings pass, a limit whose reset has passed) keeps its try: the
-                # run is tried again DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day.
+                # Any other answer (a failed findings pass) keeps its try: the run is tried again
+                # DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day.
                 self._record_dream_try_end()
         return result
 
@@ -375,25 +376,26 @@ class Jobs:
     def _record_dream_day(self):
         self._write_state(dream_day=self._today())
 
-    def _record_dream_try(self, undo=False):
-        """Counts a start of today's scheduled run, or takes back the one the core's stop ended."""
+    def _record_dream_try(self, undo=False, delay=False):
+        """Counts a start of today's scheduled run, or takes back one that cost no try (the core's stop, a usage
+        limit). With `delay`, the next start waits DREAM_RETRY_SECONDS even when no try is left counted."""
         def counted():
             tries = self._read_state().get('dream_tries')
             today = self._today()
             count = tries.get('count', 0) if isinstance(tries, dict) and tries.get('day') == today else 0
             if undo:
-                return {'day': today, 'count': max(0, count - 1), 'at': self.clock()}
+                return {'day': today, 'count': max(0, count - 1), 'at': self.clock(), 'delay': delay}
             return {'day': today, 'count': count + 1, 'at': self.clock()}
         self._write_state(dream_tries=counted)
 
     def _record_dream_try_end(self):
         """Starts the retry delay again when today's try ended without completing, so a long run that fails
-        waits DREAM_RETRY_SECONDS from its end, not from its start."""
+        waits DREAM_RETRY_SECONDS from its end, not from its start, on the day it ended too."""
         def ended():
             tries = self._read_state().get('dream_tries')
             today = self._today()
             count = tries.get('count', 0) if isinstance(tries, dict) and tries.get('day') == today else 0
-            return {'day': today, 'count': count, 'at': self.clock()}
+            return {'day': today, 'count': count, 'at': self.clock(), 'delay': True}
         self._write_state(dream_tries=ended)
 
     def _held_after(self, result):
@@ -405,14 +407,17 @@ class Jobs:
         return isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > self.clock()
 
     def _dream_try_allowed(self):
-        """Today's scheduled run may start: no try yet, or fewer than DREAM_TRIES and the last one long enough ago."""
+        """Today's scheduled run may start: no try yet and no delay running, or fewer than DREAM_TRIES and the last
+        try (or a delayed answer that cost none) long enough ago."""
         tries = self._read_state().get('dream_tries')
         if not isinstance(tries, dict) or tries.get('day') != self._today():
             return True
         count, at = tries.get('count', 0), tries.get('at', 0)
         if not isinstance(count, int) or not isinstance(at, (int, float)):
             return True
-        return count == 0 or count < DREAM_TRIES and self.clock() >= at + DREAM_RETRY_SECONDS
+        if count == 0 and tries.get('delay') is not True:
+            return True
+        return count < DREAM_TRIES and self.clock() >= at + DREAM_RETRY_SECONDS
 
     def _daily_due(self):
         return (time.localtime(self.clock()).tm_hour >= DREAM_HOUR and self._last_dream_day() != self._today()

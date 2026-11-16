@@ -86,9 +86,28 @@ def test_a_long_failed_run_waits_the_delay_from_its_end(tmp_path, monkeypatch, f
     assert all(later - earlier >= 1200 + DREAM_RETRY_SECONDS for earlier, later in zip(starts, starts[1:])), starts
 
 
-def test_a_deferral_whose_reset_has_passed_counts_as_a_try(tmp_path, monkeypatch):
-    """A usage limit whose reset time is already over holds nothing: such an answer keeps its try, so the scheduler
-    does not start the run again on every tick."""
+def test_a_deferral_whose_reset_has_passed_costs_no_try_but_waits_the_delay(tmp_path, monkeypatch):
+    """A usage limit costs no try (docs/DAEMON.md), but one whose reset time is already over holds nothing: the
+    scheduler starts the run again only after DREAM_RETRY_SECONDS, never on every tick."""
     jobs, now, starts = ticking(tmp_path, monkeypatch, [{'state': 'deferred', 'reset_at': day_at(4) - 20}])
     tick_until(jobs, now, day_at(23, 59))
-    assert len(starts) == DREAM_TRIES
+    assert len(starts) > DREAM_TRIES, 'a usage limit cost a try'
+    assert all(later - earlier >= DREAM_RETRY_SECONDS for earlier, later in zip(starts, starts[1:])), starts
+
+
+def test_a_usage_limit_leaves_the_day_all_three_tries(tmp_path, monkeypatch):
+    """One past-reset usage limit, then a broken configuration: the limit took no try, so three failed tries follow."""
+    failure = RuntimeError('a broken configuration')
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [{'state': 'deferred', 'reset_at': day_at(4) - 20}, failure])
+    tick_until(jobs, now, day_at(23, 59))
+    assert len(starts) == 1 + DREAM_TRIES, starts
+
+
+def test_a_run_that_fails_after_midnight_waits_the_delay_on_the_new_day(tmp_path, monkeypatch):
+    """A run started one day and failing the next, after the daily hour: the new day's first try still waits
+    DREAM_RETRY_SECONDS from that failure instead of starting on the next tick."""
+    failure = RuntimeError('a broken configuration')
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [failure], duration=86400)
+    tick_until(jobs, now, day_at(23, 59) + 86400)
+    assert len(starts) >= 2, starts
+    assert starts[1] - (starts[0] + 86400) >= DREAM_RETRY_SECONDS, starts
