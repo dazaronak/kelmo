@@ -49,6 +49,12 @@ entry here.
   still shows the `forgotten` event, as before. A note the editor is working on at that moment, or whose
   publication is already decided and waits for its commit, is refused with a retryable `E_BUSY` that says
   which, and then no note of that record is withdrawn. Notes filed with `--intent promote` behave as before.
+- `kelmo snapshot rollback-check` refuses when a record was forgotten after the cutover. A forget changes
+  nothing the cutover baseline recorded (the record, its versions and its journal operation stay as they
+  were), so the check called the store untouched and a rollback would have brought the record back into search
+  and list. The baseline now records the forgotten records, `kelmo snapshot tail` lists the ones forgotten since
+  under `hidden`, and the refusal names how many. A baseline written by an earlier release counts a record
+  forgotten after its `marked_at`, or within the same second, since `marked_at` has whole seconds.
 
 ### Changed
 
