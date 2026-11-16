@@ -97,6 +97,7 @@ class CoreLink:
         self._write_lock = threading.Lock()
         self._open = {}  # call id -> Context, for cancels
         self._outgoing = {}  # call id -> Future
+        self._closed = False  # set with the last swap of _outgoing: no reply can come any more
         self._state = threading.Lock()
         self._stopping = threading.Event()
         self._draining = threading.Event()  # admin.stop came: new calls are refused, replies still delivered
@@ -145,14 +146,21 @@ class CoreLink:
             header['origin'] = context.origin.to_header()
         future = Future()
         with self._state:
-            self._outgoing[call_id] = future
+            closed = self._closed
+            if not closed:
+                self._outgoing[call_id] = future
+        if closed:
+            # The channel finished: nothing would ever answer, so the call fails now instead of at its deadline.
+            future.set_exception(KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
+            return future
         try:
             self.send(header, body)
         except (OSError, ValueError, TypeError, KelmoError) as error:
             with self._state:
                 self._outgoing.pop(call_id, None)
-            future.set_exception(error if isinstance(error, KelmoError)
-                                 else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+            if not future.done():  # the channel's finish may have failed it already
+                future.set_exception(error if isinstance(error, KelmoError)
+                                     else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------
@@ -228,6 +236,7 @@ class CoreLink:
         # Outgoing calls next: no reply can arrive any more, and a handler waiting on one would hold the pool.
         with self._state:
             pending, self._outgoing = list(self._outgoing.values()), {}
+            self._closed = True
         for future in pending:
             if not future.done():
                 future.set_exception(KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))

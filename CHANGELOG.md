@@ -6,6 +6,13 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A core's call to another core made while its channel to `kelmod` was closing waited out its whole deadline
+  (up to five minutes for an archive call) when kelmod had already stopped answering. It now fails at once with
+  `E_TRANSPORT`, as calls still open at that moment already did, so the core's stop is not held up by it. A call
+  whose send fails after the channel closed no longer raises `InvalidStateError` from inside the core.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
