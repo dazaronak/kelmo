@@ -6,6 +6,23 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- The owner is told when a Dreaming run fails, or when the findings pass keeps reading nothing while
+  archived notes wait behind its cursor. Such a cursor is held by an operation that never reached the
+  archive, and nothing behind it was ever read; before, both went to the worker log only. This covers the
+  daemon's daily run and the runs of the timer `kelmo dream schedule` writes, and a daily run that cannot
+  start because the daemon's check before it fails (an unreadable `kelmo.toml`, say) while no run is under
+  way. A timer run whose `kelmo.toml` cannot be read has no `[alerts]` command to use, and its failure stays
+  in the timer's output. A run whose process died, killed or out of memory, is told when the next run
+  starts. The message goes to the `[alerts]` command once when it starts (for a held cursor, once the first
+  waiting note has waited 23 hours, so the next daily run tells it), once a day while it lasts, even after
+  the clock was set back, and once when a run completes again. An alert the command fails to take is sent
+  again with the next failure or idle answer, no sooner than 15 minutes later, and one this process sent is
+  not sent again within the day even when the state directory cannot keep the record. The findings pass's
+  idle answer now carries `waiting`, the number of archived notes behind the cursor, and with any waiting,
+  `waiting_since`, when the first of them reached the archive.
+
 ### Fixed
 
 - A daily Dreaming run that fails waits 15 minutes from the end of the run before the scheduler tries it

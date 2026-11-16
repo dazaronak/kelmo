@@ -29,7 +29,7 @@ def test_evidence_larger_than_budget_skipped(world):
         contexts=world.contexts(),
         budget_tokens=10,
     )
-    assert second == {'state': 'idle'}
+    assert second == {'state': 'idle', 'waiting': 0}
 
 
 def test_link_publication_fails_once_stays_open_then_publishes(world, monkeypatch):
@@ -266,3 +266,28 @@ def test_malformed_finding_values_are_rejected_not_raised():
                    {'sources': [{'fact_key': [], 'revision': 'r1'}]},
                    {'sources': [{'archive_id': {'x': 1}, 'version': 1}]}):
         assert isinstance(Dreaming._problem(dict(good, **change), shown, facts, archived), str)
+
+
+def test_an_idle_findings_pass_names_the_notes_waiting_behind_its_cursor(world):
+    """An operation that never reached the archive and never ended holds the cursor in front of every archived
+    note behind it: the pass answers idle and says how many notes wait there."""
+    from kelmo.config import Config
+    from tests.test_editor_scoping import FEATURE
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[editor]\nmode = "nightly"\n', encoding='utf-8')
+    world.service.config = Config.load(world.root)
+    executor = Scripted()
+    dream = world.service.dreaming
+    first = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    assert first['state'] == 'finished'  # the seed is past the cursor now
+    world.service.create('A capture that never reaches the archive.', project='app', selected=[FEATURE])
+    notes = []
+    for text in ('Exports run at 01:00.', 'Exports run at 02:00.'):
+        notes.append(world.service.create(text, project='app', selected=[FEATURE])['id'])
+        world.service.run(notes[-1])
+    stuck = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    archived = world.service.journal.conn.execute(
+        "SELECT MIN(created_at) FROM events WHERE stage IN ('archived', 'applied') AND operation_id IN (?, ?)",
+        notes).fetchone()[0]
+    assert stuck == {'state': 'idle', 'waiting': 2, 'waiting_since': archived}
+    assert executor.jobs == []

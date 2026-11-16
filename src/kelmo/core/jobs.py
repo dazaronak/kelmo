@@ -244,6 +244,8 @@ class Jobs:
         self._dream_stop_cut = False  # set by _dream_run: a started run the stop ended, decided once
         daily = scheduled and action == 'run'
         found = self._read_state().get('dream_tries') if daily else None
+        from ..dreaming_cli import failure_outcome
+        told = []
         try:
             with self._dreaming_lock() as free:
                 if not free:
@@ -254,12 +256,37 @@ class Jobs:
                     # The tick read the gate before this job started: a failing run may have ended meanwhile and
                     # started the delay, and a local client may send `scheduled` itself. Read it again here.
                     return {'state': 'not_due'}
-                return self._dream_run(action, scheduled, ready)
+                if action == 'run':
+                    from ..dreaming_cli import _dream_watch_starting
+                    _dream_watch_starting(self.storage.writer.config)
+                try:
+                    return self._dream_run(action, scheduled, ready)
+                except Stopping:
+                    if action == 'run':  # the core's stop ended it: an answer of sorts, nothing died
+                        from ..dreaming_cli import _dream_watch_ended
+                        _dream_watch_ended(self.storage.writer.config)
+                    raise
+                except Exception as error:
+                    # Told before the lock goes, as an answer is: a CLI run that takes it next is told after. A
+                    # failure the core's stop caused (decided once, as for the try below) is the stop's: not told.
+                    if action == 'run':
+                        told.append(True)
+                        if self._dream_stop_cut if self._dream_started else self.should_stop():
+                            from ..dreaming_cli import _dream_watch_ended
+                            _dream_watch_ended(self.storage.writer.config)
+                        else:
+                            self._tell_dream_watch(failure_outcome(error))
+                    raise
         except Stopping:
             if daily:
                 self._write_state(dream_tries=found)  # a stop costs no try and keeps the wait it found
             raise
-        except Exception:
+        except Exception as error:
+            if action == 'run' and not told and not self.should_stop():
+                # The lock file itself, before any run: the owner hears of it too (unless the core's stop caused
+                # it). No start mark of this job's was set: one there belongs to a pass that holds the lock.
+                from ..dreaming_cli import tell_dream_watch
+                tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
             if not daily:
                 raise
             if self._dream_started:
@@ -344,7 +371,33 @@ class Jobs:
                 # Any other answer (a failed findings pass) keeps its try: the run is tried again
                 # DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day.
                 self._record_dream_try_end()
+        if action == 'run':  # the daemon's own runs and those of the timer `kelmo dream schedule` writes
+            self._tell_dream_watch(result)
         return result
+
+    def _tell_probe_failure(self, error):
+        """A probe that fails while today's daily pass is owed keeps that pass from starting: the owner hears of it
+        as of a failed run, which DreamWatch tells at once and then once a day."""
+        try:
+            owed = (time.localtime(self.clock()).tm_hour >= DREAM_HOUR
+                    and self._last_dream_day() != self._today())
+        except Exception:  # noqa: BLE001 - the state file the day is kept in is unreadable too: the pass is owed
+            owed = True
+        if not owed:
+            return
+        from ..dreaming_cli import failure_outcome, tell_dream_watch
+        try:
+            with self._dreaming_lock() as free:
+                # A pass holds the lock (this daemon's job or a timer's run in its own process): it is under way,
+                # not failed, and it tells its own outcome.
+                if free:
+                    tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
+        except Exception:  # noqa: BLE001 - the lock file cannot be opened: the pass is owed all the same
+            tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
+
+    def _tell_dream_watch(self, result):
+        from ..dreaming_cli import tell_dream_watch
+        tell_dream_watch(self.storage.writer.config, result)
 
     def _admin(self):
         from ..archive_admin import ArchiveAdmin, operator_grant
@@ -629,6 +682,7 @@ class Jobs:
         except Exception as error:  # noqa: BLE001 - a failed probe must not stop other scheduled jobs
             print(f'kelmo: Dreaming schedule probe failed: {type(error).__name__}', file=sys.stderr, flush=True)
             action = None
+            self._tell_probe_failure(error)
         if action is not None:
             options = {'action': action, 'scheduled': True}
             if action == 'apply' and self._ready_apply():
