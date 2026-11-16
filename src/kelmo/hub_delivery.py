@@ -138,10 +138,15 @@ def prune_sets(root, keep=None):
     marker = root / '.pruned'
     now = time.time()
     try:
-        if now - marker.stat().st_mtime < SWEEP_SECONDS:
+        # A marker dated ahead (the clock was set back) does not hold the sweep off until the clock catches up.
+        if 0 <= now - marker.stat().st_mtime < SWEEP_SECONDS:
             return []
     except FileNotFoundError:
         pass
+    # A sweep killed while it removed a set leaves that set under a trash name: it goes now, whatever its age.
+    for path in root.iterdir():
+        if path.name.startswith('.trash-') and path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
     current = os.readlink(root / 'current') if (root / 'current').is_symlink() else None
     sets = sorted((path for path in root.iterdir()
                    if path.name.startswith('.set-') and path.is_dir() and not path.is_symlink()),
@@ -150,7 +155,10 @@ def prune_sets(root, keep=None):
     removed = []
     for path in sets:
         if path.name not in protected and now - path.stat().st_mtime > RETAIN_SECONDS:
-            shutil.rmtree(path, ignore_errors=True)
+            # Renamed first: removing its files touches the folder, and a half-removed set must not look new.
+            trash = root / ('.trash-' + path.name[len('.set-'):])
+            os.rename(path, trash)
+            shutil.rmtree(trash, ignore_errors=True)
             removed.append(path.name)
     marker.touch()
     return removed
@@ -214,6 +222,8 @@ def install_set(root, snapshot, keep=None):
                 raise KelmoError('E_CACHE', 'Staged HOT set failed verification.')
         if (destination / 'set.json').read_bytes() != _encoded(metadata):
             raise KelmoError('E_CACHE', 'Staged HOT metadata failed verification.')
+        # A set installed again is as new as a fresh one for the sweep: its delivery has not cached its name yet.
+        os.utime(destination)
         fd, temporary_name = tempfile.mkstemp(prefix='.current-', dir=root)
         os.close(fd)
         temporary = Path(temporary_name)

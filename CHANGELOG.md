@@ -11,8 +11,9 @@ entry here.
 - A shared client removes its old HOT sets. Each publication installed a new set of HOT files under the
   client's `hot/` and none was ever removed, so the directory grew by every generation. When it installs a
   set, the client now removes, at most once a day, the sets older than two days. It keeps the current set,
-  the eight newest whatever their age, and every set a cached context names. A local vault that saves a copy
-  for a cut context sweeps its sets the same way.
+  the eight newest whatever their age, and every set a cached context names; a set installed again counts as
+  new. A local vault that saves a copy for a cut context sweeps its sets the same way. An offline delivery
+  whose set was removed says that no cached generation is left.
 
 ## [0.3.1] - 2026-11-15
 

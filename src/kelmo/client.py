@@ -1344,7 +1344,16 @@ class SharedClient:
             _, current = _set_metadata(self.profile.state / 'hot', 'current')
             if current['enrollment_revision'] != record['hub_revision']:
                 raise KelmoError('E_CACHE', 'Cached context predates the latest enrollment revision.')
-            snapshot = read_set(self.profile.state / 'hot', record.get('hub_set_name', 'current'))
+            name = record.get('hub_set_name', 'current')
+            try:
+                snapshot = read_set(self.profile.state / 'hot', name)
+            except KelmoError:
+                if name == 'current' or os.path.lexists(self.profile.state / 'hot' / name):
+                    raise
+                # The retention sweep removed the set this cached context names: no cached generation is left.
+                raise KelmoError(error.code, reason[0].upper() + reason[1:] + '; the HOT set of this '
+                                 "repository's cached generation was removed, so there is no cached generation "
+                                 'and nothing was delivered.') from None
             if (snapshot['generation'] != record['hub_generation']
                     or snapshot['enrollment_revision'] != record['hub_revision']
                     or snapshot['manifest_sha256'] != generation.manifest_sha256):
