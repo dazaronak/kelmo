@@ -338,6 +338,19 @@ def test_a_wait_timeout_bounds_the_wait_while_the_outbox_is_held(profile):
     assert ended < 0.3 + SLACK, ended
 
 
+def test_a_wait_timeout_nearer_than_a_short_request_deadline_ends_timed_out_on_time(profile):
+    """Criterion 1 holds while the request's deadline is the nearer one; when `--wait-timeout` ends first, the
+    command answers `wait_timed_out` with the operation (docs/USAGE.md), not E_BUSY at the request's deadline."""
+    with edge_core(profile) as (core, client):
+        result, ended = hold_past_the_deadline(core, client, deadline=1.0, hold=3.0, wait_timeout=0.3)
+
+    assert not isinstance(result, Exception), result
+    assert result['wait_timed_out'] is True
+    assert result['processing_deferred'] is True
+    assert result['operation']['id'] == OPERATION
+    assert ended < 0.3 + SLACK, ended
+
+
 def test_a_wait_timeout_shorter_than_the_request_deadline_still_ends_timed_out(profile, monkeypatch):
     with edge_core(profile) as (core, client):
         arrived = waiters(core, monkeypatch)

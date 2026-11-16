@@ -10,11 +10,12 @@ entry here.
 
 - `kelmo create --wait` and `kelmo add --wait` run by the edge daemon no longer wait without limit between
   their polls. Such a command lends the outbox to other callers while it waits, and it took the outbox back
-  with no deadline, so it could hang behind another writer. It now takes it back before the call's deadline
-  or fails with `E_BUSY`, naming the operation the server already accepted. Running the same command again
-  reuses its idempotency key, so the note is not captured twice. `--wait-timeout` now ends a wait with
-  `wait_timed_out` on time even while another writer holds the outbox; before, the wait went on until the
-  writer let go.
+  with no deadline, so it could hang behind another writer. It now takes it back before its wait ends. When
+  `--wait-timeout` ends first, the command answers `wait_timed_out` with the operation, as documented, even
+  while another writer holds the outbox; before, the wait went on until the writer let go. When the daemon's
+  deadline for the call ends first (it gives a `--wait` command 900 seconds, so this takes a longer
+  `--wait-timeout`), the command fails with `E_BUSY` and names the operation the server already accepted.
+  Running the same command again reuses its idempotency key, so the note is not captured twice.
 
 ## [0.3.1] - 2026-11-15
 
