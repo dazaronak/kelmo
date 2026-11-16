@@ -119,18 +119,21 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
     until=time.monotonic()+SESSION_END_SECONDS
     if deadline is not None:
         until=min(until,deadline)
-    last=None
+    last,took=None,0.0
     while True:
         left=until-time.monotonic()
-        # The first attempt runs whenever any time is left; another one only when a pause still fits.
-        if left<=0 or last is not None and left<SESSION_END_PAUSE:
+        # The first attempt runs whenever any time is left; another one only when a pause still fits and the time
+        # left is not shorter than the last attempt took, which may have overrun its budget on work, not a lock.
+        if left<=0 or last is not None and left<max(SESSION_END_PAUSE,took):
             if last is not None and last.code!='E_BUSY':
                 raise last
             raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
+        began=time.monotonic()
         try:
             _bounded_attempt(config,journal,provider,native_id,source,selected,event,left)
             return {}
         except KelmoError as error:
+            took=time.monotonic()-began
             # An attempt that waited for a locked journal outside its write transaction runs out of its own time
             # (E_CAPTURE_RETRY) just as one refused inside it does (E_BUSY): both are tried again.
             if error.code not in ('E_BUSY','E_CAPTURE_RETRY'):

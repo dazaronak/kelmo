@@ -378,3 +378,40 @@ def test_a_commit_that_meets_a_reader_late_in_an_attempt_ends_inside_its_deadlin
     assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
     assert seconds < deadline + 0.25, seconds
     assert final_jobs(root) == []
+
+
+def test_a_session_end_that_must_migrate_the_schema_under_an_exclusive_lock_ends_inside_its_deadline(
+        tmp_path, monkeypatch, capsys):
+    """A vault on the version 1 session schema migrates (and first backs the journal up) when the intake opens; an
+    exclusive lock held meanwhile still ends the hook with E_BUSY inside its deadline."""
+    root, source = prepared(tmp_path)
+    connection = sqlite3.connect(journal_path(root), isolation_level=None)
+    connection.execute('DROP TABLE session_processing')
+    connection.execute('UPDATE session_schema SET version=1')
+    connection.close()
+
+    with held(root, HOOK_DEADLINE + 5, ['BEGIN EXCLUSIVE']):
+        code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+
+    assert code != 0, printed
+    assert printed['error']['code'] == 'E_BUSY', printed
+    assert seconds < HOOK_DEADLINE, seconds
+
+
+def test_a_session_end_whose_attempt_overran_its_budget_is_not_tried_past_the_deadline(tmp_path, monkeypatch, capsys):
+    """An attempt that runs past its own budget on work, not on a lock (a transcript that takes long to read), is not
+    started again when the time left is shorter than that attempt took: the hook still answers by its deadline."""
+    from kelmo import sessions as module
+    root, source = prepared(tmp_path)
+    original = module.parse
+
+    def slow_parse(*args, **kwargs):
+        time.sleep(3.5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, 'parse', slow_parse)
+    code, printed, seconds = hook(root, source, 'session-end', monkeypatch, capsys)
+
+    assert code != 0, printed
+    assert printed['error']['code'] in ('E_BUSY', 'E_CAPTURE_RETRY'), printed
+    assert seconds < HOOK_DEADLINE, seconds
