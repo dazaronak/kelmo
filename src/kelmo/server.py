@@ -2102,8 +2102,8 @@ def session_capture(service, client_id, *, provider, native_id, event, content, 
     spool = config.internal('.state/client-sessions/' + directory.name + '/' + name + '.jsonl')
     # One writer per spool from the write until the intake has read it. The spool is extended and rewritten
     # in place, never replaced, so the intake never reads a file another write is replacing. The intake names
-    # a transcript generation by the client's file identity, not the spool's inode: a spool that is gone and
-    # written again from offset 0 continues its session. The lock keeps any reader off a partial
+    # a transcript generation by the spool's inode; a spool that is gone names nothing, so one written again from
+    # offset 0 continues its session when its content does. The lock keeps any reader off a partial
     # file, and each written piece is read back from disk before the intake reads the spool.
     # In the state core every write runs on its one writer thread, which already gives that exclusion.
     with _spool_lock(config, directory, name, single_writer):
@@ -2120,7 +2120,7 @@ def session_capture(service, client_id, *, provider, native_id, event, content, 
         try:
             result = sessions.capture(provider, client_id + ':' + native_id, spool, directory, event,
                                       checkpoint_turns=settings['checkpoint_turns'], time_budget=None,
-                                      capture_client_id=client_id, file_identity=file_identity)
+                                      capture_client_id=client_id, spool=True)
             with sessions.journal.conn as db:
                 db.execute('''CREATE TABLE IF NOT EXISTS session_native_events (
                     provider TEXT NOT NULL,event TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(provider,event))''')

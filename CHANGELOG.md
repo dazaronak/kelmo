@@ -11,10 +11,11 @@ entry here.
 - A session transcript the server has to receive again from its start no longer starts a new
   generation. The server kept each client transcript in a spool file and named the session's generation
   by that file's inode, so a spool written again from offset 0 under a new inode (after it was removed)
-  queued an extraction of the whole session a second time. The generation now follows the client's
-  identity of its own file. A session recorded by an older server keeps its generation on its first
-  capture after the upgrade. A transcript file that the client replaces still starts a new generation,
-  as before.
+  queued an extraction of the whole session a second time. When no spool of the session holds the
+  recorded inode any more, the content now decides: a transcript that continues the last snapshot keeps
+  its generation. A transcript file that the client replaces, while its old spool is still there, starts a
+  new generation as before. The journal still records the spool's inode, so sessions recorded by an older
+  server go on as before, and a server rolled back to an older build continues them too.
 
 ## [0.3.1] - 2026-11-15
 
