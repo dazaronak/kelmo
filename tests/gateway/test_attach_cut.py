@@ -40,7 +40,7 @@ def v1_answer(header, body, number):
     request = body['request']
     if request['op'] == 'hello':
         result = {'authority_id': AUTHORITY, 'client_id': CLIENT_ID,
-                  'operations': ['hello', 'search', 'create', 'status', 'reconcile']}
+                  'operations': ['hello', 'search', 'create', 'status', 'reconcile', 'graph_rebuild']}
     else:
         result = {'op': request['op'], 'key': request.get('idempotency_key'), 'call': number}
     return {'protocol': PROTOCOL, 'request_id': request['request_id'], 'ok': True, 'result': result}
@@ -112,6 +112,19 @@ def test_a_reconcile_cut_after_it_was_sent_is_not_sent_again(bridge):
         result = {'refused': error.code}
     assert result == {'refused': 'E_TRANSPORT'}, result
     assert requests(daemon) == [('reconcile', None, None)]
+
+
+def test_a_graph_rebuild_cut_after_it_was_sent_is_not_sent_again(bridge):
+    # The server's table lists graph_rebuild as a read, the state core runs it as a write (it rewrites the
+    # graph index): only what both call a read goes again, so a cut rebuild leaves its effect unknown.
+    daemon, client = bridge(Connection(ANSWER, CLOSE), Connection(ANSWER, ANSWER))
+    try:
+        with client.deadline(10):
+            result = client.call('graph_rebuild', {})
+    except KelmoError as error:
+        result = {'refused': error.code}
+    assert result == {'refused': 'E_TRANSPORT'}, result
+    assert requests(daemon) == [('graph_rebuild', None, None)]
 
 
 def test_a_reconnect_that_reaches_another_authority_fails_at_once(bridge, monkeypatch):

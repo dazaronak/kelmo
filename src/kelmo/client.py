@@ -915,10 +915,12 @@ RECONNECT_LAST_PAUSE = 2.0
 
 def _replayable_read(op):
     """Whether a request that went through `call` may be sent again after a cut: only an operation the
-    server's table marks as a read (some, such as `reconcile`, go through `call` and still write)."""
+    server's table marks as a read (some, such as `reconcile`, go through `call` and still write) and the
+    state core does not run as a write (`graph_rebuild` rewrites the graph index)."""
     from .core.operations import REPLAY_READ, by_name
+    from .core.state_core import WRITES
     found = by_name().get('state.' + op)
-    return found is not None and found.replay == REPLAY_READ
+    return found is not None and found.replay == REPLAY_READ and op not in WRITES
 
 
 class SharedClient:
