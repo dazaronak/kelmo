@@ -156,9 +156,11 @@ class CoreLink:
         try:
             self.send(header, body)
         except (OSError, ValueError, TypeError, KelmoError) as error:
+            # Whoever takes the call out of `_outgoing` under the lock fails it: here, or the channel's finish,
+            # which may already have taken it, or a reply that came first.
             with self._state:
-                self._outgoing.pop(call_id, None)
-            if not future.done():  # the channel's finish may have failed it already
+                owned = self._outgoing.pop(call_id, None) is not None
+            if owned:
                 future.set_exception(error if isinstance(error, KelmoError)
                                      else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future

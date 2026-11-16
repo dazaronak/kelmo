@@ -4,7 +4,7 @@ import socket
 import threading
 import time
 import uuid
-from concurrent.futures import wait
+from concurrent.futures import Future, wait
 
 import pytest
 
@@ -104,5 +104,56 @@ def test_a_call_whose_send_fails_after_the_swap_returns_its_failed_future():
         except Exception as error:  # noqa: BLE001 - the test's point: call() returns, it never raises
             pytest.fail(f'call() raised {error!r} instead of returning its failed future')
         assert failure(future, 0) == 'E_TRANSPORT'
+    finally:
+        parent.close()
+
+
+def test_a_send_failure_racing_the_finish_returns_one_failed_future(monkeypatch):
+    """The channel finishes on the reader thread while the send path handles its own failure: the finish has
+    taken the call and checks it, and the send path checks it too. Exactly one of them fails it."""
+    import kelmo.core.corelink as corelink
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    swapped, checked = threading.Event(), threading.Event()
+    armed, errors = {'caller': False, 'finisher': True}, []
+
+    class RacingFuture(Future):
+        def done(self):
+            if threading.current_thread() is finisher and armed['finisher']:
+                armed['finisher'] = False
+                swapped.set()  # the finish has taken the open calls and is about to fail this one
+                checked.wait(2)  # the send path looks at the call in this window
+                return False
+            if threading.current_thread() is not finisher and armed['caller']:
+                armed['caller'] = False
+                checked.set()
+                deadline = time.monotonic() + 2
+                while not super().done() and time.monotonic() < deadline:
+                    time.sleep(0.01)  # the finish fails the call first
+                return False
+            return super().done()
+
+    def finish():
+        try:
+            link._finish()
+        except Exception as error:  # noqa: BLE001 - recorded for the assertion below
+            errors.append(error)
+
+    finisher = threading.Thread(target=finish, daemon=True)
+
+    def send(header, body=None):
+        finisher.start()
+        assert swapped.wait(5)
+        armed['caller'] = True
+        raise OSError('the channel is closed')
+
+    monkeypatch.setattr(corelink, 'Future', RacingFuture)
+    link.send = send
+    try:
+        future = call(link)
+        armed['caller'] = False
+        assert failure(future, 5) == 'E_TRANSPORT'
+        finisher.join(10)
+        assert errors == [], 'the finish failed on a call the send path had already failed'
     finally:
         parent.close()
