@@ -18,8 +18,9 @@ entry here.
   never answered the hello, or never read the call, left `kelmod` waiting with no output; it now ends
   with `E_DEADLINE` five seconds after the deadline, retryable only when the call was never sent.
 - `kelmod call` and `kelmod status` connect only through a runtime directory that belongs to the user and
-  is closed to everyone else, as the MCP gateway already did. Through any other directory, or a
-  symlink, they refuse with `E_RUNTIME` before anything is sent. On Linux without `XDG_RUNTIME_DIR`
+  is closed to everyone else, as the MCP gateway already did. Through a directory open to others, or a
+  symlink, they refuse with `E_RUNTIME` before anything is sent; a directory that is not there, an empty
+  `--runtime-dir` included, is a retryable `E_TRANSPORT` without a connect. On Linux without `XDG_RUNTIME_DIR`
   and `TMPDIR` the directory is under `/tmp`, where another local user could have created it first.
 
 ## [0.3.1] - 2026-11-15

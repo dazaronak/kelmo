@@ -69,10 +69,15 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
     };
     // The socket is reached only through a directory this user owns and nobody else can write into, as the
     // gateway checks it: another user could otherwise plant the socket and read the call. A directory that is
-    // not there yet means no daemon, which the connect below reports as before.
-    if let Some(directory) = socket.parent()
-        && std::fs::symlink_metadata(directory).is_ok()
-    {
+    // not there (an empty `--runtime-dir` names none) means no daemon: the call ends without a connect, which a
+    // directory created meanwhile by someone else could otherwise answer.
+    if let Some(directory) = socket.parent() {
+        if let Err(error) = std::fs::symlink_metadata(directory) {
+            return Err(unsent(format!(
+                "E_TRANSPORT: {}: {error}",
+                socket.display()
+            )));
+        }
         crate::ipc::trusted_directory(directory).map_err(|message| CallError {
             message: format!("E_RUNTIME: {message}"),
             retryable: false,

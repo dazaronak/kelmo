@@ -85,3 +85,31 @@ fn a_missing_runtime_directory_is_still_a_retryable_transport_error() {
     assert_eq!(error["code"], "E_TRANSPORT", "{error}");
     assert_eq!(error["retryable"], Value::Bool(true), "{error}");
 }
+
+#[test]
+fn an_empty_runtime_directory_never_reaches_a_socket_in_the_working_directory() {
+    // `--runtime-dir ''` names the relative `d.sock`: one planted in the working directory must not get the call.
+    let cwd = fresh(0o755);
+    let listener = listening(&cwd);
+    let output = Command::new(env!("CARGO_BIN_EXE_kelmod"))
+        .args([
+            "call",
+            "archive.echo",
+            "--runtime-dir",
+            "",
+            "--deadline-ms",
+            "1000",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .expect("kelmod runs");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let answer: Value = serde_json::from_slice(&output.stdout).expect("JSON on stdout");
+    let error = &answer["error"];
+    assert_eq!(error["code"], "E_TRANSPORT", "{error}");
+    assert_eq!(error["retryable"], Value::Bool(true), "{error}");
+    assert!(
+        !connected(&listener),
+        "kelmod connected to a socket in the working directory"
+    );
+}
