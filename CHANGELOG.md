@@ -12,8 +12,9 @@ entry here.
   their polls. Such a command lends the outbox to other callers while it waits, and it took the outbox back
   with no deadline, so it could hang behind another writer. It now takes it back before the call's deadline
   or fails with `E_BUSY`, naming the operation the server already accepted. Running the same command again
-  reuses its idempotency key, so the note is not captured twice. `--wait-timeout` still ends a wait with
-  `wait_timed_out`.
+  reuses its idempotency key, so the note is not captured twice. `--wait-timeout` now ends a wait with
+  `wait_timed_out` on time even while another writer holds the outbox; before, the wait went on until the
+  writer let go.
 
 ## [0.3.1] - 2026-11-15
 

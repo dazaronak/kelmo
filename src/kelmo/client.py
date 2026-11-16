@@ -1514,6 +1514,8 @@ class ClientService:
                     try:
                         self.client.pause(max(0, min(0.25, limit - time.monotonic())))
                     except Busy as error:
+                        if limit - time.monotonic() <= 0:
+                            continue  # the wait's own deadline ended it: reported as a timed-out wait
                         raise Busy(f'{error} Operation {operation["id"]} was accepted; kelmo trace '
                                    f'{operation["id"]} shows it, and the same command again reuses its '
                                    'idempotency key.') from error

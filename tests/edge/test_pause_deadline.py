@@ -154,11 +154,11 @@ def create_wait(core, deadline, wait_timeout=30):
     return core.handle_cli(Context(deadline), {'argv': argv})
 
 
-def hold_past_the_deadline(core, client, deadline, hold):
+def hold_past_the_deadline(core, client, deadline, hold, wait_timeout=30):
     """Starts `create --wait`, takes the owner lock once the command lent it out after its first poll, and holds
     it until the command ends or `hold` seconds pass. Returns the command's outcome and how long it ran."""
     began = time.monotonic()
-    thread, outcome = start(create_wait, core, deadline)
+    thread, outcome = start(create_wait, core, deadline, wait_timeout)
     assert client.polled.wait(5), 'the command made no poll'
     assert core._owner.acquire(timeout=5), 'the command never lent the outbox out'
     try:
@@ -253,6 +253,17 @@ def test_a_tool_call_that_waits_lends_nothing_and_takes_nothing_back(profile):
         assert not isinstance(result, Exception), result
         assert result['operation']['state'] == 'applied'
         assert (core._owner._holder, core._owner._count) == (None, 0)
+
+
+def test_a_wait_timeout_bounds_the_wait_while_the_outbox_is_held(profile):
+    """`--wait-timeout` limits the wait (docs/USAGE.md): a held outbox does not stretch it."""
+    with edge_core(profile) as (core, client):
+        result, ended = hold_past_the_deadline(core, client, deadline=10.0, hold=3.0, wait_timeout=0.3)
+
+    assert not isinstance(result, Exception), result
+    assert result['wait_timed_out'] is True
+    assert result['operation']['id'] == OPERATION
+    assert ended < 0.3 + SLACK, ended
 
 
 def test_a_wait_timeout_shorter_than_the_request_deadline_still_ends_timed_out(profile, monkeypatch):

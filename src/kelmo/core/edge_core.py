@@ -69,6 +69,8 @@ class OwnerLock:
                     if left is not None and left <= 0:
                         return False
                     self._condition.wait(left)
+                    if end is not None and time.monotonic() >= end:
+                        return False  # woken too late: a lock freed after the deadline is not taken
                 self._holder, self._count, self._last_urgent = me, 1, urgent
                 return True
             finally:
@@ -125,7 +127,6 @@ class EdgeCore:
         self._owner = OwnerLock()
         self._urgent = threading.local()
         self.client._lock = _OwnerGate(self)
-        self._request = threading.local()  # the deadline of the call each handler thread serves
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.client.pause = self._pause
@@ -157,15 +158,12 @@ class EdgeCore:
         context.check()
         left = context.remaining() if cap is None else min(cap, context.remaining())
         previous = getattr(self._urgent, 'value', False)
-        until = getattr(self._request, 'until', None)
         self._urgent.value = urgent
-        self._request.until = time.monotonic() + max(0.001, left)
         try:
             with self.client.deadline(max(0.001, left)):
                 yield self.client
         finally:
             self._urgent.value = previous
-            self._request.until = until
 
     # Acknowledgements of HOT deliveries, run when `kelmod hook` reports that the session printed the context.
     ACK_SECONDS = 60.0
@@ -214,10 +212,7 @@ class EdgeCore:
                 self._owner.acquire()
 
     def _left(self):
-        """Seconds left before the deadline of the call this thread serves."""
-        until = getattr(self._request, 'until', None)
-        if until is not None:
-            return max(0.0, until - time.monotonic())
+        """Seconds left before the nearest deadline of this thread's call: the request's, or a wait's inside it."""
         try:
             return self.client.remaining()
         except KelmoError:
