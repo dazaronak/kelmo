@@ -121,16 +121,18 @@ label = "Server Kelmo"
 The same command hears of every Dreaming run: the daemon's own daily run, and the
 runs of the timer `kelmo dream schedule` writes, which tell it from their own
 process. A run that fails (the findings pass answers `failed`, the run raises, or
-its lock file cannot be opened) is told once when it fails and once a day for each
-error code while it keeps failing; the run is still tried again as before. A
-findings pass that answers idle while archived notes wait behind its cursor means an
-operation that never reached the archive holds the cursor, and nothing behind it is
-read. Once the first of those notes has waited 23 hours (so the next daily run tells
-it) it is told, with the time it reached the archive, then once a day. An idle pass
-with nothing waiting is a quiet vault and tells nothing. The first run that
-completes after an alert sends one message that it is over. An alert the command
-fails to take is sent again with the next failure or idle answer, no sooner than 15
-minutes later. The marker is `dream-watch.json` in the state directory.
+its lock file cannot be opened) is told once when it fails and once a calendar day
+for each error code while it keeps failing; the run is still tried again as before.
+A findings pass that answers idle while archived notes wait behind its cursor means
+an operation that never reached the archive holds the cursor, and nothing behind it
+is read. Once the first of those notes has waited a day it is told, with the time it
+reached the archive, then once a calendar day; the daemon's daily run also tells it
+on the day after the run that first saw it, whatever minute either started. An idle
+pass with nothing waiting is a quiet vault and tells nothing. The first run that
+completes after an alert sends one message that it is over; after an idle pass with
+nothing waiting, it says no note waits behind the cursor any more. An alert the
+command fails to take is sent again with the next failure or idle answer, no sooner
+than 15 minutes later. The marker is `dream-watch.json` in the state directory.
 
 Wiki/Git persistence errors use the same bounded retry path as other resolution
 failures. A dirty managed page stays untouched, the operation remains visible,

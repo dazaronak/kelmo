@@ -53,6 +53,7 @@ def answering(monkeypatch, now, *outcomes):
 
     monkeypatch.setattr(dreaming_cli, 'run_dream', run)
     monkeypatch.setattr(alerts.time, 'time', lambda: now[0])
+    monkeypatch.setattr(alerts, '_mono', lambda: now[0])
 
 
 def scheduled_run(jobs):
@@ -563,3 +564,72 @@ def test_the_watch_file_is_changed_by_one_teller_at_a_time(tmp_path):
         fcntl.flock(held, fcntl.LOCK_UN)
     teller.join(10)
     assert len(messages(tmp_path)) == 1, messages(tmp_path)
+
+
+def _watch(tmp_path, command=None):
+    from kelmo.alerts import DreamWatch
+    state = tmp_path / '.state'
+    state.mkdir(exist_ok=True)
+    config = SimpleNamespace(state=state, alerts={'command': command or recorder(tmp_path), 'label': 'K'})
+    return DreamWatch.for_config(config)
+
+
+def test_the_defined_interval_is_the_specs_day():
+    from kelmo.alerts import DREAM_IDLE_SECONDS
+    assert DREAM_IDLE_SECONDS == 86400
+
+
+def test_a_daily_reminder_goes_on_the_next_day_whatever_minute_the_run_starts(tmp_path):
+    # Told at one minute of day one; the next day's run fails again a couple of minutes earlier in the day.
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.failed('E_EXECUTOR', 'no findings answer', START + DAY - 110)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_hold_seen_by_runs_that_are_not_daily_waits_the_full_interval(tmp_path):
+    # A timer or a run by hand sees the hold twice 23 hours apart: not the defined interval yet.
+    watch = _watch(tmp_path)
+    watch.idle(2, now=START)
+    watch.idle(2, now=START + 23 * 3600)
+    assert messages(tmp_path) == []
+
+
+def test_a_failure_after_another_process_cleared_the_watch_file_is_told(tmp_path):
+    # This process told a failure and kept it in the watch file; another process's run then completed and took
+    # the file away. A new failure later the same day is a new failure and is told.
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.marker.unlink()
+    watch.failed('E_EXECUTOR', 'no findings answer', START + 900)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_quiet_idle_after_an_alert_does_not_claim_new_evidence_was_read(tmp_path):
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.idle(0, now=START + 10)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+    assert 'reads new evidence' not in messages(tmp_path)[-1], messages(tmp_path)
+
+
+def test_a_clock_set_back_does_not_let_a_failed_delivery_retry_at_once(tmp_path):
+    script = tmp_path / 'failing_alert.py'
+    script.write_text('import sys\nwith open(sys.argv[1], "a") as out:\n    out.write(sys.stdin.read() + "\\n")\n'
+                      'sys.exit(1)\n')
+    watch = _watch(tmp_path, [sys.executable, str(script), str(tmp_path / 'messages.txt')])
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.failed('E_EXECUTOR', 'no findings answer', START - 100)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+
+
+def test_a_told_alert_whose_record_never_reached_the_file_still_gets_its_recovery(tmp_path):
+    # The state directory took no write when the failure was told; it does again when a run completes.
+    watch = _watch(tmp_path)
+    watch.marker.mkdir()
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    watch.marker.rmdir()
+    watch.ran(START + 10)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+    assert 'completes again' in messages(tmp_path)[-1], messages(tmp_path)

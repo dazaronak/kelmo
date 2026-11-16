@@ -372,7 +372,7 @@ class Jobs:
                 # DREAM_RETRY_SECONDS after it ended, at most DREAM_TRIES times a day.
                 self._record_dream_try_end()
         if action == 'run':  # the daemon's own runs and those of the timer `kelmo dream schedule` writes
-            self._tell_dream_watch(result)
+            self._tell_dream_watch(result, daily=bool(scheduled))
         return result
 
     def _tell_probe_failure(self, error):
@@ -395,9 +395,9 @@ class Jobs:
         except Exception:  # noqa: BLE001 - the lock file cannot be opened: the pass is owed all the same
             tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
 
-    def _tell_dream_watch(self, result):
+    def _tell_dream_watch(self, result, daily=False):
         from ..dreaming_cli import tell_dream_watch
-        tell_dream_watch(self.storage.writer.config, result)
+        tell_dream_watch(self.storage.writer.config, result, daily=daily)
 
     def _admin(self):
         from ..archive_admin import ArchiveAdmin, operator_grant

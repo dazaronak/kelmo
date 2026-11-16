@@ -24,9 +24,9 @@ DREAM_MARKER = 'dream-watch.json'
 # Set while a Dreaming run is under way; a run that finds it left over tells the owner the last one died.
 DREAM_RUNNING = 'dream-running.json'
 # How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
-# of it: the daemon's run is daily, so two runs a day apart, less an hour for the minutes a run starts earlier or
-# later than the day before.
-DREAM_IDLE_SECONDS = 82800
+# of it: the daemon's run is daily, so two runs a day apart. A hold the daemon's daily run saw on an earlier day is
+# told by today's daily run whatever minute either started.
+DREAM_IDLE_SECONDS = 86400
 # The lock every change of the watch file is made under: a failure told before the Dreaming lock was taken and a
 # pass's own outcome may change the file at the same time.
 DREAM_WATCH_LOCK = 'dream-watch.lock'
@@ -34,8 +34,12 @@ DREAM_WATCH_LOCK = 'dream-watch.lock'
 SEND_RETRY_SECONDS = 900
 # Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
 _REFUSALS_TOLD = {}
-# Dreaming alerts this process sent, for the same reason: {(file, kind): (time, delivered)}.
-_DREAM_SENT = {}
+# Dreaming alerts this process told while the watch file took no write: {file: (fingerprint, records)}. Read only
+# while the file is still as it was then; a file another process changed since wins.
+_DREAM_UNKEPT = {}
+# When this process last tried a Dreaming alert the command did not take, on the monotonic clock: {(file, kind): t}.
+_DREAM_TRIED = {}
+_mono = time.monotonic
 
 
 def _when(epoch):
@@ -230,24 +234,54 @@ class DreamWatch(LoginWatch):
             self._running.write_text(json.dumps({'since': now}), encoding='utf-8')
         self._guarded(work)
 
-    def _held_back(self, kind, now):
-        """An alert this process already sent: one delivered waits as a told one does (_due), one the command
-        failed to take waits SEND_RETRY_SECONDS. What the watch file says is checked first."""
-        sent = _DREAM_SENT.get((str(self.marker), kind))
-        if sent is None:
-            return False
-        at, delivered = sent
-        return not self._due(at, now) if delivered else 0 <= now - at < SEND_RETRY_SECONDS
+    @staticmethod
+    def _day(epoch):
+        return time.strftime('%Y-%m-%d', time.localtime(epoch))
 
-    def _send_once(self, kind, text, now):
+    def _due_today(self, last, now):
+        """Once per calendar day: never told, or told on another day than today (a clock set back included), so a
+        daily run tells it whatever minute it starts."""
+        return not isinstance(last, (int, float)) or self._day(last) != self._day(now)
+
+    def _fingerprint(self):
+        try:
+            stat = self.marker.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+    def _send_kind(self, kind, text):
+        """Sends `text`; a send the command did not take holds this kind back for SEND_RETRY_SECONDS."""
         delivered = bool(self.send(text)) or not self.argv
-        _DREAM_SENT[(str(self.marker), kind)] = (now, delivered)
+        key = (str(self.marker), kind)
+        if delivered:
+            _DREAM_TRIED.pop(key, None)
+        else:
+            _DREAM_TRIED[key] = _mono()
         return delivered
 
-    def _forget_sent(self, *kinds):
-        mine = str(self.marker)
-        for key in [key for key in _DREAM_SENT if key[0] == mine and (not kinds or key[1][0] in kinds)]:
-            del _DREAM_SENT[key]
+    def _retry_waits(self, kind):
+        tried = _DREAM_TRIED.get((str(self.marker), kind))
+        return tried is not None and _mono() - tried < SEND_RETRY_SECONDS
+
+    def _read(self):
+        """The records, from the watch file, or from what this process told while the file took no write and
+        nobody changed it since."""
+        unkept = _DREAM_UNKEPT.get(str(self.marker))
+        if unkept is not None:
+            if unkept[0] == self._fingerprint():
+                return json.loads(json.dumps(unkept[1]))
+            del _DREAM_UNKEPT[str(self.marker)]
+        return self._records()
+
+    def _write(self, records):
+        before = self._fingerprint()
+        try:
+            self._keep(records)
+        except OSError:
+            _DREAM_UNKEPT[str(self.marker)] = (before, records)
+            raise
+        _DREAM_UNKEPT.pop(str(self.marker), None)
 
     def _exclusive(self, work):
         """Runs `work` (read the watch file, send, write it) holding the watch's file lock; a state directory
@@ -283,14 +317,16 @@ class DreamWatch(LoginWatch):
         if not isinstance(data, dict):
             return empty
         stuck, failed = data.get('stuck'), data.get('failed')
-        if not (isinstance(stuck, dict) and isinstance(stuck.get('since'), (int, float))
-                and (stuck.get('told') is None or isinstance(stuck.get('told'), (int, float)))):
+        stamp = (int, float)
+        if not (isinstance(stuck, dict) and isinstance(stuck.get('since'), stamp)
+                and (stuck.get('told') is None or isinstance(stuck.get('told'), stamp))
+                and (stuck.get('daily_seen') is None or isinstance(stuck.get('daily_seen'), stamp))):
             stuck = None
-        if isinstance(failed, dict) and isinstance(failed.get('since'), (int, float)):
+        if isinstance(failed, dict) and isinstance(failed.get('since'), stamp):
             told = failed.get('told') if isinstance(failed.get('told'), dict) else {}
             failed = {'since': failed['since'],
                       'told': {code: at for code, at in told.items()
-                               if isinstance(code, str) and isinstance(at, (int, float))}}
+                               if isinstance(code, str) and isinstance(at, stamp)}}
         else:
             failed = None
         return {'stuck': stuck, 'failed': failed}
@@ -309,35 +345,40 @@ class DreamWatch(LoginWatch):
             print(json.dumps({'alert_delivery': 'failed', 'error': type(failure).__name__}), file=sys.stderr,
                   flush=True)
 
-    def idle(self, waiting, now=None, since=None):
+    def idle(self, waiting, now=None, since=None, daily=False):
         """`since` (ISO 8601) is when the first waiting note reached the archive: the hold is at least that
-        old, even when this is the first run to see it."""
+        old, even when this is the first run to see it. `daily` marks the daemon's scheduled daily run."""
         now = time.time() if now is None else now
-        held = datetime.fromisoformat(since).timestamp() if since else now
+        try:
+            held = datetime.fromisoformat(since).timestamp() if since else now
+        except (TypeError, ValueError):
+            held = now
         if not waiting:
-            self.ran(now)
+            self.ran(now, quiet=True)
             return
 
         def work():
-            records = self._records()
+            records = self._read()
             told_failure = records['failed'] is not None and bool(records['failed']['told'])
             records['failed'] = None  # the run completed
-            self._forget_sent('failed')
             stuck = records['stuck'] or {'since': min(held, now), 'told': None}
+            if daily and stuck.get('daily_seen') is None:
+                stuck['daily_seen'] = now
             records['stuck'] = stuck
             last = stuck['told']
-            # The hold's age decides the first message only; reminders follow _due, which a clock set back does
-            # not silence.
-            if ((last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due(last, now)
-                    and not self._held_back(('stuck',), now)):
+            seen = stuck.get('daily_seen')
+            lasted = (now - stuck['since'] >= DREAM_IDLE_SECONDS
+                      or (daily and seen is not None and self._day(seen) < self._day(now)))
+            if ((last is not None or lasted) and self._due_today(last, now)
+                    and not self._retry_waits(('stuck',))):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
                         f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
                         'archive holds it.')
                 if last is not None:
                     text += f' Day {max(0, int((now - stuck["since"]) // REMINDER_SECONDS)) + 1}.'
-                if self._send_once(('stuck',), text, now):
+                if self._send_kind(('stuck',), text):
                     stuck['told'] = now
-            self._keep(records)
+            self._write(records)
             if told_failure:
                 self.send(f'{self.label}: the Dreaming run completes again.')
         self._guarded(self._exclusive(work))
@@ -346,39 +387,49 @@ class DreamWatch(LoginWatch):
         now = time.time() if now is None else now
 
         def work():
-            records = self._records()
+            records = self._read()
             failed = records['failed'] or {'since': now, 'told': {}}
             records['failed'] = failed
             last = failed['told'].get(code)
-            if not self._due(last, now) or self._held_back(('failed', code), now):
-                self._keep(records)
+            if not self._due_today(last, now) or self._retry_waits(('failed', code)):
+                self._write(records)
                 return
             text = (f'{self.label}: the Dreaming run failed with {code}: '
                     + ' '.join(str(reason).split())[:300] + '. It is tried again later.')
             if last is not None:
                 text += f' Failing since {_when(failed["since"])}.'
             # The alert goes before its record, so a state directory that cannot be written does not silence it;
-            # this process remembers it as well, so such a directory does not repeat it on every tick either.
-            if self._send_once(('failed', code), text, now):
+            # this process keeps the record itself then (`_write`), so it does not repeat it on every tick either.
+            if self._send_kind(('failed', code), text):
                 failed['told'] = {**failed['told'], code: now}
-            self._keep(records)
+            self._write(records)
         self._guarded(self._exclusive(work))
 
-    def ran(self, now=None):
+    def ran(self, now=None, quiet=False):
+        """A run completed: `quiet` for an idle answer with nothing waiting, which read nothing."""
         now = time.time() if now is None else now
 
         def work():
-            self._forget_sent()
-            if not self.marker.exists():
-                return
-            records = self._records()
-            told = ((records['stuck'] is not None and records['stuck']['told'] is not None)
-                    or (records['failed'] is not None and bool(records['failed']['told'])))
+            mine = str(self.marker)
+            unkept = _DREAM_UNKEPT.pop(mine, None)
+            for key in [key for key in _DREAM_TRIED if key[0] == mine]:
+                del _DREAM_TRIED[key]
+            def told_in(records):
+                return ((records['stuck'] is not None and records['stuck']['told'] is not None)
+                        or (records['failed'] is not None and bool(records['failed']['told'])))
+            # What this process told while the file took no write counts when the file itself tells nothing: at
+            # worst one recovery message more, never none for an alert that went out.
+            told = told_in(self._records()) or (unkept is not None and told_in(unkept[1]))
             # The marker goes first: one recovery message, even if its delivery fails.
-            self.marker.unlink()
+            if self.marker.exists():
+                self.marker.unlink()
             if told:
-                self.send(f'{self.label}: the Dreaming run completes again; the findings pass reads '
-                          'new evidence.')
+                if quiet:
+                    self.send(f'{self.label}: the Dreaming run completes again; no archived note waits behind '
+                              "the findings pass's cursor any more.")
+                else:
+                    self.send(f'{self.label}: the Dreaming run completes again; the findings pass reads '
+                              'new evidence.')
         self._guarded(self._exclusive(work))
 
 
