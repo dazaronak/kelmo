@@ -13,7 +13,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from kelmo.wiki.hot_views import strip_evidence
 from test_action_state import APP_PAGE, WEB_PAGE, PAGES, TOPIC_PAGE, world_factory as world_factory  # noqa: F401
 from test_git_ingress import git, git_world as git_world, packet, push_receipt  # noqa: F401
 
@@ -180,7 +179,9 @@ def test_person_page_arrives_whole_with_ordinary_unflagged_facts(tmp_path, world
     context = start(SimpleNamespace(root=root))
 
     # Whole, apart from the fact labels a mandatory page loses at startup.
-    assert f'## person.md\n\n{strip_evidence(person)}' in context
+    labels = [' [f:' + rule['id'] + ']', ' [f:' + ordinary['id'] + ']']
+    assert all(label in person for label in labels)
+    assert f'## person.md\n\n{untagged(person, labels)}' in context
     assert rule['text'] in context and ordinary['text'] in context
     assert 'mandatory pages: person.md.' in header(context)
 
@@ -210,12 +211,15 @@ def test_mandatory_record_on_a_project_page_is_delivered_whole_once(tmp_path, wo
     app = reader.page(APP_PAGE, generation).content.decode('utf-8')
     person = reader.page('person.md', generation).content.decode('utf-8')
     assert project['text'] in app
+    rule_label, project_label = ' [f:' + rule['id'] + ']', ' [f:' + project['id'] + ']'
+    assert rule_label in person and project_label in app
 
     for selected in ([], [APP_PAGE]):
         configure(root, selected)
         context = start(SimpleNamespace(root=root))
-        assert f'## {APP_PAGE}\n\n{strip_evidence(app)}' in context and context.count(f'## {APP_PAGE}\n') == 1
-        assert f'## person.md\n\n{strip_evidence(person)}' in context
+        assert f'## {APP_PAGE}\n\n{untagged(app, [project_label])}' in context
+        assert context.count(f'## {APP_PAGE}\n') == 1
+        assert f'## person.md\n\n{untagged(person, [rule_label])}' in context
         assert f'mandatory pages: person.md, {APP_PAGE}.' in header(context)
     # Mandatory delivery does not redefine the person project listing.
     assert [page.path for page in reader.pages('person', generation).entries] == ['person.md']

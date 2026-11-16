@@ -138,13 +138,14 @@ def test_view_that_cannot_fit_is_written_with_a_marker_not_refused():
 
 def test_mandatory_render_drops_frontmatter_retired_rows_and_fact_labels_only():
     from kelmo.wiki import hot_views
-    page_text = ('---\nkind: hub\nlayout: person\n---\n\n# User Profile\n\n## Facts\n\n'
+    page_text = ('---\nkind: hub\nlayout: person\n---\n\n# User Profile\n\n<!-- kb -->\n\n## Facts\n\n'
                  '- Live fact. [f:1] [source:a]\n'
                  '- Gone fact. [f:2] [source:b] [status: retired]\n'
-                 '- Shipped fact. [f:3] [source:c] [status: shipped]\n\n## See Also\n\n- [[life]]\n')
+                 '- Shipped fact. [f:3] [source:c] [status: shipped]\n\n<!-- /kb -->\n\n'
+                 '## See Also\n\n- [[life]]\n')
     assert hot_views.render_mandatory(page_text) == (
-        '# User Profile\n\n## Facts\n\n- Live fact.\n'
-        '- Shipped fact. [status: shipped]\n\n## See Also\n\n- [[life]]\n')
+        '# User Profile\n\n<!-- kb -->\n\n## Facts\n\n- Live fact.\n'
+        '- Shipped fact. [status: shipped]\n\n<!-- /kb -->\n\n## See Also\n\n- [[life]]\n')
     assert hot_views.render_mandatory('# Bare\n\nNo frontmatter.\n') == '# Bare\n\nNo frontmatter.\n'
 
 
@@ -158,15 +159,17 @@ def test_one_view_per_project_map_and_one_render_per_mandatory_page(tmp_path):
     value['facts']['r'] = fact('life/preferences.md', 'Old pref.', status='retired')
     wiki = tmp_path / 'wiki'
     (wiki / 'life').mkdir(parents=True)
-    (wiki / 'life/preferences.md').write_text('---\nkind: hub\n---\n\n# Preferences\n\n- Mandatory pref. [f:q]\n'
-                                              '- Old pref. [f:r] [status: retired]\n')
-    rendered = {wiki / 'person.md': '---\nkind: hub\n---\n\n# Person\n\n- Rule. [f:p]\n'}
+    (wiki / 'life/preferences.md').write_text('---\nkind: hub\n---\n\n# Preferences\n\n<!-- kb -->\n'
+                                              '- Mandatory pref. [f:q]\n'
+                                              '- Old pref. [f:r] [status: retired]\n<!-- /kb -->\n')
+    rendered = {wiki / 'person.md': '---\nkind: hub\n---\n\n# Person\n\n<!-- kb -->\n- Rule. [f:p]\n<!-- /kb -->\n'}
     views = hot_views.render_all(value, rendered, wiki, tmp_path / 'hot')
     assert sorted(path.name for path in views) == ['app.md', 'mandatory-person.md', 'mandatory-preferences.md',
                                                    'other.md']
     assert '**Other task** (H1)' in views[tmp_path / 'hot/other.md']
-    assert views[tmp_path / 'hot/mandatory-person.md'] == '# Person\n\n- Rule.\n'
-    assert views[tmp_path / 'hot/mandatory-preferences.md'] == '# Preferences\n\n- Mandatory pref.\n'
+    assert views[tmp_path / 'hot/mandatory-person.md'] == '# Person\n\n<!-- kb -->\n- Rule.\n<!-- /kb -->\n'
+    assert views[tmp_path / 'hot/mandatory-preferences.md'] == ('# Preferences\n\n<!-- kb -->\n'
+                                                            '- Mandatory pref.\n<!-- /kb -->\n')
     assert views[tmp_path / 'hot/app.md'] == hot_views.render(value, MAP, '')
 
 
@@ -339,20 +342,22 @@ def test_publication_writes_views_in_the_same_commit_and_generation(tmp_path, mo
     assert report['checks']['wiki_consistency'] and report['checks']['wiki_committed']
 
 
-TAGGED_PERSON = ('---\nkind: hub\nlayout: person\n---\n\n# Person\n\n## Facts\n\n'
+TAGGED_PERSON = ('---\nkind: hub\nlayout: person\n---\n\n# Person\n\n<!-- kb -->\n\n## Facts\n\n'
                  '- Rule. [f:0123456789ab] [source:a1b2c3] [source:2026-08-28_150000_person_rule.md]\n'
                  '- Shipped fact. [f:aaaaaaaaaaaa] [source:e5f6] [status: shipped]\n'
                  '- Legacy fact. [f:bbbbbbbbbbbb] [unresolved legacy state; retained status: active]\n'
                  '- Cite it as [source:quoted] in the note. [f:eeeeeeeeeeee] [source:c9d0]\n'
                  '- Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian]. [f:ffffffffffff]\n'
-                 '[f:dddddddddddd] starts a line the renderer never writes.\n\n## See Also\n\n- [[life]]\n')
-UNTAGGED_PERSON = ('# Person\n\n## Facts\n\n'
+                 '[f:dddddddddddd] starts a line the renderer never writes.\n\n<!-- /kb -->\n\n'
+                 '- The reference for this example is [f:external-record]\n\n## See Also\n\n- [[life]]\n')
+UNTAGGED_PERSON = ('# Person\n\n<!-- kb -->\n\n## Facts\n\n'
                    '- Rule.\n'
                    '- Shipped fact. [status: shipped]\n'
                    '- Legacy fact. [unresolved legacy state; retained status: active]\n'
                    '- Cite it as [source:quoted] in the note.\n'
                    '- Quotes `[f:cccccccccccc]` in code, links [notes](notes.md) and answers in [Russian].\n'
-                   '[f:dddddddddddd] starts a line the renderer never writes.\n\n## See Also\n\n- [[life]]\n')
+                   '[f:dddddddddddd] starts a line the renderer never writes.\n\n<!-- /kb -->\n\n'
+                   '- The reference for this example is [f:external-record]\n\n## See Also\n\n- [[life]]\n')
 SELECTED = '# Extra\n\n- A selected page keeps its labels. [f:999999999999] [source:s1]\n'
 
 
@@ -376,3 +381,33 @@ def test_generated_mandatory_files_carry_no_evidence_tags(tmp_path):
             assert label not in text, (name, label)
     # A page selected through [hot] pages is not a mandatory page: it stays byte for byte.
     assert SELECTED in views[tmp_path / 'hot' / 'mandatory.md']
+
+
+def test_a_bound_work_page_that_is_mandatory_loses_its_fact_labels(tmp_path, monkeypatch):
+    """The work channel (local hub delivery and the shared server's) sends a bound work page whole; a work page that
+    holds a mandatory fact is a mandatory page and loses its fact labels like any other."""
+    from types import SimpleNamespace
+    from kelmo import client, hot, hub_delivery, projects
+    from kelmo.server import _published_work
+    from kelmo.wiki.pages import generation_paths
+    from tests.test_hot import config
+    selected = config(tmp_path, '[hot]\nviews=true\n[hot.projects.app]\nroots=[]\n')
+    target = 'projects/app/task.md'
+    text = '# Task\n\n<!-- kb -->\n- Never deploy on Friday. [f:0123456789ab] [source:s1]\n<!-- /kb -->\n'
+    registry = {'pages': {target: {'page_id': 'work-id', 'kind': 'work'}}, 'redirects': {}}
+    root, registry_path, wiki_path, *_ = generation_paths(selected)
+    mandatory = []
+    reader = SimpleNamespace(config=selected, root=root, registry_path=registry_path, wiki_path=wiki_path,
+                             generation=lambda: 2, _pinned=lambda _: {'paths': {target}, 'registry': registry},
+                             page=lambda name, generation: SimpleNamespace(content=text.encode('utf-8')),
+                             mandatory=lambda generation: [SimpleNamespace(path=path) for path in mandatory])
+    monkeypatch.setattr(projects, 'resolve', lambda config, cwd: 'app')
+    monkeypatch.setattr(client, 'local_binding', lambda cwd: {
+        'binding_status': 'bound', 'work': 'task', 'work_project': 'app'})
+    monkeypatch.setattr(hub_delivery, 'published_set', lambda *args: {})
+    assert hot.hub_context(selected, tmp_path, reader=reader)['hub_work'] == text
+    assert _published_work(reader, 2, target) == text
+    mandatory.append(target)
+    untagged = '# Task\n\n<!-- kb -->\n- Never deploy on Friday.\n<!-- /kb -->\n'
+    assert hot.hub_context(selected, tmp_path, reader=reader)['hub_work'] == untagged
+    assert _published_work(reader, 2, target) == untagged

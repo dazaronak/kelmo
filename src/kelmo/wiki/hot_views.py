@@ -205,8 +205,13 @@ def over_budget(text):
 
 
 def strip_evidence(text):
-    """`text` without the fact and source labels of its fact rows; status labels and all other text stay."""
-    return _FACT_LABELS.sub(r'\1\3', text)
+    """`text` without the fact and source labels of the fact rows in its `<!-- kb -->` regions, where the publisher
+    writes them; status labels and all other text, the hand-written text around the regions included, stay."""
+    parts, rest = [], text
+    while (start := rest.find(pages.KB_START)) >= 0 and (end := rest.find(pages.KB_END, start)) >= 0:
+        parts += [rest[:start], _FACT_LABELS.sub(r'\1\3', rest[start:end])]
+        rest = rest[end:]
+    return ''.join(parts) + rest
 
 
 def render_mandatory(text):

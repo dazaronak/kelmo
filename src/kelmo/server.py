@@ -2233,7 +2233,8 @@ def _shared_context(service, profile, origin, config, reader, generation, *, rep
 
 
 def _published_work(reader, generation, page):
-    return reader.page(page, generation).content.decode('utf-8')
+    from .hot import published_work
+    return published_work(reader, generation, page)
 
 
 def serve_client(root, profile_path, client_id, stdin, stdout):

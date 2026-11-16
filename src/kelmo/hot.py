@@ -158,6 +158,16 @@ def render(config, cwd=None, *, project=None, reader=None):
             'fingerprint': hashlib.sha256(identity).hexdigest()}
 
 
+def published_work(reader, generation, name):
+    """A bound work page as a session gets it: whole, except that a work page holding mandatory facts is a mandatory
+    page and loses its fact and source labels as every mandatory page does."""
+    text = reader.page(name, generation).content.decode('utf-8')
+    if '[f:' in text and name in {page.path for page in reader.mandatory(generation)}:
+        from .wiki.hot_views import strip_evidence
+        text = strip_evidence(text)
+    return text
+
+
 def has_hub_generation(config, reader=None, generation=None):
     from .wiki.pages import KnowledgeReader
     reader = reader or KnowledgeReader(config)
@@ -188,7 +198,7 @@ def hub_context(config, cwd, *, reader=None):
         name = resolve_bound_work(reader._pinned(generation)['registry'], project,
                                   binding['work_project'], binding['work'])
         if name is not None and name in reader._pinned(generation)['paths']:
-            work = reader.page(name, generation).content.decode('utf-8')
+            work = published_work(reader, generation, name)
             work_path = name
         else:
             warning = 'Bound work page is absent from the selected project generation.'
