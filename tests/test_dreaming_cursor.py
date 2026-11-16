@@ -183,3 +183,25 @@ def test_a_retried_note_a_finding_already_cites_is_not_read_again_after_a_0_3_1_
     result, read = dream()
     assert result['state'] != 'idle', result
     assert read == [archive_id(world, newer)]
+
+
+def test_under_a_one_source_ceiling_a_late_archive_waits_only_behind_what_was_archived_before_it(
+        world, dream, tmp_path, capsys):
+    # The ceiling bounds every pass (docs/DREAMING.md: ceilings, not targets), so a late note is read by the next
+    # pass with room for it: in archive order, after a note archived before it, and never skipped.
+    from kelmo.cli import call
+    dream.drain()
+    code = call(['--vault', str(world.root), 'dream', 'configure', '--executor-config', str(tmp_path / 'executor.json'),
+                 '--max-sources', '1', '--apply', '--json'])
+    capsys.readouterr()
+    assert code == 0
+    late = waiting(world, 'Late: the export owner changed.', 'late-ceiling')
+    newer, _ = world.archive('Newer: exports moved to 20:00.', key='newer-ceiling')
+    assert dream()[1] == [archive_id(world, newer)]
+    between, _ = world.archive('Archived before the late one: exports run twice.', key='between-ceiling')
+    assert world.service.run(late)['durable_stage'] == 'archived'
+
+    assert dream()[1] == [archive_id(world, between)]
+    assert dream()[1] == [archive_id(world, late)]
+    result, read = dream()
+    assert result['state'] == 'idle' and read is None, result
