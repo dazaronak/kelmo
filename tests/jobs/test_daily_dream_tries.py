@@ -176,3 +176,24 @@ def test_a_scheduled_run_that_reaches_the_job_inside_the_delay_starts_nothing(tm
         answer = error
     assert len(starts) == 1, answer
     assert answer == {'state': 'not_due'}
+
+
+def test_a_stop_that_fails_a_call_before_the_start_charges_no_try(tmp_path, monkeypatch):
+    # The core is stopping while the run waits on a call to another core (its archive writer check): that call
+    # fails with a KelmoError, not Stopping. The stop caused it, so it charges no try and starts no delay.
+    from kelmo import dreaming_cli
+    from kelmo.errors import KelmoError
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+
+    def stopped_before_start(*args, **kwargs):
+        jobs._stop.set()
+        raise KelmoError('E_TRANSPORT', 'The archive core can no longer answer.')
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', stopped_before_start)
+    try:
+        jobs._dream({'action': 'run', 'scheduled': True})
+    except KelmoError:
+        pass
+    tries = jobs._read_state().get('dream_tries') or {}
+    assert tries.get('count', 0) == 0, tries
+    assert tries.get('delay') is not True, tries

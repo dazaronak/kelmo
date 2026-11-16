@@ -255,7 +255,9 @@ class Jobs:
         except Exception:
             # A scheduled run that failed before it started (the lock, Dreaming's settings) is a failed try too:
             # it counts towards DREAM_TRIES and waits DREAM_RETRY_SECONDS. One that started is counted there.
-            if scheduled and action == 'run' and not self._dream_started:
+            # While the core is stopping, a call to another core fails as a KelmoError rather than Stopping
+            # (stopping.py): the stop caused it, so like a stop it charges no try.
+            if scheduled and action == 'run' and not self._dream_started and not self.should_stop():
                 self._record_dream_try()
                 self._record_dream_try_end()
             raise
