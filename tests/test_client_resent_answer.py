@@ -48,3 +48,29 @@ def test_a_note_of_another_project_with_the_same_text_does_not_answer_for_a_refu
     [item] = client.outbox.resend(('E_INPUT',), apply=True)
     assert item['resend_as'] == 'refused-in-app#resend1' and 'duplicate' not in item, item
     assert [row['idempotency_key'] for row in client.outbox.pending()] == ['refused-in-app#resend1']
+
+
+def test_a_note_with_other_arguments_and_the_same_text_does_not_answer_for_a_refusal(shared):
+    """A refused rule change, new work or pending note is not the plain note that carries its text."""
+    client = shared.client()
+    for flag, value in (('rule_change', True), ('new_work', 'new-page'), ('pending', 'a pending note')):
+        refused, delivered = f'refused-{flag}', f'plain-{flag}'
+        text = f'The same text for {flag}.'
+        client.outbox.enqueue('create', dict(ARGS, content=text, **{flag: value}), refused)
+        client.outbox.settle(refused, 'refused', {'code': 'E_INPUT', 'message': 'Page is not registered'})
+        client.outbox.enqueue('create', dict(ARGS, content=text), delivered)
+        client.outbox.settle(delivered, 'delivered', {'id': 'op-' + flag})
+    items = {item['idempotency_key']: item for item in client.outbox.resend(('E_INPUT',), apply=True)}
+    for flag in ('rule_change', 'new_work', 'pending'):
+        item = items[f'refused-{flag}']
+        assert 'duplicate' not in item and item['resend_as'] == f'refused-{flag}#resend1', item
+
+
+def test_a_note_resent_with_a_fixed_target_or_name_is_still_the_same_note(shared):
+    client = shared.client()
+    client.outbox.enqueue('create', dict(ARGS, selected=['app.md'], filename='a.md'), 'refused-target')
+    client.outbox.settle('refused-target', 'refused', {'code': 'E_INPUT', 'message': 'Page is not registered'})
+    client.outbox.enqueue('create', dict(ARGS, selected=['app/fixed.md'], filename='b.md'), 'fixed-target')
+    client.outbox.settle('fixed-target', 'delivered', {'id': 'op-fixed'})
+    [item] = client.outbox.resend(('E_INPUT',), apply=True)
+    assert item.get('duplicate') is True and item['resend_as'] == 'fixed-target', item

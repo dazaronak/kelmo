@@ -297,13 +297,18 @@ class Outbox:
         `resent` and names its successor. Without `apply` nothing changes. The refusals are read under the
         write lock, so two runs at once never resend one note twice.
 
-        A note is sent once: a refusal whose text another queued or delivered note of the same project
-        already carries is not sent again but names that note (`duplicate`), and of several refusals with one
-        text in one project only the newest goes out; the older ones name it too. The targets are not
-        compared, since a refusal is often resent once its target is fixed."""
+        A note is sent once: a refusal whose request another queued or delivered note already carries is not
+        sent again but names that note (`duplicate`), and of several refusals with one request only the newest
+        goes out; the older ones name it too. Two requests are the same when every argument matches, the text
+        compared without its surrounding whitespace. The targets, the file name and the budget are not
+        compared, since a refusal is often resent once its target is fixed; a different project, rule change,
+        new work page or pending flag makes another note."""
         def text(row):
             args = json.loads(row['args'])
-            return args.get('project'), args.get('content', '').strip()
+            same = {name: value for name, value in args.items()
+                    if name not in ('selected', 'filename', 'budget_tokens')}
+            same['content'] = args.get('content', '').strip()
+            return canonical(same)
 
         items = []
         with self.conn:
