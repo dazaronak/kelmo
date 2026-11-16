@@ -253,7 +253,13 @@ class Jobs:
                     # The tick read the gate before this job started: a failing run may have ended meanwhile and
                     # started the delay, and a local client may send `scheduled` itself. Read it again here.
                     return {'state': 'not_due'}
-                return self._dream_run(action, scheduled, ready)
+                result = self._dream_run(action, scheduled, ready)
+                state = result.get('state') if isinstance(result, dict) else None
+                if daily and self.should_stop() and state not in DREAM_DAY_STATES:
+                    # Cut by the stop and answered rather than raised (a `failed` pass whose executor the stop
+                    # ended): like a stop, it costs nothing.
+                    self._write_state(dream_tries=found)
+                return result
         except Stopping:
             if daily:
                 self._write_state(dream_tries=found)  # a stop costs no try and keeps the wait it found

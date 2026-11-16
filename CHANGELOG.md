@@ -15,9 +15,9 @@ entry here.
   now one of the three tries and waits the same 15 minutes; it used to be started again on every scheduler
   tick, all day. A run that answers a usage limit whose reset time has already passed still costs no try,
   but now waits the same 15 minutes instead of starting again on every scheduler tick. The tries and the wait
-  are read again when the run starts, so a run that failed just after the scheduler looked, or a local client
-  that sends a run marked as scheduled, gets the answer `not_due` instead of an extra try. A `kelmo dream run`
-  by hand is not limited.
+  are read again when the run starts, so a run that failed just after the scheduler looked gets the answer
+  `not_due` instead of an extra try. A run that ends while the daemon stops, however it ends short of a
+  finished day, costs no try and keeps the wait it found. A `kelmo dream run` by hand is not limited.
 
 ## [0.3.1] - 2026-11-15
 

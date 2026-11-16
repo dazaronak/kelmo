@@ -233,3 +233,34 @@ def test_a_stopped_try_gives_back_the_wait_it_found(tmp_path, monkeypatch):
     assert jobs._read_state()['dream_tries'] == before
     now[0] = day_at(4, 26)
     assert jobs._dream_try_allowed()
+
+
+def test_a_run_that_answers_failed_while_the_core_stops_charges_no_try(tmp_path, monkeypatch):
+    # The executor is cut by the stop and the pass answers `failed` instead of raising: the stop caused it, so it
+    # costs no try and starts no delay, as when it raises.
+    from kelmo import dreaming_cli
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('unused')])
+
+    def failed_by_the_stop(*args, **kwargs):
+        kwargs['on_start']()
+        jobs._stop.set()
+        return {'state': 'failed', 'code': 'E_EXECUTOR', 'reason': 'the provider exited'}
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', failed_by_the_stop)
+    jobs._dream({'action': 'run', 'scheduled': True})
+    tries = jobs._read_state().get('dream_tries') or {}
+    assert tries.get('count', 0) == 0, tries
+    assert tries.get('delay') is not True, tries
+
+
+def test_a_pause_answered_before_the_start_leaves_an_earlier_try_counted(tmp_path, monkeypatch):
+    # A failed try is counted; Dreaming is then paused and the next run answers `paused` before it starts: that
+    # answer takes back nothing, so the failed try and its wait stay.
+    from kelmo import dreaming_cli
+    jobs, now, starts = ticking(tmp_path, monkeypatch, [RuntimeError('a broken executor')])
+    jobs._tick()
+    before = dict(jobs._read_state()['dream_tries'])
+    monkeypatch.setattr(dreaming_cli, 'run_dream', lambda *args, **kwargs: {'state': 'paused'})
+    now[0] = day_at(4, 20)
+    jobs._dream({'action': 'run', 'scheduled': True})
+    assert jobs._read_state()['dream_tries'] == before
