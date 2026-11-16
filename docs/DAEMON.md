@@ -125,17 +125,17 @@ routed to an installed daemon service that is stopped, is not heard; its error
 stays in the timer's output. A run that fails (the findings pass answers `failed`, the run raises, or
 its lock file cannot be opened) is told once when it fails and once a calendar day
 for each error code while it keeps failing; the run is still tried again as before.
-A findings pass that answers idle while archived notes wait behind its cursor means
-an operation that never reached the archive holds the cursor, and nothing behind it
-is read. Once the first of those notes has waited a day it is told, with the time it
-reached the archive, then once a calendar day. An idle pass with nothing waiting is
+The findings pass reads notes in the order they reached the archive, so a note
+still on its way holds nothing back. If it answers idle while archived notes it has
+not read wait behind its cursor anyway, it is told once the first of them has waited
+a day, with the time it reached the archive, then once a calendar day. An idle pass with nothing waiting is
 a quiet vault and tells nothing. The first run that completes after an alert sends
 one message that it is over; after an idle pass with nothing waiting, it says no
 note waits behind the cursor any more. An alert the command fails to take is sent
 again with the next failure or idle answer; while it runs, the daemon waits at
 least 15 minutes between such tries (a restarted daemon may try at once), and a
 timer tries once in each of its runs. When a run
-completes after a failure or a held cursor whose alert never went out, its one
+completes after a failure or a waiting alert that never went out, its one
 message names what was missed. The marker is `dream-watch.json` in the state
 directory.
 

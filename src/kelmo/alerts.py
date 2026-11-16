@@ -205,10 +205,9 @@ class VaultWatch(LoginWatch):
 class DreamWatch(LoginWatch):
     """What the owner hears of Dreaming runs (`core.jobs`): the daemon's daily run and those a timer starts.
 
-    - `idle(waiting)`: the findings pass found nothing to read. With archived notes waiting behind its cursor
-      (`waiting` > 0) an operation that never reached the archive holds the cursor, and nothing behind it is ever
-      read: once that has lasted DREAM_IDLE_SECONDS the owner is told, then once a day while it lasts. With none
-      waiting the vault is only quiet, and the run completed.
+    - `idle(waiting)`: the findings pass found nothing to read. With archived notes it has not read waiting
+      behind its cursor (`waiting` > 0), once that has lasted DREAM_IDLE_SECONDS the owner is told, then once a
+      day while it lasts. With none waiting the vault is only quiet, and the run completed.
     - `failed(code, reason)`: a run failed. Told at once, then once a day for each code.
     - `ran()`: a run completed. Both records end; one recovery message goes out when anything was told.
 
@@ -399,8 +398,7 @@ class DreamWatch(LoginWatch):
             if ((last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due_today(last, now)
                     and not self._retry_waits(('stuck',))):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
-                        f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
-                        'archive holds it.')
+                        f'{waiting} archived notes wait unread behind its cursor.')
                 if last is not None:
                     text += f' Day {max(0, int((now - stuck["since"]) // REMINDER_SECONDS)) + 1}.'
                 if self._send_kind(('stuck',), text):

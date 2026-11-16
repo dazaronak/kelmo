@@ -205,23 +205,22 @@ class Dreaming:
         return found, last
 
     def _waiting_evidence(self, cursor):
-        """How many archived operations after `cursor` the pass did not reach, and when the first of them
-        reached the archive: an operation still on its way there holds the cursor in front of them. Dreaming's
-        own notes are left out, as in `_changed_evidence`. One aggregate over `events`, which has no index on
-        `operation_id`."""
-        query = ('SELECT COUNT(*), MIN(s.reached_at) FROM operations o JOIN ('
-                 " SELECT operation_id, MAX(stage IN ('archived','applied')) AS reached,"
-                 " MIN(CASE WHEN stage IN ('archived','applied') THEN created_at END) AS reached_at,"
-                 " MAX(stage = 'purged') AS purged FROM events GROUP BY operation_id"
-                 ') s ON s.operation_id = o.id'
-                 ' WHERE s.reached = 1 AND s.purged = 0 AND substr(o.filename, 1, ?) != ?'
-                 ' AND o.id NOT IN (SELECT note_operation_id FROM dream_findings'
-                 ' WHERE note_operation_id IS NOT NULL)')
-        params = [len(NOTE_PREFIX), NOTE_PREFIX]
-        if cursor:
-            query += ' AND (o.created_at > ? OR (o.created_at = ? AND o.id > ?))'
-            params += [cursor[0], cursor[0], cursor[1]]
-        return tuple(self.journal.conn.execute(query, params).fetchone())
+        """How many archived operations after `cursor` the pass has not read, and when the first of them reached
+        the archive. They are the ones `_changed_evidence` would take: Dreaming's own notes, the upgrade's `seen`
+        and records no longer readable (forgotten, withdrawn) are left out. The pass reads in archive order, so
+        an idle answer normally counts none; a count says notes stay unread behind the cursor anyway."""
+        notes = {row[0] for row in self.journal.conn.execute(
+            'SELECT note_operation_id FROM dream_findings WHERE note_operation_id IS NOT NULL')}
+        seen = set(cursor.get('seen', ()))
+        waiting = [row for row in self._durable(' AND d.first > ?', (cursor['sequence'],))
+                   if row['id'] not in notes and row['id'] not in seen
+                   and not (row['filename'] or '').startswith(NOTE_PREFIX)
+                   and self.journal.evidence_record(row['id']) is not None]
+        if not waiting:
+            return 0, None
+        first = min(row['first'] for row in waiting)
+        since = self.journal.conn.execute('SELECT created_at FROM events WHERE sequence = ?', (first,)).fetchone()[0]
+        return len(waiting), since
 
     def _related(self, registry, references, max_pages):
         """Non-person pages whose facts cite the evidence, then their neighbours, at most max_pages."""
@@ -253,7 +252,7 @@ class Dreaming:
         if not evidence:
             if last != self._state('cursor'):
                 self._set_state('cursor', last)
-            # A quiet vault and a held cursor both answer idle; `waiting` tells them apart (alerts.DreamWatch).
+            # A quiet vault answers idle with nothing waiting; a count means notes stay unread (alerts.DreamWatch).
             waiting, since = self._waiting_evidence(last)
             return {'state': 'idle', 'waiting': waiting, **({'waiting_since': since} if waiting else {})}
         run_id = _digest({'generation': generation.to_dict(), 'evidence': [item[0] for item in evidence]})[:16]

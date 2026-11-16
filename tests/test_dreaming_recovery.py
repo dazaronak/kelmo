@@ -269,8 +269,10 @@ def test_malformed_finding_values_are_rejected_not_raised():
 
 
 def test_an_idle_findings_pass_names_the_notes_waiting_behind_its_cursor(world):
-    """An operation that never reached the archive and never ended holds the cursor in front of every archived
-    note behind it: the pass answers idle and says how many notes wait there."""
+    """The waiting count of an idle answer is the archived notes after the cursor that the pass has not read, with
+    the moment the first of them reached the archive. A capture that never reaches the archive has no place in
+    archive order and holds nothing back, so the next pass takes the notes behind it, and an idle pass after
+    that counts none."""
     from kelmo.config import Config
     from tests.test_editor_scoping import FEATURE
     toml = world.root / 'kelmo.toml'
@@ -280,14 +282,20 @@ def test_an_idle_findings_pass_names_the_notes_waiting_behind_its_cursor(world):
     dream = world.service.dreaming
     first = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
     assert first['state'] == 'finished'  # the seed is past the cursor now
+    cursor = dream._cursor()
     world.service.create('A capture that never reaches the archive.', project='app', selected=[FEATURE])
     notes = []
     for text in ('Exports run at 01:00.', 'Exports run at 02:00.'):
         notes.append(world.service.create(text, project='app', selected=[FEATURE])['id'])
         world.service.run(notes[-1])
-    stuck = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
     archived = world.service.journal.conn.execute(
         "SELECT MIN(created_at) FROM events WHERE stage IN ('archived', 'applied') AND operation_id IN (?, ?)",
         notes).fetchone()[0]
-    assert stuck == {'state': 'idle', 'waiting': 2, 'waiting_since': archived}
+    assert dream._waiting_evidence(cursor) == (2, archived)
+    taken = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    assert taken['state'] == 'finished'  # larger than the budget, so skipped: the capture held nothing back
+    assert sorted(item['archive_id'] for item in taken['skipped']) == sorted(row[0] for row in (
+        world.service.journal.conn.execute('SELECT archive_id FROM operations WHERE id IN (?, ?)', notes)))
+    idle = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    assert idle == {'state': 'idle', 'waiting': 0}
     assert executor.jobs == []
