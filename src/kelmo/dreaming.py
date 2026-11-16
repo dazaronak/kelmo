@@ -270,7 +270,16 @@ class Dreaming:
         texts, skipped, included = [], [], []
         used = consumed = 0
         for _operation_id, reference, _position in evidence:
-            text = self.service.show(reference.archive_id)['content']
+            try:
+                text = self.service.show(reference.archive_id)['content']
+            except KelmoError as error:
+                if error.code != 'E_FORGOTTEN':
+                    raise
+                # Forgotten after it was archived: it is no evidence any more, and it must not hold the cursor.
+                skipped.append({'archive_id': reference.archive_id, 'version': reference.version,
+                                'reason': 'forgotten'})
+                consumed += 1
+                continue
             item = {'archive_id': reference.archive_id, 'version': reference.version, 'text': text}
             cost = views._cost(item)
             if cost > budget_tokens:

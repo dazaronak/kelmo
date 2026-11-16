@@ -6,6 +6,13 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Dreaming's findings pass skips a record that was forgotten after it was archived and moves past it.
+  It used to fail with `E_FORGOTTEN` on such a record, and since the cursor moves only after a
+  successful pass, every later pass failed on the same record. The run lists it in `skipped` with
+  `"reason": "forgotten"`.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added

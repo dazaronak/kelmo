@@ -32,6 +32,20 @@ def test_evidence_larger_than_budget_skipped(world):
     assert second == {'state': 'idle'}
 
 
+def test_forgotten_evidence_is_skipped_and_never_holds_the_cursor(world):
+    """A record forgotten after it was archived is still in the findings pass's window; the pass skips it
+    instead of failing on it, and the cursor moves past it, so the next pass is not stuck behind it."""
+    world.service.forget(world.seed.archive_id)
+    executor = Scripted()
+    result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'finished', result
+    assert result['skipped'] == [{'archive_id': world.seed.archive_id, 'version': world.seed.version,
+                                  'reason': 'forgotten'}]
+    assert len(executor.jobs) == 0
+    second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert second == {'state': 'idle'}
+
+
 def test_link_publication_fails_once_stays_open_then_publishes(world, monkeypatch):
     finding = {
         'kind': 'link',
