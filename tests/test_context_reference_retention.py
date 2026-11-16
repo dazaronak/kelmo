@@ -28,3 +28,15 @@ def test_a_reference_used_again_counts_as_used_now(tmp_path):
     assert context_reference(tmp_path, {'pending': ['same']}) == reused
     Client(tmp_path).context(binding=BINDING)
     assert reused.exists(), 'a reference a delivery used again today was removed'
+
+
+def test_the_sweep_leaves_files_behind_a_symlinked_folder_alone(tmp_path):
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    report = elsewhere / 'report.json'
+    report.write_text('{}')
+    _age(report, 40)
+    for name in ('hub-context', 'hub-sessions'):
+        (tmp_path / name).symlink_to(elsewhere, target_is_directory=True)
+    Client(tmp_path).context(binding=BINDING)
+    assert report.exists(), 'the sweep removed a file through a symlinked folder'
