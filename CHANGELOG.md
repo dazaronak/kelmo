@@ -9,7 +9,8 @@ entry here.
 ### Fixed
 
 - A core that receives bytes from `kelmod` that are not a frame (a length over the frame bound, a header that
-  does not parse) now ends its channel the way a closed channel ends: it says why in `kelmod`'s log and asks
+  does not parse or has a field of the wrong JSON type, a body nested too deeply) now ends its channel the
+  way a closed channel ends: it says why in `kelmod`'s log and asks
   its work to stop. The error used to escape the channel's loop as a Python traceback.
 
 ## [0.3.1] - 2026-11-15
