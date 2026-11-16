@@ -130,9 +130,10 @@ def _metadata(snapshot):
     return result
 
 
-def prune_sets(root, keep=()):
+def prune_sets(root, keep=None):
     """Remove installed sets past their retention (RETAIN_SECONDS, RETAIN_SETS), never the current one or a
-    set named in `keep`; at most once per SWEEP_SECONDS. Called under the set lock. Returns the removed names."""
+    set `keep()` names; at most once per SWEEP_SECONDS, and `keep` is only called when a sweep is due. Called
+    under the set lock. Returns the removed names."""
     root = Path(root)
     marker = root / '.pruned'
     now = time.time()
@@ -145,7 +146,7 @@ def prune_sets(root, keep=()):
     sets = sorted((path for path in root.iterdir()
                    if path.name.startswith('.set-') and path.is_dir() and not path.is_symlink()),
                   key=lambda path: path.stat().st_mtime, reverse=True)
-    protected = {current, *keep, *(path.name for path in sets[:RETAIN_SETS])}
+    protected = {current, *(keep() if keep is not None else ()), *(path.name for path in sets[:RETAIN_SETS])}
     removed = []
     for path in sets:
         if path.name not in protected and now - path.stat().st_mtime > RETAIN_SECONDS:
@@ -223,7 +224,7 @@ def install_set(root, snapshot, keep=None):
         finally:
             temporary.unlink(missing_ok=True)
         try:
-            prune_sets(root, set(keep()) if keep is not None else ())
+            prune_sets(root, keep)
         except OSError:
             pass  # the sweep never fails a delivery; the next install tries again
     return destination

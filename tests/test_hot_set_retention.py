@@ -86,6 +86,23 @@ def test_a_set_a_cached_context_names_is_kept_and_still_serves_offline(tmp_path)
     assert offline['freshness'] == 'stale' and offline['hub_set']['generation'] == 2
 
 
+def test_a_delivery_with_no_sweep_due_reads_no_cached_context(tmp_path):
+    class Counting(Client):
+        reads = 0
+
+        def _cached_set_names(self):
+            Counting.reads += 1
+            return super()._cached_set_names()
+
+    client = Counting(tmp_path)
+    client.context(binding=BINDING)
+    assert Counting.reads == 1, 'the first install sweeps and reads the cached contexts once'
+    client.generation = 3
+    client.context(binding=BINDING)
+    client.context(binding=dict(BINDING, work='other-task'))
+    assert Counting.reads == 1, f'deliveries with no sweep due read the cached contexts {Counting.reads - 1} times'
+
+
 def test_old_sets_are_swept_at_most_once_a_day(tmp_path):
     hot = tmp_path / 'hot'
     for index in range(1, 13):
