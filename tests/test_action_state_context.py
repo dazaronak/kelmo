@@ -433,7 +433,7 @@ def test_session_start_strips_labels_whatever_the_source_id_holds(tmp_path, worl
     from kelmo.config import Config
     from kelmo.wiki.pages import KnowledgeReader
     root = tmp_path / 'odd-source-vault'
-    labels = tagged_person_vault(root, sources=('2026-10-05 person rule.md', 'odd]id'))
+    labels = tagged_person_vault(root, sources=('2026-10-05 person rule.md', 'odd]id\nnext line'))
     reader = KnowledgeReader(Config.load(root))
     person = reader.page('person.md', reader.generation()).content.decode('utf-8')
     assert all(label in person for label in labels)

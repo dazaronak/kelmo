@@ -201,9 +201,9 @@ def over_budget(text):
 
 def strip_evidence(text, registry, target):
     """`text`, the page `target`, without the fact and source labels of its fact rows: in its `<!-- kb -->`
-    regions, a line that is exactly the row the publisher writes for one of the page's registered facts becomes
-    that row without them. Status labels and every other line stay byte for byte, so no label is parsed and a
-    source id may hold any character."""
+    regions, whole lines that are exactly the row the publisher writes for one of the page's registered facts
+    become that row without them. Status labels and every other line stay byte for byte, so no label is parsed
+    and a source id may hold any character, a line break included (the row then spans lines)."""
     rows = {}
     for fact in registry['facts'].values():
         if fact['target'] == target:
@@ -212,7 +212,10 @@ def strip_evidence(text, registry, target):
         return text
     parts, rest = [], text
     while (start := rest.find(pages.KB_START)) >= 0 and (end := rest.find(pages.KB_END, start)) >= 0:
-        parts += [rest[:start], '\n'.join(rows.get(line, line) for line in rest[start:end].split('\n'))]
+        framed = '\n' + rest[start:end] + '\n'
+        for row, bare in rows.items():
+            framed = framed.replace('\n' + row + '\n', '\n' + bare + '\n')
+        parts += [rest[:start], framed[1:-1]]
         rest = rest[end:]
     return ''.join(parts) + rest
 

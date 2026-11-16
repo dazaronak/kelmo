@@ -89,10 +89,11 @@ def _render_generation(config, project, paths, budget, reader, *, generation=Non
     mandatory = [page.path for page in reader.mandatory(generation)]
     selected = [name for name in dict.fromkeys(paths) if name not in mandatory]
     blocks, pages = [], []
+    registry = reader.registry_view(generation) if mandatory else None
     for name in mandatory + selected:
         text = _published(reader, generation, name)
         if name in mandatory:
-            text = strip_evidence(text, reader.registry_view(generation), name)
+            text = strip_evidence(text, registry, name)
         blocks.append(f'## {name}\n\n{text}')
         pages.append({'path': name, 'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
                       'bytes': len(text.encode('utf-8'))})
