@@ -6,6 +6,15 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The edge core's status no longer gets ahead of a hook waiting for the outbox. Status read the outbox
+  only after a zero-timeout turn at the owner lock, and right after a hook had held it, that turn could
+  come before the next hook's. It now reads the outbox only while nobody holds the lock or waits for it.
+  Otherwise it answers at once with `"outbox": {"busy": true}`, where it used to answer
+  `{"error": "The edge core is busy ..."}`, the same shape as a failed read. A failed read still answers
+  `{"error": ...}`.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
