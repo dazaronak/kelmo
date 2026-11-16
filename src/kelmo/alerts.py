@@ -26,8 +26,12 @@ DREAM_RUNNING = 'dream-running.json'
 # How long the findings pass may answer idle while archived notes wait behind its cursor before the owner hears
 # of it: the daemon's run is daily, so two runs a day apart.
 DREAM_IDLE_SECONDS = 86400
+# A Dreaming alert the owner's command failed to take is tried again after this long, not on every tick.
+SEND_RETRY_SECONDS = 900
 # Refusals told by this process, for a state directory that cannot keep the record: {(file, command, work): time}.
 _REFUSALS_TOLD = {}
+# Dreaming alerts this process sent, for the same reason: {(file, kind): (time, delivered)}.
+_DREAM_SENT = {}
 
 
 def _when(epoch):
@@ -222,6 +226,25 @@ class DreamWatch(LoginWatch):
             self._running.write_text(json.dumps({'since': now}), encoding='utf-8')
         self._guarded(work)
 
+    def _held_back(self, kind, now):
+        """An alert this process already sent: one delivered waits as a told one does (_due), one the command
+        failed to take waits SEND_RETRY_SECONDS. What the watch file says is checked first."""
+        sent = _DREAM_SENT.get((str(self.marker), kind))
+        if sent is None:
+            return False
+        at, delivered = sent
+        return not self._due(at, now) if delivered else 0 <= now - at < SEND_RETRY_SECONDS
+
+    def _send_once(self, kind, text, now):
+        delivered = bool(self.send(text)) or not self.argv
+        _DREAM_SENT[(str(self.marker), kind)] = (now, delivered)
+        return delivered
+
+    def _forget_sent(self, *kinds):
+        mine = str(self.marker)
+        for key in [key for key in _DREAM_SENT if key[0] == mine and (not kinds or key[1][0] in kinds)]:
+            del _DREAM_SENT[key]
+
     def ended(self):
         """The run under way ended with something to tell (its answer, a failure, the core's stop)."""
         def work():
@@ -281,18 +304,20 @@ class DreamWatch(LoginWatch):
             records = self._records()
             told_failure = records['failed'] is not None and bool(records['failed']['told'])
             records['failed'] = None  # the run completed
+            self._forget_sent('failed')
             stuck = records['stuck'] or {'since': min(held, now), 'told': None}
             records['stuck'] = stuck
             last = stuck['told']
             # The hold's age decides the first message only; reminders follow _due, which a clock set back does
             # not silence.
-            if (last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due(last, now):
+            if ((last is not None or now - stuck['since'] >= DREAM_IDLE_SECONDS) and self._due(last, now)
+                    and not self._held_back(('stuck',), now)):
                 text = (f'{self.label}: the findings pass has read nothing since {_when(stuck["since"])} while '
                         f'{waiting} archived notes wait behind its cursor: an operation that never reached the '
                         'archive holds it.')
                 if last is not None:
                     text += f' Day {max(0, int((now - stuck["since"]) // REMINDER_SECONDS)) + 1}.'
-                if self.send(text) or not self.argv:
+                if self._send_once(('stuck',), text, now):
                     stuck['told'] = now
             self._keep(records)
             if told_failure:
@@ -307,15 +332,16 @@ class DreamWatch(LoginWatch):
             failed = records['failed'] or {'since': now, 'told': {}}
             records['failed'] = failed
             last = failed['told'].get(code)
-            if not self._due(last, now):
+            if not self._due(last, now) or self._held_back(('failed', code), now):
                 self._keep(records)
                 return
             text = (f'{self.label}: the Dreaming run failed with {code}: '
                     + ' '.join(str(reason).split())[:300] + '. It is tried again later.')
             if last is not None:
                 text += f' Failing since {_when(failed["since"])}.'
-            # The alert goes before its record, so a state directory that cannot be written does not silence it.
-            if self.send(text) or not self.argv:
+            # The alert goes before its record, so a state directory that cannot be written does not silence it;
+            # this process remembers it as well, so such a directory does not repeat it on every tick either.
+            if self._send_once(('failed', code), text, now):
                 failed['told'] = {**failed['told'], code: now}
             self._keep(records)
         self._guarded(work)
@@ -324,6 +350,7 @@ class DreamWatch(LoginWatch):
         now = time.time() if now is None else now
 
         def work():
+            self._forget_sent()
             if not self.marker.exists():
                 return
             records = self._records()

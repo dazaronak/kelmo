@@ -137,7 +137,8 @@ def dispatch(root, args):
         raise told.error from None
     except Exception as error:
         if not (isinstance(error, KelmoError) and error.code == "E_CONFIG" and str(error) == UNCONFIGURED):
-            tell_dream_watch(_alert_config(root), failure_outcome(error))
+            # Before the lock: no run of this call set the start mark, so a pass that holds the lock keeps its own.
+            tell_dream_watch(_alert_config(root), failure_outcome(error), run_ended=False)
         raise
 
 

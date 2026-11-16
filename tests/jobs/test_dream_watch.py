@@ -463,3 +463,67 @@ def test_a_schedule_probe_that_fails_while_a_run_holds_the_dreaming_lock_tells_n
         now[0] += 5
         jobs._tick()
     assert messages(tmp_path) == [], messages(tmp_path)
+
+
+def test_a_watch_file_that_cannot_be_written_tells_a_failure_once_a_day(tmp_path, monkeypatch):
+    # The state directory takes no write (here the watch file is a directory): the told time cannot be kept on
+    # disk, and a failing run tried on the next tick is still told once a day.
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, RuntimeError('the pass broke'), RuntimeError('the pass broke'),
+              RuntimeError('the pass broke'))
+    (tmp_path / '.state' / 'dream-watch.json').mkdir()
+    scheduled_run(jobs)
+    now[0] += 5
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    now[0] += DAY
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_failing_alert_command_is_tried_again_after_the_retry_delay_not_on_every_tick(tmp_path, monkeypatch):
+    # The owner's alert command fails: nothing reached the owner, so the alert is tried again, but not on every
+    # five-second tick of the scheduler.
+    from kelmo.alerts import SEND_RETRY_SECONDS
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    script = tmp_path / 'failing_alert.py'
+    script.write_text('import sys\nwith open(sys.argv[1], "a") as out:\n    out.write(sys.stdin.read() + "\\n")\n'
+                      'sys.exit(1)\n')
+    jobs.storage.writer.config.alerts = {'command': [sys.executable, str(script), str(tmp_path / 'messages.txt')],
+                                         'label': 'Server Kelmo'}
+    answering(monkeypatch, now, *[RuntimeError('the pass broke')] * 3)
+    scheduled_run(jobs)
+    now[0] += 5
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    now[0] += SEND_RETRY_SECONDS
+    scheduled_run(jobs)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+
+
+def test_a_cli_failure_before_the_lock_leaves_the_start_mark_of_a_pass_that_holds_it(tmp_path, monkeypatch):
+    # A daemon pass is under way (its start mark is set) when a timer's run fails before it takes the lock: the
+    # failure is told, and the mark stays for the pass that set it.
+    now = [START]
+    run = direct(tmp_path, monkeypatch, now, {'state': 'finished'})
+    running = tmp_path / '.state' / 'dream-running.json'
+    running.write_text('{"since": %d}' % START)
+    (tmp_path / '.state' / 'dreaming.lock').mkdir()
+    assert isinstance(run(), OSError)
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    assert running.exists()
+
+
+def test_a_daemon_failure_before_the_lock_leaves_the_start_mark_of_a_pass_that_holds_it(tmp_path, monkeypatch):
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now)
+    running = tmp_path / '.state' / 'dream-running.json'
+    running.write_text('{"since": %d}' % START)
+    (tmp_path / '.state' / 'dreaming.lock').mkdir()
+    with pytest.raises(OSError):
+        jobs._dream({'scheduled': True, 'action': 'run'})
+    assert len(messages(tmp_path)) == 1, messages(tmp_path)
+    assert running.exists()

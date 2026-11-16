@@ -265,7 +265,9 @@ class Jobs:
                     raise
         except Exception as error:  # the lock file itself, before any run: the owner hears of it too
             if action == 'run' and not told:
-                self._tell_dream_watch(failure_outcome(error))
+                # No start mark of this job's was set: one there belongs to a pass that holds the lock.
+                from ..dreaming_cli import tell_dream_watch
+                tell_dream_watch(self.storage.writer.config, failure_outcome(error), run_ended=False)
             raise
 
     @contextmanager
