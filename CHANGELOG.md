@@ -13,8 +13,9 @@ entry here.
   archive, and nothing behind it is read while it holds; before, both went to the worker log only. This covers the
   daemon's daily run and the runs of the timer `kelmo dream schedule` writes, and a daily run that cannot
   start because the daemon's check before it fails (an unreadable `kelmo.toml`, say) while no run is under
-  way. A timer run whose `kelmo.toml` cannot be read has no `[alerts]` command to use, and its failure stays
-  in the timer's output. A run whose process died, killed or out of memory, is told when the next run
+  way. A timer run that never reaches Kelmo is not heard and its error stays in the timer's output: its
+  `kelmo.toml` cannot be read, so there is no `[alerts]` command to use, or its command goes to an installed
+  daemon service that is stopped. A run whose process died, killed or out of memory, is told when the next run
   starts. The message goes to the `[alerts]` command once when it starts (for a held cursor, once the first
   waiting note has waited a day), once a calendar day while it lasts, even after the clock was set back, and
   once when a run completes again. An alert the command fails to take is sent again with the next failure or

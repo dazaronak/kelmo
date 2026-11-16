@@ -118,9 +118,11 @@ command = ["/usr/bin/python3", "-I", "/opt/kelmo/telegram-alert.py", "/etc/kelmo
 label = "Server Kelmo"
 ```
 
-The same command hears of every Dreaming run: the daemon's own daily run, and the
-runs of the timer `kelmo dream schedule` writes, which tell it from their own
-process. A run that fails (the findings pass answers `failed`, the run raises, or
+The same command hears of every Dreaming run that Kelmo starts: the daemon's own
+daily run, and the runs of the timer `kelmo dream schedule` writes. A timer run
+that never reaches Kelmo, because its `kelmo.toml` cannot be read or its command is
+routed to an installed daemon service that is stopped, is not heard; its error
+stays in the timer's output. A run that fails (the findings pass answers `failed`, the run raises, or
 its lock file cannot be opened) is told once when it fails and once a calendar day
 for each error code while it keeps failing; the run is still tried again as before.
 A findings pass that answers idle while archived notes wait behind its cursor means

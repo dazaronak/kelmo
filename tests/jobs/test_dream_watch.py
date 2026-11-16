@@ -304,7 +304,7 @@ def test_a_cli_result_is_told_before_its_lock_is_released(tmp_path, monkeypatch)
     now[0] += DAY
     run()
     assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
-    assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)
+    assert messages(tmp_path)[-1] == 'Server Kelmo: the Dreaming run completes again.', messages(tmp_path)
 
 
 def test_a_cli_failure_inside_its_lock_is_told_before_the_lock_is_released(tmp_path, monkeypatch):
@@ -325,7 +325,7 @@ def test_a_cli_failure_inside_its_lock_is_told_before_the_lock_is_released(tmp_p
     monkeypatch.setattr(dreaming_cli, '_dispatch', then_the_daemon_recovers)
     assert isinstance(run(), RuntimeError)
     assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
-    assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)
+    assert messages(tmp_path)[-1] == 'Server Kelmo: the Dreaming run completes again.', messages(tmp_path)
 
 
 def test_a_daemon_failure_is_told_before_its_lock_is_released(tmp_path, monkeypatch):
@@ -349,7 +349,7 @@ def test_a_daemon_failure_is_told_before_its_lock_is_released(tmp_path, monkeypa
     monkeypatch.setattr(jobs, '_dreaming_lock', then_a_cli_run_completes)
     assert isinstance(scheduled_run(jobs), RuntimeError)
     assert not (tmp_path / '.state' / 'dream-watch.json').exists(), messages(tmp_path)
-    assert messages(tmp_path)[-1].endswith('reads new evidence.'), messages(tmp_path)
+    assert messages(tmp_path)[-1] == 'Server Kelmo: the Dreaming run completes again.', messages(tmp_path)
 
 
 def test_a_schedule_probe_that_fails_while_the_daily_run_is_owed_is_told_to_the_owner(tmp_path, monkeypatch):
@@ -762,3 +762,34 @@ def test_a_run_by_hand_that_the_core_stop_cut_is_not_told_as_a_failure(tmp_path,
     answering(monkeypatch, now, {'state': 'finished'})
     jobs._dream({'action': 'run'})
     assert messages(tmp_path) == []
+
+
+def test_an_idle_recovery_whose_record_never_reached_the_file_is_not_sent_again_by_the_next_run(tmp_path):
+    # A told failure is in the watch file. The next run answers idle with notes waiting and sends the recovery,
+    # but the file takes no write, so it still holds the told failure. A run that completes later must not take
+    # that stale record for a new alert and send a second recovery.
+    from datetime import UTC, datetime
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    keep = watch._keep
+
+    def full(records):
+        raise OSError('no space left')
+    watch._keep = full
+    # The notes have waited an hour: no hold alert is due, so the only alert to recover is the failure.
+    since = datetime.fromtimestamp(START + 3600, UTC).isoformat()
+    watch.idle(2, now=START + 7200, since=since)
+    watch._keep = keep
+    watch.ran(START + 7260)
+    recoveries = [line for line in messages(tmp_path) if 'completes again' in line]
+    assert len(recoveries) == 1, messages(tmp_path)
+
+
+def test_a_recovery_does_not_claim_the_findings_pass_read_evidence(tmp_path):
+    # A completed run may have only skipped evidence larger than its budget: the recovery says the run completes,
+    # not that the pass read anything.
+    watch = _watch(tmp_path)
+    watch.failed('E_EXECUTOR', 'no findings answer', START)
+    watch.ran(START + 10)
+    assert len(messages(tmp_path)) == 2, messages(tmp_path)
+    assert messages(tmp_path)[-1] == 'K: the Dreaming run completes again.', messages(tmp_path)

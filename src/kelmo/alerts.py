@@ -449,11 +449,13 @@ class DreamWatch(LoginWatch):
             unkept = _DREAM_UNKEPT.pop(mine, None)
             for key in [key for key in _DREAM_TRIED if key[0] == mine]:
                 del _DREAM_TRIED[key]
-            # What this process told while the file took no write counts when the file itself tells nothing,
-            # unless the file then held a told alert and has changed since: whoever changed it saw that alert and
-            # owns its recovery. A file that never held one leaves the recovery to this process.
-            usable = unkept is not None and (unkept[0] == self._fingerprint() or not unkept[2])
-            on_file = self._records()
+            # While the file is as it was when it refused this process's write, this process's records are the
+            # state: the file may still hold an alert whose recovery was already sent. Once the file has changed,
+            # what this process told counts on top of it only if the file then held no told alert: whoever
+            # changed a file that held one saw that alert and owns its recovery.
+            current = unkept is not None and unkept[0] == self._fingerprint()
+            on_file = unkept[1] if current else self._records()
+            usable = unkept is not None and not current and not unkept[2]
             told = _told_in(on_file) or (usable and _told_in(unkept[1]))
             # Nothing told, but something went wrong that the owner never heard of: the recovery names it.
             missed = None if told else self._missed(on_file, now) or (usable and self._missed(unkept[1], now))
@@ -467,8 +469,8 @@ class DreamWatch(LoginWatch):
                     self.send(f'{self.label}: the Dreaming run completes again; no archived note waits behind '
                               "the findings pass's cursor any more.")
                 else:
-                    self.send(f'{self.label}: the Dreaming run completes again; the findings pass reads '
-                              'new evidence.')
+                    # A completed run may have only skipped evidence over its budget: it says no more than that.
+                    self.send(f'{self.label}: the Dreaming run completes again.')
         self._guarded(self._exclusive(work))
 
 
