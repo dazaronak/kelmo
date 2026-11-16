@@ -192,3 +192,21 @@ def test_a_resend_that_waits_for_the_client_lock_ends_inside_its_deadline(bridge
     assert result == {'refused': 'E_TRANSPORT'}, result
     assert ended < 3.5, ended
     assert requests(daemon) == [('search', None, None)]
+
+
+def test_a_keyed_write_cut_every_time_is_refused_on_its_third_cut_and_the_writes_behind_it_go(bridge):
+    # A write whose every delivery ends kelmod's channel (one that crashes the daemon, say) must not hold the
+    # outbox forever: on its third cut it is refused as having an unknown effect, as any cut write was before.
+    daemon, client = bridge(*[Connection(ANSWER, CLOSE) for _ in range(3)], Connection(ANSWER, ANSWER, ANSWER))
+    outcomes = []
+    for args, key in (({'content': 'Cut every time.', 'filename': 'cut.md'}, 'k-a'),
+                      ({'content': 'Queued behind it.', 'filename': 'behind.md'}, 'k-b')):
+        try:
+            outcomes.append(client.submit('create', args, key))
+        except KelmoError as error:
+            outcomes.append({'refused': error.code})
+    flushed = client.flush()
+    assert client.outbox.get('k-a')['state'] == 'refused', (outcomes, flushed)
+    assert json.loads(client.outbox.get('k-a')['outcome'])['code'] == 'E_TRANSPORT'
+    assert client.outbox.get('k-b')['state'] == 'delivered', (outcomes, flushed)
+    assert requests(daemon) == [('create', 'k-a', 'k-a')] * 3 + [('create', 'k-b', 'k-b')]

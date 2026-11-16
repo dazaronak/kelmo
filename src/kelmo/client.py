@@ -69,6 +69,8 @@ def utc_now():
 
 
 _RLOCK = type(threading.RLock())
+# Cuts after which a keyed write is refused instead of sent again under its key.
+CUT_LIMIT = 3
 
 
 class Unbound(KelmoError):
@@ -188,6 +190,9 @@ class Outbox:
                 op TEXT NOT NULL, args TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at TEXT NOT NULL,
                 settled_at TEXT, outcome TEXT)''')
+            # How often kelmod's channel ended under an entry after it was sent (`SharedClient._deliver`).
+            if 'cuts' not in {row[1] for row in self.conn.execute('PRAGMA table_info(entries)')}:
+                self.conn.execute('ALTER TABLE entries ADD COLUMN cuts INTEGER NOT NULL DEFAULT 0')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS transcripts (
                 provider TEXT NOT NULL, native_id TEXT NOT NULL, file_identity TEXT NOT NULL,
                 size INTEGER NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY (provider, native_id))''')
@@ -275,6 +280,13 @@ class Outbox:
     def attempt(self, key):
         with self.conn:
             self.conn.execute('UPDATE entries SET attempts=attempts+1 WHERE idempotency_key=?', (key,))
+
+    @_serial
+    def cut(self, key):
+        """Counts one more cut under the entry and returns the count."""
+        with self.conn:
+            self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
+        return self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
 
     @_serial
     def note(self, key, code):
@@ -1241,6 +1253,15 @@ class SharedClient:
                 if value['code'] == 'E_TRANSPORT':
                     # The bridge answered for a server it lost and has ended: the next pass opens a new one.
                     self._drop(channel)
+                    if self.outbox.cut(key) >= CUT_LIMIT:
+                        # A write that ends the channel every time it is delivered would hold every write
+                        # behind it: it is refused with its effect unknown, as a cut write was before.
+                        value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is '
+                                                    'not sent again.')
+                        outcome = {'code': value['code'], 'message': value['message']}
+                        self.outbox.settle(key, 'refused', outcome)
+                        refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
+                        continue
                 self.outbox.note(key, value['code'])
                 stopped = value['code']
                 break
