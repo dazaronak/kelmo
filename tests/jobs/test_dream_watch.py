@@ -739,3 +739,26 @@ def test_a_hold_that_ends_before_its_alert_was_due_tells_nothing(tmp_path):
     watch.idle(2, now=START, since=datetime.fromtimestamp(START - 23 * 3600, UTC).isoformat())
     watch.ran(START + 2 * 3600)
     assert messages(tmp_path) == []
+
+
+def test_a_run_by_hand_that_the_core_stop_cut_is_not_told_as_a_failure(tmp_path, monkeypatch):
+    # `kelmo dream run` through the daemon (not scheduled): the core starts to stop, and the run's next call to
+    # another core fails as a KelmoError. The stop caused it: nothing is told, now or as a died run later.
+    from kelmo import dreaming_cli
+    from kelmo.errors import KelmoError
+    now = [START]
+    jobs = scheduler(tmp_path, now)
+    answering(monkeypatch, now, {'state': 'finished'})
+
+    def stopped_after_start(*args, **kwargs):
+        kwargs['on_start']()
+        jobs._stop.set()
+        raise KelmoError('E_UNAVAILABLE', 'The core is stopping.')
+
+    monkeypatch.setattr(dreaming_cli, 'run_dream', stopped_after_start)
+    with pytest.raises(KelmoError):
+        jobs._dream({'action': 'run'})
+    jobs._stop.clear()
+    answering(monkeypatch, now, {'state': 'finished'})
+    jobs._dream({'action': 'run'})
+    assert messages(tmp_path) == []

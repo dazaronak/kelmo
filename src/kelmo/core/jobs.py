@@ -344,13 +344,13 @@ class Jobs:
             stopped = True  # _dream puts the try state back
             raise
         except Exception:
-            if daily:
-                # Decided once: a failure while the core stops is the stop's, and _dream gives its try back; any
-                # other keeps its try and waits from now, even if a stop arrives right after.
-                if self.should_stop():
-                    self._dream_stop_cut = True
-                else:
-                    self._record_dream_try_end()
+            # Decided once, for every run: a failure while the core stops is the stop's (not told, and for the
+            # daily run _dream gives its try back); any other keeps its try and waits from now, even if a stop
+            # arrives right after.
+            if self.should_stop():
+                self._dream_stop_cut = True
+            elif daily:
+                self._record_dream_try_end()
             raise
         finally:
             if scheduled and action == 'apply' and getattr(self, '_apply_started', False):
