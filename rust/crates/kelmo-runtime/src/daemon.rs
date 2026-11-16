@@ -105,19 +105,19 @@ pub async fn serve(spec: Spec, ephemeral: bool) -> i32 {
 pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> i32 {
     if ephemeral && front.is_some() {
         // An ephemeral daemon counts socket clients only and would stop under live HTTP sessions.
-        eprintln!("E_CONFIG: an ephemeral daemon serves no HTTP endpoint");
+        crate::logln!("E_CONFIG: an ephemeral daemon serves no HTTP endpoint");
         return EXIT_CONFIG;
     }
     let _lock = match ipc::InstanceLock::acquire(&spec.state_dir.join("daemon.lock")) {
         Ok(lock) => lock,
         Err(message) => {
-            eprintln!("E_BUSY: {message}");
+            crate::logln!("E_BUSY: {message}");
             return EXIT_BUSY;
         }
     };
     let open_files = crate::sys::raise_open_files(OPEN_FILES);
     if open_files < MIN_OPEN_FILES {
-        eprintln!(
+        crate::logln!(
             "kelmod: the open-file limit is {open_files}; connections past it wait for a free descriptor"
         );
     }
@@ -129,21 +129,21 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
     {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("E_RUNTIME: {error}");
+            crate::logln!("E_RUNTIME: {error}");
             return 1;
         }
     };
     let listener = match ipc::bind(&runtime) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("E_RUNTIME: {}: {error}", runtime.display());
+            crate::logln!("E_RUNTIME: {}: {error}", runtime.display());
             return 1;
         }
     };
     let front = match front.map(|prepare| prepare()).transpose() {
         Ok(front) => front,
         Err(message) => {
-            eprintln!("E_CONFIG: {message}");
+            crate::logln!("E_CONFIG: {message}");
             let _ = std::fs::remove_file(ipc::socket_path(&runtime));
             return EXIT_CONFIG;
         }
@@ -244,15 +244,15 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
             ended = &mut router_task => {
                 router_lost = true;
                 match ended {
-                    Err(error) if error.is_panic() => eprintln!("kelmod: the router panicked; stopping"),
-                    _ => eprintln!("kelmod: the router stopped before a shutdown; stopping"),
+                    Err(error) if error.is_panic() => crate::logln!("kelmod: the router panicked; stopping"),
+                    _ => crate::logln!("kelmod: the router stopped before a shutdown; stopping"),
                 }
                 break EXIT_ROUTER;
             }
             _ = stall_check.tick() => {
                 let age = beat.age();
                 if !router_alive(age, ROUTER_STALL) {
-                    eprintln!("kelmod: the router has handled no event for {} ms; stopping", age.as_millis());
+                    crate::logln!("kelmod: the router has handled no event for {} ms; stopping", age.as_millis());
                     router_lost = true;
                     break EXIT_ROUTER;
                 }
@@ -267,7 +267,7 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
                 if ping.is_some_and(|interval| router_alive(age, interval)) {
                     notify("WATCHDOG=1");
                 } else {
-                    eprintln!("kelmod: the router has handled no event for {} ms; no watchdog ping", age.as_millis());
+                    crate::logln!("kelmod: the router has handled no event for {} ms; no watchdog ping", age.as_millis());
                 }
             }
             idle = async {

@@ -193,7 +193,7 @@ async fn run_core(
     let mut commands_open = true;
     loop {
         if charge_restart && !budget.restart(Instant::now()) {
-            eprintln!(
+            crate::logln!(
                 "kelmod: core {} restarted more than {restart_max} times within {} s; giving up, kelmod exits {}",
                 core.name,
                 restart_window.as_secs(),
@@ -207,7 +207,7 @@ async fn run_core(
         let (mut child, stream) = match spawn(&core) {
             Ok(spawned) => spawned,
             Err(error) => {
-                eprintln!(
+                crate::logln!(
                     "kelmod: core {} could not be started ({error}); trying again",
                     core.name
                 );
@@ -252,10 +252,10 @@ async fn run_core(
                     match status {
                         _ if stopping => {}
                         Ok(_) if planned_restart => {
-                            eprintln!("kelmod: core {} stopped for its planned restart; starting it again", core.name);
+                            crate::logln!("kelmod: core {} stopped for its planned restart; starting it again", core.name);
                         }
-                        Ok(status) => eprintln!("kelmod: core {} exited ({status}); restarting it", core.name),
-                        Err(error) => eprintln!(
+                        Ok(status) => crate::logln!("kelmod: core {} exited ({status}); restarting it", core.name),
+                        Err(error) => crate::logln!(
                             "kelmod: core {} ended and its status could not be read ({error}); restarting it",
                             core.name
                         ),
@@ -281,11 +281,11 @@ async fn run_core(
                     };
                     let then = if stopping { "" } else { "; restarting it" };
                     match (reason, exited) {
-                        (Some(reason), _) => eprintln!(
+                        (Some(reason), _) => crate::logln!(
                             "kelmod: the channel of core {} stopped ({reason}){then}", core.name),
-                        (None, Some(status)) => eprintln!(
+                        (None, Some(status)) => crate::logln!(
                             "kelmod: core {} exited ({status}){then}", core.name),
-                        (None, None) => eprintln!(
+                        (None, None) => crate::logln!(
                             "kelmod: the channel of core {} stopped{then}", core.name),
                     }
                     sys::kill_group(pid);
@@ -335,7 +335,7 @@ async fn run_core(
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    eprintln!(
+                    crate::logln!(
                         "kelmod: core {} did not stop within its drain time of {} s; killing it",
                         core.name,
                         drain.as_secs()
