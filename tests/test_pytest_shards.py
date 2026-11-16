@@ -72,6 +72,40 @@ class PytestShardsTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertTrue(done.stdout.splitlines()[-1].startswith('4 passed in '), done.stdout)
 
+    def test_a_selection_that_matches_nothing_is_not_called_a_collection_failure(self):
+        summary = self.root / 'summary.md'
+        done = self.shards('-k', 'nothing_matches_this', GITHUB_STEP_SUMMARY=str(summary))
+        self.assertEqual(done.returncode, 5, done.stdout)
+        self.assertNotIn('collection failed', summary.read_text())
+        self.assertIn('no tests collected', summary.read_text())
+
+    def test_a_coloured_collection_error_still_names_the_module(self):
+        (self.root / 'test_broken.py').write_text('def test_e(:\n')
+        summary = self.root / 'summary.md'
+        self.shards(PY_COLORS='1', GITHUB_STEP_SUMMARY=str(summary))
+        self.assertIn('test_broken.py', summary.read_text())
+
+    def test_the_summary_block_starts_on_a_line_of_its_own(self):
+        summary = self.root / 'summary.md'
+        summary.write_text('earlier step text without a line end')
+        self.shards(GITHUB_STEP_SUMMARY=str(summary))
+        self.assertIn('\n### pytest\n', summary.read_text())
+
+    def test_a_shard_whose_cases_were_all_dropped_says_so(self):
+        (self.root / 'conftest.py').write_text(
+            'def pytest_collection_modifyitems(config, items):\n'
+            '    if not config.option.collectonly:\n'
+            '        items[:] = [item for item in items if item.name not in ("test_a", "test_c")]\n')
+        done = self.shards(width='2')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertNotIn('without a pytest summary', done.stdout)
+        self.assertIn('2 never ran', done.stdout)
+
+    def test_an_unwritable_step_summary_costs_the_run_nothing(self):
+        done = self.shards(GITHUB_STEP_SUMMARY=str(self.root / 'missing' / 'summary.md'))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('step summary not written', done.stderr)
+
     def test_an_option_whose_value_is_the_next_argument_keeps_it(self):
         done = self.shards('--deselect', 'test_four.py::test_a')
         self.assertEqual(done.returncode, 0, done.stdout)

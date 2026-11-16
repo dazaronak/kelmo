@@ -28,7 +28,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-SUMMARY = re.compile(r'^=*\s*\d+ [a-z]+.*\bin [\d.]+s\b')
+SUMMARY = re.compile(r'^=*\s*(?:\d+ [a-z]+.*|no tests ran) in [\d.]+s\b')
 COUNT = re.compile(r'(\d+) (failed|passed|skipped|errors?|xfailed|xpassed|warnings?|deselected)')
 REPORT = re.compile(r'^(?:FAILED|ERROR|SUBFAILED|SKIPPED|XFAIL|XPASS)\b')
 ORDER = ('failed', 'passed', 'skipped', 'error', 'xfailed', 'xpassed', 'warning', 'deselected')
@@ -80,9 +80,10 @@ def collect(args):
     quiet = [arg for arg in args if arg not in ('-q', '-qq', '--quiet')]
     done = subprocess.run([sys.executable, '-c', COLLECTOR, '--collect-only', '-q', '-p', 'no:cacheprovider', *quiet],
                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
-    lines = done.stdout.splitlines()
+    lines = COLOUR.sub('', done.stdout).splitlines()
     roots = [line[len(ROOTDIR):] for line in lines if line.startswith(ROOTDIR)]
     done.stdout = ''.join(line + '\n' for line in lines if not line.startswith(ROOTDIR))
+    done.stderr = COLOUR.sub('', done.stderr)
     ids = [line.strip() for line in lines if '::' in line and not line.startswith((' ', ROOTDIR))]
     return done, ids, (roots[-1] if roots else None)
 
@@ -119,7 +120,8 @@ def main(args):
         sys.stdout.write(collected.stderr)
         code = collected.returncode or 5
         errors = [line for line in shown + collected.stderr.splitlines() if line.startswith('ERROR')]
-        step_summary(errors, 'collection failed (pytest exit %d): no case ran' % code,
+        what = 'no tests collected' if code == 5 else 'collection failed'
+        step_summary(errors, '%s (pytest exit %d): no case ran' % (what, code),
                      '%d cases collected in %.2fs' % (len(ids), time.time() - started))
         return code
     if root:
@@ -186,7 +188,7 @@ def step_summary(reports, passed, summary):
     lines += ['    ' + line for line in reports]
     try:
         with open(target, 'a', encoding='utf-8') as out:
-            out.write('\n'.join(lines) + '\n')
+            out.write('\n' + '\n'.join(lines) + '\n')  # a line of its own after another step's text
     except OSError as error:
         print('step summary not written: %s' % error, file=sys.stderr)
 
