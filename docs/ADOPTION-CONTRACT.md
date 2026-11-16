@@ -368,7 +368,9 @@ preserving the journal schema for vaults that never dream.
   Purged operations (a `purged` event) are left out, and `_packet` passes a forgotten or purged
   record. Dreaming's own notes (filename starting with `dreaming-` or recorded in
   `dream_findings.note_operation_id`) are skipped and never treated as evidence. A 0.3.1 cursor
-  `[created_at, id]` is converted once, with a `seen` list of operations that build already read.
+  `[created_at, id]` is converted once, with a `seen` list of operations that build already read; an
+  operation at or before it with a `failed` event before its first durable event is not in `seen` and is
+  read again, since 0.3.1 may have passed it unread.
 - Pinned context and budget: `Dreaming._packet` gathers evidence text via `Service.show` and calls
   `Dreaming._related` to find related non-person pages citing the evidence archive IDs, followed
   by their graph neighbours. Evidence items whose cost exceeds `budget_tokens` are recorded in

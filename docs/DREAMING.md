@@ -44,9 +44,12 @@ back: the first pass after it is archived reads it. A finished pass never reads
 a note again, and a pass with nothing new answers `idle`. A pass that fails,
 defers or stops keeps the cursor, so the next pass reads the same evidence. A
 forgotten or purged record is passed. A cursor written by Kelmo 0.3.1 is
-converted on the first pass after the upgrade: what that build read is not read
-again, and what it had not reached is read, including a note it passed because
-the note had failed and that was archived later. The 0.3.1 build cannot read
+converted on the first pass after the upgrade: what that build had not reached
+is read, including a note it passed because the note had failed and that was
+archived later, and what it read is not read again, with one exception. A note
+at or before the old cursor that failed and was archived after a retry may be
+read once more: the 0.3.1 journal cannot show whether that build read it, and
+reading it twice is better than never reading it. The 0.3.1 build cannot read
 the converted cursor.
 
 `apply` keeps capture order. It takes only notes captured before the pass began,
