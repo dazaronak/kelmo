@@ -281,14 +281,33 @@ def test_a_session_end_whose_intake_opened_late_still_ends_inside_its_deadline(t
     assert seconds < deadline - began + 0.2, seconds
 
 
-def test_a_lent_journal_whose_commit_never_meets_a_free_reader_is_left_without_a_transaction(tmp_path):
-    """A reader holds the journal for longer than every attempt: each commit is refused, and the state core's
-    writer journal is handed back with no transaction open, so the baton gives it back cleanly and the hook
-    answers E_BUSY (retryable) rather than a processing failure."""
+def test_a_lent_journal_whose_commit_never_meets_a_free_reader_is_left_without_a_transaction(tmp_path,
+                                                                                            monkeypatch):
+    """A reader starts after the first attempt has parsed its transcript and outlasts every attempt: that
+    attempt's commit is refused, and the state core's writer journal is handed back with no transaction open, so
+    the baton gives it back cleanly and the hook answers E_BUSY (retryable) rather than a processing failure."""
+    import kelmo.sessions as sessions_module
+
     root, source = prepared(tmp_path)
+    original = sessions_module.parse
+    readers = []
+
+    def reading_parse(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not readers:
+            reader = journal_read(root, 6.0)
+            reader.__enter__()
+            readers.append(reader)
+        return result
+
+    monkeypatch.setattr(sessions_module, 'parse', reading_parse)
     with lent(root) as journal:
-        with journal_read(root, 6.0):
+        try:
             outcome = state_core_hook(root, source, 'session-end', journal)
+        finally:
+            for reader in readers:
+                reader.__exit__(None, None, None)
+        assert readers, 'no reader was started'
         assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
         assert not journal.conn.in_transaction
         assert answers(journal)
