@@ -134,8 +134,8 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
             return {}
         except KelmoError as error:
             took=time.monotonic()-began
-            # An attempt that waited for a locked journal outside its write transaction runs out of its own time
-            # (E_CAPTURE_RETRY) just as one refused inside it does (E_BUSY): both are tried again.
+            # An attempt that ran out of its own budget (E_CAPTURE_RETRY) is tried again like one the journal
+            # refused (E_BUSY), as long as the time left is not shorter than the attempt took (checked above).
             if error.code not in ('E_BUSY','E_CAPTURE_RETRY'):
                 raise
             last=error
