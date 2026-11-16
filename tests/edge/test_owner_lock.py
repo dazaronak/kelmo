@@ -102,6 +102,49 @@ def test_urgent_waiter_gets_the_lock_before_an_earlier_ordinary_waiter(monkeypat
     assert order == ['urgent', 'ordinary']
 
 
+def test_a_new_ordinary_caller_never_goes_ahead_of_a_woken_ordinary_waiter(monkeypatch):
+    """The holder releases; the ordinary waiter it woke has not yet taken the condition back when another ordinary
+    caller arrives. The newcomer must not take the lock ahead of the waiter."""
+    lock = OwnerLock()
+    arrived = threading.Semaphore(0)
+    woken, gate = threading.Event(), threading.Event()
+    wait = lock._condition.wait
+
+    def wait_then_pause_once(timeout=None):
+        arrived.release()
+        result = wait(timeout)
+        if not woken.is_set():
+            # Woken: give the condition up for a moment, as a scheduler may, before re-checking the turn.
+            woken.set()
+            lock._condition._lock.release()
+            gate.wait(5)
+            lock._condition._lock.acquire()
+        return result
+
+    monkeypatch.setattr(lock._condition, 'wait', wait_then_pause_once)
+    order = []
+
+    def take_and_record(name, timeout):
+        got = lock.acquire(timeout=timeout)
+        if got:
+            order.append(name)
+            lock.release()
+        return got
+
+    lock.acquire()
+    waiter = call_in_thread(take_and_record, 'waiter', 5)
+    assert arrived.acquire(timeout=5)
+    lock.release()
+    assert woken.wait(5)
+    newcomer = call_in_thread(take_and_record, 'newcomer', 0)
+    try:
+        assert newcomer() is False, order
+    finally:
+        gate.set()
+    assert waiter() is True
+    assert order == ['waiter']
+
+
 def test_timed_out_urgent_waiter_does_not_hold_back_ordinary_waiters(monkeypatch):
     lock = OwnerLock()
     arrived = count_waits(lock, monkeypatch)

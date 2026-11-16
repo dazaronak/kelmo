@@ -14,6 +14,9 @@ entry here.
   Otherwise it answers at once with `"outbox": {"busy": true}`, where it used to answer
   `{"error": "The edge core is busy ..."}`, the same shape as a failed read. A failed read still answers
   `{"error": ...}`.
+- Tool calls that write through the edge core now take the outbox in the order they came. A new call could
+  take it ahead of an earlier one that had just been woken, and a busy session could keep another session's
+  write waiting until its deadline. Hooks keep their turn ahead of tool calls, also in arrival order.
 
 ## [0.3.1] - 2026-11-15
 
