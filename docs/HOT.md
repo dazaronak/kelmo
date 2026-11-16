@@ -138,7 +138,8 @@ next delivery. It also
 removes a session's delivery record no delivery has written for 30 days; such a
 session, if it resumes, gets the whole context once as a new one does, with no
 restart notice, since nothing records what it was given.
-A saved context reference that no delivery has used for 30 days goes the same way.
+A saved context reference that no delivery has shown for 30 days goes the same way;
+the one-line marker of an unchanged prompt shows none.
 
 Codex managed blocks contain the published combined view. Bound work and pending
 notes travel through the hook and are not persisted into the repository's instruction file.

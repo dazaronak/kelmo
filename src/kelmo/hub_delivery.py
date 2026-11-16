@@ -298,8 +298,6 @@ def context_reference(root, data):
     if path.is_symlink():
         raise KelmoError('E_CACHE', 'Context reference file is unsafe.')
     if path.is_file() and path.read_bytes() == raw:
-        # Used again: the sweep (prune_sets) counts a reference's age from its last use.
-        os.utime(path)
         return path
     fd, name = tempfile.mkstemp(prefix='.context-', dir=directory)
     try:
@@ -516,9 +514,9 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
     if previous and previous != _hash(identity.encode('utf-8')):
         reserve += len(RESTART_WARNING)
     complete = provider != 'claude' or len(full) <= 10000 - reserve
+    reference = None
     if not complete:
         current = current() if callable(current) else current
-        reference = None
         def omitted_source(field):
             nonlocal reference
             if reference is None:
@@ -564,7 +562,18 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
                         and str(path) in context), None)
         if not sync_failed and settled:
             acknowledge(functools.partial(update['commit'], pointed))
+    if reference is not None and str(reference) in context:
+        _used(reference)
     return context
+
+
+def _used(reference):
+    """A delivery showed this reference's path: the sweep (prune_sets) counts its age from that use. A marker
+    that shows no path is no use."""
+    try:
+        os.utime(reference)
+    except OSError:
+        pass
 
 
 def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
@@ -577,6 +586,7 @@ def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
         return context
     reference = context_reference(root, {'context': context, 'pending': pending,
                                          'generation': delivered.get('generation')})
+    _used(reference)
     pointer = ('Kelmo HOT exceeds the hook limit. Read the complete saved context and pending updates at '
                + str(reference) + ' (context and pending fields).')
     return '\n\n'.join(part for part in (warning, pointer, notice) if part)

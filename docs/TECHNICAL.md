@@ -365,8 +365,10 @@ Hook delivery acknowledges only after stdout flush succeeds. Pending read failur
 published HOT available with a warning and no acknowledgement. Local view pointers use
 the existing immutable set cache; omitted work/pending and legacy context use private
 content-addressed JSON references under `hub-context`. Those files retain the complete
-source for the emitted pointer, including during offline delivery, until no delivery
-has used one for 30 days; the client's daily sweep then removes it.
+source for the emitted pointer, including during offline delivery. The daily sweep that
+runs when a HOT set is installed removes one that no delivery has shown for 30 days; a
+delivery that only shows the unchanged marker does not count, and where no set is ever
+installed (legacy context without views) nothing is swept.
 
 ## Verification and context pitfalls
 
