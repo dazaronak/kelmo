@@ -442,13 +442,15 @@ async fn v1_request(
                 }
                 Err(_) => {
                     // Sent and unanswered: whether it took effect is unknown, so only a keyed request may
-                    // go again.
-                    let refusal = v1_refusal(
+                    // go again. `cut` tells the client this is the bridge losing the daemon, not a server's
+                    // own refusal, so it can count the cuts of one write.
+                    let mut refusal = v1_refusal(
                         request_id,
                         "E_TRANSPORT",
                         "The daemon closed the channel; the effect of the request is unknown.",
                         keyed,
                     );
+                    refusal["error"]["cut"] = Value::Bool(true);
                     return Outcome::End(Some(refusal), 1);
                 }
             },

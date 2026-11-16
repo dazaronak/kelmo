@@ -35,11 +35,12 @@ def daemon():
         each.close()
 
 
-def outcome(daemon, op, body=None, *, seconds=5.0, key=None):
+def outcome(daemon, op, body=None, *, seconds=5.0, key=None, resend=False):
     """('ok', result, elapsed) or ('error', code, retryable, message, elapsed) of one call."""
     started = time.monotonic()
     try:
-        result = daemon_client.call(daemon.directory, op, body, seconds=seconds, key=key, path=daemon.path)
+        result = daemon_client.call(daemon.directory, op, body, seconds=seconds, key=key, path=daemon.path,
+                                    resend=resend)
     except KelmoError as error:
         return ('error', error.code, getattr(error, 'retryable', None), str(error), time.monotonic() - started)
     except Exception as error:  # noqa: BLE001 - an untyped failure is itself the wrong outcome
@@ -212,3 +213,44 @@ def test_a_resend_whose_connect_never_completes_ends_at_the_deadline(daemon, mon
     assert got[:2] == ('error', 'E_DEADLINE'), got
     assert got[-1] < 2.5, got
     assert len(peer.calls) == 1
+
+
+def test_a_keyless_write_cut_on_its_second_attempt_reports_its_effect_unknown(daemon):
+    # The first connection ends before its hello is answered, so nothing was sent and the call goes again; the
+    # second cuts it after it was sent. That write may have taken effect, and the caller must hear so.
+    peer = daemon(Connection(hello=False), Connection(CLOSE), Connection(ANSWER))
+    got = outcome(peer, 'state.cli', {'argv': ['create']})
+    assert got[0] == 'error', got
+    assert got[1] == 'E_TRANSPORT' and got[2] is False, got
+    assert 'unknown' in got[3], got
+    assert len(peer.calls) == 1
+
+
+def test_a_cli_call_its_caller_marks_safe_to_resend_is_sent_again_after_a_cut(daemon):
+    peer = daemon(Connection(CLOSE), Connection(ANSWER))
+    got = outcome(peer, 'state.cli', {'argv': ['search', 'x']}, resend=True)
+    assert got[:2] == ('ok', {'answer': 2}), got
+    assert [header['op'] for header, _body in peer.calls] == ['state.cli', 'state.cli']
+
+
+@pytest.mark.parametrize('argv,resend', [
+    (['search', 'x'], True),
+    (['show', 'm-1'], True),
+    (['queue', 'list'], True),
+    (['create', '--text', 'A note.', '--project', 'p', '--idempotency-key', 'k-1'], True),
+    (['create', '--text', 'A note.', '--project', 'p'], False),
+    (['forget', 'm-1'], False),
+])
+def test_the_cli_lets_a_read_or_a_keyed_write_be_sent_again(tmp_path, monkeypatch, argv, resend):
+    """A command that changes nothing, or a write whose own key the server settles once, may go again after a
+    cut; any other CLI call may have taken effect."""
+    from kelmo import cli
+    from kelmo.interface import build_parser
+    parser, _commands = build_parser('0')
+    args = parser.parse_args([*argv, '--vault', str(tmp_path)])
+    calls = []
+    monkeypatch.setattr(daemon_client, 'ensure', lambda root, **kwargs: tmp_path / 'kelmod.sock')
+    monkeypatch.setattr(daemon_client, 'call', lambda root, op, body, **kwargs: calls.append((op, kwargs))
+                        or {'ok': True})
+    cli.through_daemon(args, [*argv, '--vault', str(tmp_path)], str(tmp_path / 'kelmo'))
+    assert [(op, kwargs.get('resend', False)) for op, kwargs in calls] == [('state.cli', resend)]

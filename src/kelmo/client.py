@@ -1080,7 +1080,7 @@ class SharedClient:
         if not isinstance(error.get('code'), str) or type(error.get('retryable')) is not bool:
             raise Unbound('E_TRANSPORT', 'The refusal names no server code or retryability.')
         return False, {'code': error['code'], 'message': str(error.get('message', '')),
-                       'retryable': error['retryable']}
+                       'retryable': error['retryable'], 'cut': error.get('cut') is True}
 
     def _connect(self):
         # One thread connects; the others wait for its channel instead of starting their own.
@@ -1251,9 +1251,10 @@ class SharedClient:
                 continue
             if value['retryable']:
                 if value['code'] == 'E_TRANSPORT':
-                    # The bridge answered for a server it lost and has ended: the next pass opens a new one.
+                    # The bridge may have lost its server and ended: the next pass opens a new one.
                     self._drop(channel)
-                    if self.outbox.cut(key) >= CUT_LIMIT:
+                    # Only the bridge's own cut counts; a server's retryable E_TRANSPORT leaves it pending.
+                    if value['cut'] and self.outbox.cut(key) >= CUT_LIMIT:
                         # A write that ends the channel every time it is delivered would hold every write
                         # behind it: it is refused with its effect unknown, as a cut write was before.
                         value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is '

@@ -91,10 +91,11 @@ def _frames(sock, reader, until):
             return frames
 
 
-def _resendable(op, key):
-    """Whether a call cut after it was sent may go once more: kelmod's own replay rule (operations.py)."""
+def _resendable(op, key, resend=False):
+    """Whether a call cut after it was sent may go once more: kelmod's own replay rule (operations.py), or the
+    caller's word that this call changes nothing or carries its own idempotency key (`resend`)."""
     from .operations import REPLAY_KEYED, REPLAY_READ, by_name
-    if op == 'daemon.status':  # served by kelmod itself, outside the cores' operation table
+    if resend or op == 'daemon.status':  # daemon.status is served by kelmod itself, outside the operation table
         return True
     found = by_name().get(op)
     replay = found.replay if found is not None else None
@@ -150,12 +151,21 @@ def _attempt(sock, op, body, key, until, deadline_ms):
             raise _Cut(sent) from error
 
 
-def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
+def _unknown(cause):
+    error = KelmoError('E_TRANSPORT', 'The daemon closed the connection after the call was sent; its effect is '
+                                      'unknown.')
+    error.retryable = False
+    return error
+
+
+def call(root, op, body=None, *, seconds=60.0, key=None, path=None, resend=False):
     """One call to the daemon of `root`; returns the reply body or raises KelmoError with its verdict.
 
     A channel cut under the call (kelmod stopping, restarting or crashing) is met by kelmod's own replay
     rule: a call cut before it was sent, a read, or a write under a key goes once more inside the deadline;
-    any other write is not sent again and is reported with its effect unknown."""
+    any other write is not sent again and is reported with its effect unknown. `resend=True` is the caller's
+    word that the call is safe to send again although its op is not a read: a CLI command that changes
+    nothing, or one under its own idempotency key."""
     target = str(path or socket_path(root))
     if not _trusted(target):
         raise KelmoError('E_TRANSPORT', f'The daemon directory of {target} is not private to this user.')
@@ -164,11 +174,8 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
         until = limit + GRACE_SECONDS
         reply, result = _attempt(_connect(target, until), op, body, key, until, int(seconds * 1000))
     except _Cut as cut:
-        if cut.sent and not _resendable(op, key):
-            error = KelmoError('E_TRANSPORT', 'The daemon closed the connection after the call was sent; '
-                                              'its effect is unknown.')
-            error.retryable = False
-            raise error from cut
+        if cut.sent and not _resendable(op, key, resend):
+            raise _unknown(cut) from cut
         if limit - time.monotonic() <= 0:
             raise KelmoError('E_DEADLINE', 'The daemon did not answer in time.') from cut
         sock = _connect(target, limit, min(limit, time.monotonic() + RECONNECT_SECONDS))
@@ -179,7 +186,11 @@ def call(root, op, body=None, *, seconds=60.0, key=None, path=None):
         try:
             reply, result = _attempt(sock, op, body, key, limit, int(left * 1000))
         except _Cut as again:
-            raise KelmoError('E_TRANSPORT', 'The daemon closed the connection again.') from again
+            if again.sent and not _resendable(op, key, resend):
+                raise _unknown(again) from again
+            error = KelmoError('E_TRANSPORT', 'The daemon closed the connection again.')
+            error.retryable = True  # nothing was sent the second time, or the call is safe to send again
+            raise error from again
     if reply.get('ok'):
         return result
     error = KelmoError(reply['error']['code'], reply['error']['message'])

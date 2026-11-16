@@ -62,8 +62,8 @@ def bridge(tmp_path):
         pytest.fail(f'kelmod is missing at {KELMOD}: build it with tools/build_kelmod.sh', pytrace=False)
     made = []
 
-    def make(*script):
-        daemon = ScriptedDaemon(*script, answer=v1_answer)
+    def make(*script, answer=v1_answer):
+        daemon = ScriptedDaemon(*script, answer=answer)
         command = [str(KELMOD), 'attach', '--client-id', CLIENT_ID, '--protocol', '1',
                    '--runtime-dir', str(daemon.directory)]
         root = tmp_path / f'client-{len(made)}'
@@ -210,3 +210,31 @@ def test_a_keyed_write_cut_every_time_is_refused_on_its_third_cut_and_the_writes
     assert json.loads(client.outbox.get('k-a')['outcome'])['code'] == 'E_TRANSPORT'
     assert client.outbox.get('k-b')['state'] == 'delivered', (outcomes, flushed)
     assert requests(daemon) == [('create', 'k-a', 'k-a')] * 3 + [('create', 'k-b', 'k-b')]
+
+
+def test_a_keyed_write_the_server_refuses_retryable_e_transport_stays_pending_past_three_refusals(bridge):
+    # The bridge answers a server's own refusal and keeps its channel: that is no cut, so however often the
+    # server says E_TRANSPORT, retryable, the write stays pending and goes once the server takes it.
+    creates = []
+
+    def answer(header, body, number):
+        request = body['request']
+        if request['op'] == 'create':
+            creates.append(number)
+            if len(creates) <= 3:
+                return {'protocol': PROTOCOL, 'request_id': request['request_id'], 'ok': False,
+                        'error': {'code': 'E_TRANSPORT', 'message': 'A call between cores was cut.',
+                                  'retryable': True}}
+        return v1_answer(header, body, number)
+
+    daemon, client = bridge(*[Connection(ANSWER, ANSWER) for _ in range(4)], answer=answer)
+    try:
+        client.submit('create', {'content': 'Refused by the server.', 'filename': 'refused.md'}, 'k-a')
+    except KelmoError:
+        pass
+    for _ in range(6):
+        if client.outbox.get('k-a')['state'] != 'pending' or len(creates) >= 4:
+            break
+        client.flush()
+    assert client.outbox.get('k-a')['state'] == 'delivered', (creates, client.outbox.get('k-a'))
+    assert requests(daemon) == [('create', 'k-a', 'k-a')] * 4

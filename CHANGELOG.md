@@ -20,18 +20,20 @@ entry here.
   that was sent and then cut as final, even when it carried an idempotency key, so the client's outbox
   settled the note as refused for good. A keyed request is now refused as retryable: the note stays pending
   and the next flush sends it again under the same key. On its third cut it is refused as before, so a note
-  that ends the channel every time cannot hold the notes behind it. A request without a key is still refused,
-  with its effect reported as unknown.
+  that ends the channel every time cannot hold the notes behind it. Only a cut counts: a retryable refusal the
+  server itself gives leaves the note pending however often it comes. A request without a key is still
+  refused, with its effect reported as unknown.
 - A read that a shared client sends is sent once more, within the call's deadline, when the channel to the
   server is cut under it. Reconnecting is tried for at most 15 seconds, pausing 0.25 seconds at first and
   doubling the pause up to 2 seconds.
   A request that writes on the server, such as `reconcile`, is not sent again.
 - A call from the installed CLI to the local daemon follows kelmod's replay rule when kelmod drops the
-  socket. A call cut before it was sent, and a daemon status or scheduler read cut after it, go once more
-  within the deadline. A CLI command runs in the daemon as one call that may write, so a command cut after
-  it was sent fails at once with `E_TRANSPORT` and its effect reported as unknown. The resend tries to
-  reconnect for at most 15 seconds, and the whole call stays inside its deadline. A hello the daemon never
-  answers is now `E_TRANSPORT` with nothing sent, not `E_DEADLINE`.
+  socket. A call cut before it was sent goes once more within the deadline, and so does one cut after it was
+  sent when it changes nothing (a daemon status or scheduler read, or a command a fenced server still runs,
+  such as `search`, `show` or `status`) or carries `--idempotency-key`. Any other command cut after it was
+  sent fails at once with `E_TRANSPORT` and its effect reported as unknown, on the second attempt as on the
+  first. The resend tries to reconnect for at most 15 seconds, and the whole call stays inside its deadline.
+  A hello the daemon never answers is now `E_TRANSPORT` with nothing sent, not `E_DEADLINE`.
 
 ## [0.3.1] - 2026-11-15
 

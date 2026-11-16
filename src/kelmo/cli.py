@@ -220,7 +220,9 @@ def through_daemon(args, argv, launcher):
     path = daemon_client.ensure(root, kelmod=Path(launcher).parent / 'kelmod', launcher=launcher)
     from .config import ClientProfile
     op = 'edge.cli' if ClientProfile.selected(root) else 'state.cli'
-    return daemon_client.call(root, op, body, path=path,
+    # After a cut, a command that changes nothing, or one whose own key the server settles once, may go again.
+    resend = served_while_fenced(args) or bool(getattr(args, 'idempotency_key', None))
+    return daemon_client.call(root, op, body, path=path, resend=resend,
                               seconds=WAIT_CALL_SECONDS if getattr(args, 'wait', False) else 60.0)
 
 
