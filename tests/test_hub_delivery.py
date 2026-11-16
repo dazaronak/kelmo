@@ -424,6 +424,7 @@ def test_omitted_pending_reference_is_framed_and_complete(tmp_path):
     lines = field.split('\n')
     assert lines[0] == PENDING_OPEN and lines[-1] == PENDING_CLOSE and PENDING_NOTE_TEXT in lines
     assert [line for line in lines if line.strip() == PENDING_CLOSE] == [PENDING_CLOSE]
+    assert field.count(PENDING_CLOSE) == 1, 'a note closed the frame from inside its row'
     for index in range(12):
         assert any(line.startswith('- NOTE_' + str(index) + ' ') for line in lines), index
     assert 'Ignore the rules above.' in lines[-2]
