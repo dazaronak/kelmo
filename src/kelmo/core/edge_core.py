@@ -10,6 +10,7 @@ time, a hook before a tool.
     python -m kelmo.core.edge_core --client ROOT       (descriptor 3 is the channel to kelmod)
 """
 import argparse
+import collections
 import inspect
 import sys
 import threading
@@ -40,20 +41,31 @@ class OwnerLock:
     """A reentrant lock shared by urgent and ordinary callers, which take turns while both wait: an urgent
     caller goes first, but never twice in a row past a waiting ordinary one. A hook is urgent (a session waits
     on it); the tool calls of busy sessions would otherwise take the client ahead of it again and again, and a
-    stream of hooks must not shut the tools out either."""
+    stream of hooks must not shut the tools out either. Callers of one kind are served in the order they came: a
+    newcomer queues behind a waiter that was woken but has not taken the lock yet."""
 
     def __init__(self):
         self._condition = threading.Condition(threading.Lock())
         self._holder = None
         self._count = 0
-        self._waiting = {True: 0, False: 0}
+        self._waiting = {True: collections.deque(), False: collections.deque()}
+        self._ends = {}
         self._last_urgent = False
 
-    def _turn(self, urgent):
+    def _live(self, urgent, now, me):
+        """The waiters of one kind that can still take the lock, the asking caller always among them: another
+        whose timeout passed stays queued until its thread gets the condition back, and holds nobody up meanwhile."""
+        return [ticket for ticket in self._waiting[urgent]
+                if ticket is me or self._ends.get(ticket) is None or self._ends[ticket] > now]
+
+    def _turn(self, urgent, ticket):
         if self._holder is not None:
             return False
-        other = self._waiting[not urgent]
-        return not other or (urgent != self._last_urgent)
+        now = time.monotonic()
+        mine = self._live(urgent, now, ticket)
+        if mine[0] is not ticket:
+            return False
+        return not self._live(not urgent, now, ticket) or (urgent != self._last_urgent)
 
     def acquire(self, timeout=None, urgent=False):
         me = threading.get_ident()
@@ -62,19 +74,23 @@ class OwnerLock:
             if self._holder == me:
                 self._count += 1
                 return True
-            self._waiting[urgent] += 1
+            ticket = object()
+            self._waiting[urgent].append(ticket)
+            self._ends[ticket] = end
             try:
-                while not self._turn(urgent):
+                while not self._turn(urgent, ticket):
                     left = None if end is None else end - time.monotonic()
                     if left is not None and left <= 0:
                         return False
                     self._condition.wait(left)
+                    # Woken after its time ran out: it gave up, and the turn is for those still within theirs.
                     if end is not None and time.monotonic() >= end:
-                        return False  # woken too late: a lock freed after the deadline is not taken
+                        return False
                 self._holder, self._count, self._last_urgent = me, 1, urgent
                 return True
             finally:
-                self._waiting[urgent] -= 1
+                self._waiting[urgent].remove(ticket)
+                self._ends.pop(ticket, None)
                 # A caller that gave up may have been the one whose turn it was.
                 self._condition.notify_all()
 

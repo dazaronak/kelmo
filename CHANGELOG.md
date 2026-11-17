@@ -40,6 +40,11 @@ entry here.
   on the server", where `dream status` and the other local actions used to answer `E_NOT_INITIALIZED` as if the
   vault were missing. `dream run` and `dream apply` are no longer sent to the client's daemon, which has no dream
   job; they get the same refusal.
+- Tool calls that write through the edge core now take the outbox in the order they came. A new call could
+  take it ahead of an earlier one that had just been woken, and a busy session could keep another session's
+  write waiting until its deadline. Hooks still go ahead of tool calls, but never twice in a row past a
+  waiting tool call, and hooks among themselves also go in the order they came. A caller whose wait ran out
+  holds nobody back and no longer takes the lock if its turn comes after that.
 
 ### Added
 
