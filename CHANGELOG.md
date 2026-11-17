@@ -12,7 +12,8 @@ entry here.
   thread in the outbox. Before it sends an entry, its reads and the count of the attempt wait no longer than
   the pass's deadline; then the pass ends with `stopped: E_BUSY`, the entry stays pending and counts no
   attempt. The code of a retryable answer is noted only while the file is free in time. An answer the server
-  already gave is still recorded, however long the file stays held. A session start whose writes were held back
+  already gave is still recorded while the file stays held, for up to five minutes; after that the entry stays
+  pending and the server answers its key again on a later pass. A session start whose writes were held back
   this way gets the cached context, as when the server cannot be reached.
 - A shared client's outbox gives its free space back again. Settled transcript pieces drop their bytes but
   leave their pages in `outbox.sqlite3`; since Kelmo 0.2.0 the edge daemon owns the outbox and only `kelmo

@@ -154,6 +154,9 @@ OUTBOX_FILE_TRY_SECONDS = 0.5
 REFUSED_SHOWN = 20
 
 
+# How long an answer the server gave is retried into a held outbox file before the pass gives up and leaves the
+# entry pending; the server answers its key again on a later pass.
+RECORD_GIVE_UP_SECONDS = 300.0
 OUTBOX_STALL_SECONDS = 3600
 
 
@@ -187,6 +190,9 @@ def _serial(method):
             return method(self, *args, **kwargs)
     return guarded
 
+
+# What `_record` returns when the file stayed held past RECORD_GIVE_UP_SECONDS.
+_GAVE_UP = object()
 
 # What a failed read names when it knows no channel of its own: `_drop` then leaves the current one alone.
 _NO_CHANNEL = object()
@@ -1435,15 +1441,18 @@ class SharedClient:
             self.outbox._serial.release()
 
     def _record(self, method, *args):
-        """What a server's answer changes in the outbox (settle, cut, reset) is recorded whatever the wait: a
-        lock on the file that outlasts the outbox's own wait is waited for again, so an answer is never
-        dropped."""
+        """What a server's answer changes in the outbox (settle, cut, reset): a lock on the file that outlasts the
+        outbox's own wait is waited for again, up to RECORD_GIVE_UP_SECONDS. Then `_GAVE_UP`: the entry stays
+        pending and the server, which keeps its answer under the key, answers it again on a later pass."""
+        give_up = time.monotonic() + RECORD_GIVE_UP_SECONDS
         while True:
             try:
                 return method(*args)
             except sqlite3.OperationalError as error:
                 if not sqlite_busy(error):
                     raise  # a disk or I/O error is reported as itself
+                if time.monotonic() >= give_up:
+                    return _GAVE_UP
 
     def _note_if_free(self, key, code):
         """The code of a retryable answer, noted only while the file is free within the deadline: the entry
@@ -1494,7 +1503,9 @@ class SharedClient:
                 stopped, reached = error.code, bool(reached) and not (held and not sending)
                 break
             if ok:
-                self._record(self.outbox.settle, key, 'delivered', value)
+                if self._record(self.outbox.settle, key, 'delivered', value) is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False  # our own held outbox: the entry stays pending
+                    break
                 delivered += 1
                 continue
             if value['cut']:
@@ -1503,7 +1514,11 @@ class SharedClient:
                 # delivered would hold every write behind it, so on its CUT_LIMIT-th cut it is refused with its
                 # effect unknown, as a cut write was before.
                 self._drop(channel)
-                if self._record(self.outbox.cut, key) < CUT_LIMIT:
+                cuts = self._record(self.outbox.cut, key)
+                if cuts is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False
+                    break
+                if cuts < CUT_LIMIT:
                     self._note_if_free(key, value['code'])
                     stopped = value['code']
                     break
@@ -1518,11 +1533,16 @@ class SharedClient:
                 stopped = value['code']
                 break
             outcome = {'code': value['code'], 'message': value['message']}
-            self._record(self.outbox.settle, key, 'refused', outcome)
-            if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
-                # The server does not hold the bytes this piece followed: the next capture starts over.
-                self._record(self.outbox.reset_transcript, args['provider'], args['native_id'])
+            if self._record(self.outbox.settle, key, 'refused', outcome) is _GAVE_UP:
+                stopped, reached = 'E_BUSY', False
+                break
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
+            if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
+                # The server does not hold the bytes this piece followed: the next capture starts over. Not
+                # recorded in time, the next piece meets the same refusal and tries again.
+                if self._record(self.outbox.reset_transcript, args['provider'], args['native_id']) is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False
+                    break
         return {'delivered': delivered, 'refused': refused, 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': reached}
 

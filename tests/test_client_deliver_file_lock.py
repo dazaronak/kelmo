@@ -291,3 +291,35 @@ def test_a_pass_whose_next_entry_is_held_back_by_its_own_outbox_does_not_report_
         result = client.flush()
     assert result['delivered'] == 1 and result['stopped'] == 'E_BUSY', result
     assert result['reached'] is not True, result
+
+
+def test_an_answer_that_cannot_be_recorded_within_the_ceiling_ends_the_pass_and_stays_pending(shared, monkeypatch):
+    """Another process keeps the file past the ceiling for recording an answer: the pass gives up, ends with E_BUSY
+    and leaves the entry pending, so the server answers its key again on a later pass, instead of waiting for as long
+    as that process holds the file."""
+    import kelmo.client as client_module
+    monkeypatch.setattr(client_module, 'RECORD_GIVE_UP_SECONDS', 0.5)
+    client = shared.client()
+    client.outbox.conn.execute('PRAGMA busy_timeout = 100')  # the outbox's normal wait, made short
+    client.outbox.enqueue('capture', ARGS, 'answered-never-recorded')
+    real, holders = client._send, []
+
+    def send(channel, op, args, key, *rest, **kwargs):
+        answer = real(channel, op, args, key, *rest, **kwargs)
+        if op == 'capture':
+            other = _holder(client, 'IMMEDIATE')
+            holders.append(other)
+            threading.Timer(3.0, lambda: (other.rollback(), other.close())).start()  # lets go well past the ceiling
+        return answer
+
+    client._send = send
+    started = time.monotonic()
+    try:
+        with client.deadline(5.0):
+            result = client.flush()
+    finally:
+        took = time.monotonic() - started
+    time.sleep(max(0.0, 3.2 - took))  # the holder's timer has let go
+    assert took < 2.0, f'the pass waited {took:.2f} s to record an answer past its 0.5 s ceiling'
+    assert result['stopped'] == 'E_BUSY' and result['delivered'] == 0, result
+    assert client.outbox.get('answered-never-recorded')['state'] == 'pending'
