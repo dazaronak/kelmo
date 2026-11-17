@@ -1468,7 +1468,9 @@ class SharedClient:
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                self._note_if_free(key, error.code)
+                if not (isinstance(error, Unsent) and error.code == 'E_BUSY'):
+                    # A busy outbox here says nothing about the entry: it keeps the refusal it had.
+                    self._note_if_free(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break
             if ok:

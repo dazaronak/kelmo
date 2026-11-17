@@ -205,3 +205,25 @@ def test_a_cut_recorded_behind_a_reader_counts_once(shared):
     assert client._record(client.outbox.cut, 'cut-behind-reader') == 1
     assert client.outbox.conn.execute("SELECT cuts FROM entries WHERE idempotency_key='cut-behind-reader'"
                                       ).fetchone()[0] == 1
+
+
+def test_a_pass_that_finds_the_file_busy_keeps_the_entrys_earlier_refusal(shared):
+    """The outbox file is busy when the pass records its attempt, and free again at once: nothing about the entry
+    failed, so it keeps the refusal the server gave it before, not a local E_BUSY."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'busy-once')
+    client.outbox.note('busy-once', 'E_EARLIER')
+    real, calls = client.outbox.attempt, []
+
+    def attempt(key, *rest):
+        calls.append(key)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError('database is locked')  # busy once, free right after
+        return real(key, *rest)
+
+    client.outbox.attempt = attempt
+    with client.deadline(5.0):
+        result = client.flush()
+    entry = client.outbox.get('busy-once')
+    assert result['stopped'] == 'E_BUSY', result
+    assert (entry['state'], entry['last_error']) == ('pending', 'E_EARLIER'), entry
