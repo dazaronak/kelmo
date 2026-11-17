@@ -551,6 +551,7 @@ class MuxChannel:
         self._state_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._flag_lock = threading.Lock()  # around setting `_closed` and each os.write that checked it
         self._waiters = {}
         self._hello = threading.Event()
         self._hello_result = None
@@ -701,12 +702,13 @@ class MuxChannel:
         descriptor is used only under the write lock, which `close` takes before it closes the pipe, so no byte goes
         to a number another open may have taken; a close stops the write between two looks at the pipe."""
         view = memoryview(data)
-        written = 0
-        if not self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
-            error.partial = False
-            raise error
+        written, held = 0, False
         try:
+            held = self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+            if not held:
+                error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
+                error.partial = False
+                raise error
             if self._closed:
                 raise ValueError('The channel was closed before the frame.')
             descriptor = self.process.stdin.fileno()
@@ -727,12 +729,16 @@ class MuxChannel:
                         raise error
                     if not selector.select(min(remaining, self.WRITE_POLL_SECONDS)) or self._closed:
                         continue  # a close that came during the wait is seen at the top, before another byte
-                    try:
-                        count = os.write(descriptor, view)
-                        written += count
-                        view = view[count:]
-                    except BlockingIOError:
-                        continue
+                    with self._flag_lock:
+                        # `close` sets the flag under this lock: once it is set, no byte goes out.
+                        if self._closed:
+                            continue
+                        try:
+                            count = os.write(descriptor, view)
+                        except BlockingIOError:
+                            continue
+                    written += count
+                    view = view[count:]
         except (ValueError, OSError) as error:
             if not written:
                 raise  # closed before the frame: nothing written
@@ -741,7 +747,8 @@ class MuxChannel:
             partial.partial = True
             raise partial from error
         finally:
-            self._write_lock.release()
+            if held:
+                self._write_lock.release()
 
     def _read(self):
         reader = wire.FrameReader()
@@ -795,7 +802,8 @@ class MuxChannel:
         with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
+            with self._flag_lock:  # waits at most for one non-blocking os.write in progress
+                self._closed = True
             self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
             # A write in progress sees `_closed` within WRITE_POLL_SECONDS and lets the lock go.
             with self._write_lock:

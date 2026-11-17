@@ -356,3 +356,39 @@ def test_a_close_during_the_wait_for_room_stops_the_write_before_its_next_byte(m
         monkeypatch.undo()
         channel._closed = False
         channel.close()
+
+
+def test_a_close_that_lands_between_the_look_and_the_write_lets_no_byte_out_after_it(monkeypatch):
+    """A close begins after the write looked at the flag and before it wrote: no byte goes out once the close has
+    set its flag; the write either goes before the flag is set or not at all."""
+    import kelmo.client as client_module
+    channel = MuxChannel(command(), timeout=2)
+    channel.grace = 0
+    descriptor = channel.process.stdin.fileno()
+    real_write, after_close, closer = os.write, [], []
+
+    def write(fd, data):
+        if fd == descriptor and not closer:
+            thread = threading.Thread(target=channel.close, daemon=True)
+            closer.append(thread)
+            thread.start()  # the close begins now, after the write's last look at the flag
+            stop = time.monotonic() + 0.5
+            while not channel._closed and time.monotonic() < stop:
+                time.sleep(0.005)
+        if fd == descriptor and channel._closed:
+            after_close.append(len(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('close-before-the-write'))
+        except Exception:  # noqa: BLE001, S110 - only whether a byte went out after the flag matters here
+            pass
+        monkeypatch.undo()
+        assert after_close == [], f'bytes went out after the close set its flag: {after_close}'
+    finally:
+        monkeypatch.undo()
+        for thread in closer:
+            thread.join(5)
+        channel.close()
