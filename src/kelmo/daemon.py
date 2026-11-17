@@ -507,6 +507,16 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
                                      processed, skipped, failed_attempts)
 
 
+def _give_back(queue, request):
+    """Returns a request the core's stop interrupted, uncharged. A journal that refuses it now leaves the claim
+    to expire with its lease; the stop stays a stop either way."""
+    try:
+        queue.release_busy(request['id'], request['token'])
+    except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
+        print(f'kelmo worker: resolution {request["id"]} not given back at the stop: {type(error).__name__}',
+              file=sys.stderr, flush=True)
+
+
 def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping, processed, skipped,
                           failed_attempts):
     from .resolution import Resolution
@@ -521,6 +531,9 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
         # the check itself.
         try:
             instructions_standing(argv, timeout, service.config, RESOLVE_TASKS, 'resolution requests')
+        except Stopping:
+            _give_back(queue, request)
+            raise
         except VaultFailure as error:
             queue.release_busy(request['id'], request['token'])
             skipped.append({'resolution_id': request['id'], 'error_code': error.code})
@@ -530,6 +543,11 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
             reply = request['response'] if request['response'] is not None else quota.checked(
                 execute(argv, request['payload'], timeout=timeout))
             queue.submit(request['id'], request['token'], reply)
+        except Stopping:
+            # The core's stop ended the call: the request goes back unanswered, its attempt given back, for the next
+            # start (stopping.py); without this it stayed claimed until its lease ran out, charged.
+            _give_back(queue, request)
+            raise
         except Exception as error:  # noqa: BLE001 - One failed request must not stop the worker.
             from .core.baton import BatonError
             if isinstance(error, BatonError):
