@@ -57,6 +57,9 @@ entry here.
   without being charged an attempt, as a stop met earlier in the same run already did, also when the editor
   answers busy. It used to be staged failed and charged: retried later for a transient code, needing a
   manual retry otherwise.
+- A sandboxed core that woke its channel reader after the channel was closed wrote a byte into whatever
+  file had since been given the freed descriptor number. The wake now does nothing once the channel is
+  closed.
 
 ### Added
 
