@@ -166,7 +166,7 @@ def outbox_stall_warning(summary, clock=None):
     if age <= OUTBOX_STALL_SECONDS:
         return None
     return (f"{summary['pending']} write(s) have waited {int(age // 60)} min to reach the server behind "
-            f"{head['op']} {head['idempotency_key']} (last refusal {head.get('last_error') or 'none'}); "
+            f"{head['op']} {head['idempotency_key']} (last reason {head.get('last_error') or 'none'}); "
             'check the server for a stuck lock or a stopped worker, then run kelmo client flush.')
 
 
@@ -1253,7 +1253,10 @@ class SharedClient:
                 self._channel = channel = None
             if channel is None:
                 channel, hello = self._hello_channel()
-                self._channel, self.server = channel, hello
+                # The hello first: a status read takes the channel without the connect lock, and the channel's
+                # operations must already be known when it sees the channel.
+                self.server = hello
+                self._channel = channel
             return channel
 
     def _hello_channel(self):

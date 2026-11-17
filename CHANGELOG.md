@@ -27,10 +27,10 @@ entry here.
   waiting for that caller's hello; such a delivery, one that gave up because another request held the
   channel, and one whose deadline passed before its request went out no longer counts as an attempt or
   shows a refusal as the entry's last. When the authority's hello does not answer in time, an entry with
-  no refusal yet shows `E_TRANSPORT` as the reason it waits. While another caller is reading or rewriting the outbox, or another
-  process holds its file, `kelmo status` and `kelmo client status` answer with `"outbox": {"busy": true}`
-  instead of waiting past their deadline; during a delivery, which leaves the file free, they report the
-  counts.
+  no refusal yet shows `E_TRANSPORT` as the reason it waits. While another caller is reading or rewriting
+  the outbox, or another process holds its file, `kelmo status`, `kelmo client status` and the MCP tool
+  `memory_status` answer with `"outbox": {"busy": true}` instead of waiting past their deadline; during a
+  delivery, which leaves the file free, they report the counts.
 
 ## [0.3.1] - 2026-11-15
 
