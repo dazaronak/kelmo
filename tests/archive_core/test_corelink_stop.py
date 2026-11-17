@@ -209,6 +209,7 @@ def test_a_call_that_cannot_be_encoded_does_not_stop_the_core():
     try:
         future = link.call('archive.echo', {'x': object()}, Context.local(uuid.uuid4().hex, 30))
         assert future.exception() is not None
+        assert future.exception().code == 'E_PROTOCOL', future.exception()
         assert order == [], order
     finally:
         parent.close()
@@ -426,3 +427,26 @@ def test_a_stop_hook_that_raises_out_of_the_call_leaves_no_call_waiting():
     with pytest.raises(SystemExit):
         link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
     assert link._outgoing == {}
+
+
+def test_a_reply_kelmod_sent_before_closing_still_reaches_its_call_after_a_write_found_it_gone():
+    """kelmod answered call A and closed the channel; call B's write then fails on the closed channel. The reader
+    still reads A's reply, which is already in the channel, before it reaches the end."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.hold_hello = True  # no hello: the test plays kelmod's side by hand
+    peer = Peer(parent)
+    serving = None
+    try:
+        first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+        header, _ = peer.frame()
+        answer(peer, header, {'echo': 1})
+        parent.shutdown(socket.SHUT_RDWR)
+        parent.close()
+        second = link.call('archive.echo', {'n': 2}, Context.local(uuid.uuid4().hex, 30))
+        assert second.exception().code == 'E_TRANSPORT'
+        serving = serve(link)
+        assert first.result(10) == {'echo': 1}, 'a reply already in the channel was lost'
+    finally:
+        if serving is not None:
+            serving.join(10)

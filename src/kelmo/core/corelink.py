@@ -176,8 +176,8 @@ class CoreLink:
                 self._outgoing.pop(call_id, None)
             if isinstance(error, OSError) and error.errno in PEER_GONE:
                 # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
-                # hears of the stop before this call fails, as it does for the calls the reader fails.
-                self._stopping.set()
+                # hears of the stop before this call fails, as it does for the calls the reader fails. The reader
+                # itself goes on to the channel's end, so replies kelmod sent before closing still arrive.
                 self._ask_owner_to_stop()
             _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future
