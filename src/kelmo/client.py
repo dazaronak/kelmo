@@ -673,10 +673,10 @@ class MuxChannel:
             error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
             error.partial = False
             raise error
+        written = 0
         try:
             descriptor = self.process.stdin.fileno()
             view = memoryview(data)
-            written = 0
             with selectors.DefaultSelector() as selector:
                 selector.register(descriptor, selectors.EVENT_WRITE)
                 while view:
@@ -692,6 +692,13 @@ class MuxChannel:
                         view = view[count:]
                     except BlockingIOError:
                         continue
+        except (ValueError, OSError) as error:
+            if not written:
+                raise  # closed before the frame: nothing written
+            # Closed under the frame after part of it went out: the server may hold a prefix.
+            partial = KelmoError('E_TRANSPORT', 'The channel closed while the request was being written.')
+            partial.partial = True
+            raise partial from error
         finally:
             self._write_lock.release()
 
@@ -969,7 +976,7 @@ class SharedClient:
         kelmo-client/1, which is remembered for a while so every reconnect does not start two processes."""
         if self._multiplex and time.monotonic() >= self._legacy_until:
             try:
-                return MuxChannel(self.profile.command, self.remaining())
+                return MuxChannel(self.profile.command, self._left_before_send())
             except KelmoError as error:
                 if not getattr(error, 'legacy', False):
                     raise
@@ -1006,10 +1013,7 @@ class SharedClient:
     def _waiting_for(self, lock, what):
         """Holds `lock`, waiting no longer than the active deadline. A caller whose deadline passes while
         another holds it is refused before a byte is written, so the channel stays as it is."""
-        try:
-            seconds = self.remaining()
-        except Unbound as error:  # passed before the wait began: nothing written, the channel stays
-            raise Unsent(error.code, str(error)) from error
+        seconds = self._left_before_send()  # passed before the wait began: nothing written, the channel stays
         if not lock.acquire(timeout=seconds):
             raise Unsent('E_BUSY', f'The deadline passed while another request {what}.')
         try:
@@ -1055,6 +1059,14 @@ class SharedClient:
         if left <= 0:
             raise Unbound('E_TRANSPORT', 'The deadline passed before the shared kelmo server answered.')
         return min(self.profile.timeout_seconds, left)
+
+    def _left_before_send(self):
+        """Seconds left before the active deadline, read before any byte of a request is written: a deadline that
+        already passed is `Late`, so a queued write keeps its attempts and its earlier refusal."""
+        try:
+            return self.remaining()
+        except Unbound as error:
+            raise Late(error.code, str(error)) from error
 
     def __enter__(self):
         return self
@@ -1154,22 +1166,15 @@ class SharedClient:
         try:
             if getattr(channel, 'concurrent', False):
                 # Several threads share the channel: each request carries its own deadline.
-                try:
-                    timeout = self.remaining()
-                except Unbound as error:  # the deadline passed before the request: nothing was written
-                    raise Late(error.code, str(error)) from error
-                reply = channel.request(frame, timeout=timeout)
+                reply = channel.request(frame, timeout=self._left_before_send())
             else:
                 try:
                     with self._waiting_for(self._turn_for(channel), 'held the channel'):
                         if getattr(channel, 'dropped', False):  # marked while this request waited for the turn
                             raise Closed('E_TRANSPORT', 'The shared-memory channel was dropped before the request.')
                         try:
-                            if isinstance(channel, StdioChannel):
-                                try:
-                                    channel.timeout = self.remaining()
-                                except Unbound as error:  # nothing written yet: the channel stays as it is
-                                    raise Unsent(error.code, str(error)) from error
+                            if isinstance(channel, StdioChannel):  # nothing written yet: the channel stays
+                                channel.timeout = self._left_before_send()
                             reply = channel.request(frame)
                         finally:
                             if getattr(channel, 'close_when_free', False):  # dropped while this request was on it
@@ -1223,7 +1228,7 @@ class SharedClient:
 
     def _hello_channel(self):
         """A new channel whose hello named this client's authority, and that hello; closed on any failure."""
-        self.remaining()
+        self._left_before_send()
         try:
             channel = self._factory()
         except Unbound:

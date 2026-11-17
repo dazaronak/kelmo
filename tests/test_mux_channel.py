@@ -1,4 +1,5 @@
 """Black-box coverage for concurrent kelmo/2 requests over one client process."""
+import os
 import sys
 import threading
 import time
@@ -205,4 +206,35 @@ def test_a_request_that_cannot_take_the_write_lock_before_its_deadline_is_unsent
     finally:
         release.set()
         holder.join(10)
+        channel.close()
+
+
+def test_a_frame_whose_pipe_closes_after_part_of_it_went_out_ends_the_channel(monkeypatch):
+    """The pipe closes under a frame after some of its bytes went out: the peer may hold a prefix, so the request
+    fails as a transport error and the channel is not used again, never as an unsent request that may go again."""
+    import kelmo.client as client_module
+    channel = MuxChannel(command(), timeout=2)
+    descriptor = channel.process.stdin.fileno()
+    real, calls = os.write, []
+
+    def write(fd, data):
+        if fd != descriptor:
+            return real(fd, data)
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real(fd, bytes(data[:1]))  # one byte of the frame reaches the peer
+        raise ValueError('I/O operation on closed file.')
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('cut-mid-frame'))
+            outcome = None
+        except Exception as error:  # noqa: BLE001 - the kind of failure is what this test checks
+            outcome = error
+        monkeypatch.undo()
+        assert isinstance(outcome, KelmoError), f'a frame cut after {calls} reached the caller as {outcome!r}'
+        assert not channel.alive, 'a channel that may hold a prefix of a frame stayed in use'
+    finally:
+        monkeypatch.undo()
         channel.close()

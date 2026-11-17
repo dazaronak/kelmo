@@ -1251,3 +1251,57 @@ def test_a_delivery_whose_deadline_passes_before_its_kelmo2_request_counts_no_at
     finally:
         release.set()
         client.close()
+
+
+def test_a_delivery_whose_deadline_passes_before_its_turn_on_a_one_request_channel_keeps_its_refusal(profile):
+    """The deadline runs out between counting the attempt and taking a one-request channel's turn: nothing reached
+    the server, so the entry's attempts and last refusal stay as they were."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    real = client.outbox.attempt
+
+    def slow_attempt(key, *rest):
+        result = real(key, *rest)
+        time.sleep(0.5)  # past the pass's deadline before the request takes the channel's turn
+        return result
+
+    client.outbox.attempt = slow_attempt
+    try:
+        client._connect()
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'late-turn')
+        client.outbox.note('late-turn', 'E_EARLIER')
+        with client.deadline(0.3):
+            client.flush()
+        entry = client.outbox.pending()[0]
+        assert (entry['attempts'], entry['last_error']) == (0, 'E_EARLIER'), entry
+    finally:
+        release.set()
+        client.close()
+
+
+def test_a_delivery_whose_deadline_passes_before_its_channel_is_connected_keeps_its_refusal(profile):
+    """The deadline runs out after the flush began and before the channel's hello: nothing reached the server,
+    so the entry's last refusal stays as it was."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    real = client._hello_channel
+
+    def slow_hello():
+        time.sleep(0.5)  # past the pass's deadline before the channel is started
+        return real()
+
+    client._hello_channel = slow_hello
+    try:
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'late-connect')
+        client.outbox.note('late-connect', 'E_EARLIER')
+        with client.deadline(0.3):
+            client.flush()
+        entry = client.outbox.pending()[0]
+        assert (entry['attempts'], entry['last_error']) == (0, 'E_EARLIER'), entry
+    finally:
+        release.set()
+        client.close()
