@@ -33,6 +33,13 @@ entry here.
   request: the same project, text, rule change, new work page and pending flag. Before, a note of any project
   with that text answered for it, whatever its other arguments.
 
+### Fixed
+
+- A note whose server process died after capturing it is no longer refused when its request is taken over. The
+  takeover checked the note again before it looked for the capture, so a registry change in between (a project
+  map removed, a page renamed) refused a note that was already captured, and a later resend captured it a second
+  time. A taken-over request now answers with the note its earlier attempt captured.
+
 ## [0.3.1] - 2026-11-15
 
 ### Added
