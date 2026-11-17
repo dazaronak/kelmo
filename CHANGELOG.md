@@ -12,6 +12,11 @@ entry here.
   charged an attempt. It used to stay claimed until its lease ran out, with the attempt counted. If the
   journal cannot be written at that moment, the request still waits out its lease and the attempt counts,
   as before; the stop is reported either way.
+- Reading one operation from the journal no longer scans every event ever recorded. The journal gets an index
+  on its events by operation and stage the first time a writer opens it; on a synthetic journal of 20,000
+  operations and 160,000 events, reading one operation went from about 5.7 ms to 0.02 ms. Commands and passes
+  that read many operations, such as the findings pass, the queue and the worker, gain the most. Building the
+  index on a large journal takes a moment once; nothing else changes.
 
 ## [0.3.2] - 2026-11-16
 
