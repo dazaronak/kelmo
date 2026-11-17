@@ -183,6 +183,28 @@ def prune_sets(root, keep=None):
     return removed
 
 
+def sweep(root, keep=None):
+    """The daily retention sweep for a delivery that installs no set (a local vault whose context fits): takes
+    the set lock and runs prune_sets when a sweep is due. Returns the removed names; never fails a delivery."""
+    root = Path(root)
+    try:
+        if 0 <= time.time() - (root / '.pruned').stat().st_mtime < SWEEP_SECONDS:
+            return []  # not due: no lock taken on every prompt
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return []
+    if not any(path.is_dir() for path in (root, root.parent / 'hub-sessions', root.parent / 'hub-context')):
+        return []
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / '.lock').open('a+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return prune_sets(root, keep)
+    except OSError:
+        return []
+
+
 def _pointed_sets(sessions, now):
     """The sets the recent session delivery records name: a session was given a path into each."""
     names = set()

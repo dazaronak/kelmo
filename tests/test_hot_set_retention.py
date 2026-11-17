@@ -277,3 +277,47 @@ def test_a_sweep_that_fails_part_way_still_waits_a_day_before_the_next(tmp_path,
         except OSError:
             pass
     assert len(reads) == 1, f'the sweep ran {len(reads)} times in one day'
+
+
+def _local_vault(tmp_path):
+    root = tmp_path / 'vault'
+    wiki = root / 'knowledge/wiki'
+    wiki.mkdir(parents=True)
+    (root / 'kelmo.toml').write_text('schema_version = 1\nwriter = "local"\n'
+                                     'vault_id = "00000000-0000-0000-0000-000000000001"\nnode_label = "test"\n'
+                                     '[hot]\npages = ["global.md"]\n')
+    (wiki / 'global.md').write_text('global page')
+    from kelmo.config import Config
+    return root, Config.load(root).state
+
+
+def test_a_local_vault_sweeps_its_old_sets_and_records_though_no_set_is_installed(tmp_path):
+    """On a local vault whose context fits, no hook installs a set, which is where the daily sweep ran: the hook
+    runs the sweep itself, once a day."""
+    from kelmo.integration import hook
+    root, state = _local_vault(tmp_path)
+    hot = state / 'hot'
+    old = [_old_set(hot, 100 + index, days=3 + index) for index in range(1, 11)]  # 4 to 13 days old
+    reference = state / 'hub-context' / ('0' * 64 + '.json')
+    reference.parent.mkdir(parents=True)
+    reference.write_text('{}')
+    stamp = time.time() - 40 * DAY
+    os.utime(reference, (stamp, stamp))
+    hook(SimpleNamespace(root=root), 'start', {})
+    left = _sets(hot)
+    assert set(old[:8]) <= left, 'a set among the newest eight was removed'
+    assert not set(old[8:]) & left, f'old sets were kept: {sorted(set(old[8:]) & left)}'
+    assert not reference.exists(), 'a context reference unused for 40 days was kept'
+
+
+def test_a_local_vault_sweeps_at_most_once_a_day(tmp_path):
+    from kelmo.integration import hook
+    root, state = _local_vault(tmp_path)
+    hot = state / 'hot'
+    hot.mkdir(parents=True)
+    hook(SimpleNamespace(root=root), 'start', {})
+    late = _old_set(hot, 300, days=20)
+    for index in range(8):
+        _old_set(hot, 200 + index, days=1)
+    hook(SimpleNamespace(root=root), 'prompt', {})
+    assert late in _sets(hot), 'a second sweep ran within a day'
