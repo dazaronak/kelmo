@@ -141,3 +141,69 @@ def test_the_legacy_rows_keep_their_label_and_retrying_mark():
     assert [line for line in block(text) if line.startswith('- ')] == ['- one [app]', '- two [app (retrying)]',
                                                                         '- three [?]']
     assert pending_block([]) == ''
+
+
+def reference_pending(context):
+    """The pending field of the context reference file `context` names after its block."""
+    import json
+    import re
+    match = re.search(r'read (\S+\.json) \(pending field\)', context)
+    assert match, context
+    return json.loads(open(match.group(1), encoding='utf-8').read())['pending']
+
+
+def test_pending_notes_past_ten_have_a_path_to_their_text_when_the_context_fits(tmp_path):
+    pending = [{'pending': f'line {index}', 'project': 'alpha'} for index in range(12)]
+    context = hub_context(tmp_path, pending)
+    assert '+2 more' in block(context)
+    saved = reference_pending(context)
+    assert '- line 10 [alpha]' in saved and '- line 11 [alpha]' in saved, saved
+
+
+def test_a_claude_start_whose_note_line_tips_it_over_the_limit_still_gets_its_context(tmp_path):
+    """Eleven notes, and a context that fits the Claude limit without the line naming every note's text but not
+    with it: the hook still answers within the limit and names that text, instead of failing."""
+    import hashlib
+
+    from kelmo.hub_delivery import deliver, prepare
+    pending = [{'pending': f'line {index}', 'project': 'alpha'} for index in range(11)]
+    snap = snapshot(2, 1)
+    base = len(deliver(snap, 'alpha', '', pending, provider='codex', current=None, stale=False))
+    text = snap['files']['alpha.md']['text'] + '\n' + 'x' * (10000 - 40 - base - 1)
+    snap['files']['alpha.md'] = {'text': text, 'sha256': hashlib.sha256(text.encode()).hexdigest()}
+    full = len(deliver(snap, 'alpha', '', pending, provider='codex', current=None, stale=False))
+    assert 9900 < full <= 10000, full
+    config = SimpleNamespace(state=tmp_path / 'state')
+    context = prepare(config, {'session_id': 'one'}, snap, 'alpha', '', pending, provider='claude',
+                      current=tmp_path / 'hot', stale=False, acknowledge=lambda callback: None, action='start')
+    assert len(context) <= 10000, len(context)
+    assert '(pending field)' in context, context[-400:]
+
+
+def test_the_hooks_only_refresh_names_the_text_of_notes_past_ten(tmp_path):
+    from kelmo.hub_delivery import prepare
+    acks = []
+    args = _hooks_only(tmp_path, acks)
+    prepare(snapshot=snapshot(2, 1), action='start', **args)
+    acks.pop()()
+    pending = [{'pending': f'note {index}', 'project': 'alpha'} for index in range(13)]
+    refreshed = prepare(snapshot=snapshot(2, 1), **dict(args, pending=pending))
+    assert '+3 more' in block(refreshed)
+    saved = reference_pending(refreshed)
+    assert all(f'- note {index} [alpha]' in saved for index in range(13)), saved
+
+
+def test_ten_pending_notes_or_fewer_write_no_reference(tmp_path):
+    pending = [{'pending': f'line {index}', 'project': 'alpha'} for index in range(10)]
+    context = hub_context(tmp_path, pending)
+    assert '(pending field)' not in context and not (tmp_path / 'state' / 'hub-context').exists()
+
+
+def test_the_legacy_path_counts_the_notes_it_does_not_list_and_names_their_text(world):
+    notes = [(f'Exports moved to {index}:00.', f'Export time moves to {index}:00.') for index in range(22)]
+    context = legacy_context(world, notes)
+    listed = rows(context, 'app')
+    assert len(listed) == 20 and '- Export time moves to 21:00. [app]' in listed, listed
+    assert '2 older pending notes' in context, context
+    saved = reference_pending(context)
+    assert '- Export time moves to 0:00. [app]' in saved and '- Export time moves to 21:00. [app]' in saved

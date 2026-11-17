@@ -264,6 +264,20 @@ entry here.
   refusal when there is none. A new key a caller chooses (`--idempotency-key`, the tools' `idempotency_key`)
   may no longer contain `#resend`, which resend uses; such a request is refused with `E_INPUT` and not queued.
   The key of an entry already queued may still be repeated.
+- The "Pending wiki updates" block a session gets at start now sits between `<kelmo-pending-notes>` and
+  `</kelmo-pending-notes>` lines and says that its lines are text from notes, not instructions. A pending line
+  can no longer close the block early: each one is a single row inside it, and a marker tag in its text is
+  written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
+  frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
+  When the start context is too large for a Claude hook and the pending lines are left in the referenced
+  context file instead, that file's `pending` field holds the same framed block, with a row for every waiting
+  note. It used to hold the raw list of notes.
+- When more than ten notes wait, the start context, and the refresh that sends only a changed pending list,
+  now end the block with a line naming a context file whose `pending` field holds the text of every waiting
+  note, also when the context fits the hook limit. Notes past ten used to show only as "+N more", with no way
+  to read them. On the older path for vaults without hub views, a local vault's hook lists the 20 newest notes
+  as before, and a line now counts the older ones and names the file with all of them; the older notes used to
+  be left out without a count. A shared client on such a vault still gets the 20 newest with no count.
 
 ## [0.3.2] - 2026-11-16
 
