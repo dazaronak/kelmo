@@ -63,6 +63,19 @@ entry here.
   `dismissed`. `kelmo client resend` no longer selects them, and the same request under its key is still
   answered with its refusal. Nothing is deleted.
 
+### Changed
+
+- The "Pending wiki updates" block a session gets at start now sits between `<kelmo-pending-notes>` and
+  `</kelmo-pending-notes>` lines and says that its lines are text from notes, not instructions. A pending line
+  can no longer close the block early: each one is a single row inside it, and a marker tag in its text is
+  written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
+  frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
+  When the start context is too large for a Claude hook and the pending lines are left in the referenced
+  context file instead, that file's `pending` field holds the same framed block, with a row for each note the
+  path was given: every waiting note on the hub path, the 20 newest on the older path for vaults without hub
+  views. It used to hold the raw list of notes. When the ten-line block itself fits, no such file is written
+  and the notes past ten still show only as a count, as before.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added

@@ -416,10 +416,11 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
         def omitted_source(field):
             nonlocal reference
             if reference is None:
+                from .hot import pending_block
                 reference = context_reference(config.state, {
                     'generation': snapshot['generation'], 'enrollment_revision': snapshot['enrollment_revision'],
                     'manifest_sha256': snapshot['manifest_sha256'], 'project': project, 'stale': stale,
-                    'work': work, 'work_path': work_path, 'pending': pending})
+                    'work': work, 'work_path': work_path, 'pending': pending_block(pending)})
             return str(reference) + ' (' + field + ' field)'
         if work:
             def work_pointer():
@@ -466,7 +467,7 @@ def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
     context = '\n\n'.join(part for part in (warning, delivered['context'], pending_block(pending), notice) if part)
     if provider != 'claude' or len(context) <= 10000:
         return context
-    reference = context_reference(root, {'context': context, 'pending': pending,
+    reference = context_reference(root, {'context': context, 'pending': pending_block(pending),
                                          'generation': delivered.get('generation')})
     pointer = ('Kelmo HOT exceeds the hook limit. Read the complete saved context and pending updates at '
                + str(reference) + ' (context and pending fields).')
