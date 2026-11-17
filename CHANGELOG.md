@@ -94,6 +94,14 @@ entry here.
 - A server that serves one client both through the daemon's state core and through `kelmo serve-client` at
   once no longer runs one write request twice: the state core now also takes the request's lock file, so each
   refuses a request the other is running with `E_BUSY`, which the client retries.
+- A session capture that `kelmod hook` spooled while the daemon was running, because no reply came in time, no
+  longer waits for the next start of the state core. The next hook the core serves starts a pass over the spool,
+  one pass at a time, and none once the core is told to stop. A pass stopped by a busy journal while a hook
+  asked for another runs again a second later. A spooled capture reads its transcript for up to 5 seconds,
+  where a hook has 1.5, since no caller waits for it. One refused as worth retrying no longer holds back the
+  captures behind it: a refusal the server marked worth retrying keeps it for later passes, as the edge core
+  keeps it, and a local one (a transcript read that ran out of time, or one that changed while it was read)
+  sets it aside as `.bad` on its third try in one run of the core. It used to be set aside on the first.
 
 ### Added
 

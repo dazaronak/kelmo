@@ -95,9 +95,10 @@ def inspect(root):
     return result
 
 
-def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,deadline=None):
+def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,deadline=None,time_budget=None):
     """`internal_job` is what the hook's own process saw (None: this process's environment); `journal` lends the
-    state core's writer journal; `deadline` (monotonic) is when the hook's caller stops waiting for it."""
+    state core's writer journal; `deadline` (monotonic) is when the hook's caller stops waiting for it;
+    `time_budget` bounds each transcript read (a hook's CAPTURE_BUDGET by default)."""
     if internal_job is None:
         internal_job=os.environ.get('KELMO_INTERNAL_JOB')=='1'
     if internal_job:
@@ -111,10 +112,11 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
     roots=config.sessions['sources'].get(provider,[])
     source=enrolled_transcript(payload['transcript_path'],roots,'Native transcript is outside enrolled provider locations.')
     selected=next(real for real in (Path(r).expanduser().resolve() for r in roots) if source.is_relative_to(real))
+    budget=CAPTURE_BUDGET if time_budget is None else time_budget
     event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
     native_id=payload.get('session_id') or payload.get('thread_id')
     if event!='SessionEnd':
-        _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET)
+        _capture_once(config,journal,provider,native_id,source,selected,event,budget)
         return {}
     until=time.monotonic()+SESSION_END_SECONDS
     if deadline is not None:
@@ -130,7 +132,7 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
             raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
         began=time.monotonic()
         try:
-            _bounded_attempt(config,journal,provider,native_id,source,selected,event,left)
+            _bounded_attempt(config,journal,provider,native_id,source,selected,event,left,budget)
             return {}
         except KelmoError as error:
             took=time.monotonic()-began
@@ -142,7 +144,7 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
         time.sleep(SESSION_END_PAUSE)
 
 
-def _bounded_attempt(config,journal,provider,native_id,source,selected,event,left):
+def _bounded_attempt(config,journal,provider,native_id,source,selected,event,left,budget=CAPTURE_BUDGET):
     """One SessionEnd attempt whose every wait for the journal, opening and schema reads included, ends within
     `left` seconds; a lock still held then is `E_BUSY`."""
     from .journal import Journal
@@ -153,14 +155,14 @@ def _bounded_attempt(config,journal,provider,native_id,source,selected,event,lef
         if journal is None:
             own=Journal(config.internal('.state/journal.sqlite3'),wait_seconds=0)
             try:
-                _capture_once(config,own,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
+                _capture_once(config,own,provider,native_id,source,selected,event,budget,until=until)
             finally:
                 own.close()
             return
         previous=journal.conn.execute('PRAGMA busy_timeout').fetchone()[0]
         journal.conn.execute('PRAGMA busy_timeout=0')
         try:
-            _capture_once(config,journal,provider,native_id,source,selected,event,CAPTURE_BUDGET,until=until)
+            _capture_once(config,journal,provider,native_id,source,selected,event,budget,until=until)
         finally:
             journal.conn.execute(f'PRAGMA busy_timeout={previous}')
     except sqlite3.OperationalError as error:

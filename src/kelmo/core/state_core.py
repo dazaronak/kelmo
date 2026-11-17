@@ -44,6 +44,14 @@ HANDLER_LANE = 32
 HOOK_LANE = 4
 # Kept back from a hook's deadline so its answer still reaches `kelmod hook` before it stops waiting.
 HOOK_REPLY_SECONDS = 0.5
+# The pause before another spool pass when the last stopped on a busy journal while a hook asked for one.
+SPOOL_PAUSE_SECONDS = 1.0
+# A spooled capture answers no caller, so it reads its transcript for longer than a hook's 1.5 s; a hook capture
+# that waits for the writer behind it (5 + 1.5 s) still answers inside kelmod's 7 s.
+SPOOL_CAPTURE_SECONDS = 5.0
+# A spooled capture refused locally as worth retrying (its transcript read ran out of time, or changed while read)
+# on this many tries in one core process is set aside as `*.bad`; one the server marked worth retrying stays.
+SPOOL_TRIES = 3
 
 _FACADE = contextvars.ContextVar('kelmo_state_facade', default=None)
 
@@ -191,6 +199,11 @@ class StateCore:
         from ..service import Service
         self.root = Path(root).expanduser().resolve()
         self._spool = None
+        self._spool_lock = threading.Lock()
+        self._spool_again = False
+        self._spool_tries = {}  # spool file name -> local refusals worth retrying it met in this core process
+        # The channel's draining event (CoreLink sets it when admin.stop arrives, before it asks the core to stop).
+        self._draining = None
         self._acks = {}
         self._acks_lock = threading.Lock()
         self.profile_path = Path(profile_path) if profile_path is not None else None
@@ -415,9 +428,15 @@ class StateCore:
         if self._enrolled(context.origin) is not None:
             raise KelmoError('E_FORBIDDEN', 'Hooks are served to local callers only.')
         # Measured from the call: a wait for the baton leaves a capture less time to try a busy journal again.
-        return self.serve_hook(body, deadline=time.monotonic() + context.remaining() - HOOK_REPLY_SECONDS)
+        result = self.serve_hook(body, deadline=time.monotonic() + context.remaining() - HOOK_REPLY_SECONDS)
+        # A hook served means the daemon answers again: captures `kelmod hook` spooled since the start, when no
+        # daemon answered in time, are taken now instead of at the next start.
+        self._spool_waiting()
+        return result
 
-    def serve_hook(self, body, deadline=None):
+    def serve_hook(self, body, deadline=None, *, capture_budget=None):
+        """`deadline` (monotonic): when the hook's caller stops waiting. `capture_budget`: seconds a session capture
+        may read its transcript (a hook's own 1.5 s without it)."""
         from ..integration import hook
         from ..session_control import capture_hook
         if not isinstance(body, dict) or not isinstance(body.get('action'), str):
@@ -434,9 +453,10 @@ class StateCore:
             # A session end waits for another writer only until its deadline (`capture_hook`); Stop and
             # PreCompact wait as before.
             with self.storage.baton.hold(until=deadline if action == 'session-end' else None):
+                options = {} if capture_budget is None else {'time_budget': capture_budget}
                 result = capture_hook(self.root, provider, action, payload,
                                       internal_job=frame.get('internal_job') is True,
-                                      journal=self.storage.writer.journal, deadline=deadline)
+                                      journal=self.storage.writer.journal, deadline=deadline, **options)
         elif action in ('start', 'prompt'):
             if provider:
                 payload['kelmo_provider'] = provider
@@ -477,15 +497,21 @@ class StateCore:
 
     def ingest_spool(self):
         """Runs every capture `kelmod hook` spooled while no daemon answered (`.state/hook-spool/`), oldest
-        first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`;
-        a hook that fails otherwise stays for the next start."""
+        first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`.
+        Each capture reads its transcript within SPOOL_CAPTURE_SECONDS. A refusal worth retrying skips that capture
+        for this pass and the pass goes on: one the server marked so stays for later passes; a local one is renamed
+        `*.bad` on its SPOOL_TRIES-th try in this core. A refusal for good renames it `*.bad`. A busy journal or a
+        failure that is not a refusal stops the pass, and the captures stay for the next pass (the next start, or
+        the next hook served)."""
         from . import spool
         from .instance import state_dir
-        from .. import stopping
+        if self._told_to_stop():
+            # Listing may remove stale temporary files: a core told to stop leaves the spool as it is.
+            return {'ingested': 0, 'stopped': 'stopping'}
         names = spool.entries(state_dir(self.root) / 'hook-spool')
         ingested = 0
         for path in names:
-            if stopping.requested():
+            if self._told_to_stop():
                 return {'ingested': ingested, 'stopped': 'stopping'}
             try:
                 body = json.loads(path.read_text(encoding='utf-8'))
@@ -496,20 +522,32 @@ class StateCore:
                 spool.reject(path)
                 continue
             try:
-                self.serve_hook(body)
+                self.serve_hook(body, capture_budget=SPOOL_CAPTURE_SECONDS)
             except KelmoError as error:
-                if stopping.requested():
-                    # The stop caused it (the archive no longer answers): the capture stays for the next start.
+                if self._told_to_stop():
+                    # The stop caused it (the archive no longer answers): the capture stays for the next pass.
                     return {'ingested': ingested, 'stopped': 'stopping'}
-                if not getattr(error, 'retryable', False) and error.code not in ('E_BUSY',):
-                    spool.reject(path)
+                if error.code == 'E_BUSY':
+                    return {'ingested': ingested, 'stopped': error.code}  # every capture would meet the same
+                # A refusal worth retrying keeps the file for a later pass without holding back the captures behind
+                # it. One the server marked so stays, as the edge core keeps it. A local one (a transcript read that
+                # ran out even the spool's budget, or one that changed while read) holds the writer on every try, so
+                # it is set aside after a few; a refusal for good would repeat on every pass and is set aside now.
+                from ..server import RETRYABLE
+                marked = getattr(error, 'retryable', None)
+                if marked is True:
                     continue
-                return {'ingested': ingested, 'stopped': error.code}
-            except Exception as error:  # noqa: BLE001 - kept in the spool for the next start; the core serves on
-                print(f'kelmo state core: a spooled hook failed ({type(error).__name__}); kept for the next start',
+                tries = self._spool_tries[path.name] = self._spool_tries.get(path.name, 0) + 1
+                if marked is False or error.code not in RETRYABLE or tries >= SPOOL_TRIES:
+                    self._spool_tries.pop(path.name, None)
+                    spool.reject(path)
+                continue
+            except Exception as error:  # noqa: BLE001 - kept in the spool for the next pass; the core serves on
+                print(f'kelmo state core: a spooled hook failed ({type(error).__name__}); kept for the next pass',
                       file=sys.stderr)
                 return {'ingested': ingested, 'stopped': type(error).__name__}
             path.unlink(missing_ok=True)
+            self._spool_tries.pop(path.name, None)
             ingested += 1
         return {'ingested': ingested}
 
@@ -582,26 +620,89 @@ class StateCore:
     def recycle(self):
         """admin.recycle: the background work running now; none means the core may be restarted, and no job starts
         until it is (`Jobs.quiesce`)."""
-        if self._spool is not None and self._spool.is_alive():
+        spool = self._spool  # read once: a pass that ends clears it
+        if spool is not None and spool.is_alive():
             return ['hook-spool']
         return self.jobs.quiesce()
 
     def begin_stop(self):
         """The core is told to stop: model calls end now, and every job ends at its next step."""
         from .. import stopping
-        stopping.request()
+        # Under the spool lock, so no pass is started between start_spool's look at the flag and its start.
+        with self._spool_lock:
+            stopping.request()
         self.jobs.request_stop()
 
     def wait_stopped(self):
         """Waits for the jobs and the spooled-capture pass to end; kelmod kills the core at its drain deadline."""
         self.jobs.stop()
-        if self._spool is not None:
-            self._spool.join()
+        spool = self._spool  # read once: a pass that ends clears it
+        if spool is not None:
+            spool.join()
+
+    def _told_to_stop(self):
+        """The core's stop flag, or the channel already draining: admin.stop marks the channel before the drain
+        thread asks the core to stop, and no spool pass starts or goes on in between."""
+        from .. import stopping
+        return stopping.requested() or (self._draining is not None and self._draining.is_set())
 
     def start_spool(self):
-        """Applies the captures spooled while no daemon ran, beside serving."""
-        self._spool = threading.Thread(target=self.ingest_spool, name='hook-spool', daemon=True)
-        self._spool.start()
+        """Applies the captures spooled while no daemon ran, beside serving. One pass at a time, none once the
+        core is stopping."""
+        with self._spool_lock:
+            if self._told_to_stop():
+                return
+            if self._spool is not None and self._spool.is_alive():
+                # The running pass listed the spool already: it lists it again before it ends.
+                self._spool_again = True
+                return
+            self._spool_again = False
+            thread = threading.Thread(target=self._spool_passes, name='hook-spool', daemon=True)
+            thread.start()
+            self._spool = thread
+
+    def _spool_passes(self):
+        """Passes over the spool until no hook asked for one while the last ran. A pass that stopped early on a
+        busy journal or a failure, with a hook asking meanwhile, is followed by another after SPOOL_PAUSE_SECONDS,
+        once per hook served; the core stopping ends them."""
+        while True:
+            try:
+                result = self.ingest_spool()
+            except Exception as error:  # noqa: BLE001 - the captures stay for the next pass; the core serves on
+                print(f'kelmo state core: a spool pass failed ({type(error).__name__}); captures kept',
+                      file=sys.stderr)
+                result = {'stopped': type(error).__name__}
+            with self._spool_lock:
+                if not self._spool_again or self._told_to_stop():
+                    self._spool_again = False
+                    # Done under the lock: a hook served from here on starts a new pass rather than asking this
+                    # one, which no longer looks.
+                    if self._spool is threading.current_thread():
+                        self._spool = None
+                    return
+                self._spool_again = False
+            if 'stopped' in result:
+                stop = time.monotonic() + SPOOL_PAUSE_SECONDS
+                while time.monotonic() < stop and not self._told_to_stop():
+                    time.sleep(0.05)
+
+    def _spool_waiting(self):
+        """After a hook was served: starts a pass when captures wait. Nothing here may fail the hook's answer,
+        which `kelmod hook` would spool and send again."""
+        from . import spool
+        from .instance import state_dir
+        if self._told_to_stop():
+            return  # listing may remove stale temporary files: a core told to stop leaves the spool as it is
+        try:
+            waiting = spool.entries(state_dir(self.root) / 'hook-spool')
+        except OSError:
+            return  # the next start, or a later hook, tries the spool again
+        if not waiting:
+            return
+        try:
+            self.start_spool()
+        except RuntimeError as error:  # no thread could be started; the next hook served tries again
+            print(f'kelmo state core: no spool pass started ({error})', file=sys.stderr)
 
     def close(self):
         from .baton import install
@@ -661,6 +762,7 @@ def main(argv=None):
                      archive_link=link if args.archive_core else None)
     link.handlers, link.trim, link.status = core.handlers(), core.trim, core.status
     link.recycle, link.begin_stop, link.wait_stopped = core.recycle, core.begin_stop, core.wait_stopped
+    core._draining = link._draining
     link.operations = sorted(link.handlers)
     if stopping.requested():
         core.begin_stop()  # the stop came while the core was starting
