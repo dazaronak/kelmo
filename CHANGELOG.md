@@ -24,6 +24,11 @@ entry here.
   does not parse or has a field of the wrong JSON type, a body nested too deeply) now ends its channel the
   way a closed channel ends: it says why in `kelmod`'s log and asks
   its work to stop. The error used to escape the channel's loop as a Python traceback.
+- `kelmod call --deadline-ms` now also bounds the part before the call is sent. A daemon that accepted the
+  connection and then never answered the hello, or never read the call, left `kelmod` waiting with no
+  output; the connection, the hello and the write of the call now end with `E_DEADLINE` five seconds after
+  the deadline, retryable when the call was never sent or carries a key. The wait for the reply is
+  unchanged: the deadline plus five seconds, counted from the moment the call was written.
 
 ## [0.3.2] - 2026-11-16
 

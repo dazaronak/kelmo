@@ -53,8 +53,12 @@ async fn next_frame(
     }
 }
 
-/// Sends one call and returns (reply header, reply body).
+/// Sends one call and returns (reply header, reply body). The call's deadline plus five seconds bounds the
+/// connection, the hello and the write of the call frame together, so a daemon that accepts the connection and
+/// then stalls ends the call with `E_DEADLINE`. The reply then gets the same window again, counted from the
+/// write.
 pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), CallError> {
+    let end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
     let keyed = request.key.is_some();
     let unsent = |message: String| CallError {
         message,
@@ -64,18 +68,22 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
         message,
         retryable: keyed,
     };
-    let mut stream = UnixStream::connect(socket)
+    let mut stream = tokio::time::timeout_at(end, UnixStream::connect(socket))
         .await
+        .map_err(|_| unsent("E_DEADLINE: no connection".to_owned()))?
         .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;
     let mut reader = kelmo_wire::FrameReader::new();
     let hello = json!({"v": 2, "kind": "hello", "id": random_id(), "body_type": "json",
                        "protocols": ["kelmo/2"], "operations": []});
     let bytes = kelmo_wire::encode(&hello, &Value::Null).map_err(|e| unsent(e.to_string()))?;
-    stream
-        .write_all(&bytes)
+    tokio::time::timeout_at(end, stream.write_all(&bytes))
         .await
+        .map_err(|_| unsent("E_DEADLINE: no hello".to_owned()))?
         .map_err(|e| unsent(format!("E_TRANSPORT: {e}")))?;
-    next_frame(&mut stream, &mut reader).await.map_err(unsent)?;
+    tokio::time::timeout_at(end, next_frame(&mut stream, &mut reader))
+        .await
+        .map_err(|_| unsent("E_DEADLINE: no hello".to_owned()))?
+        .map_err(unsent)?;
     let mut header = json!({"v": 2, "kind": "call", "id": random_id(), "op": request.op,
                             "deadline_ms": request.deadline.as_millis() as u64, "body_type": "json"});
     if let Some(lane) = request.lane {
@@ -86,15 +94,15 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
     }
     let bytes = kelmo_wire::encode(&header, &request.body).map_err(|e| unsent(e.to_string()))?;
     // From here the daemon may have the call: part of a frame may have reached it even if the write fails.
-    stream
-        .write_all(&bytes)
+    tokio::time::timeout_at(end, stream.write_all(&bytes))
         .await
+        .map_err(|_| sent("E_DEADLINE: the daemon did not take the call".to_owned()))?
         .map_err(|e| sent(format!("E_TRANSPORT: {e}")))?;
-    tokio::time::timeout(
-        request.deadline + Duration::from_secs(5),
-        next_frame(&mut stream, &mut reader),
-    )
-    .await
-    .map_err(|_| sent("E_DEADLINE: no reply".to_owned()))?
-    .map_err(sent)
+    // The daemon counts the deadline from the moment it has the call, so the reply gets its own window from
+    // the write: a slow connect or hello does not eat the time the daemon was given.
+    let reply_end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
+    tokio::time::timeout_at(reply_end, next_frame(&mut stream, &mut reader))
+        .await
+        .map_err(|_| sent("E_DEADLINE: no reply".to_owned()))?
+        .map_err(sent)
 }
