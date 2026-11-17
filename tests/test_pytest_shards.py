@@ -76,7 +76,8 @@ class PytestShardsTests(unittest.TestCase):
             '        os._exit(9)\n')
         done = self.shards(width='2')
         self.assertEqual(done.returncode, 1, done.stdout)
-        self.assertIn('dealt: 2 never ran or ran unreported', done.stdout)
+        # test_a finished before the shard died; test_c, dealt to the same shard, never ran.
+        self.assertIn('dealt: 1 never ran or ran unreported', done.stdout)
 
     def test_the_summary_stays_the_last_line_when_the_step_summary_cannot_be_written(self):
         env = dict(os.environ, GATE_SHARD_WIDTH='2', PYTHONUNBUFFERED='1',
@@ -175,6 +176,25 @@ class PytestShardsTests(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         progress = [line for line in done.stdout.splitlines() if line.startswith('progress: ')]
         self.assertEqual(progress, ['progress: shard 1 of 1 ended with exit 0, 3 of 4 cases done'], done.stdout)
+
+    def test_a_case_with_two_outcomes_does_not_hide_a_case_that_never_ran(self):
+        """test_a passes and errors in its teardown (two outcomes); --maxfail=1 then stops the shard before test_b.
+        Two outcomes for two cases must not read as every case having run."""
+        (self.root / 'test_four.py').write_text(
+            'import pytest\n\n'
+            '@pytest.fixture\n'
+            'def broken():\n'
+            '    yield\n'
+            '    raise RuntimeError("synthetic teardown error")\n\n'
+            'def test_a(broken):\n'
+            '    pass\n\n'
+            'def test_b():\n'
+            '    pass\n')
+        done = self.shards('--maxfail=1', width='1')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn('for the 2 case(s) they were dealt: 1 never ran', done.stdout)
+        progress = [line for line in done.stdout.splitlines() if line.startswith('progress: ')]
+        self.assertEqual(progress, ['progress: shard 1 of 1 ended with exit 1, 1 of 2 cases done'], done.stdout)
 
     def test_a_module_that_does_not_import_still_reaches_the_step_summary(self):
         (self.root / 'test_broken.py').write_text('def test_e(:\n')
