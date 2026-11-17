@@ -1466,7 +1466,8 @@ class SharedClient:
             try:
                 entry = self._before_send(self.outbox.next_pending, after, high)
             except Unsent as error:
-                stopped = error.code
+                # Our own held outbox may hide a write of ours still queued: no reached server, as below.
+                stopped, reached = error.code, False if reached else reached
                 break
             if entry is None:
                 break

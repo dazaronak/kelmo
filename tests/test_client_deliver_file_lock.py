@@ -270,3 +270,24 @@ def test_a_pass_stopped_by_its_own_held_outbox_does_not_report_the_server_reache
         result = client.flush()
     assert result['stopped'] == 'E_BUSY', result
     assert result['reached'] is not True, result
+
+
+def test_a_pass_whose_next_entry_is_held_back_by_its_own_outbox_does_not_report_the_server_reached(shared):
+    """The first of two entries goes out; the outbox is then held when the pass looks for the next one: a write of
+    ours is still queued, so the pass does not report a reached server and the session hook serves the cache."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'first-goes')
+    client.outbox.enqueue('capture', dict(ARGS, filename='second.md'), 'second-held')
+    real, calls = client.outbox.next_pending, []
+
+    def next_pending(*args):
+        calls.append(args)
+        if len(calls) == 2:
+            raise sqlite3.OperationalError('database is locked')
+        return real(*args)
+
+    client.outbox.next_pending = next_pending
+    with client.deadline(5.0):
+        result = client.flush()
+    assert result['delivered'] == 1 and result['stopped'] == 'E_BUSY', result
+    assert result['reached'] is not True, result
