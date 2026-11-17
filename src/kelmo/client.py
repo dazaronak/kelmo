@@ -79,6 +79,16 @@ class Unsent(Unbound):
     does not advertise); the channel stays healthy and the entry stays pending."""
 
 
+class Closed(Unsent):
+    """Nothing was written because another caller closed the channel while this request waited for its turn;
+    the channel is already dropped, and a read may go again over a new one."""
+
+
+# How long dropping a one-request channel waits for a request still on it before closing it under that request,
+# which then fails as a transport error.
+DROP_TURN_SECONDS = 1.0
+
+
 def _atomic_write(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
@@ -335,6 +345,15 @@ class Outbox:
                     self.conn.execute("UPDATE entries SET state='resent', outcome=? WHERE seq=?",
                                       (canonical(dict(outcome, resent_as=key)), row['seq']))
         return [item for _, item in sorted(items, key=lambda pair: pair[0])]
+
+    def summary_within(self, seconds):
+        """The summary, or {'busy': True} when another caller holds the outbox longer than `seconds`."""
+        if not self._serial.acquire(timeout=max(0.0, seconds)):
+            return {'busy': True}
+        try:
+            return self.summary()
+        finally:
+            self._serial.release()
 
     @_serial
     def summary(self):
@@ -1026,8 +1045,14 @@ class SharedClient:
         if getattr(channel, 'concurrent', False):
             channel.close()
             return
-        with self._turn_for(channel):  # never under another thread's request on a one-request channel
+        # Not under another thread's request on a one-request channel, unless that request outlasts the bound.
+        turn = self._turn_for(channel)
+        taken = turn.acquire(timeout=DROP_TURN_SECONDS)
+        try:
             channel.close()
+        finally:
+            if taken:
+                turn.release()
 
     def _send(self, channel, op, args, key):
         """One request: (True, result) or (False, error) for a reply bound to it; Unbound otherwise.
@@ -1055,7 +1080,10 @@ class SharedClient:
             else:
                 with self._waiting_for(self._turn_for(channel), 'held the channel'):
                     if isinstance(channel, StdioChannel):
-                        channel.timeout = self.remaining()
+                        try:
+                            channel.timeout = self.remaining()
+                        except Unbound as error:  # nothing written yet: the channel stays as it is
+                            raise Unsent(error.code, str(error)) from error
                     reply = channel.request(frame)
         except Unbound:
             raise
@@ -1063,7 +1091,8 @@ class SharedClient:
             raise Unbound(error.code, str(error)) from error
         except ValueError as error:
             # A channel closed by another thread while this request waited for its turn: its pipe is gone.
-            raise Unbound('E_TRANSPORT', 'The shared-memory channel was closed before the request.') from error
+            self._drop(channel)
+            raise Closed('E_TRANSPORT', 'The shared-memory channel was closed before the request.') from error
         if (not isinstance(reply, dict) or set(reply) - REPLY_FIELDS or reply.get('protocol') != PROTOCOL
                 or type(reply.get('ok')) is not bool):
             raise Unbound('E_TRANSPORT', 'The shared-memory reply is outside the protocol.')
@@ -1124,10 +1153,18 @@ class SharedClient:
         return self._read(op, args)
 
     def _read(self, op, args, channel=None):
+        given = channel is not None
         try:
             if channel is None:
                 channel = self._connect()
-            ok, value = self._send(channel, op, args or {}, None)
+            try:
+                ok, value = self._send(channel, op, args or {}, None)
+            except Closed:
+                if given:
+                    raise
+                # Closed under this read while it waited for its turn: once more, over a new channel.
+                channel = self._connect()
+                ok, value = self._send(channel, op, args or {}, None)
         except Unbound as error:
             if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                 self._drop(channel)
@@ -1581,7 +1618,8 @@ class ClientService:
                                                   'selected': list(selected)})
 
     def status(self):
-        return dict(self.client.call('status'), outbox=self.client.outbox.summary())
+        server = self.client.call('status')
+        return dict(server, outbox=self.client.outbox.summary_within(self.client.remaining()))
 
     def trace(self, operation_id):
         return self.client.call('trace', {'operation_id': operation_id})

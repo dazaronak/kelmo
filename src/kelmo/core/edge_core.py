@@ -363,8 +363,9 @@ class EdgeCore:
                 'edge.cli': (self.handle_cli, 'handler'), 'edge.ack': (self.handle_ack, 'hook')}
 
     def status(self):
-        # Status runs on the frame reader: it reads the outbox only while nobody holds or waits for it, so it never
-        # waits for the client and never goes ahead of a queued hook; otherwise it reports the outbox busy.
+        # admin.status runs on a thread of its own and must answer at once: it reads the outbox only while nobody
+        # holds or waits for it, so it never waits for the client and never goes ahead of a queued hook; otherwise
+        # it reports the outbox busy.
         if not self._owner.acquire_if_idle():
             outbox = {'busy': True}
         else:

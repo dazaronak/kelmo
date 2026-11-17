@@ -22,7 +22,8 @@ entry here.
   authority that answers `kelmo-client/1`, whose channel carries one request at a time, a read now waits
   for its turn on the channel instead of holding the outbox. A delivery that needs the channel while
   another caller is still connecting gives up at its own deadline, with its writes kept, instead of waiting
-  for that caller's hello.
+  for that caller's hello. While another caller holds the outbox, `kelmo status` answers with
+  `"outbox": {"busy": true}` instead of waiting past its deadline.
 
 ## [0.3.1] - 2026-11-15
 

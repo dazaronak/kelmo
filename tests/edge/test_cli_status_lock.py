@@ -240,6 +240,185 @@ def test_a_probe_hello_on_its_own_channel_does_not_hold_the_main_channel(profile
         client.close()
 
 
+def _channels(profile, first_status):
+    """A factory of one-request channels: the first answers `status` with `first_status()`, the later ones with
+    {'ok': True}."""
+    from kelmo.client import PROTOCOL
+    opened = []
+
+    class Channel:
+        def __init__(self):
+            self.number = len(opened)
+            self.closed = False
+            opened.append(self)
+
+        def request(self, frame, timeout=None):
+            if frame['op'] == 'hello':
+                result = {'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+            elif self.number == 0:
+                result = first_status()
+            else:
+                result = {'ok': True}
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            self.closed = True
+
+    return Channel, opened
+
+
+def test_a_read_whose_one_request_channel_was_closed_under_it_opens_a_new_one(profile):
+    """A read that waited for its turn on a channel another caller closed meanwhile answers over a new channel,
+    as it did when reads held the client's lock, instead of failing E_TRANSPORT."""
+    from kelmo.client import SharedClient
+
+    def closed():
+        raise ValueError('I/O operation on closed file.')
+
+    factory, opened = _channels(profile, closed)
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    try:
+        assert client.call('status') == {'ok': True}
+    finally:
+        client.close()
+    assert len(opened) == 2 and opened[0].closed, opened
+
+
+def test_a_deadline_that_passes_while_waiting_for_the_turn_leaves_the_channel_open(profile, monkeypatch):
+    """Nothing was written when the deadline is found passed inside the turn: the healthy channel stays."""
+    from kelmo.client import SharedClient, StdioChannel, Unbound
+
+    class Pipe(StdioChannel):
+        def __init__(self):
+            self.timeout, self.grace, self.closed = 1.0, 0, False
+
+        def request(self, frame):
+            from kelmo.client import PROTOCOL
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+                      if frame['op'] == 'hello' else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            self.closed = True
+
+    client = SharedClient(profile, channel_factory=Pipe, multiplex=True)
+    try:
+        assert client.call('status') == {'ok': True}
+        channel = client._channel
+        real = client.remaining
+
+        def remaining():
+            if client._turn_for(channel)._is_owned():
+                raise Unbound('E_TRANSPORT', 'The deadline passed before the shared kelmo server answered.')
+            return real()
+
+        monkeypatch.setattr(client, 'remaining', remaining)
+        with pytest.raises(Unbound):
+            client.call('status')
+        assert client._channel is channel and not channel.closed, 'a request never written closed the channel'
+    finally:
+        client.close()
+
+
+def test_dropping_a_failed_channel_does_not_wait_without_bound_for_its_turn(profile):
+    """A request still holds the turn of a one-request channel that failed for another caller: the drop closes
+    the channel within a bounded wait instead of waiting for that request."""
+    from kelmo.client import SharedClient
+    factory, opened = _channels(profile, lambda: {'ok': True})
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    holding, release = threading.Event(), threading.Event()
+    try:
+        client.call('status')
+        channel = client._channel
+
+        def hold():
+            with client._turn_for(channel):
+                holding.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        assert holding.wait(5)
+        dropper = threading.Thread(target=client._drop, args=(channel,), daemon=True)
+        start = time.monotonic()
+        dropper.start()
+        dropper.join(3)
+        assert not dropper.is_alive() and channel.closed, 'the drop waited for the other request'
+        assert time.monotonic() - start < 3
+    finally:
+        release.set()
+        client.close()
+
+
+def test_two_borrowed_status_commands_at_once_leave_standard_output_alone(monkeypatch):
+    """Parsing a borrowed command silences standard output for the parse only; two at once must not leave it
+    pointing at one parse's buffer."""
+    import sys
+    a_in, b_in, a_done = threading.Event(), threading.Event(), threading.Event()
+    real = cli.build_parser
+
+    def build_parser(version):
+        parser, commands = real(version)
+        parse = parser.parse_args
+
+        def parse_args(argv):
+            if threading.current_thread().name == 'first':
+                a_in.set()
+                b_in.wait(1)
+            else:
+                b_in.set()
+                a_done.wait(5)
+            return parse(argv)
+
+        parser.parse_args = parse_args
+        return parser, commands
+
+    monkeypatch.setattr(cli, 'build_parser', build_parser)
+    original = sys.stdout
+
+    def first():
+        cli.borrowed_read_only(['status'])
+        a_done.set()
+
+    one = threading.Thread(target=first, name='first', daemon=True)
+    two = threading.Thread(target=lambda: cli.borrowed_read_only(['status']), name='second', daemon=True)
+    one.start()
+    assert a_in.wait(5)
+    two.start()
+    one.join(10)
+    two.join(10)
+    left, sys.stdout = sys.stdout, original
+    assert left is original, 'standard output was left redirected'
+
+
+def test_status_reports_the_outbox_busy_instead_of_outwaiting_its_deadline(profile):
+    """`kelmo status` reads the outbox summary within its deadline: while another caller holds the outbox (a
+    flush rewriting it), status answers with the outbox busy instead of waiting past its deadline."""
+    from kelmo.client import ClientService, SharedClient
+    factory, _opened = _channels(profile, lambda: {'ok': True})
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            holding.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert holding.wait(5)
+        start = time.monotonic()
+        with client.deadline(1.0):
+            status = ClientService(client).status()
+        assert time.monotonic() - start < 2.0, 'status waited for the outbox past its deadline'
+        assert status['outbox'] == {'busy': True}, status
+    finally:
+        release.set()
+        holder.join(10)
+        client.close()
+
+
 def test_a_command_that_does_not_parse_is_not_a_status_read():
     """It goes on to the borrowed run, which refuses it under the owner lock with the command's own error."""
     for argv in (['no-such-command'], ['client', 'status', '--no-such-option']):
