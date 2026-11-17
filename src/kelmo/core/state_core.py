@@ -43,7 +43,6 @@ DEFAULT_READERS = 4
 HANDLER_LANE = 32
 HOOK_LANE = 4
 # A spooled capture refused this many times as worth retrying, in one core process, is set aside as `*.bad`.
-SPOOL_TRIES = 3
 # The pause before another spool pass when the last stopped on a busy journal while a hook asked for one.
 SPOOL_PAUSE_SECONDS = 1.0
 
@@ -195,7 +194,6 @@ class StateCore:
         self._spool = None
         self._spool_lock = threading.Lock()
         self._spool_again = False
-        self._spool_tries = {}  # spool file name -> refusals worth retrying it met in this core process
         # The channel's draining event (CoreLink sets it when admin.stop arrives, before it asks the core to stop).
         self._draining = None
         self._acks = {}
@@ -486,9 +484,9 @@ class StateCore:
     def ingest_spool(self):
         """Runs every capture `kelmod hook` spooled while no daemon answered (`.state/hook-spool/`), oldest
         first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`.
-        A refusal worth retrying skips that capture for this pass and the pass goes on; on its third such refusal
-        in this core the capture is renamed `*.bad`. A busy journal or another failure stops the pass, and the
-        captures stay for the next pass (the next start, or the next hook served)."""
+        A refusal worth retrying skips that capture for this pass, keeps it for a later one, and the pass goes on;
+        a refusal for good renames it `*.bad`. A busy journal or a failure that is not a refusal stops the pass,
+        and the captures stay for the next pass (the next start, or the next hook served)."""
         from . import spool
         from .instance import state_dir
         if self._told_to_stop():
@@ -515,15 +513,13 @@ class StateCore:
                     return {'ingested': ingested, 'stopped': 'stopping'}
                 if error.code == 'E_BUSY':
                     return {'ingested': ingested, 'stopped': error.code}  # every capture would meet the same
-                # A refusal worth retrying (a transcript that changed while it was read) keeps the file for a
-                # later pass without holding back the captures behind it; one that repeats on every try, and
-                # one not worth retrying, is set aside.
+                # A refusal worth retrying (the archive fenced or unreachable for now, a transcript that changed
+                # while it was read) keeps the file for a later pass, as the edge core keeps it, without holding
+                # back the captures behind it; a refusal for good would repeat on every pass and is set aside.
                 from ..server import RETRYABLE
                 retryable = getattr(error, 'retryable', None)
                 retryable = error.code in RETRYABLE if retryable is None else retryable
-                tries = self._spool_tries[path.name] = self._spool_tries.get(path.name, 0) + 1
-                if not retryable or tries >= SPOOL_TRIES:
-                    self._spool_tries.pop(path.name, None)
+                if not retryable:
                     spool.reject(path)
                 continue
             except Exception as error:  # noqa: BLE001 - kept in the spool for the next pass; the core serves on
@@ -531,7 +527,6 @@ class StateCore:
                       file=sys.stderr)
                 return {'ingested': ingested, 'stopped': type(error).__name__}
             path.unlink(missing_ok=True)
-            self._spool_tries.pop(path.name, None)
             ingested += 1
         return {'ingested': ingested}
 
@@ -641,15 +636,21 @@ class StateCore:
                 self._spool_again = True
                 return
             self._spool_again = False
-            self._spool = threading.Thread(target=self._spool_passes, name='hook-spool', daemon=True)
-            self._spool.start()
+            thread = threading.Thread(target=self._spool_passes, name='hook-spool', daemon=True)
+            thread.start()
+            self._spool = thread
 
     def _spool_passes(self):
         """Passes over the spool until no hook asked for one while the last ran. A pass that stopped early on a
         busy journal or a failure, with a hook asking meanwhile, is followed by another after SPOOL_PAUSE_SECONDS,
         once per hook served; the core stopping ends them."""
         while True:
-            result = self.ingest_spool()
+            try:
+                result = self.ingest_spool()
+            except Exception as error:  # noqa: BLE001 - the captures stay for the next pass; the core serves on
+                print(f'kelmo state core: a spool pass failed ({type(error).__name__}); captures kept',
+                      file=sys.stderr)
+                result = {'stopped': type(error).__name__}
             with self._spool_lock:
                 if not self._spool_again or self._told_to_stop():
                     self._spool_again = False
@@ -665,14 +666,22 @@ class StateCore:
                     time.sleep(0.05)
 
     def _spool_waiting(self):
+        """After a hook was served: starts a pass when captures wait. Nothing here may fail the hook's answer,
+        which `kelmod hook` would spool and send again."""
         from . import spool
         from .instance import state_dir
+        if self._told_to_stop():
+            return  # listing may remove stale temporary files: a core told to stop leaves the spool as it is
         try:
             waiting = spool.entries(state_dir(self.root) / 'hook-spool')
         except OSError:
-            return  # the hook is already served; the next start, or a later hook, tries the spool again
-        if waiting:
+            return  # the next start, or a later hook, tries the spool again
+        if not waiting:
+            return
+        try:
             self.start_spool()
+        except RuntimeError as error:  # no thread could be started; the next hook served tries again
+            print(f'kelmo state core: no spool pass started ({error})', file=sys.stderr)
 
     def close(self):
         from .baton import install

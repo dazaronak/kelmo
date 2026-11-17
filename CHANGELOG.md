@@ -11,10 +11,10 @@ entry here.
 - A session capture that `kelmod hook` spooled while the daemon was running, because no reply came in time, no
   longer waits for the next start of the state core. The next hook the core serves starts a pass over the spool,
   one pass at a time, and none once the core is told to stop. A pass stopped by a busy journal while a hook
-  asked for another runs again a second later. A spooled capture refused as worth retrying (its transcript
-  changed while it was read) stays for a later pass and no longer holds back the captures behind it; on its
-  third such refusal in one run of the core it is set aside as `.bad`, where it used to be set aside on the
-  first.
+  asked for another runs again a second later. A spooled capture refused as worth retrying (the archive
+  fenced or unreachable for now, or a transcript that changed while it was read) stays for a later pass, as
+  the edge core keeps it, and no longer holds back the captures behind it. A transcript change used to set the
+  capture aside as `.bad` at once.
 
 ## [0.3.1] - 2026-11-15
 

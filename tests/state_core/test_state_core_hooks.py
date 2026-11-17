@@ -254,26 +254,52 @@ def test_a_core_whose_channel_was_told_to_stop_starts_no_spool_pass_after_a_hook
 
 
 def test_a_spooled_capture_refused_every_time_does_not_hold_back_the_ones_behind_it(world_factory, core_factory):
-    """A capture whose transcript read runs out of time (E_CAPTURE_RETRY) is skipped for the pass and the captures
-    behind it run; the refusal is worth retrying, so the file stays, and on its third try in this core it is set
-    aside as bad, as the edge core does, instead of being retried on every pass for good."""
+    """A capture refused as worth retrying, by the archive (E_FENCED with `retryable`) or locally (a transcript
+    read over its time, E_CAPTURE_RETRY), is skipped for the pass and the captures behind it run. The refusal is
+    worth retrying, so the file stays for a later pass however often it repeats, as the edge core keeps it."""
     from kelmo.errors import KelmoError
     core = core_factory(world_factory().root)
     spool = core.root / '.state' / 'hook-spool'
     spool.mkdir(parents=True)
     serve_hook = core.serve_hook
 
-    def slow_transcript(body):
-        if body['payload'].get('order') == 'slow':
+    def refused(body):
+        order = body['payload'].get('order')
+        if order == 'fenced':
+            error = KelmoError('E_FENCED', 'Synthetic archive writer fenced.')
+            error.retryable = True
+            raise error
+        if order == 'slow':
             raise KelmoError('E_CAPTURE_RETRY', 'Synthetic transcript read over its time.')
         return serve_hook(body)
 
-    core.serve_hook = slow_transcript
-    (spool / '00000000000000000001-101.json').write_text(capture_frame('slow'))
-    (spool / '00000000000000000002-101.json').write_text(capture_frame('behind'))
-    passes = [core.ingest_spool() for _ in range(3)]
+    core.serve_hook = refused
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('fenced'))
+    (spool / '00000000000000000002-101.json').write_text(capture_frame('slow'))
+    (spool / '00000000000000000003-101.json').write_text(capture_frame('behind'))
+    passes = [core.ingest_spool() for _ in range(4)]
     assert passes[0]['ingested'] == 1, passes
-    assert sorted(path.name for path in spool.iterdir()) == ['00000000000000000001-101.bad'], passes
+    assert sorted(path.name for path in spool.iterdir()) == [
+        '00000000000000000001-101.json', '00000000000000000002-101.json'], passes
+
+
+def test_a_spooled_capture_refused_for_good_is_set_aside(world_factory, core_factory):
+    """A refusal not worth retrying would repeat on every pass: the capture is renamed `*.bad` at once."""
+    from kelmo.errors import KelmoError
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    serve_hook = core.serve_hook
+
+    def refused(body):
+        if body['payload'].get('order') == 'bad':
+            raise KelmoError('E_INPUT', 'Synthetic capture refused for good.')
+        return serve_hook(body)
+
+    core.serve_hook = refused
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('bad'))
+    assert core.ingest_spool() == {'ingested': 0}
+    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.bad']
 
 
 def test_a_capture_refused_once_as_worth_retrying_runs_on_a_later_pass(world_factory, core_factory):
@@ -349,3 +375,82 @@ def test_a_core_told_to_stop_does_not_list_the_spool(world_factory, core_factory
     core._draining.set()
     core.ingest_spool()
     assert listed == [], 'a core told to stop listed the spool'
+
+
+def test_a_hook_served_by_a_core_told_to_stop_does_not_list_the_spool(world_factory, core_factory, monkeypatch):
+    """A hook a stopping core still serves must leave the spool as it is: listing it may remove stale temporary
+    files."""
+    import threading
+
+    from kelmo.core import spool as spool_module
+    core = core_factory(world_factory().root)
+    listed = []
+    monkeypatch.setattr(spool_module, 'entries', lambda directory: listed.append(directory) or [])
+    core._draining = threading.Event()
+    core._draining.set()
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    assert listed == [], 'a hook served by a core told to stop listed the spool'
+
+
+def test_a_spool_pass_that_cannot_start_does_not_fail_the_hook_already_served(world_factory, core_factory,
+                                                                             monkeypatch):
+    """The hook was served; a thread that cannot be started for the spool pass must not turn the answer into a
+    failure, which `kelmod hook` would spool and send again."""
+    import threading
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+
+    def no_threads(self):
+        raise RuntimeError("synthetic: can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, 'start', no_threads)
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    try:
+        answer = core.handle_hook(Context.local('hook', 30), live)
+    except RuntimeError as error:
+        answer = error
+    assert answer == {}, 'the served hook was answered with a failure: ' + repr(answer)
+    assert core._spool is None, 'a thread that never started is kept as the running pass'
+
+
+def test_a_spool_pass_that_fails_ends_quietly_and_leaves_no_running_pass(world_factory, core_factory, monkeypatch):
+    """A pass whose spool listing fails ends without an uncaught exception in its thread, clears itself, and the
+    next hook served starts a new pass that takes the capture."""
+    import threading
+    import time
+
+    from kelmo.core import spool as spool_module
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+    real = spool_module.entries
+    calls = []
+
+    def fails_in_the_pass(directory):
+        calls.append(threading.current_thread().name)
+        if threading.current_thread().name == 'hook-spool' and calls.count('hook-spool') == 1:
+            raise PermissionError('synthetic unreadable spool in the pass')
+        return real(directory)
+
+    uncaught = []
+    monkeypatch.setattr(threading, 'excepthook', lambda args: uncaught.append(args.exc_type))
+    monkeypatch.setattr(spool_module, 'entries', fails_in_the_pass)
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    limit = time.monotonic() + 10
+    while core._spool is not None and time.monotonic() < limit:
+        time.sleep(0.05)
+    assert uncaught == [], uncaught
+    assert core._spool is None, 'the failed pass is still held as the running pass'
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    limit = time.monotonic() + 10
+    while list(spool.iterdir()) and time.monotonic() < limit:
+        time.sleep(0.05)
+    assert list(spool.iterdir()) == [], 'the next hook did not take the capture'
