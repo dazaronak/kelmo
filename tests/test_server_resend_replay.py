@@ -279,3 +279,20 @@ def test_a_duplicate_under_a_resend_key_answers_the_old_key_as_the_client_with_t
     held = _answer(lambda: first.submit('create', ARGS, 'old'))
     again = shared.client(root=tmp_path / 'client-mac-a-again')
     assert _answer(lambda: again.submit('create', ARGS, 'old')) == held
+
+
+def test_a_key_chosen_by_the_caller_may_not_name_a_resend(shared):
+    """`#resend` belongs to `kelmo client resend`, whose chains the server follows: a caller's own key with it could
+    answer a refusal under another key with a note the client never linked to it."""
+    from kelmo.client import ClientService
+    from kelmo.errors import KelmoError
+    import pytest
+    client = shared.client()
+    service = ClientService(client)
+    for call in (lambda: service.create(ARGS['content'], project='app', idempotency_key='mine#resend1'),
+                 lambda: service.capture('text', 'memory.md', idempotency_key='mine#resend1'),
+                 lambda: service.register(['projects/app/new-page'], apply=True, idempotency_key='mine#resend1')):
+        with pytest.raises(KelmoError) as refused:
+            call()
+        assert refused.value.code == 'E_INPUT', refused.value
+    assert client.outbox.get('mine#resend1') is None, 'a caller\'s key with #resend was queued'
