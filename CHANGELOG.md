@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A server that serves one client both through the daemon's state core and through `kelmo serve-client` at
+  once no longer runs one write request twice: the state core now also takes the request's lock file, so each
+  refuses a request the other is running with `E_BUSY`, which the client retries.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added
