@@ -3,14 +3,27 @@
 The caller owns transport and must acknowledge a refresh only after its output succeeds.
 """
 import fcntl
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
+import time
 
 from .errors import KelmoError
+
+# Installed HOT sets kept besides the current one: every set younger than RETAIN_SECONDS (a session's context
+# can point at the set it was given) and the RETAIN_SETS newest whatever their age. Older ones are removed at
+# most once per SWEEP_SECONDS, when a new set is installed.
+RETAIN_SECONDS = 2 * 86400
+RETAIN_SETS = 8
+SWEEP_SECONDS = 86400
+# A set a session's delivery pointed at stays while that session's delivery record is younger than this: the
+# session may read the path days later.
+POINTED_RETAIN_SECONDS = 30 * 86400
 
 
 def _hash(raw):
@@ -121,7 +134,60 @@ def _metadata(snapshot):
     return result
 
 
-def install_set(root, snapshot):
+def prune_sets(root, keep=None):
+    """Remove installed sets past their retention (RETAIN_SECONDS, RETAIN_SETS), never the current one or a
+    set `keep()` names; at most once per SWEEP_SECONDS, and `keep` is only called when a sweep is due. Called
+    under the set lock. Returns the removed names."""
+    root = Path(root)
+    marker = root / '.pruned'
+    now = time.time()
+    try:
+        # A marker dated ahead (the clock was set back) does not hold the sweep off until the clock catches up.
+        if 0 <= now - marker.stat().st_mtime < SWEEP_SECONDS:
+            return []
+    except FileNotFoundError:
+        pass
+    # Dated before the sweep runs: a sweep that fails part way waits a day too instead of costing every delivery.
+    marker.touch()
+    # A sweep killed while it removed a set leaves that set under a trash name: it goes now, whatever its age.
+    for path in root.iterdir():
+        if path.name.startswith('.trash-') and path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+    current = os.readlink(root / 'current') if (root / 'current').is_symlink() else None
+    sets = sorted((path for path in root.iterdir()
+                   if path.name.startswith('.set-') and path.is_dir() and not path.is_symlink()),
+                  key=lambda path: path.stat().st_mtime, reverse=True)
+    protected = {current, *(keep() if keep is not None else ()), *(path.name for path in sets[:RETAIN_SETS]),
+                 *_pointed_sets(root.parent / 'hub-sessions', now)}
+    removed = []
+    for path in sets:
+        if path.name not in protected and now - path.stat().st_mtime > RETAIN_SECONDS:
+            # Renamed first: removing its files touches the folder, and a half-removed set must not look new.
+            trash = root / ('.trash-' + path.name[len('.set-'):])
+            os.rename(path, trash)
+            shutil.rmtree(trash, ignore_errors=True)
+            removed.append(path.name)
+    return removed
+
+
+def _pointed_sets(sessions, now):
+    """The sets the recent session delivery records name: a session was given a path into each."""
+    names = set()
+    for record in (() if sessions.is_symlink() else sessions.glob('*.json')):
+        try:
+            if record.is_symlink() or now - record.stat().st_mtime > POINTED_RETAIN_SECONDS:
+                continue
+            name = json.loads(record.read_bytes()).get('set')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(name, str):
+            names.add(name)
+    return names
+
+
+def install_set(root, snapshot, keep=None):
+    """Install a verified set and make it current. `keep` returns the names of sets that must outlive the
+    retention sweep (the client's cached contexts name the sets they were delivered with)."""
     snapshot = _validate(snapshot)
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -177,6 +243,8 @@ def install_set(root, snapshot):
                 raise KelmoError('E_CACHE', 'Staged HOT set failed verification.')
         if (destination / 'set.json').read_bytes() != _encoded(metadata):
             raise KelmoError('E_CACHE', 'Staged HOT metadata failed verification.')
+        # A set installed again is as new as a fresh one for the sweep: its delivery has not cached its name yet.
+        os.utime(destination)
         fd, temporary_name = tempfile.mkstemp(prefix='.current-', dir=root)
         os.close(fd)
         temporary = Path(temporary_name)
@@ -186,6 +254,10 @@ def install_set(root, snapshot):
             os.replace(temporary, root / 'current')
         finally:
             temporary.unlink(missing_ok=True)
+        try:
+            prune_sets(root, keep)
+        except OSError:
+            pass  # the sweep never fails a delivery; the next install tries again
     return destination
 
 
@@ -332,8 +404,9 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
     try:
         record = json.loads(state_path.read_text(encoding='utf-8'))
         previous, previous_core = record.get('digest'), record.get('core')
+        pointed_before = record.get('set') if isinstance(record.get('set'), str) else None
     except (OSError, ValueError, AttributeError):
-        previous = previous_core = None
+        previous = previous_core = pointed_before = None
     changed = previous != digest
     core_changed = changed if core_digest is None else previous_core != core_digest
     forced = not verified or stale or compacted
@@ -346,12 +419,17 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
         if context and previous and changed and core_changed:
             context = RESTART_WARNING + context
 
-    def commit():
+    def commit(pointed=None):
+        """`pointed`: the set this delivery's answer gave a path into; a marker that gives none keeps the
+        set the session was pointed at before."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix='.delivery-', dir=state_path.parent)
+        written = {'digest': digest, 'core': core_digest}
+        if pointed or pointed_before:
+            written['set'] = pointed or pointed_before
         try:
             with os.fdopen(fd, 'wb') as out:
-                out.write(_encoded({'digest': digest, 'core': core_digest}))
+                out.write(_encoded(written))
             os.replace(name, state_path)
         finally:
             Path(name).unlink(missing_ok=True)
@@ -454,8 +532,11 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
                          marker=unchanged_marker(snapshot, project, installed) if hook_mode else '',
                          pending_only=pending_only)
         context = update['context']
+        pointed = next((Path(path).name for path in (current, installed)
+                        if path is not None and not callable(path) and Path(path).name.startswith('.set-')
+                        and str(path) in context), None)
         if not sync_failed and settled:
-            acknowledge(update['commit'])
+            acknowledge(functools.partial(update['commit'], pointed))
     return context
 
 

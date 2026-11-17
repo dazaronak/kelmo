@@ -1738,11 +1738,23 @@ class SharedClient:
                                        'was cached.') from failure
         if hub_set is not None:
             from .hub_delivery import install_set
-            directory = install_set(self.profile.state / 'hot', hub_set)
+            directory = install_set(self.profile.state / 'hot', hub_set, keep=self._cached_set_names)
             record['hub_set_name'] = directory.name
             result['hub_directory'] = str(directory)
         _atomic_write(self._cache_path(key), canonical(record).encode('utf-8'))
         return result
+
+    def _cached_set_names(self):
+        """The HOT sets the cached contexts were delivered with: a stale delivery reads its set by name."""
+        names = set()
+        for path in (self.profile.state / 'cache').glob('context-*.json'):
+            try:
+                name = json.loads(path.read_bytes()).get('hub_set_name')
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(name, str):
+                names.add(name)
+        return names
 
     def _stale(self, key, binding, error):
         with self.files:
@@ -1787,7 +1799,16 @@ class SharedClient:
             _, current = _set_metadata(self.profile.state / 'hot', 'current')
             if current['enrollment_revision'] != record['hub_revision']:
                 raise KelmoError('E_CACHE', 'Cached context predates the latest enrollment revision.')
-            snapshot = read_set(self.profile.state / 'hot', record.get('hub_set_name', 'current'))
+            name = record.get('hub_set_name', 'current')
+            try:
+                snapshot = read_set(self.profile.state / 'hot', name)
+            except KelmoError:
+                if name == 'current' or os.path.lexists(self.profile.state / 'hot' / name):
+                    raise
+                # The retention sweep removed the set this cached context names: no cached generation is left.
+                raise KelmoError(error.code, reason[0].upper() + reason[1:] + '; the HOT set of this '
+                                 "repository's cached generation was removed, so there is no cached generation "
+                                 'and nothing was delivered.') from None
             if (snapshot['generation'] != record['hub_generation']
                     or snapshot['enrollment_revision'] != record['hub_revision']
                     or snapshot['manifest_sha256'] != generation.manifest_sha256):
