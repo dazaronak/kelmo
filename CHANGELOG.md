@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A Dreaming link finding whose cited evidence could not be read for a moment, because the archive was busy or
+  its process restarted, is no longer settled `stale` for good. It stays open with the error's code and a later
+  `publish` links the pages. Only evidence that was forgotten or is gone settles the finding `stale`.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added

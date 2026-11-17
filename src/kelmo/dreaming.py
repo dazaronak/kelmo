@@ -472,7 +472,9 @@ class Dreaming:
 
     def _stale(self, row, own=None):
         """The pages, facts and evidence a finding cites, as they stand now, differ from what it was found
-        against. `own` maps a page to the revision Dreaming's own link left this run: not a change."""
+        against. `own` maps a page to the revision Dreaming's own link left this run: not a change. Evidence
+        forgotten or gone is a change; any other read failure is raised, since it says nothing about the
+        evidence."""
         registry = self.service.knowledge.registry_view(self.service.knowledge.generation())
         for target, revision in row['baseline']['pages'].items():
             current = (registry['pages'].get(target) or {}).get('revision')
@@ -486,6 +488,8 @@ class Dreaming:
             try:
                 record = self.service.show(source['archive_id'])
             except KelmoError as error:
+                if error.code not in ('E_FORGOTTEN', 'E_NOT_FOUND'):
+                    raise
                 return 'evidence ' + source['archive_id'] + ' is no longer readable: ' + error.code
             if record['version'] != source['version'] or record.get('superseded_by'):
                 return 'evidence ' + source['archive_id'] + ' changed after the finding'
@@ -501,7 +505,11 @@ class Dreaming:
     def _publish(self, row, origin, contexts, budget_tokens, own=None):
         """One link through the editor, from an archived note naming the finding and its sources."""
         fingerprint, finding = row['fingerprint'], row['finding']
-        stale = self._stale(row, own)
+        try:
+            stale = self._stale(row, own)
+        except KelmoError as error:
+            # The evidence could not be read now: the finding stays open for a later publish().
+            return self._settle(fingerprint, 'open', {'code': error.code, 'reason': str(error)})
         if stale:
             return self._settle(fingerprint, 'stale', {'reason': stale})
         first, second = finding['pages']

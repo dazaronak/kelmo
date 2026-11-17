@@ -299,3 +299,49 @@ def test_an_idle_findings_pass_names_the_notes_waiting_behind_its_cursor(world):
     idle = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
     assert idle == {'state': 'idle', 'waiting': 0}
     assert executor.jobs == []
+
+
+def test_link_whose_evidence_read_fails_once_stays_open_then_publishes(world, monkeypatch):
+    """One transient read failure of the cited evidence is not a change of it: the finding stays open, with the
+    code, and a later publish links the pages."""
+    finding = {
+        'kind': 'link',
+        'pages': [NOTES, OTHER],
+        'sources': [{'archive_id': world.seed.archive_id, 'version': world.seed.version}],
+        'reason': 'Seed evidence links notes and archive.',
+    }
+    real_edit = world.service.editor.edit
+    edits = []
+
+    def busy_editor_once(*args, **kwargs):
+        edits.append(1)
+        if len(edits) == 1:
+            raise KelmoError('E_BUSY', 'editor is busy')
+        return real_edit(*args, **kwargs)
+
+    monkeypatch.setattr(world.service.editor, 'edit', busy_editor_once)
+    first_run = world.service.dreaming.run(
+        Scripted(ModelOutcome('proposal', {'findings': [finding]})),
+        origin=world.origins['editor'],
+        contexts=world.contexts(),
+    )
+    fp = first_run['new'][0]
+    assert world.service.dreaming._row(fp)['state'] == 'open'
+
+    real_show = world.service.show
+    reads = []
+
+    def busy_archive_once(archive_id, *args, **kwargs):
+        reads.append(archive_id)
+        if len(reads) == 1:
+            raise KelmoError('E_BUSY', 'synthetic busy archive')
+        return real_show(archive_id, *args, **kwargs)
+
+    monkeypatch.setattr(world.service, 'show', busy_archive_once)
+    second = world.service.dreaming.publish(fp, origin=world.origins['editor'], contexts=world.contexts())
+    row = world.service.dreaming._row(fp)
+    assert row['state'] == 'open', row
+    assert row['detail'].get('code') == 'E_BUSY', row
+    third = world.service.dreaming.publish(fp, origin=world.origins['editor'], contexts=world.contexts())
+    assert third['state'] == 'published', (second, third)
+    assert 'app-archive' in world.registry()['pages'][NOTES]['links']
