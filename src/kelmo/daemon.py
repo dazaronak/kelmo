@@ -507,14 +507,46 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
                                      processed, skipped, failed_attempts)
 
 
+GIVE_BACK_TRIES = 3
+GIVE_BACK_PAUSE_SECONDS = 0.2
+# The give-back's share of kelmod's drain deadline. Another try starts only when one more try as long as the last
+# (a busy refusal waits out the journal's own 30 s timeout) still ends inside it.
+GIVE_BACK_SECONDS = 35.0
+
+
 def _give_back(queue, request):
-    """Returns a request the core's stop interrupted, uncharged. A journal that refuses it now leaves the claim
-    to expire with its lease; the stop stays a stop either way."""
+    """Returns a request the core's stop interrupted, uncharged. A journal busy past one wait is usually free a
+    moment later, so it is tried again while the stop has room; one that still refuses leaves the claim to
+    expire with its lease. The stop stays a stop either way."""
+    started = time.monotonic()
+    for attempt in range(1, GIVE_BACK_TRIES + 1):
+        tried = time.monotonic()
+        try:
+            queue.release_busy(request['id'], request['token'])
+            return
+        except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
+            _end_open_transaction(queue)
+            now = time.monotonic()
+            if (sqlite_busy(error) and attempt < GIVE_BACK_TRIES
+                    and now - started + GIVE_BACK_PAUSE_SECONDS + (now - tried) < GIVE_BACK_SECONDS):
+                time.sleep(GIVE_BACK_PAUSE_SECONDS)
+                continue
+            try:
+                print(f'kelmo worker: resolution {request["id"]} not given back at the stop: '
+                      f'{type(error).__name__}', file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # no stderr to report on; the stop is still raised
+            return
+
+
+def _end_open_transaction(queue):
+    """A busy refusal at COMMIT leaves SQLite's transaction open; the next try must not start inside it."""
+    conn = getattr(queue, 'conn', None)
     try:
-        queue.release_busy(request['id'], request['token'])
-    except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
-        print(f'kelmo worker: resolution {request["id"]} not given back at the stop: {type(error).__name__}',
-              file=sys.stderr, flush=True)
+        if conn is not None and conn.in_transaction:
+            conn.rollback()
+    except sqlite3.Error:
+        pass
 
 
 def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping, processed, skipped,

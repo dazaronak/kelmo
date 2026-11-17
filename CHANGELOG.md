@@ -60,6 +60,11 @@ entry here.
 - A sandboxed core that woke its channel reader after the channel was closed wrote a byte into whatever
   file had since been given the freed descriptor number. The wake now does nothing once the channel is
   closed.
+- A resolution request whose model call the core's stop ended is given back at once, without being
+  charged an attempt. It used to stay claimed until its lease ran out, with the attempt counted. A journal
+  still busy after its own wait is tried again, at most twice and only while the stop leaves room for
+  another wait. If it still cannot be written, the request waits out its lease and the attempt counts, as
+  before; the stop is reported either way.
 
 ### Added
 
