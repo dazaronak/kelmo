@@ -136,6 +136,10 @@ entry here.
 - A call a core makes once it is stopping (kelmod closed its channel, or a stop finished the core's work) now
   fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not come,
   holding the stop for that call's deadline, about five minutes for an archive call.
+- A note whose server process died after capturing it is no longer refused when its request is taken over. The
+  takeover checked the note again before it looked for the capture, so a registry change in between (a project
+  map removed, a page renamed) refused a note that was already captured, and a later resend captured it a second
+  time. A taken-over request now answers with the note its earlier attempt captured.
 
 ### Added
 

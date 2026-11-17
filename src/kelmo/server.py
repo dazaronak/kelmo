@@ -1937,9 +1937,16 @@ class ClientSession:
 
     def write_create(self, key, content, filename, project, selected=(), rule_change=False,
                      budget_tokens=None, new_work=None, pending=None):
+        scoped = self._scoped(key)
+        # Only a taken-over attempt finds its note captured: `_mutate` replays a settled request without coming
+        # here, and the ledger matched this request's fingerprint. The note the dead attempt captured is the answer,
+        # also when it would no longer pass the checks a first attempt makes (the registry changed meanwhile).
+        prior = self.service.journal.operation_for_request_key(self.service.capture_request_key(scoped))
+        if prior is not None and self.service.journal.origin_record(prior) == self.origin.to_dict():
+            return self._operation_result({'operation': self.service.journal.get(prior)})
         operation = self.service.create(content, filename, project=project, selected=selected,
                                         rule_change=rule_change, budget_tokens=budget_tokens,
-                                        idempotency_key=self._scoped(key), new_work=new_work, pending=pending)
+                                        idempotency_key=scoped, new_work=new_work, pending=pending)
         return self._operation_result({'operation': operation})
 
     def write_process(self, key, capture_key):
