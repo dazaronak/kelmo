@@ -307,13 +307,14 @@ class Outbox:
 
     @contextmanager
     def waiting(self, seconds):
-        """Wait at most `seconds` for another connection's lock on the file inside, then OUTBOX_WAIT_SECONDS
-        again. Called with the outbox held."""
+        """Wait at most `seconds` for another connection's lock on the file inside, then as long as before
+        (OUTBOX_WAIT_SECONDS outside any other `waiting`). Called with the outbox held."""
+        previous = self.conn.execute('PRAGMA busy_timeout').fetchone()[0]
         self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
         try:
             yield
         finally:
-            self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
+            self.conn.execute(f'PRAGMA busy_timeout = {int(previous)}')
 
     def summary_within(self, seconds):
         """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
@@ -330,11 +331,19 @@ class Outbox:
         finally:
             self._serial.release()
 
-    @_serial
-    def record_skip(self, provider, event, native_id, reason):
-        with self.conn:
-            self.conn.execute('INSERT INTO skips (provider,event,native_id,reason,at) VALUES (?,?,?,?,?)',
-                              (provider, event, native_id, reason, utc_now()))
+    def record_skip(self, provider, event, native_id, reason, seconds=OUTBOX_FILE_TRY_SECONDS):
+        """Records a session event this client deliberately did not capture. A skip is a record, never a
+        delivery: one the outbox cannot take within `seconds` (a rewrite holds it) is left out. True when
+        recorded."""
+        if not self._serial.acquire(timeout=seconds):
+            return False
+        try:
+            with self.waiting(seconds), self.conn:
+                self.conn.execute('INSERT INTO skips (provider,event,native_id,reason,at) VALUES (?,?,?,?,?)',
+                                  (provider, event, native_id, reason, utc_now()))
+            return True
+        finally:
+            self._serial.release()
 
     @_serial
     def close(self):
@@ -1327,8 +1336,9 @@ class SharedClient:
         """Deliver pending entries in order. A bound refusal the server calls final settles its entry; a
         retryable one, or no verdict at all (launcher, channel, hello, a reply bound to no request), leaves
         it and everything after it pending and stops. `reached` says whether a channel was open. `pending`
-        is None when the outbox stayed held. Without `wait_for_holder`, an outbox another caller keeps ends the
-        call at once with `E_BUSY`, leaving the delivery to that caller."""
+        is None when the outbox stayed held. Without `wait_for_holder`, an outbox whose pending count another
+        caller keeps from being read within the pre-check's bound ends the call with `E_BUSY`, leaving the
+        delivery to that caller; once counted, the delivery waits for the owner of the outbox as usual."""
         if self._multiplex:
             pending = self._pending_within()
             if pending == 0:

@@ -12,6 +12,7 @@ time, a hook before a tool.
 import argparse
 import inspect
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -39,17 +40,30 @@ CONVERSION_SECONDS_PER_MB = 0.012
 # Where the rewrite is stopped and rolled back when the machine is slower than predicted: about a quarter of the
 # rewrite is its copy phase, the only part that can be stopped.
 COMPACT_COPY_SECONDS = 0.25
-# An old outbox too large for the bound is rewritten once at idle: no call served for this long.
+# An old outbox too large for the bound (or whose bounded rewrite was stopped) is rewritten once at idle: no call
+# served for this long. It is looked at again the first moment the daemon can have been idle that long.
 IDLE_SECONDS = 600.0
 # How soon a pass compacts again after it found the outbox held or gave way to a waiter, and after a failure.
 BUSY_RETRY_SECONDS = 1.0
 COMPACT_RETRY_SECONDS = 3600.0
+# A rewrite refused by another process reading the file had copied it first: the next try waits this many times as
+# long as that try took (at least BUSY_RETRY_SECONDS), so a reader that stays costs the outbox about 1% of the time.
+BUSY_REWRITE_PAUSE_FACTOR = 100.0
 # Bound of a hook that is not a SessionStart or prompt hook (those carry their own, shorter deadline).
 HOOK_SECONDS = 3.0
 # Bound of one spooled hook replayed by the deliverer.
 SPOOL_HOOK_SECONDS = 10.0
 
 _SERVICE = ContextVar('kelmo_edge_service')
+
+
+class _RewriteRefused(Exception):
+    """A rewrite another connection's lock refused, after `seconds` of work (its copy phase, when a reader held the
+    file)."""
+
+    def __init__(self, seconds):
+        super().__init__(seconds)
+        self.seconds = seconds
 
 
 class OwnerLock:
@@ -161,6 +175,9 @@ class EdgeCore:
         self._last_call = time.monotonic()
         self.client.compactor = self  # `kelmo client flush` leaves the compaction to the deliverer
         self._compaction = self._compaction_load()
+        self._saved = bool(self._compaction)
+        # A bounded rewrite of this old file was stopped for being slow: it waits for idle from then on.
+        self._over_limit = self._compaction.get('over_limit') is True
         self._wake.set()  # the first pass ingests what was spooled while no daemon ran
         self._deliverer = threading.Thread(target=self._deliver_loop, name='deliverer', daemon=True)
         self._deliverer.start()
@@ -280,7 +297,8 @@ class EdgeCore:
                 spool = {'ingested': 0, 'pending': None, 'stopped': type(error).__name__}
             try:
                 with self.client.deadline(DELIVER_SECONDS):
-                    # An outbox another caller keeps ends the pass at once: that caller delivers.
+                    # An outbox whose pending count another caller keeps from this pass ends it with E_BUSY: that
+                    # caller delivers. Once counted, the pass waits for the outbox up to DELIVER_SECONDS.
                     result = self.client.flush(wait_for_holder=False)
             except Exception as error:  # noqa: BLE001 - the next pass retries; the outbox keeps every entry
                 result = {'stopped': type(error).__name__, 'message': str(error)[:200]}
@@ -311,18 +329,30 @@ class EdgeCore:
                     return self._compaction_done('busy', freed, BUSY_RETRY_SECONDS)
                 state, given = step
                 freed += given
+                if state == 'too_large':
+                    # Waits for idle: looked at again the first moment the daemon can have been idle long enough.
+                    quiet = time.monotonic() - self._last_call
+                    return self._compaction_done(state, freed, min(COMPACT_RETRY_SECONDS,
+                                                                   max(0.0, IDLE_SECONDS - quiet)))
                 if state != 'more':
-                    return self._compaction_done(state, freed, COMPACT_RETRY_SECONDS
-                                                 if state in ('too_large', 'stuck') else 0.0)
+                    return self._compaction_done(state, freed, COMPACT_RETRY_SECONDS if state == 'stuck' else 0.0)
+        except _RewriteRefused as refused:
+            return self._compaction_done('busy', freed, max(BUSY_RETRY_SECONDS,
+                                                            BUSY_REWRITE_PAUSE_FACTOR * refused.seconds))
         except sqlite3.OperationalError as error:
             from ..errors import sqlite_busy
+            if self._stopping.is_set():
+                return self._compaction_done('paused', freed, 0.0)  # the outbox closed under it: no pause to keep
             if sqlite_busy(error):
                 return self._compaction_done('busy', freed, BUSY_RETRY_SECONDS)
             if getattr(error, 'sqlite_errorcode', None) == sqlite3.SQLITE_INTERRUPT:
-                # Slower than predicted: rolled back, the file stays as it was; converted at idle instead.
+                # Slower than predicted: rolled back, the file stays as it was; from now on it waits for idle.
+                self._over_limit = True
                 return self._compaction_done('too_large', freed, COMPACT_RETRY_SECONDS)
             return self._compaction_done('error', freed, COMPACT_RETRY_SECONDS, error)
         except Exception as error:  # noqa: BLE001 - an outbox that cannot be compacted still delivers
+            if self._stopping.is_set():
+                return self._compaction_done('paused', freed, 0.0)
             return self._compaction_done('error', freed, COMPACT_RETRY_SECONDS, error)
         finally:
             self._compaction['at'] = now
@@ -337,25 +367,35 @@ class EdgeCore:
             if not outbox._serial.acquire(timeout=try_seconds):
                 return None
             try:
+                # Every statement here, reads included, waits for another connection no longer than the try.
                 with outbox.waiting(try_seconds):
                     if outbox.pending_count():  # a hook queued since the flush: deliver first
                         return 'nothing', 0
-                pages, free, size, mode = outbox.compaction_state()
-                if mode != 2:
-                    live_mb = (pages - free) * size / 1e6
-                    fits = live_mb * CONVERSION_SECONDS_PER_MB <= COMPACT_MAX_SECONDS
-                    idle = time.monotonic() - self._last_call >= IDLE_SECONDS
-                    if not fits and not idle:
-                        return 'too_large', 0
-                    return 'done', outbox.convert(copy_seconds=COMPACT_COPY_SECONDS if fits else None)
-                if not free:
-                    return ('done' if draining else 'nothing'), 0
-                if not draining and free < chunk and not due(pages, free, size):
-                    return 'nothing', 0
-                given, left = outbox.vacuum_step(chunk)
-                if not given:
-                    return 'stuck', 0
-                return ('more' if left else 'done'), given * size
+                    pages, free, size, mode = outbox.compaction_state()
+                    if mode != 2:
+                        live_mb = (pages - free) * size / 1e6
+                        fits = live_mb * CONVERSION_SECONDS_PER_MB <= COMPACT_MAX_SECONDS and not self._over_limit
+                        idle = time.monotonic() - self._last_call >= IDLE_SECONDS
+                        if not fits and not idle:
+                            return 'too_large', 0
+                        started = time.monotonic()
+                        try:
+                            given = outbox.convert(copy_seconds=COMPACT_COPY_SECONDS if fits else None)
+                        except sqlite3.OperationalError as error:
+                            from ..errors import sqlite_busy
+                            if sqlite_busy(error):
+                                raise _RewriteRefused(time.monotonic() - started) from error
+                            raise
+                        self._over_limit = False
+                        return 'done', given
+                    if not free:
+                        return ('done' if draining else 'nothing'), 0
+                    if not draining and free < chunk and not due(pages, free, size):
+                        return 'nothing', 0
+                    given, left = outbox.vacuum_step(chunk)
+                    if not given:
+                        return 'stuck', 0
+                    return ('more' if left else 'done'), given * size
             finally:
                 outbox._serial.release()
         finally:
@@ -363,13 +403,17 @@ class EdgeCore:
 
     def _compaction_done(self, state, freed, pause, error=None):
         record = {'state': state, 'freed': freed}
+        if self._over_limit:
+            record['over_limit'] = True
         if error is not None:
             record['error'] = f'{type(error).__name__}: {str(error)[:200]}'
         if pause:
             record['retry_at'] = time.time() + pause
         self._compaction = record
-        if state in ('too_large', 'stuck', 'error'):
-            self._compaction_save(record)  # a pause of an hour survives the edge core's recycles
+        if state in ('too_large', 'stuck', 'error') or self._over_limit:
+            self._compaction_save(record)  # a pause of an hour, and a stopped rewrite, survive the core's recycles
+        elif self._saved:
+            self._compaction_forget()  # done, or nothing to keep: a restart must not wait for the old pause
         return record
 
     def _compaction_path(self):
@@ -380,7 +424,15 @@ class EdgeCore:
             record = json.loads(self._compaction_path().read_text())
         except (OSError, ValueError):
             return {}
-        return record if isinstance(record, dict) and isinstance(record.get('retry_at', 0.0), (int, float)) else {}
+        if not isinstance(record, dict):
+            return {}
+        retry = record.get('retry_at', 0.0)
+        if isinstance(retry, bool) or not isinstance(retry, (int, float)):
+            return {}
+        latest = time.time() + COMPACT_RETRY_SECONDS
+        if not math.isfinite(retry) or retry > latest:
+            record = dict(record, retry_at=latest)  # saved under a wall clock since set back: an hour at most
+        return record
 
     def _compaction_save(self, record):
         path = self._compaction_path()
@@ -389,7 +441,15 @@ class EdgeCore:
             temporary.write_text(json.dumps(record))
             os.replace(temporary, path)
         except OSError:
-            pass  # the pause then lasts this process only
+            return  # the pause then lasts this process only
+        self._saved = True
+
+    def _compaction_forget(self):
+        try:
+            self._compaction_path().unlink(missing_ok=True)
+        except OSError:
+            return
+        self._saved = False
 
     # --- handlers --------------------------------------------------------------------------------------
 

@@ -175,7 +175,11 @@ def test_a_held_outbox_leaves_compaction_to_a_pass_a_second_later(real_edge, pro
         assert time.monotonic() - started < 3, 'the pass waited for the held outbox'
         assert _size(profile) == before, 'compacted while another caller held the outbox'
     assert core._deliverer.is_alive()
-    assert _until(lambda: _size(profile) < before // 4, 6), 'no pass compacted soon after the outbox was let go'
+    wait = core._compaction.get('retry_at', 0.0) - time.time()
+    assert wait <= edge_core.BUSY_RETRY_SECONDS + 0.1, core._compaction
+    time.sleep(max(0.0, wait) + 0.05)
+    _passes(core, 1)
+    assert _size(profile) < before // 4, 'the next pass did not compact'
 
 
 def test_a_pass_does_not_compact_while_a_hook_waits_for_the_outbox(real_edge, profile, monkeypatch):
@@ -256,12 +260,13 @@ def test_a_pass_does_not_wait_on_another_process_holding_the_outbox_file(real_ed
 
 def test_a_paused_compaction_survives_a_restart_of_the_edge_core(legacy_edge, profile, monkeypatch):
     before = _size(profile)
-    monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 1000.0)
+    monkeypatch.setattr(edge_core, 'COMPACT_COPY_SECONDS', 0.0)
+    monkeypatch.setattr(client_module, 'COMPACT_PROGRESS_STEPS', 1)
     core, client = legacy_edge()
     record = json.loads((profile.state / 'compaction.json').read_text())
     assert record['state'] == 'too_large' and record['retry_at'] > time.time() + 600, record
     core.close()
-    monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 0.0)
+    monkeypatch.setattr(edge_core, 'COMPACT_COPY_SECONDS', 10.0)
     again = EdgeCore(profile.root, client=SharedClient(profile, multiplex=True))
     try:
         _passes(again, 1)
@@ -405,3 +410,145 @@ def test_status_reads_the_outbox_within_the_deadline_while_another_process_holds
         other.rollback()
         other.close()
         client.close()
+
+
+
+def test_a_compaction_statement_does_not_wait_for_another_process_that_took_the_file_after_the_check(
+        real_edge, profile, monkeypatch):
+    """The pending count ran within the short try; the file is taken right after it: the reads that follow wait
+    no longer than that try either."""
+    core, client = real_edge
+    _settled_pieces(client.outbox)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    armed, timers = [], []
+    real_count, real_compact = client.outbox.pending_count, core._compact
+
+    def pending_count():
+        count = real_count()
+        if armed:
+            armed.clear()
+            other.execute('BEGIN EXCLUSIVE')
+            timers.append(threading.Timer(5.0, other.rollback))
+            timers[-1].start()
+        return count
+
+    def compact():
+        armed.append(True)
+        return real_compact()
+
+    monkeypatch.setattr(client.outbox, 'pending_count', pending_count)
+    monkeypatch.setattr(core, '_compact', compact)
+    try:
+        started = time.monotonic()
+        _passes(core, 1)
+        assert time.monotonic() - started < 2, 'a compaction read waited for another process past its try'
+        assert core._last['result']['compaction']['state'] == 'busy', core._last['result']
+    finally:
+        for timer in timers:
+            timer.cancel()
+        other.rollback()
+        other.close()
+
+
+def test_an_old_outbox_over_the_bound_is_converted_at_the_first_idle_moment_not_an_hour_later(
+        legacy_edge, profile, monkeypatch):
+    monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 1000.0)
+    monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 1.5)
+    core, client = legacy_edge()
+    assert core._compaction['state'] == 'too_large', core._compaction
+    assert core._compaction['retry_at'] - time.time() <= 1.6, core._compaction
+    assert _until(lambda: core._compaction.get('state') == 'done', 8), core._compaction
+    assert _mode(profile) == 2, 'the idle pass did not convert the old outbox'
+
+
+def test_after_a_stopped_rewrite_the_old_outbox_waits_for_idle_instead_of_the_bound_again(legacy_edge, profile,
+                                                                                         monkeypatch):
+    monkeypatch.setattr(edge_core, 'COMPACT_COPY_SECONDS', 0.0)
+    monkeypatch.setattr(client_module, 'COMPACT_PROGRESS_STEPS', 1)
+    monkeypatch.setattr(edge_core, 'COMPACT_RETRY_SECONDS', 0.0)
+    core, client = legacy_edge()
+    assert core._compaction['state'] == 'too_large', core._compaction
+    rewrites = []
+    real = client.outbox.convert
+
+    def convert(copy_seconds=None):
+        rewrites.append(copy_seconds)
+        return real(copy_seconds=copy_seconds)
+
+    monkeypatch.setattr(client.outbox, 'convert', convert)
+    _passes(core, 1)
+    assert rewrites == [], f'the bound was tried again after a rewrite past it was stopped: {rewrites}'
+    assert json.loads((profile.state / 'compaction.json').read_text()).get('over_limit') is True
+    monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 0.0)
+    _passes(core, 1)
+    assert rewrites == [None] and _mode(profile) == 2, rewrites
+    assert not (profile.state / 'compaction.json').exists(), 'a finished conversion left its pause behind'
+
+
+def test_a_compaction_cut_short_by_the_stop_saves_no_pause(real_edge, profile, monkeypatch):
+    core, client = real_edge
+    _settled_pieces(client.outbox)
+
+    def closed_meanwhile():
+        core._stopping.set()
+        raise sqlite3.ProgrammingError('Cannot operate on a closed database.')
+
+    monkeypatch.setattr(client.outbox, 'compaction_state', closed_meanwhile)
+    record = core._compact()
+    assert record['state'] != 'error' and 'retry_at' not in record, record
+    assert not (profile.state / 'compaction.json').exists(), "a stop saved an hour's pause"
+
+
+@pytest.mark.parametrize('retry_at', [1e12, float('inf')], ids=['far', 'infinite'])
+def test_a_saved_pause_far_in_the_future_waits_no_longer_than_the_retry_interval(profile, retry_at):
+    """The wall clock was far ahead when the pause was saved and has since been set right."""
+    profile.state.mkdir(parents=True, exist_ok=True)
+    (profile.state / 'compaction.json').write_text(json.dumps({'state': 'error', 'freed': 0, 'retry_at': retry_at}))
+    client = SharedClient(profile, multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    try:
+        assert core._compaction.get('retry_at', 0.0) <= time.time() + edge_core.COMPACT_RETRY_SECONDS + 1, \
+            core._compaction
+    finally:
+        core.close()
+
+
+def test_a_skipped_session_event_does_not_wait_for_a_long_rewrite(profile):
+    """A skip is a record, never a delivery: one the outbox cannot take within half a second is left out."""
+    client = SharedClient(profile, multiplex=True)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        started = time.monotonic()
+        result = client.capture_session('claude', 'Stop', {'session_id': 'x'}, internal_job=True)
+        assert time.monotonic() - started < 2.0, 'the skip record waited for the outbox'
+        assert result == {'captured': False, 'skipped': 'internal-job'}, result
+    finally:
+        release.set()
+        holder.join(10)
+        client.close()
+
+
+def test_a_rewrite_refused_by_a_reader_in_another_process_is_not_repeated_every_second(legacy_edge, profile,
+                                                                                      monkeypatch):
+    """The refused rewrite copied the file first: the next try waits in proportion to that copy."""
+    monkeypatch.setattr(edge_core, 'BUSY_REWRITE_PAUSE_FACTOR', 1e6, raising=False)
+    reader = sqlite3.connect(profile.state / 'outbox.sqlite3', check_same_thread=False)
+    reader.execute('BEGIN')
+    reader.execute('SELECT count(*) FROM entries').fetchone()
+    try:
+        core, client = legacy_edge()
+        record = core._compaction
+        assert record['state'] == 'busy', record
+        assert record['retry_at'] - time.time() > 2, f'a refused rewrite is tried again a second later: {record}'
+    finally:
+        reader.rollback()
+        reader.close()
