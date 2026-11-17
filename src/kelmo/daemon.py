@@ -507,14 +507,25 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
                                      processed, skipped, failed_attempts)
 
 
+GIVE_BACK_TRIES = 3
+GIVE_BACK_PAUSE_SECONDS = 0.2
+
+
 def _give_back(queue, request):
-    """Returns a request the core's stop interrupted, uncharged. A journal that refuses it now leaves the claim
-    to expire with its lease; the stop stays a stop either way."""
-    try:
-        queue.release_busy(request['id'], request['token'])
-    except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
-        print(f'kelmo worker: resolution {request["id"]} not given back at the stop: {type(error).__name__}',
-              file=sys.stderr, flush=True)
+    """Returns a request the core's stop interrupted, uncharged. A journal busy past one wait is usually free a
+    moment later, so it is tried again a few times; one that still refuses leaves the claim to expire with its
+    lease. The stop stays a stop either way."""
+    for attempt in range(1, GIVE_BACK_TRIES + 1):
+        try:
+            queue.release_busy(request['id'], request['token'])
+            return
+        except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
+            if sqlite_busy(error) and attempt < GIVE_BACK_TRIES:
+                time.sleep(GIVE_BACK_PAUSE_SECONDS)
+                continue
+            print(f'kelmo worker: resolution {request["id"]} not given back at the stop: {type(error).__name__}',
+                  file=sys.stderr, flush=True)
+            return
 
 
 def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping, processed, skipped,

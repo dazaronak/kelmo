@@ -279,6 +279,35 @@ def test_a_core_stop_stays_a_stop_when_giving_the_request_back_fails(service, mo
         tick(service, ['/synthetic/executor'], max_attempts=3)
 
 
+def test_a_give_back_the_busy_journal_refuses_for_a_moment_still_returns_the_request(service, monkeypatch):
+    """A journal busy past one wait at the stop is usually free a moment later: the give-back tries again within
+    the stop, so the request goes back uncharged instead of waiting out its lease."""
+    import sqlite3
+
+    from kelmo.daemon import tick
+    from kelmo.errors import Stopping
+    from kelmo.resolution import Resolution
+    pending(service)
+    real = Resolution.release_busy
+    refusals = []
+
+    def cut_by_the_stop(argv, payload, **kwargs):
+        raise Stopping()
+
+    def busy_twice(self, *args, **kwargs):
+        if len(refusals) < 2:
+            refusals.append(1)
+            raise sqlite3.OperationalError('database is locked')
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr('kelmo.daemon.execute', cut_by_the_stop)
+    monkeypatch.setattr(Resolution, 'release_busy', busy_twice)
+    with pytest.raises(Stopping):
+        tick(service, ['/synthetic/executor'], max_attempts=3)
+    job = Resolution(service).list()[0]
+    assert (job['state'], job['attempts']) == ('pending', 0), job
+
+
 def test_resolution_submit_rejects_symlinked_worker_lock(service, tmp_path):
     from kelmo.resolution import Resolution
     pending(service)
