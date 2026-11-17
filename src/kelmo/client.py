@@ -84,6 +84,11 @@ class Closed(Unsent):
     the channel is already dropped, and a read may go again over a new one."""
 
 
+class Late(Unsent):
+    """Nothing was written because the deadline passed while this request waited (for its deadline to be read,
+    or for another thread's write on a channel that carries several requests); the channel stays healthy."""
+
+
 
 def _atomic_write(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -624,7 +629,8 @@ class MuxChannel:
                 raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.') from error
             with self._state_lock:
                 self._waiters.pop(call_id, None)
-            raise KelmoError('E_TRANSPORT', 'The channel did not reply before its deadline.') from error
+            # Not a byte of this frame went out: the request is unsent and may go again.
+            raise Late('E_TRANSPORT', 'The channel did not take the request before its deadline.') from error
         if not waiter['event'].wait(max(0.0, deadline - time.monotonic())):
             with self._state_lock:
                 expired = self._waiters.pop(call_id, None) is not None
@@ -661,23 +667,33 @@ class MuxChannel:
         }
 
     def _write(self, data, deadline):
-        descriptor = self.process.stdin.fileno()
-        view = memoryview(data)
-        written = 0
-        with self._write_lock, selectors.DefaultSelector() as selector:
-            selector.register(descriptor, selectors.EVENT_WRITE)
-            while view:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
-                    error = KelmoError('E_TRANSPORT', 'The channel did not accept the request before its deadline.')
-                    error.partial = written > 0
-                    raise error
-                try:
-                    count = os.write(descriptor, view)
-                    written += count
-                    view = view[count:]
-                except BlockingIOError:
-                    continue
+        """The whole frame within the deadline, the wait for another thread's write included. A deadline missed
+        before any byte went out raises E_TRANSPORT with `partial` False; the channel stays usable."""
+        if not self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
+            error.partial = False
+            raise error
+        try:
+            descriptor = self.process.stdin.fileno()
+            view = memoryview(data)
+            written = 0
+            with selectors.DefaultSelector() as selector:
+                selector.register(descriptor, selectors.EVENT_WRITE)
+                while view:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        error = KelmoError('E_TRANSPORT',
+                                           'The channel did not accept the request before its deadline.')
+                        error.partial = written > 0
+                        raise error
+                    try:
+                        count = os.write(descriptor, view)
+                        written += count
+                        view = view[count:]
+                    except BlockingIOError:
+                        continue
+        finally:
+            self._write_lock.release()
 
     def _read(self):
         reader = wire.FrameReader()
@@ -929,7 +945,8 @@ class SharedClient:
 
     `multiplex` (the edge core) opens a channel that carries several requests at once, when the server speaks
     kelmo/2: reads then overlap on it. Against a kelmo-client/1 server, and without `multiplex`, requests take
-    turns on the channel. Either way only what touches the outbox takes `_lock`; a read never does."""
+    turns on the channel. What touches the outbox takes `_lock`; a read takes it only to wait for its turn on a
+    channel that carries one request at a time (`call`), and the status reads (`read_aside`) never do."""
 
     def __init__(self, profile, channel_factory=None, *, multiplex=False):
         if not isinstance(profile, ClientProfile):
@@ -1137,7 +1154,11 @@ class SharedClient:
         try:
             if getattr(channel, 'concurrent', False):
                 # Several threads share the channel: each request carries its own deadline.
-                reply = channel.request(frame, timeout=self.remaining())
+                try:
+                    timeout = self.remaining()
+                except Unbound as error:  # the deadline passed before the request: nothing was written
+                    raise Late(error.code, str(error)) from error
+                reply = channel.request(frame, timeout=timeout)
             else:
                 try:
                     with self._waiting_for(self._turn_for(channel), 'held the channel'):
@@ -1345,9 +1366,9 @@ class SharedClient:
                     self._drop(channel)
                 if isinstance(error, (Closed, Unsent)) and attempted:
                     self.outbox.attempt(key, -1)  # refused here before a byte went out: no attempt
-                if not (isinstance(error, Closed) or (isinstance(error, Unsent) and error.code == 'E_BUSY')):
-                    # A busy turn, or a channel closed or dropped while this request waited for it, keeps no
-                    # refusal: another request held the channel, nothing about this entry failed.
+                if not (isinstance(error, (Closed, Late)) or (isinstance(error, Unsent) and error.code == 'E_BUSY')):
+                    # A busy turn, a channel closed or dropped while this request waited for it, or a deadline
+                    # that passed before the request went out keeps no refusal: nothing about this entry failed.
                     self.outbox.note(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break

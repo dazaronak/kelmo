@@ -127,7 +127,7 @@ class EdgeCore:
         self.client = client or SharedClient(ClientProfile.load(self.root), multiplex=True)
         self._tools = None
         # The outbox is one connection and a delivery is one ordered pass: one caller at a time owns it, handlers
-        # and the deliverer alike. Reads do not take it.
+        # and the deliverer alike. A read over a channel that carries several requests does not take it.
         self._owner = OwnerLock()
         self._urgent = threading.local()
         self.client._lock = _OwnerGate(self)

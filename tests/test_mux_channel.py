@@ -177,3 +177,32 @@ def test_a_cancel_that_finds_the_pipe_closed_still_ends_the_call_on_its_deadline
         assert not channel.alive, 'a channel whose pipe closed under the cancel stayed in use'
     finally:
         channel.close()
+
+
+def test_a_request_that_cannot_take_the_write_lock_before_its_deadline_is_unsent():
+    """Another thread's write holds the pipe past this request's deadline: nothing of this frame was written, so it
+    fails as unsent, on its deadline, and the channel stays in use."""
+    from kelmo.client import Unsent
+    channel = MuxChannel(command(), timeout=0.3)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with channel._write_lock:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        started = time.monotonic()
+        with pytest.raises(KelmoError) as refused:
+            channel.request(request('behind-a-write'))
+        took = time.monotonic() - started
+        assert took < 1.0, f'the request waited {took:.2f} s for the write lock past its 0.3 s deadline'
+        assert isinstance(refused.value, Unsent), type(refused.value)
+        assert channel.alive and channel._waiters == {}, channel._waiters
+    finally:
+        release.set()
+        holder.join(10)
+        channel.close()

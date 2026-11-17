@@ -1218,3 +1218,36 @@ def test_a_delivery_refused_here_before_it_was_sent_counts_no_attempt(profile, m
     finally:
         release.set()
         client.close()
+
+
+def test_a_delivery_whose_deadline_passes_before_its_kelmo2_request_counts_no_attempt(profile):
+    """The deadline runs out between counting the attempt and sending on a kelmo/2 channel: nothing reached the
+    server, so the entry's attempts and last refusal stay as they were."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+
+    class Concurrent(WritesChannel):
+        concurrent = True
+        alive = True
+        stalled = False
+
+    client = SharedClient(profile, channel_factory=lambda: Concurrent(profile.authority_id, entered, release),
+                          multiplex=True)
+    real = client.outbox.attempt
+
+    def slow_attempt(key, *rest):
+        result = real(key, *rest)
+        time.sleep(0.5)  # past the pass's deadline before the request is made
+        return result
+
+    client.outbox.attempt = slow_attempt
+    try:
+        client._connect()
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'late-one')
+        with client.deadline(0.3):
+            client.flush()
+        entry = client.outbox.pending()[0]
+        assert (entry['attempts'], entry['last_error']) == (0, None), entry
+    finally:
+        release.set()
+        client.close()

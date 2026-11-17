@@ -20,15 +20,16 @@ entry here.
   checks the authority on a channel of its own and closes it, so it no longer replaces the channel the
   client's requests use. `kelmo status` reads the authority over the open kelmo/2 channel, which carries
   several requests at once, or else over a channel of its own, so a delivery never waits for its reply or
-  its hello. `kelmo client flush` and `resend` still hold the outbox for the whole command. Other reads
-  (`trace`, `show`, the tools' reads) still keep the outbox while they wait on a channel that carries one
+  its hello. `kelmo client flush`, `resend` and the other commands (`trace`, `show`) still hold the outbox
+  for the whole command, and the tools' reads keep it while they wait on a channel that carries one
   request at a time, so a hook queued meanwhile goes before a delivery. A delivery that needs the channel
   while another caller is still connecting gives up at its own deadline, with its writes kept, instead of
-  waiting for that caller's hello; such a delivery, and one that gave up because another request held the
-  channel, no longer counts as an attempt or shows `E_BUSY` as the entry's last refusal. While another
-  caller is reading or rewriting the outbox, or another process holds its file, `kelmo status` and `kelmo
-  client status` answer with `"outbox": {"busy": true}` instead of waiting past their deadline; during a
-  delivery, which leaves the file free, they report the counts.
+  waiting for that caller's hello; such a delivery, one that gave up because another request held the
+  channel, and one whose deadline passed before its request went out no longer counts as an attempt or
+  shows a refusal as the entry's last. While another caller is reading or rewriting the outbox, or another
+  process holds its file, `kelmo status` and `kelmo client status` answer with `"outbox": {"busy": true}`
+  instead of waiting past their deadline; during a delivery, which leaves the file free, they report the
+  counts.
 
 ## [0.3.1] - 2026-11-15
 
