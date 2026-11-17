@@ -890,8 +890,8 @@ class SharedClient:
     """One client root: its outbox, its cache and at most one open channel.
 
     `multiplex` (the edge core) opens a channel that carries several requests at once, when the server speaks
-    kelmo/2: reads then overlap on it, and only what touches the outbox takes `_lock`. Against a
-    kelmo-client/1 server, and without `multiplex`, every request takes `_lock` and they go one at a time."""
+    kelmo/2: reads then overlap on it. Against a kelmo-client/1 server, and without `multiplex`, requests take
+    turns on the channel. Either way only what touches the outbox takes `_lock`; a read never does."""
 
     def __init__(self, profile, channel_factory=None, *, multiplex=False):
         if not isinstance(profile, ClientProfile):
@@ -936,6 +936,22 @@ class SharedClient:
     @property
     def _connecting(self):
         return self._guard('_connect_lock', threading.RLock)
+
+    @property
+    def _turn(self):
+        """Held around one request on a channel that carries one at a time."""
+        return self._guard('_turn_lock', threading.RLock)
+
+    @contextmanager
+    def _waiting_for(self, lock, what):
+        """Holds `lock`, waiting no longer than the active deadline. A caller whose deadline passes while
+        another holds it is refused before a byte is written, so the channel stays as it is."""
+        if not lock.acquire(timeout=self.remaining()):
+            raise Unsent('E_BUSY', f'The deadline passed while another request {what}.')
+        try:
+            yield
+        finally:
+            lock.release()
 
     def pause(self, seconds):
         """How a wait sleeps between polls; the edge core replaces it to lend its owner lock out meanwhile."""
@@ -1001,7 +1017,11 @@ class SharedClient:
             self._channel = None
         if isinstance(channel, StdioChannel) and self._deadline is not None:
             channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
-        channel.close()
+        if getattr(channel, 'concurrent', False):
+            channel.close()
+            return
+        with self._turn:  # never under another thread's request on a channel that carries one at a time
+            channel.close()
 
     def _send(self, channel, op, args, key):
         """One request: (True, result) or (False, error) for a reply bound to it; Unbound otherwise.
@@ -1027,9 +1047,10 @@ class SharedClient:
                 # Several threads share the channel: each request carries its own deadline.
                 reply = channel.request(frame, timeout=self.remaining())
             else:
-                if isinstance(channel, StdioChannel):
-                    channel.timeout = self.remaining()
-                reply = channel.request(frame)
+                with self._waiting_for(self._turn, 'held the channel'):
+                    if isinstance(channel, StdioChannel):
+                        channel.timeout = self.remaining()
+                    reply = channel.request(frame)
         except Unbound:
             raise
         except KelmoError as error:
@@ -1051,8 +1072,9 @@ class SharedClient:
                        'retryable': error['retryable']}
 
     def _connect(self):
-        # One thread connects; the others wait for its channel instead of starting their own.
-        with self._connecting:
+        # One thread connects; the others wait for its channel instead of starting their own, each no longer than
+        # its own deadline.
+        with self._waiting_for(self._connecting, 'was connecting'):
             channel = self._channel
             if channel is not None and getattr(channel, 'concurrent', False) and not channel.alive:
                 # It ended between two requests: the next one starts a new channel, as after a failed request.
@@ -1088,14 +1110,9 @@ class SharedClient:
         return channel, hello
 
     def call(self, op, args=None):
-        """A read: no outbox, and a transport failure is reported, never answered from the cache. Over a
-        channel that carries several requests it does not wait for the owner of the outbox."""
-        if self._multiplex:
-            channel = self._connect()
-            if getattr(channel, 'concurrent', False):
-                return self._read(op, args, channel)
-        with self._lock:
-            return self._read(op, args)
+        """A read: no outbox, and a transport failure is reported, never answered from the cache. It does not
+        wait for the owner of the outbox; on a channel that carries one request at a time it takes its turn."""
+        return self._read(op, args)
 
     def _read(self, op, args, channel=None):
         try:

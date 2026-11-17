@@ -104,6 +104,80 @@ def test_a_hook_gets_the_outbox_while_a_status_probe_waits_for_the_authority(pro
     assert answers and all(channel.closed for channel in channels), (answers, channels)
 
 
+class OneAtATimeChannel:
+    """A kelmo-client/1 channel (one request at a time): hello answers at once, `status` waits until released,
+    as an authority far away would answer."""
+
+    def __init__(self, authority, entered, release):
+        self.authority, self.entered, self.release = authority, entered, release
+
+    def request(self, frame, timeout=None):
+        from kelmo.client import PROTOCOL
+        if frame['op'] == 'hello':
+            result = {'authority_id': self.authority, 'operations': ['hello', 'status']}
+        else:
+            self.entered.set()
+            self.release.wait(10)
+            result = {'ok': True}
+        return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+    def close(self):
+        pass
+
+
+def test_a_hook_gets_the_outbox_while_status_waits_on_a_one_request_channel(profile):
+    """Against an authority that answers kelmo-client/1 the channel carries one request at a time; `kelmo status`
+    waiting for its reply holds the channel, not the owner of the outbox."""
+    from kelmo.client import SharedClient
+    from kelmo.core.edge_core import EdgeCore
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: OneAtATimeChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    context = SimpleNamespace(remaining=lambda: 30.0, check=lambda: None)
+    answers = []
+    command = threading.Thread(target=lambda: answers.append(
+        core.handle_cli(context, {'argv': ['status', '--vault', str(profile.root)]})), daemon=True)
+    try:
+        command.start()
+        assert entered.wait(5), 'status never reached the authority'
+        start = time.monotonic()
+        got = core._owner.acquire(timeout=1.0, urgent=True)
+        waited = time.monotonic() - start
+        if got:
+            core._owner.release()
+        assert got and waited < 1.0, 'the hook waited for `kelmo status` on a one-request channel'
+    finally:
+        release.set()
+        command.join(10)
+        core.close()
+    assert answers, 'status gave no answer'
+
+
+def test_a_hook_with_writes_queued_does_not_outwait_its_deadline_behind_a_slow_hello(profile):
+    """A status command connecting to a slow authority holds the connect; a delivery that needs the channel
+    meanwhile gives up at its own deadline, entries pending, instead of waiting for that hello."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: SlowHelloChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    client.outbox.enqueue('remember', {'content': 'synthetic queued note'}, 'synthetic-key-1')
+    reader = threading.Thread(target=client._connect, daemon=True)  # how `kelmo status` opens the channel
+    try:
+        reader.start()
+        assert entered.wait(5), 'the connect never started'
+        start = time.monotonic()
+        with client.deadline(1.0):
+            result = client.flush()
+        waited = time.monotonic() - start
+        assert waited < 2.0, f'the delivery waited {waited:.1f} s for another caller\'s hello'
+        assert result['pending'] == 1, result
+    finally:
+        release.set()
+        reader.join(10)
+        client.close()
+
+
 def test_a_command_that_does_not_parse_is_not_a_status_read():
     """It goes on to the borrowed run, which refuses it under the owner lock with the command's own error."""
     for argv in (['no-such-command'], ['client', 'status', '--no-such-option']):
