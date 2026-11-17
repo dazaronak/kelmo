@@ -450,3 +450,28 @@ def test_a_reply_kelmod_sent_before_closing_still_reaches_its_call_after_a_write
     finally:
         if serving is not None:
             serving.join(10)
+
+
+def test_a_call_made_once_the_link_is_stopping_fails_at_once_without_being_sent():
+    """After the reader reached the channel's end (`_finish` failed the open calls), a new call is never registered
+    where nothing will fail it: it fails at once, after the owner has heard of the stop, and writes nothing."""
+    parent, child = socket.socketpair()
+    order = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    link._stopping.set()  # as `_finish` leaves it, its snapshot of the open calls taken
+    try:
+        future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+        future.add_done_callback(lambda _: order.append('failed'))
+        assert future.done(), 'a call made while the link stops waited for a reply that cannot come'
+        assert future.exception().code == 'E_TRANSPORT'
+        assert order == ['stop', 'failed'], order
+        assert link._outgoing == {}
+        parent.setblocking(False)
+        try:
+            leaked = parent.recv(65536)
+        except BlockingIOError:
+            leaked = b''
+        assert leaked == b'', 'the call was written to a stopping channel'
+    finally:
+        parent.close()
