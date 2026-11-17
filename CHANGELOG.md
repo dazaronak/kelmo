@@ -29,6 +29,13 @@ entry here.
   output; the connection, the hello and the write of the call now end with `E_DEADLINE` five seconds after
   the deadline, retryable when the call was never sent or carries a key. The wait for the reply is
   unchanged: the deadline plus five seconds, counted from the moment the call was written.
+- `kelmod call` and `kelmod status` connect only through a runtime directory that belongs to the user and
+  is closed to everyone else, as the MCP gateway already did. Through a directory open to others, or a
+  symlink, they refuse with `E_RUNTIME` before anything is sent; a directory that is not there, an empty
+  `--runtime-dir` included, is a retryable `E_TRANSPORT` without a connect. After the connect they also check
+  that the daemon runs under the same user, and refuse with `E_RUNTIME` before the hello if not, so a
+  directory swapped in after the check cannot take the call. Without `XDG_RUNTIME_DIR` and `TMPDIR` the
+  directory is under `/tmp`, where another local user could have created it first.
 
 ## [0.3.2] - 2026-11-16
 

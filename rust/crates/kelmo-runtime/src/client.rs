@@ -68,10 +68,47 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
         message,
         retryable: keyed,
     };
+    // The socket is reached only through a directory this user owns and nobody else can write into, as the
+    // gateway checks it: another user could otherwise plant the socket and read the call. A directory that is
+    // not there (an empty `--runtime-dir` names none) means no daemon: the call ends without a connect, which a
+    // directory created meanwhile by someone else could otherwise answer.
+    if let Some(directory) = socket.parent() {
+        if let Err(error) = std::fs::symlink_metadata(directory) {
+            return Err(unsent(format!(
+                "E_TRANSPORT: {}: {error}",
+                socket.display()
+            )));
+        }
+        crate::ipc::trusted_directory(directory).map_err(|message| {
+            if std::fs::symlink_metadata(directory).is_err() {
+                // Gone since the look above: no daemon, as when it was never there.
+                unsent(format!(
+                    "E_TRANSPORT: {}: no such directory",
+                    socket.display()
+                ))
+            } else {
+                CallError {
+                    message: format!("E_RUNTIME: {message}"),
+                    retryable: false,
+                }
+            }
+        })?;
+    }
     let mut stream = tokio::time::timeout_at(end, UnixStream::connect(socket))
         .await
         .map_err(|_| unsent("E_DEADLINE: no connection".to_owned()))?
         .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;
+    // The path is looked up again by the connect, so a directory swapped in after the check could hold another
+    // user's socket: the listener must run under this user before anything is sent.
+    if !crate::ipc::same_user(&stream) {
+        return Err(CallError {
+            message: format!(
+                "E_RUNTIME: {}: the socket belongs to another user",
+                socket.display()
+            ),
+            retryable: false,
+        });
+    }
     let mut reader = kelmo_wire::FrameReader::new();
     let hello = json!({"v": 2, "kind": "hello", "id": random_id(), "body_type": "json",
                        "protocols": ["kelmo/2"], "operations": []});
