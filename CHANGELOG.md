@@ -105,6 +105,9 @@ entry here.
 - A promoted note that met a database held by another writer while it went through the editor no longer fails
   with `E_PROCESSING` and loses an attempt. It waits its turn as `E_BUSY`, uncharged, as it already did before
   the editor call.
+- A Dreaming link finding whose cited evidence could not be read for a moment, because the archive was busy or
+  its process restarted, is no longer settled `stale` for good. It stays open with the error's code and a later
+  `publish` links the pages. Only evidence that was forgotten or is gone settles the finding `stale`.
 
 ### Added
 
