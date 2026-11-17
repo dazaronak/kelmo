@@ -34,7 +34,12 @@ class BrokenFrame(OSError):
     may follow it on that channel."""
 
     def __init__(self, cause):
-        super().__init__(getattr(cause, 'errno', None), f'The frame was cut short: {cause}')
+        code = getattr(cause, 'errno', None)
+        message = f'The frame was cut short: {getattr(cause, "strerror", None) or cause}'
+        if code is None:
+            super().__init__(message)
+        else:
+            super().__init__(code, message)
 
 
 _SOCKET = socket.socket  # the class itself, taken at import: a sandboxed core may have socket.socket replaced
@@ -61,7 +66,9 @@ class DescriptorChannel:
     """The channel as a plain descriptor, for a core inside the Linux sandbox: its seccomp policy refuses every
     socket syscall (`getsockopt` already, which `socket.socket(fileno=...)` makes), while read, write and poll on
     an inherited descriptor stay allowed. Offers the socket methods CoreLink uses; `shutdown` of the read side wakes
-    the reader through a pipe instead of `shutdown(2)`, and a write shutdown does nothing."""
+    the reader through a pipe instead of `shutdown(2)`. A write shutdown cannot half-close the descriptor, so it
+    wakes the reader CONFINED_DRAIN_SECONDS later: replies already on their way are read meanwhile, then the channel
+    ends and is closed, and kelmod sees the end of the stream."""
 
     def __init__(self, fd):
         self.fd = fd
@@ -93,9 +100,15 @@ class DescriptorChannel:
 
     def shutdown(self, how):
         if how == socket.SHUT_WR:
-            # No half-close without shutdown(2): writes already stop on `_peer_gone`, and replies on their way are
-            # still read until kelmod closes its end.
+            # No half-close without shutdown(2): writes already stop on `_peer_gone`; kelmod's reader would wait for
+            # the rest of a cut frame for good, so the whole channel ends after the drain.
+            timer = threading.Timer(CONFINED_DRAIN_SECONDS, self._wake)
+            timer.daemon = True
+            timer.start()
             return
+        self._wake()
+
+    def _wake(self):
         try:
             os.write(self._wake_write, b'x')
         except OSError:
@@ -114,6 +127,8 @@ class DescriptorChannel:
                 pass
 
 
+# How long a confined channel ended for writing still reads replies on their way before it ends whole.
+CONFINED_DRAIN_SECONDS = 1.0
 # How long the stop waits for a write in progress before it closes the channel anyway.
 CLOSE_WAIT_SECONDS = 5.0
 

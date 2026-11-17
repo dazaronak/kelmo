@@ -2,6 +2,7 @@
 one. A write that fails before any byte went out fails its call alone."""
 import errno
 import socket
+import threading
 import uuid
 
 from kelmo.core import corelink, wire
@@ -40,14 +41,19 @@ def _link(cls):
 
 
 def _drain(parent, seconds=1.0):
+    return _drain_to_end(parent, seconds)[0]
+
+
+def _drain_to_end(parent, seconds=1.0):
+    """What kelmod's end reads within `seconds`, and whether it read the end of the stream."""
     parent.settimeout(seconds)
     data = b''
     try:
         while chunk := parent.recv(65536):
             data += chunk
     except TimeoutError:
-        pass
-    return data
+        return data, False
+    return data, True
 
 
 def test_a_frame_cut_part_way_ends_the_channel_and_no_frame_follows_it():
@@ -62,7 +68,8 @@ def test_a_frame_cut_part_way_ends_the_channel_and_no_frame_follows_it():
         assert second.done() and second.exception().code == 'E_TRANSPORT', 'a call after the broken frame was written and waits for a reply'
         assert order[:2] == ['stop', 'failed'], order
         assert HalfThenFull.sends == 2, f'a call after the broken frame wrote again ({HalfThenFull.sends} sends)'
-        received = _drain(parent)
+        received, ended = _drain_to_end(parent)
+        assert ended, 'kelmod did not see the end of the channel after the broken frame'
         whole = len(wire.encode({'v': wire.VERSION, 'kind': 'call', 'id': uuid.uuid4().hex, 'op': 'archive.echo',
                                  'body_type': 'json', 'deadline_ms': 1}, {'n': 1}))
         assert len(received) < whole, 'kelmod received more than the broken frame'
@@ -130,3 +137,44 @@ def test_a_confined_channel_ended_for_writing_still_reads_the_replies_on_their_w
     finally:
         channel.close()
         parent.close()
+
+
+def test_a_confined_channel_whose_frame_was_cut_ends_so_kelmod_sees_the_end(monkeypatch):
+    """A confined core cannot half-close its descriptor, and kelmod's reader waits for the rest of a cut frame: the
+    channel still ends shortly after the cut, so kelmod sees the end of the stream and starts the core again."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), confined=True, handlers={}, lanes={'read': 1})
+    link.hold_hello = True  # the test plays kelmod's side by hand
+    channel = link.sock
+    writes = []
+    real_write = corelink.os.write
+
+    def write(fd, data):
+        if fd != channel.fd:
+            return real_write(fd, data)
+        writes.append(len(data))
+        if len(writes) == 1:
+            return real_write(fd, bytes(data[:len(data) // 2]))
+        raise OSError(errno.ENOBUFS, 'No buffer space available')
+
+    monkeypatch.setattr(corelink.os, 'write', write)
+    reader = threading.Thread(target=link.serve, daemon=True)
+    reader.start()
+    ended = False
+    try:
+        first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+        assert first.exception(5).code == 'E_TRANSPORT'
+        parent.settimeout(5)
+        try:
+            while parent.recv(65536):
+                pass
+            ended = True
+        except TimeoutError:
+            pass
+        assert ended, 'kelmod never saw the end of a confined channel whose frame was cut'
+        reader.join(5)
+        assert not reader.is_alive(), 'the core kept serving a channel whose frame was cut'
+    finally:
+        monkeypatch.undo()
+        parent.close()
+        reader.join(5)
