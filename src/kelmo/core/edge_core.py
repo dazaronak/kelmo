@@ -539,7 +539,8 @@ class EdgeCore:
     def ingest_spool(self):
         """Runs every hook `kelmod hook` spooled while no daemon answered, oldest first, and removes each file
         once its hook ran. A file that is not a hook frame is renamed `*.bad` and kept for inspection; a hook
-        that fails for any other reason stays in the spool and the next pass retries it."""
+        that fails for any other reason stays in the spool and the next pass retries it. Each hook runs only while
+        nobody holds or waits for the outbox: otherwise the pass leaves it, and the rest, for a later pass."""
         import json
         from . import spool
         names = spool.entries(self.spool_directory())
@@ -558,9 +559,14 @@ class EdgeCore:
             except (OSError, ValueError, UnicodeDecodeError):
                 spool.reject(path)
                 continue
+            if not self._owner.acquire_if_idle():
+                return {'ingested': ingested, 'pending': len(names) - index, 'stopped': 'E_BUSY'}
             try:
                 with self.client.deadline(SPOOL_HOOK_SECONDS):
-                    self._run_hook(body)
+                    try:
+                        self._run_hook(body)  # takes the owner again inside (reentrant), so never waits
+                    finally:
+                        self._owner.release()
             except KelmoError as error:
                 # Only a refusal worth retrying (busy, unreachable) keeps the file; any other would repeat for
                 # ever and hold back every later capture.
