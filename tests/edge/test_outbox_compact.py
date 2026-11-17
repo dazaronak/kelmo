@@ -278,6 +278,7 @@ def test_a_paused_compaction_survives_a_restart_of_the_edge_core(legacy_edge, pr
 def test_a_pause_in_the_past_does_not_make_the_deliverer_spin(real_edge):
     core, _client = real_edge
     core._compaction = {'state': 'done', 'retry_at': time.time() - 60}
+    core._compact_after = time.monotonic() - 60  # the pause the loop reads: a minute in the past
     passes = []
     real = core.ingest_spool
 
@@ -651,3 +652,50 @@ def test_a_bounded_summary_counts_its_wait_for_the_outbox_against_its_bound(prof
         other.rollback()
         other.close()
         client.close()
+
+
+
+def test_a_client_on_its_own_does_not_wait_for_another_process_while_it_rewrites(profile):
+    """`kelmo client flush` without an edge core on an old outbox: another process takes the file between the
+    compaction's first look and the rewrite's own; the compaction is left for the next flush instead of waiting."""
+    _legacy(profile)
+    client = SharedClient(profile, multiplex=True)
+    _settled_pieces(client.outbox)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    looks, timers = [], []
+
+    def between(statement):
+        if 'page_count' not in statement:
+            return
+        looks.append(statement)
+        if len(looks) == 2:
+            other.execute('BEGIN EXCLUSIVE')
+            timers.append(threading.Timer(3.0, other.rollback))
+            timers[-1].start()
+
+    client.outbox.conn.set_trace_callback(between)
+    try:
+        started = time.monotonic()
+        given = client.outbox.compact()
+        took = time.monotonic() - started
+        assert given == 0 and took < 1.0, (given, took)
+    finally:
+        client.outbox.conn.set_trace_callback(None)
+        for timer in timers:
+            timer.cancel()
+        try:
+            other.rollback()
+        except sqlite3.ProgrammingError:
+            pass
+        other.close()
+        client.close()
+
+
+def test_an_over_limit_mark_is_dropped_once_the_outbox_is_converted(real_edge, profile):
+    """A file already in incremental mode (converted by a client on its own meanwhile) needs no idle rewrite: the
+    mark goes, and no pause is saved for it on every pass."""
+    core, _client = real_edge
+    core._over_limit = True
+    _passes(core, 1)
+    assert core._over_limit is False, core._compaction
+    assert not (profile.state / 'compaction.json').exists(), 'a converted outbox kept saving an over-limit pause'

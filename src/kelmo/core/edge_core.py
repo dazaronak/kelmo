@@ -394,6 +394,7 @@ class EdgeCore:
                             raise
                         self._over_limit = False
                         return 'done', given
+                    self._over_limit = False  # converted (by a client on its own meanwhile): no rewrite is owed
                     if not free:
                         return ('done' if draining else 'nothing'), 0
                     if not draining and free < chunk and not due(pages, free, size):

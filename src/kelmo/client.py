@@ -258,8 +258,8 @@ class Outbox:
         Settled transcript entries drop their bytes but SQLite keeps the pages. An old file is rewritten once,
         which also makes it give pages back in steps from then on; a converted one is drained. A busy file is left
         for the next flush. Returns the bytes given back, 0 when nothing was due."""
+        # Another process's lock on the file, at any statement here, leaves the compaction to the next flush.
         try:
-            # Another process's lock on the file leaves the compaction to the next flush instead of being waited for.
             with self.waiting(COMPACT_TRY_SECONDS):
                 pages, free, size, mode = self.compaction_state()
         except sqlite3.OperationalError as error:
@@ -270,13 +270,12 @@ class Outbox:
             return 0
         try:
             if mode != 2:
-                self.convert()
-            else:
-                with self.waiting(COMPACT_TRY_SECONDS):
-                    self.conn.execute('PRAGMA incremental_vacuum').fetchall()
+                return self.convert()
+            with self.waiting(COMPACT_TRY_SECONDS):
+                self.conn.execute('PRAGMA incremental_vacuum').fetchall()
+                return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
         except sqlite3.OperationalError:
             return 0
-        return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
 
     @_serial
     def compaction_state(self):
@@ -290,8 +289,8 @@ class Outbox:
         it at once. With `copy_seconds`, a rewrite whose copy phase runs longer is stopped and rolled back
         (SQLITE_INTERRUPT): its copy back into the file and its commit cannot be stopped, so the bound is on the
         part that can. Returns the bytes given back."""
-        pages, _free, size, _mode = self.compaction_state()
         with self.waiting(COMPACT_TRY_SECONDS):
+            pages, _free, size, _mode = self.compaction_state()
             self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
             if copy_seconds is not None:
                 limit = time.monotonic() + copy_seconds
@@ -301,7 +300,7 @@ class Outbox:
             finally:
                 # Cleared before the busy timeout is set back, which the handler would interrupt too.
                 self.conn.set_progress_handler(None, 0)
-        return max(0, pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
+            return max(0, pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
 
     @_serial
     def vacuum_step(self, pages=COMPACT_CHUNK_PAGES):
