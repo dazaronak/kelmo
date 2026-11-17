@@ -215,3 +215,50 @@ def test_a_real_replayed_capture_that_finds_the_owner_taken_while_it_read_is_lef
         if holder.is_alive():
             holder.join(10)
         core.close()
+
+
+def test_a_busy_spool_is_looked_at_again_after_a_long_compaction(profile):
+    """The spool was busy (a tool held the owner), the tool let go before the flush, so the same pass compacted, for
+    longer than a second: the deliverer looks at the spool again once the compaction ends, not after its full
+    interval."""
+    core, ran = _core(profile)
+    taken, let_go = threading.Event(), threading.Event()
+
+    def hold():
+        core._owner.acquire()
+        taken.set()
+        let_go.wait(30)
+        core._owner.release()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    real_ingest = core.ingest_spool
+
+    def ingest_then_let_go():
+        result = real_ingest()
+        if result.get('stopped') == 'E_BUSY' and not let_go.is_set():
+            let_go.set()  # the tool's write ends before the pass's flush
+            holder.join(5)
+        return result
+
+    def slow_compact():
+        time.sleep(1.5)
+        return {'state': 'done', 'freed': 0}
+
+    try:
+        holder.start()
+        assert taken.wait(5)
+        path = _spool(core)
+        core.ingest_spool = ingest_then_let_go
+        core._compact = slow_compact
+        core._compact_after = 0.0
+        core._wake.set()
+        stop = time.monotonic() + 4.5
+        while path.exists() and time.monotonic() < stop:
+            time.sleep(0.05)
+        assert let_go.is_set(), 'the spool was never found busy'
+        assert not path.exists(), 'the busy spool waited past the compaction for the full interval'
+        assert ran == ['session-stop'], ran
+    finally:
+        let_go.set()
+        holder.join(10)
+        core.close()

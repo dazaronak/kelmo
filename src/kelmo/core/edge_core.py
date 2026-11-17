@@ -303,9 +303,12 @@ class EdgeCore:
         while not self._stopping.is_set():
             interval = DELIVER_INTERVAL
             now = time.monotonic()
-            for after in (self._compact_after, self._busy_after):
-                if 0 < after - now < interval:
-                    interval = after - now  # a pause of a second comes back without being woken
+            if 0 < self._compact_after - now < interval:
+                interval = self._compact_after - now  # a pause of a second comes back without being woken
+            if self._busy_after:
+                # A held outbox is looked at again a second later, at once when that second passed meanwhile (a
+                # long compaction in the same pass); every pass sets the retry afresh, so this never spins.
+                interval = min(interval, max(0.0, self._busy_after - now))
             self._wake.wait(interval)
             self._wake.clear()
             if self._stopping.is_set():
