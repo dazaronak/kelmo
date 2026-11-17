@@ -24,10 +24,11 @@ entry here.
   again under the same client id) gets the same answer from the server, which follows the resend chain itself:
   the same request sent under `<key>#resendN` after the refusal. While the resent note is still running there,
   the request stays queued; a resent note whose server process died before it settled is run again under its
-  own key and answers with its outcome. A refusal answered as a duplicate of another note still gets the old
-  refusal from the server. A new key a caller chooses (`--idempotency-key`, the tools' `idempotency_key`) may
-  no longer contain `#resend`, which resend uses; such a request is refused with `E_INPUT` and not queued. The
-  key of an entry already queued may still be repeated.
+  own key and answers with its outcome. A refusal answered as a duplicate of a note under another key gets
+  from the server the refusal of the last `<key>#resendN` it recorded, or the old refusal when there is none.
+  A new key a caller chooses (`--idempotency-key`, the tools' `idempotency_key`) may no longer contain
+  `#resend`, which resend uses; such a request is refused with `E_INPUT` and not queued. The key of an entry
+  already queued may still be repeated.
 - `kelmo client resend` counts a refusal as a duplicate only of a queued or delivered note with the same
   request: the same project, text, rule change, new work page and pending flag. Before, a note of any project
   with that text answered for it, whatever its other arguments.
