@@ -104,14 +104,15 @@ applies takes the next free suffix, so a note refused again can be resent
 once more after the next fix. A request goes out once: a refusal whose
 request a queued or delivered note already carries names that note instead
 (`duplicate: true`), and of several refusals with one request only the newest
-is sent. Two requests are the same when the project, the text (without its
-surrounding whitespace), the rule change, the new work page and the pending
-flag match; the targets, the file name and the budget are not compared, since
-a refusal is usually resent once its target is fixed. While the client still
-holds the old entry, the same request submitted again under the old key is
-answered as the note it went out as: its outcome, its refusal, or queued under
-its new key. Without that entry the request reaches the server, which answers
-with the old refusal.
+is sent. For this, two requests are the same when the project, the text
+(without its surrounding whitespace), the rule change, the new work page and
+the pending flag match; the targets, the file name and the budget are not
+compared, since a refusal is usually resent once its target is fixed. Under
+the old key itself, only the request with exactly its arguments is accepted
+again; any other is refused with `E_IDEMPOTENCY`. While the client still holds
+the old entry, that request is answered as the note it went out as: its
+outcome, its refusal, or queued under its new key. Without that entry the
+request reaches the server, which answers with the old refusal.
 A refusal that will not be resent stays in `kelmo client status` until it is
 dismissed. `kelmo client dismiss` lists the refused entries whose code matches
 `--code` or whose key matches `--key` (both repeatable; with neither, every
