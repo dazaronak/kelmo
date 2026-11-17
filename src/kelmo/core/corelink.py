@@ -319,9 +319,10 @@ class CoreLink:
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
         # Closed only once no write is on the descriptor: a number closed under a write could be reused by another
-        # open before that write runs. kelmod has closed its end, so a write in progress ends at once. One still stuck
-        # at the bound is made to fail by a shutdown, which keeps the number, and the descriptor is closed by a thread
-        # of its own once that write lets go: the stop does not wait for it.
+        # open before that write runs. A write still in progress at the bound (kelmod not reading) is cut short by a
+        # shutdown on a socket, which keeps the number; a confined channel has no shutdown(2), so its write goes on
+        # until kelmod reads or goes. Either way the descriptor is closed by a thread of its own once that write lets
+        # go, and this step does not wait for it.
         if not self._write_lock.acquire(timeout=CLOSE_WAIT_SECONDS):
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)

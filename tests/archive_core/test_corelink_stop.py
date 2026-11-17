@@ -626,6 +626,7 @@ def test_waking_a_closed_confined_channel_writes_into_no_reused_descriptor(tmp_p
     finally:
         for descriptor in opened:
             os.close(descriptor)
+        parent.close()
 
 
 def test_the_channel_is_closed_only_after_a_write_in_progress_has_ended():
@@ -720,9 +721,12 @@ def test_a_write_stuck_past_the_close_bound_still_ends_before_the_channel_closes
     link._wait_for_owner = reply_while_the_owner_stops
     stopper = threading.Thread(target=link._finish, daemon=True)
     try:
+        started = time.monotonic()
         stopper.start()
         stopper.join(3)
+        took = time.monotonic() - started
         assert not stopper.is_alive(), 'the stop waited past its bound for a stuck write'
+        assert took < 1.5, f'the stop took {took:.2f} s with a 0.3 s close bound'
         assert 'close' not in events, f'the channel was closed under a write still in progress: {events}'
         release.set()
         caller.join(10)
