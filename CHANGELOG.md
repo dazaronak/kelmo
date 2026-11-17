@@ -200,6 +200,10 @@ entry here.
   takes the outbox only while nobody holds it or waits for it; otherwise it ends at once, leaving the writes
   to that caller, and looks again a second later. Before, it waited up to five seconds each pass behind a long
   hook or tool call.
+- The edge daemon replays a hook that `kelmod hook` spooled only while nobody holds or waits for the outbox,
+  and a session event reads its transcript before it takes the outbox; otherwise it leaves the file, and the
+  rest, for a pass a second later. Before, a pass could wait up to ten seconds behind a caller that held the
+  outbox.
 
 ## [0.3.2] - 2026-11-16
 

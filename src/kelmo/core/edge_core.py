@@ -167,6 +167,10 @@ class _OwnerGate:
     def __enter__(self):
         from ..client import Busy
         core = self._core
+        if getattr(core._idle_only, 'value', False) and not core._owner.held():
+            if not core._owner.acquire_if_idle():
+                raise Busy('The outbox is in use; the spooled hook is left for a later pass.')
+            return self
         try:
             seconds = core.client.remaining()
         except KelmoError:  # the deadline has passed: one try, no wait
@@ -201,6 +205,7 @@ class EdgeCore:
         # and the deliverer alike. A read over a channel that carries several requests does not take it.
         self._owner = OwnerLock()
         self._urgent = threading.local()
+        self._idle_only = threading.local()  # a spooled hook takes the outbox only while nobody holds or waits for it
         self.client._lock = _OwnerGate(self)
         self._acks = {}
         self._acks_lock = threading.Lock()
@@ -324,9 +329,12 @@ class EdgeCore:
         while not self._stopping.is_set():
             interval = DELIVER_INTERVAL
             now = time.monotonic()
-            for after in (self._compact_after, self._busy_after):
-                if 0 < after - now < interval:
-                    interval = after - now  # a pause of a second comes back without being woken
+            if 0 < self._compact_after - now < interval:
+                interval = self._compact_after - now  # a pause of a second comes back without being woken
+            if self._busy_after:
+                # A held outbox is looked at again a second later, at once when that second passed meanwhile (a
+                # long compaction in the same pass); every pass sets the retry afresh, so this never spins.
+                interval = min(interval, max(0.0, self._busy_after - now))
             self._wake.wait(interval)
             self._wake.clear()
             if self._stopping.is_set():
@@ -344,7 +352,8 @@ class EdgeCore:
             except Exception as error:  # noqa: BLE001 - the next pass retries; the outbox keeps every entry
                 result = {'stopped': type(error).__name__, 'message': str(error)[:200]}
             # An outbox another caller held is looked at again a second later, woken or not.
-            self._busy_after = time.monotonic() + BUSY_RETRY_SECONDS if result.get('stopped') == 'E_BUSY' else 0.0
+            busy = result.get('stopped') == 'E_BUSY' or spool.get('stopped') == 'E_BUSY'
+            self._busy_after = time.monotonic() + BUSY_RETRY_SECONDS if busy else 0.0
             if result.get('pending') == 0 and time.monotonic() >= self._compact_after:
                 result = dict(result, compaction=self._compact())
             self._last = {'at': time.time(), 'result': result, 'spool': spool}
@@ -588,7 +597,8 @@ class EdgeCore:
     def ingest_spool(self):
         """Runs every hook `kelmod hook` spooled while no daemon answered, oldest first, and removes each file
         once its hook ran. A file that is not a hook frame is renamed `*.bad` and kept for inspection; a hook
-        that fails for any other reason stays in the spool and the next pass retries it."""
+        that fails for any other reason stays in the spool and the next pass retries it. Each hook runs only while
+        nobody holds or waits for the outbox: otherwise the pass leaves it, and the rest, for a later pass."""
         import json
         from . import spool
         names = spool.entries(self.spool_directory())
@@ -607,6 +617,10 @@ class EdgeCore:
             except (OSError, ValueError, UnicodeDecodeError):
                 spool.reject(path)
                 continue
+            if not self._owner.acquire_if_idle():
+                return {'ingested': ingested, 'pending': len(names) - index, 'stopped': 'E_BUSY'}
+            self._owner.release()  # free now; the hook takes it for its own outbox steps, idle-only, never waiting
+            self._idle_only.value = True
             try:
                 with self.client.deadline(SPOOL_HOOK_SECONDS):
                     self._run_hook(body)
@@ -619,6 +633,8 @@ class EdgeCore:
                 return {'ingested': ingested, 'pending': len(names) - index, 'stopped': error.code}
             except Exception as error:  # noqa: BLE001 - kept in the spool, retried on the next pass
                 return {'ingested': ingested, 'pending': len(names) - index, 'stopped': type(error).__name__}
+            finally:
+                self._idle_only.value = False
             path.unlink(missing_ok=True)
             ingested += 1
         return {'ingested': ingested, 'pending': 0}
