@@ -109,6 +109,13 @@ once more after the next fix. A text goes out once: a refusal whose text a
 queued or delivered note already carries names that note instead
 (`duplicate: true`), and of several refusals with one text only the newest is
 sent.
+A refusal that will not be resent stays in `kelmo client status` until it is
+dismissed. `kelmo client dismiss` lists the refused entries whose code matches
+`--code` or whose key matches `--key` (both repeatable; with neither, every
+refused entry); with `--apply` they become `dismissed`. The entry keeps its
+request and its refusal: status counts it under `dismissed` instead of listing
+it, `client resend` no longer selects it, and the same request under its key
+is still answered with that refusal. Nothing is deleted.
 The editor sends the archived source, its reconciliation receipts and every
 mandatory person page whole, then the selected pages and the pages the model
 asks for (each as its facts, narratives and actions plus its hand-written

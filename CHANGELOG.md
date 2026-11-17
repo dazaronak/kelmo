@@ -41,6 +41,15 @@ entry here.
   vault were missing. `dream run` and `dream apply` are no longer sent to the client's daemon, which has no dream
   job; they get the same refusal.
 
+### Added
+
+- `kelmo client dismiss` stops listing refusals the owner has read. A shared client kept every refused
+  entry in `kelmo client status` for good, so one that would never be resent stayed there. The command lists
+  the refused entries whose code matches `--code` or whose key matches `--key` (both repeatable; with
+  neither, every refused entry), and with `--apply` marks them `dismissed`. Status then counts them under
+  `dismissed`. `kelmo client resend` no longer selects them, and the same request under its key is still
+  answered with its refusal. Nothing is deleted.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added
