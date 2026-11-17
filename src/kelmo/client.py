@@ -361,11 +361,18 @@ class Outbox:
         `resent` and names its successor. Without `apply` nothing changes. The refusals are read under the
         write lock, so two runs at once never resend one note twice.
 
-        A note is sent once: a refusal whose text another queued or delivered note already carries is not
-        sent again but names that note (`duplicate`), and of several refusals with one text only the newest
-        goes out; the older ones name it too."""
+        A note is sent once: a refusal whose request another queued or delivered note already carries is not
+        sent again but names that note (`duplicate`), and of several refusals with one request only the newest
+        goes out; the older ones name it too. Two requests are the same when every argument matches, the text
+        compared without its surrounding whitespace. The targets, the file name and the budget are not
+        compared, since a refusal is often resent once its target is fixed; a different project, rule change,
+        new work page or pending flag makes another note."""
         def text(row):
-            return json.loads(row['args']).get('content', '').strip()
+            args = json.loads(row['args'])
+            same = {name: value for name, value in args.items()
+                    if name not in ('selected', 'filename', 'budget_tokens')}
+            same['content'] = args.get('content', '').strip()
+            return canonical(same)
 
         items = []
         with self.conn:
@@ -1624,6 +1631,14 @@ class SharedClient:
                 'stopped': stopped, 'reached': reached}
 
     def _entry_result(self, entry):
+        # A resent refusal is answered as the note it went out as (`client resend`), down a chain of resends.
+        seen = set()
+        while entry['state'] == 'resent' and entry['idempotency_key'] not in seen:
+            seen.add(entry['idempotency_key'])
+            successor = self.outbox.get(json.loads(entry['outcome'] or '{}').get('resent_as') or '')
+            if successor is None:
+                break
+            entry = successor
         if entry['state'] == 'delivered':
             return json.loads(entry['outcome'])
         if entry['state'] in ('refused', 'dismissed'):

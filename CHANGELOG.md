@@ -143,6 +143,14 @@ entry here.
   so a case that passed and then failed in its teardown no longer hides a case that never ran. The
   measurement gate (`bash run-tests.sh`) shows those collected and progress lines as they come, while the
   source suite still runs, instead of only after the section ended.
+- A request submitted again under the key of a refusal that `kelmo client resend` sent again is answered as
+  the note it went out as: with that note's outcome, its refusal, or as queued under its new key. Before, the
+  old key always answered that the request was queued and would be delivered on the next contact, even after
+  the resent note had been delivered or refused. A client that no longer holds the old entry still gets the
+  old refusal from the server.
+- `kelmo client resend` counts a refusal as a duplicate only of a queued or delivered note with the same
+  request: the same project, text, rule change, new work page and pending flag. Before, a note of any project
+  with that text answered for it, whatever its other arguments.
 
 ## [0.3.2] - 2026-11-16
 
