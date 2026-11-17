@@ -337,7 +337,10 @@ class Dreaming:
             except KelmoError as error:
                 if error.code not in ('E_FORGOTTEN', 'E_PURGED'):
                     raise
-                consumed += 1  # a hidden record is no evidence; passed like one larger than the budget
+                # A record hidden after it was archived is no evidence any more, and it must not hold the cursor.
+                skipped.append({'archive_id': reference.archive_id, 'version': reference.version,
+                                'reason': 'forgotten'})
+                consumed += 1
                 continue
             item = {'archive_id': reference.archive_id, 'version': reference.version, 'text': text}
             cost = views._cost(item)

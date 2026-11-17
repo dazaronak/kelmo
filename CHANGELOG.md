@@ -45,6 +45,10 @@ entry here.
   write waiting until its deadline. Hooks still go ahead of tool calls, but never twice in a row past a
   waiting tool call, and hooks among themselves also go in the order they came. A caller whose wait ran out
   holds nobody back and no longer takes the lock if its turn comes after that.
+- Dreaming's findings pass skips a record that was forgotten after it was archived and moves past it.
+  It used to fail with `E_FORGOTTEN` on such a record, and since the cursor moves only after a
+  successful pass, every later pass failed on the same record. The run lists it in `skipped` with
+  `"reason": "forgotten"`.
 
 ### Added
 
