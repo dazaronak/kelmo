@@ -55,3 +55,31 @@ def test_a_request_whose_encoding_outlasts_its_deadline_sends_nothing(monkeypatc
     finally:
         channel.grace = 0
         channel.close()
+
+
+def test_a_pipe_that_closes_before_a_byte_of_the_request_goes_out_refuses_it_as_unsent(monkeypatch):
+    """The server exited before the request's first byte: nothing was written, so the request is unsent (no attempt,
+    no refusal kept) and the channel is ended, never reused."""
+    import errno
+
+    from kelmo.client import Unsent
+    channel = _silent()
+    descriptor = channel.process.stdin.fileno()
+    real = os.write
+
+    def write(fd, data):
+        if fd != descriptor:
+            return real(fd, data)
+        raise BrokenPipeError(errno.EPIPE, 'Broken pipe')
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        with pytest.raises(Exception) as raised:
+            channel.request({'protocol': client_module.PROTOCOL, 'request_id': 'r3', 'op': 'status', 'args': {}})
+        monkeypatch.undo()
+        assert isinstance(raised.value, Unsent), repr(raised.value)
+        assert channel.ended, 'a channel whose server is gone was left for reuse'
+    finally:
+        monkeypatch.undo()
+        channel.grace = 0
+        channel.close()

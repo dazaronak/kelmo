@@ -291,6 +291,13 @@ class Outbox:
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=?', (code, key))
 
     @_serial
+    def note_if_unset(self, key, code):
+        """The code as the entry's pending reason only when it has none: a server's refusal is never replaced."""
+        with self.conn:
+            self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=? AND last_error IS NULL',
+                              (code, key))
+
+    @_serial
     def settle(self, key, state, outcome):
         with self.conn:
             self.conn.execute("UPDATE entries SET state=?, outcome=?, settled_at=? "
@@ -469,6 +476,9 @@ class StdioChannel:
         except OSError as error:
             self.grace = 0
             self.close()
+            if not self.wrote and getattr(error, 'partial', None) is False:
+                # The server was gone before a byte of the frame went out: the request is unsent.
+                raise Closed('E_TRANSPORT', 'The shared-memory channel closed before the request.') from error
             raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.') from error
         except KelmoError as error:
             # A channel that missed its deadline or broke framing is ended now, never waited for.
@@ -499,6 +509,9 @@ class StdioChannel:
                     view = view[count:]
                 except BlockingIOError:
                     continue
+                except OSError as error:
+                    error.partial = written > 0
+                    raise
 
     def close(self):
         self.ended = True
@@ -627,10 +640,12 @@ class MuxChannel:
                 self._waiters.pop(call_id, None)
             raise
         except OSError as error:
+            # The peer was gone before a byte of the frame went out (`_write` wraps an error after part of it):
+            # the request is unsent, and the channel is not used again.
             self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
             self.grace = 0
             self.close()
-            raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.') from error
+            raise Closed('E_TRANSPORT', 'The shared-memory channel closed before the request.') from error
         except KelmoError as error:
             if getattr(error, 'partial', False):
                 self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
@@ -1292,6 +1307,11 @@ class SharedClient:
                 return self._read(op, args, channel=channel)
             except Closed:
                 pass  # closed under this read before it went out: once more, on a channel of its own
+            except Unbound:
+                if channel.alive:
+                    raise
+                # The channel ended under this read after it went out: a read is safe to repeat, on a channel of
+                # its own.
         channel, hello = self._hello_channel()
         try:
             ok, value = self._send(channel, op, args or {}, None, server=hello)
@@ -1392,9 +1412,14 @@ class SharedClient:
                     self._drop(channel)  # a local refusal leaves the channel healthy, unless it ended the channel
                 if isinstance(error, (Closed, Unsent)) and attempted:
                     self.outbox.attempt(key, -1)  # refused here before a byte went out: no attempt
-                if not (isinstance(error, (Closed, Late)) or (isinstance(error, Unsent) and error.code == 'E_BUSY')):
-                    # A busy turn, a channel closed or dropped while this request waited for it, or a deadline
-                    # that passed before the request went out keeps no refusal: nothing about this entry failed.
+                if isinstance(error, (Closed, Late)):
+                    # A channel closed or dropped before the request, or a deadline that passed before it went out:
+                    # nothing about this entry failed, so an earlier refusal stays. When no channel came up in time
+                    # (the server's hello did not answer), an entry with no refusal is told why it still waits.
+                    if channel is None:
+                        self.outbox.note_if_unset(key, error.code)
+                elif not (isinstance(error, Unsent) and error.code == 'E_BUSY'):
+                    # A busy turn keeps no refusal either.
                     self.outbox.note(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break

@@ -1362,3 +1362,61 @@ def test_a_hello_that_runs_past_the_deadline_keeps_the_entrys_refusal(profile):
         assert (entry['attempts'], entry['last_error']) == (0, 'E_EARLIER'), entry
     finally:
         client.close()
+
+
+def test_a_hello_that_runs_past_the_deadline_names_the_cause_of_an_entry_with_none(profile):
+    """The channel's hello outlasts the pass's deadline and the entry has no refusal yet: it counts no attempt but
+    gets the transport code as its pending reason, so status and the stall warning say why it waits."""
+    from kelmo.client import SharedClient
+    from kelmo.errors import KelmoError
+
+    class SlowHello:
+        def request(self, frame, timeout=None):
+            time.sleep(0.5)
+            raise KelmoError('E_TRANSPORT', 'The hello timed out.')
+
+        def close(self):
+            pass
+
+    client = SharedClient(profile, channel_factory=SlowHello, multiplex=True)
+    try:
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'slow-hello-fresh')
+        with client.deadline(0.3):
+            client.flush()
+        entry = client.outbox.pending()[0]
+        assert (entry['attempts'], entry['last_error']) == (0, 'E_TRANSPORT'), entry
+    finally:
+        client.close()
+
+
+def test_a_status_read_whose_shared_channel_ended_under_it_goes_again_on_its_own(profile):
+    """The open kelmo/2 channel ends while a status read waits for its reply: a read is safe to repeat, so it goes
+    again on a channel of its own instead of failing."""
+    from kelmo.client import SharedClient
+    from kelmo.errors import KelmoError
+    entered, release = threading.Event(), threading.Event()
+    release.set()
+
+    class EndsUnderIt:
+        concurrent, alive, stalled = True, True, False
+
+        def request(self, frame, timeout=None):
+            self.alive = False  # the peer went away after the request was written
+            raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.')
+
+        def close(self):
+            self.alive = False
+
+    client = SharedClient(profile, channel_factory=lambda: OneAtATimeChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    client._channel = EndsUnderIt()
+    client.server = {'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+    try:
+        with client.deadline(5.0):
+            try:
+                value = client.read_aside('status')
+            except Exception as error:  # noqa: BLE001 - the kind of failure is what this test checks
+                value = error
+        assert value == {'ok': True}, repr(value)
+    finally:
+        client.close()

@@ -249,3 +249,34 @@ def test_a_request_on_a_closed_channel_is_refused_as_closed():
     with pytest.raises(KelmoError) as refused:
         channel.request(request('after-close'))
     assert isinstance(refused.value, Closed), type(refused.value)
+
+
+def test_a_pipe_that_closes_before_a_byte_of_the_frame_goes_out_refuses_it_as_closed(monkeypatch):
+    """The peer exited after the channel's checks and before the frame's first byte: nothing was written, so the
+    request is refused as Closed (no attempt, no refusal kept) and the channel is not used again."""
+    import errno
+
+    import kelmo.client as client_module
+    from kelmo.client import Closed
+    channel = MuxChannel(command(), timeout=2)
+    descriptor = channel.process.stdin.fileno()
+    real = os.write
+
+    def write(fd, data):
+        if fd != descriptor:
+            return real(fd, data)
+        raise BrokenPipeError(errno.EPIPE, 'Broken pipe')
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('gone-before-frame'))
+            outcome = None
+        except Exception as error:  # noqa: BLE001 - the kind of failure is what this test checks
+            outcome = error
+        monkeypatch.undo()
+        assert isinstance(outcome, Closed), f'a frame never written reached the caller as {outcome!r}'
+        assert not channel.alive, 'a channel whose peer is gone stayed in use'
+    finally:
+        monkeypatch.undo()
+        channel.close()
