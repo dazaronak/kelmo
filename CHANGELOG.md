@@ -49,6 +49,10 @@ entry here.
   It used to fail with `E_FORGOTTEN` on such a record, and since the cursor moves only after a
   successful pass, every later pass failed on the same record. The run lists it in `skipped` with
   `"reason": "forgotten"`.
+- A session note forgotten while the session worker waits for its reconcile call is no longer published: the
+  job ends `wiki_unchanged`. So is one forgotten after an attempt that got the editor's answer but stopped
+  before its publication was prepared; that request is refused. A session note whose publication was already
+  prepared is finished as before, and a replay of a finished one still makes no second commit.
 
 ### Added
 
