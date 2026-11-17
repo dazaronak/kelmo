@@ -282,7 +282,7 @@ def borrowed_read_only(argv):
     try:
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             args = parser.parse_args(argv)
-    except SystemExit:
+    except (SystemExit, UsageError):  # the borrowed run refuses it with its own error
         return False
     return args.command == 'status' or (args.command == 'client' and getattr(args, 'action', None) == 'status')
 

@@ -102,3 +102,14 @@ def test_a_hook_gets_the_outbox_while_a_status_probe_waits_for_the_authority(pro
         command.join(10)
         core.close()
     assert answers and all(channel.closed for channel in channels), (answers, channels)
+
+
+def test_a_command_that_does_not_parse_is_not_a_status_read():
+    """It goes on to the borrowed run, which refuses it under the owner lock with the command's own error."""
+    for argv in (['no-such-command'], ['client', 'status', '--no-such-option']):
+        try:
+            answer = cli.borrowed_read_only(argv)
+        except Exception as error:  # noqa: BLE001 - the answer under test, whatever it is
+            answer = error
+        assert answer is False, (argv, answer)
+
