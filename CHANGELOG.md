@@ -232,6 +232,15 @@ entry here.
   and a session event reads its transcript before it takes the outbox; otherwise it leaves the file, and the
   rest, for a pass a second later. Before, a pass could wait up to ten seconds behind a caller that held the
   outbox.
+- A shared client removes its old HOT sets. Each publication installed a new set of HOT files under the
+  client's `hot/` and none was ever removed, so the directory grew by every generation. When it installs a
+  set, the client now removes, at most once a day, the sets older than two days. It keeps the eight newest
+  whatever their age (the current set among them), every set a cached context names, and every set a
+  session's delivery gave a path into while that session's record is younger than 30 days; a set installed
+  again counts as new.
+  A local vault that saves a copy for a cut context sweeps its sets the same way. An offline delivery whose
+  set was removed says that no cached generation is left. The same sweep removes a cached context no delivery,
+  online or from the cache, has used for 30 days, so a binding nobody uses any more no longer holds its set.
 
 ## [0.3.2] - 2026-11-16
 
