@@ -7,6 +7,7 @@ the archive process re-issues the same Origins from the enrollment its parent se
 import base64
 import contextvars
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -1714,14 +1715,14 @@ class ClientSession:
                 if stored['fingerprint'] != fingerprint:
                     raise KelmoError('E_IDEMPOTENCY', 'The idempotency key already identifies a different request.')
                 if stored['state'] == 'finished':
-                    return dict(json.loads(stored['reply']), replayed=True)
+                    return self._replay(key, stored)
             if self._fenced():
                 raise KelmoError('E_FENCED', 'This server is fenced; writes stay queued until the cutover completes.')
             self.service.archive_api.assert_writer()
             with self._request_lock(request_key) as release:
                 row, claimed = _ledger(journal.client_request_claim, request_key, self.client_id, op, fingerprint)
                 if claimed is None:
-                    return dict(json.loads(row['reply']), replayed=True)
+                    return self._replay(key, row)
                 try:
                     outcome = {'ok': True, 'result': getattr(self, 'write_' + op)(key=key, **args)}
                 except KelmoError as error:
@@ -1744,6 +1745,28 @@ class ClientSession:
             # can settle it, so the refusal is retryable rather than a final answer.
             raise _verdict(KelmoError(_unsettled(error).code, 'The write did not settle; it is retried under '
                                                              'the same key.'), True) from error
+
+    def _replay(self, key, row):
+        """The stored reply of a finished request. A refusal that `kelmo client resend` sent again under
+        `<key>#resend<n>` answers as the last note of that chain, which this client's outbox may no longer
+        know (a profile made again under the same client id); a resend still running is answered busy."""
+        reply = json.loads(row['reply'])
+        if reply.get('ok') is False:
+            base, mark, number = key.partition('#resend')
+            if not (mark and number.isdigit()):
+                base, number = key, '0'
+            journal, after = self.service.journal, None
+            for successor in itertools.count(int(number) + 1):
+                stored = journal.client_request(_request_digest([self.client_id, f'{base}#resend{successor}']))
+                if stored is None:
+                    break
+                after = stored
+            if after is not None:
+                if after['state'] != 'finished':
+                    raise KelmoError('E_BUSY', 'The note this request was resent as is still running; it stays '
+                                              'queued.')
+                reply = json.loads(after['reply'])
+        return dict(reply, replayed=True)
 
     @contextmanager
     def _request_lock(self, request_key):

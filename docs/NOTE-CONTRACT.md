@@ -111,8 +111,10 @@ compared, since a refusal is usually resent once its target is fixed. Under
 the old key itself, only the request with exactly its arguments is accepted
 again; any other is refused with `E_IDEMPOTENCY`. While the client still holds
 the old entry, that request is answered as the note it went out as: its
-outcome, its refusal, or queued under its new key. Without that entry the
-request reaches the server, which answers with the old refusal.
+outcome, its refusal, or queued under its new key. Without that entry (a
+profile made again under the same client id) the request reaches the server,
+which answers it the same way from its own record of the resend chain; while
+the note it went out as is still running there, the request stays queued.
 A refusal that will not be resent stays in `kelmo client status` until it is
 dismissed. `kelmo client dismiss` lists the refused entries whose code matches
 `--code` or whose key matches `--key` (both repeatable; with neither, every
