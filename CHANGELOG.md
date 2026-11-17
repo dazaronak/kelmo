@@ -91,6 +91,9 @@ entry here.
   answer with `"outbox": {"busy": true}` instead of waiting past their deadline; during a delivery, which
   leaves the file free, they report the counts. A client that runs without the edge daemon still waits for a
   held file while it opens the outbox, as before.
+- A server that serves one client both through the daemon's state core and through `kelmo serve-client` at
+  once no longer runs one write request twice: the state core now also takes the request's lock file, so each
+  refuses a request the other is running with `E_BUSY`, which the client retries.
 
 ### Added
 

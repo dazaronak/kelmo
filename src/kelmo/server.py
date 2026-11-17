@@ -1721,6 +1721,7 @@ class ClientSession:
             with self._request_lock(request_key) as release:
                 row, claimed = _ledger(journal.client_request_claim, request_key, self.client_id, op, fingerprint)
                 if claimed is None:
+                    release()  # finished by another attempt meanwhile: the file goes, as after a settlement
                     return dict(json.loads(row['reply']), replayed=True)
                 try:
                     outcome = {'ok': True, 'result': getattr(self, 'write_' + op)(key=key, **args)}
@@ -1749,12 +1750,18 @@ class ClientSession:
     def _request_lock(self, request_key):
         """The exclusive lock of one ledger row, refused at once (E_BUSY, retryable) while another live
         attempt holds it. The file is removed after the row is settled: a later opener of the old or a new
-        file then finds the finished row and replays it. In the state core, where one process executes
-        every write, the lock is the core's in-process table of keys in flight and no file is made."""
+        file then finds the finished row and replays it. Every server process takes the file, the state core
+        too, so a state core and a `kelmo serve-client` serving one client at once still run a key once; the
+        state core first refuses a key another of its threads runs (its table of keys in flight)."""
         if self.keys_in_flight is not None:
-            with self.keys_in_flight.hold(request_key):
-                yield lambda: None
+            with self.keys_in_flight.hold(request_key), self._file_lock(request_key) as release:
+                yield release
             return
+        with self._file_lock(request_key) as release:
+            yield release
+
+    @contextmanager
+    def _file_lock(self, request_key):
         import fcntl
         directory = self.service.config.internal('.state/client-requests')
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1771,8 +1778,8 @@ class ClientSession:
             if settled:
                 try:
                     path.unlink()
-                except FileNotFoundError:
-                    pass
+                except OSError:
+                    pass  # a file left behind only makes the next opener find the finished row
         finally:
             os.close(descriptor)
 
