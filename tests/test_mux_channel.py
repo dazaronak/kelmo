@@ -279,4 +279,38 @@ def test_a_pipe_that_closes_before_a_byte_of_the_frame_goes_out_refuses_it_as_cl
         assert not channel.alive, 'a channel whose peer is gone stayed in use'
     finally:
         monkeypatch.undo()
+
+
+def test_close_does_not_close_the_pipe_under_a_write_in_progress():
+    """The peer stopped reading, so a large request waits inside `_write` for room in the pipe. The close takes the
+    pipe away only once that write has stopped, within about one poll slice: its number is never closed under it
+    (another open could take the number and receive the rest of the frame)."""
+    channel = MuxChannel(command('--stop-reading'), timeout=5)
+    failures = []
+
+    def write_big():
+        try:
+            channel.request(request('big', blob='x' * (1 << 20)))
+        except KelmoError as error:
+            failures.append(error.code)
+
+    writer = threading.Thread(target=write_big, daemon=True)
+    try:
+        writer.start()
+        stop = time.monotonic() + 5
+        while not channel._write_lock.locked() and time.monotonic() < stop:
+            time.sleep(0.01)
+        assert channel._write_lock.locked(), 'the request never started writing'
+        time.sleep(0.2)  # the pipe is full: the write waits for room
+        channel.grace = 0
+        started = time.monotonic()
+        channel.close()
+        took = time.monotonic() - started
+        still_writing = channel._write_lock.locked()
+        assert not still_writing, 'the pipe was closed while a write was still in progress on it'
+        assert took < 0.5, f'the close waited {took:.2f} s for the write'
+        writer.join(5)
+        assert failures == ['E_TRANSPORT'], failures
+    finally:
+        channel.grace = 0
         channel.close()
