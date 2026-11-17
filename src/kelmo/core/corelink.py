@@ -217,8 +217,9 @@ class CoreLink:
             self._finish()
 
     def _ask_owner_to_stop(self):
-        """`begin_stop`, once. A caller that comes while it runs returns only after it has run, so its own
-        failure is counted as the stop's too; `begin_stop` does not wait, so neither does that caller for long."""
+        """`begin_stop`, once. A caller on another thread that comes while it runs returns only after it has run,
+        so its own failure is counted as the stop's too; `begin_stop` does not wait, so neither does that caller for
+        long. A call `begin_stop` itself made would return at once (the lock is reentrant)."""
         failure = None
         with self._owner_stop_lock:
             if self._owner_stop_asked:
