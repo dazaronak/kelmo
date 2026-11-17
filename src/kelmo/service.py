@@ -1008,6 +1008,10 @@ class Service:
                                  budget_tokens=promotion.BUDGET_TOKENS, rule_change=request['rule_change'],
                                  contexts=self.context_bindings)
             except Exception as error:  # noqa: BLE001 - Preserve failed operations across backend faults.
+                from . import stopping
+                if stopping.requested():
+                    # The core's stop caused it, as in `run`: the note waits, uncharged, and the claim is released.
+                    raise Stopping() from error
                 if isinstance(error, KelmoError) and error.code in ('E_BUSY', 'E_CLAIM'):
                     raise
                 code = error.code if isinstance(error, KelmoError) else 'E_PROCESSING'

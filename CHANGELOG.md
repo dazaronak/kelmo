@@ -53,6 +53,10 @@ entry here.
   job ends `wiki_unchanged`. So is one forgotten after an attempt that got the editor's answer but stopped
   before its publication was prepared; that request is refused. A session note whose publication was already
   prepared is finished as before, and a replay of a finished one still makes no second commit.
+- A promote note whose editor call fails because the core is stopping now waits for the next start
+  without being charged an attempt, as a stop met earlier in the same run already did, also when the editor
+  answers busy. It used to be staged failed and charged: retried later for a transient code, needing a
+  manual retry otherwise.
 
 ### Added
 
