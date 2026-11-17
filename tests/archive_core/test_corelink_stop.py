@@ -144,13 +144,18 @@ def test_a_second_unsent_call_does_not_fail_before_the_core_has_heard_of_the_sto
     first.start()
     assert entered.wait(5)
 
+    started = threading.Event()
+
     def second():
+        started.set()
         link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
         order.append('second failed')
 
     other = threading.Thread(target=second, daemon=True)
     other.start()
+    assert started.wait(5)
     other.join(0.5)
+    assert other.is_alive(), 'the second call returned while the first was still telling the core of the stop'
     release.set()
     other.join(10)
     first.join(10)
@@ -336,3 +341,88 @@ def test_an_unsent_call_already_failed_by_the_stop_returns_its_failed_future(mon
     link.sock = FailedFirst(link.sock)
     future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
     assert future.exception() is not None
+
+
+def test_the_stop_does_not_break_on_a_call_failed_while_it_fails_the_open_calls():
+    """A call thread fails its own future between the stop's look at it and the stop's own failure of it: the stop
+    goes on (closing the channel, stopping the pools) instead of raising out of the reader."""
+    from concurrent.futures import InvalidStateError
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    class FailedMeanwhile:
+        def done(self):
+            return False
+
+        def set_exception(self, error):
+            raise InvalidStateError('failed by the call thread meanwhile')
+
+    link._outgoing['racing'] = FailedMeanwhile()
+    parent.close()
+    try:
+        link._finish()
+    except InvalidStateError as error:
+        raise AssertionError(f'the stop broke on a call failed meanwhile: {error}') from error
+
+
+def test_any_error_while_encoding_a_call_fails_that_call_alone(monkeypatch):
+    import kelmo.core.corelink as corelink
+    parent, child = socket.socketpair()
+    stops = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: stops.append('stop')
+
+    def deep(header, body):
+        raise RecursionError('maximum recursion depth exceeded while encoding')
+
+    monkeypatch.setattr(corelink.wire, 'encode', deep)
+    try:
+        future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    except RecursionError as error:
+        raise AssertionError('an encoder error escaped the call') from error
+    finally:
+        parent.close()
+    assert future.exception().code == 'E_TRANSPORT'
+    assert link._outgoing == {} and stops == []
+
+
+def test_a_write_error_that_is_not_an_os_error_fails_that_call_alone():
+    parent, child = socket.socketpair()
+    stops = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: stops.append('stop')
+
+    class Refusing:
+        def sendall(self, data):
+            raise ValueError('the channel refused the write')
+
+        def close(self):
+            pass
+
+    real, link.sock = link.sock, Refusing()
+    try:
+        future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    except ValueError as error:
+        raise AssertionError('a write error escaped the call') from error
+    finally:
+        real.close()
+        parent.close()
+    assert future.exception().code == 'E_TRANSPORT'
+    assert link._outgoing == {} and stops == []
+
+
+def test_a_stop_hook_that_raises_out_of_the_call_leaves_no_call_waiting():
+    """A BaseException from begin_stop leaves the call without returning its future; nothing may stay registered
+    for a reply that cannot come."""
+    import pytest
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    def begin_stop():
+        raise SystemExit(3)
+
+    link.begin_stop = begin_stop
+    parent.close()
+    with pytest.raises(SystemExit):
+        link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    assert link._outgoing == {}

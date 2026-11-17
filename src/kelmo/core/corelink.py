@@ -162,8 +162,7 @@ class CoreLink:
             self._outgoing[call_id] = future
         try:
             data = wire.encode(header, body)
-        except (OSError, ValueError, TypeError, KelmoError) as error:
-            # Nothing was written: the call alone fails, whatever the encoder raised.
+        except Exception as error:  # noqa: BLE001 - nothing was written: the call alone fails, whatever the encoder raised
             with self._state:
                 self._outgoing.pop(call_id, None)
             _fail(future, error if isinstance(error, KelmoError)
@@ -172,10 +171,10 @@ class CoreLink:
         try:
             with self._write_lock:
                 self.sock.sendall(data)
-        except OSError as error:
+        except Exception as error:  # noqa: BLE001 - a failed write fails this call; only a gone peer stops the core
             with self._state:
                 self._outgoing.pop(call_id, None)
-            if error.errno in PEER_GONE:
+            if isinstance(error, OSError) and error.errno in PEER_GONE:
                 # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
                 # hears of the stop before this call fails, as it does for the calls the reader fails.
                 self._stopping.set()
@@ -264,8 +263,8 @@ class CoreLink:
         with self._state:
             pending, self._outgoing = list(self._outgoing.values()), {}
         for future in pending:
-            if not future.done():
-                future.set_exception(KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
+            # A call thread may fail its own future meanwhile; the stop goes on.
+            _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
         for pool in self.pools.values():
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
