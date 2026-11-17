@@ -129,7 +129,7 @@ def test_a_pass_whose_flush_lock_is_held_counts_pending_with_the_owner_released(
         owner_held.clear()
         _passes(core, 1)
         assert core._last['result'].get('stopped') == 'E_BUSY', core._last
-        assert owner_held and owner_held[-1] == 0, f'the pending count was read holding the owner: {owner_held}'
+        assert owner_held and not any(owner_held), f'the pending count was read holding the owner: {owner_held}'
     finally:
         core.close()
 
