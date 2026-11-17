@@ -321,30 +321,42 @@ def test_a_deadline_that_passes_while_waiting_for_the_turn_leaves_the_channel_op
 
 
 def test_dropping_a_failed_channel_does_not_wait_without_bound_for_its_turn(profile):
-    """A request still holds the turn of a one-request channel that failed for another caller: the drop closes
-    the channel within a bounded wait instead of waiting for that request."""
-    from kelmo.client import SharedClient
-    factory, opened = _channels(profile, lambda: {'ok': True})
-    client = SharedClient(profile, channel_factory=factory, multiplex=True)
-    holding, release = threading.Event(), threading.Event()
-    try:
-        client.call('status')
-        channel = client._channel
+    """A request is still on a one-request channel that failed for another caller: the drop returns within a bounded
+    wait and the channel is closed when that request ends, never under it (a descriptor closed under a read could be
+    reused and the read would take another channel's reply)."""
+    from kelmo.client import PROTOCOL, SharedClient
+    entered, release = threading.Event(), threading.Event()
 
-        def hold():
-            with client._turn_for(channel):
-                holding.set()
+    class Channel:
+        closed = False
+
+        def request(self, frame, timeout=None):
+            if frame['op'] != 'hello' and not entered.is_set():
+                entered.set()
                 release.wait(10)
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+                      if frame['op'] == 'hello' else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
 
-        holder = threading.Thread(target=hold, daemon=True)
-        holder.start()
-        assert holding.wait(5)
+        def close(self):
+            assert not entered.is_set() or release.is_set(), 'closed under a request in flight'
+            self.closed = True
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    try:
+        channel = client._connect()
+        reader = threading.Thread(target=client.call, args=('status',), daemon=True)
+        reader.start()
+        assert entered.wait(5)
         dropper = threading.Thread(target=client._drop, args=(channel,), daemon=True)
         start = time.monotonic()
         dropper.start()
         dropper.join(3)
-        assert not dropper.is_alive() and channel.closed, 'the drop waited for the other request'
-        assert time.monotonic() - start < 3
+        assert not dropper.is_alive() and time.monotonic() - start < 3, 'the drop waited for the other request'
+        assert not channel.closed, 'the channel was closed under the request in flight'
+        release.set()
+        reader.join(10)
+        assert channel.closed, 'the channel was not closed once its request ended'
     finally:
         release.set()
         client.close()
@@ -417,6 +429,178 @@ def test_status_reports_the_outbox_busy_instead_of_outwaiting_its_deadline(profi
         release.set()
         holder.join(10)
         client.close()
+
+
+def test_a_read_whose_deadline_passed_before_its_turn_leaves_the_channel_open(profile):
+    from kelmo.client import SharedClient, Unbound
+    factory, _opened = _channels(profile, lambda: {'ok': True})
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    try:
+        channel = client._connect()
+        with client.deadline(0.01):
+            time.sleep(0.05)
+            with pytest.raises(Unbound):
+                client._read('status', {}, channel)
+        assert client._channel is channel and not channel.closed, 'a request never written dropped the channel'
+    finally:
+        client.close()
+
+
+def test_a_read_whose_frame_was_written_before_the_channel_closed_is_not_sent_again(profile):
+    """A closed pipe found after the frame went out is not "nothing written": the read is not sent a second time."""
+    from kelmo.client import PROTOCOL, SharedClient, StdioChannel, Unbound
+    sent = []
+
+    class Pipe(StdioChannel):
+        def __init__(self):
+            self.timeout, self.grace, self.closed, self.wrote = 1.0, 0, False, False
+
+        def request(self, frame):
+            if frame['op'] == 'hello':
+                return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True,
+                        'result': {'authority_id': profile.authority_id, 'operations': ['hello', 'status']}}
+            sent.append(frame['op'])
+            self.wrote = True
+            raise ValueError('I/O operation on closed file.')
+
+        def close(self):
+            self.closed = True
+
+    client = SharedClient(profile, channel_factory=Pipe, multiplex=True)
+    try:
+        with pytest.raises(Unbound):
+            client.call('status')
+        assert sent == ['status'], sent
+    finally:
+        client.close()
+
+
+def test_client_status_reports_the_outbox_busy_instead_of_outwaiting_its_deadline(profile):
+    from kelmo.client import SharedClient
+    factory, _opened = _channels(profile, lambda: {'ok': True})
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            holding.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert holding.wait(5)
+        start = time.monotonic()
+        with client.deadline(1.0):
+            status = client.local_status()
+        assert time.monotonic() - start < 2.0, 'client status waited for the outbox past its deadline'
+        assert status['outbox'] == {'busy': True}, status
+    finally:
+        release.set()
+        holder.join(10)
+        client.close()
+
+
+def test_a_probe_closes_its_channel_within_the_deadline(profile):
+    from kelmo.client import PROTOCOL, SharedClient
+    graces = []
+
+    class Channel:
+        grace = 5
+
+        def request(self, frame, timeout=None):
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True,
+                    'result': {'authority_id': profile.authority_id, 'operations': ['hello']}}
+
+        def close(self):
+            graces.append(self.grace)
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    try:
+        with client.deadline(1.0):
+            client.probe()
+        assert graces and graces[0] <= 1.0, graces
+    finally:
+        client.close()
+
+
+def test_status_answered_at_the_end_of_its_deadline_still_reports(profile):
+    """The server answered within the deadline but the outbox summary comes after it: status reports what it has
+    instead of failing."""
+    from kelmo.client import ClientService, SharedClient
+
+    def slow():
+        time.sleep(0.4)
+        return {'ok': True}
+
+    factory, _opened = _channels(profile, slow)
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    try:
+        with client.deadline(0.3):
+            status = ClientService(client).status()
+        assert status['ok'] is True and 'outbox' in status, status
+    finally:
+        client.close()
+
+
+def test_a_borrowed_parse_leaves_standard_error_to_other_threads(monkeypatch, capsys):
+    """The edge core logs to standard error from other threads; a borrowed parse must not swap it, and a command
+    that does not parse is refused without printing."""
+    import sys
+    seen = []
+    real = cli.build_parser
+
+    def build_parser(version):
+        parser, commands = real(version)
+        parse = parser.parse_args
+
+        def parse_args(argv):
+            seen.append(sys.stderr)
+            return parse(argv)
+
+        parser.parse_args = parse_args
+        return parser, commands
+
+    monkeypatch.setattr(cli, 'build_parser', build_parser)
+    original = sys.stderr
+    assert cli.borrowed_read_only(['status']) is True
+    assert seen == [original], 'standard error was swapped during the parse'
+    assert cli.borrowed_read_only(['client', 'no-such-action']) is False
+    assert capsys.readouterr().err == ''
+
+
+def test_a_hook_gets_the_outbox_while_status_waits_on_a_kelmo2_channel(profile):
+    """The same for a kelmo/2 channel, which carries several requests at once."""
+    from kelmo.client import SharedClient
+    from kelmo.core.edge_core import EdgeCore
+    entered, release = threading.Event(), threading.Event()
+
+    class Concurrent(OneAtATimeChannel):
+        concurrent = True
+        alive = True
+        stalled = False
+
+    client = SharedClient(profile, channel_factory=lambda: Concurrent(profile.authority_id, entered, release),
+                          multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    context = SimpleNamespace(remaining=lambda: 30.0, check=lambda: None)
+    answers = []
+    command = threading.Thread(target=lambda: answers.append(
+        core.handle_cli(context, {'argv': ['status', '--vault', str(profile.root)]})), daemon=True)
+    try:
+        command.start()
+        assert entered.wait(5), 'status never reached the authority'
+        start = time.monotonic()
+        got = core._owner.acquire(timeout=1.0, urgent=True)
+        waited = time.monotonic() - start
+        if got:
+            core._owner.release()
+        assert got and waited < 1.0, 'the hook waited for `kelmo status` on a kelmo/2 channel'
+    finally:
+        release.set()
+        command.join(10)
+        core.close()
+    assert answers, 'status gave no answer'
 
 
 def test_a_command_that_does_not_parse_is_not_a_status_read():

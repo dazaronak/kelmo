@@ -84,8 +84,8 @@ class Closed(Unsent):
     the channel is already dropped, and a read may go again over a new one."""
 
 
-# How long dropping a one-request channel waits for a request still on it before closing it under that request,
-# which then fails as a transport error.
+# How long dropping a one-request channel waits for a request still on it; past it, that request closes the
+# channel when it ends, so a descriptor is never closed under a read in flight.
 DROP_TURN_SECONDS = 1.0
 
 
@@ -443,8 +443,10 @@ class StdioChannel:
         # healthy channel stays open.
         data = encode_frame(frame)
         deadline = time.monotonic() + self.timeout
+        self.wrote = False  # set once the frame is out: a closed pipe after it is not "nothing written"
         try:
             self._write(data, deadline)
+            self.wrote = True
             return self.reader.frame(max(0.0, deadline - time.monotonic()))
         except OSError as error:
             self.grace = 0
@@ -971,7 +973,11 @@ class SharedClient:
     def _waiting_for(self, lock, what):
         """Holds `lock`, waiting no longer than the active deadline. A caller whose deadline passes while
         another holds it is refused before a byte is written, so the channel stays as it is."""
-        if not lock.acquire(timeout=self.remaining()):
+        try:
+            seconds = self.remaining()
+        except Unbound as error:  # passed before the wait began: nothing written, the channel stays
+            raise Unsent(error.code, str(error)) from error
+        if not lock.acquire(timeout=seconds):
             raise Unsent('E_BUSY', f'The deadline passed while another request {what}.')
         try:
             yield
@@ -1045,14 +1051,15 @@ class SharedClient:
         if getattr(channel, 'concurrent', False):
             channel.close()
             return
-        # Not under another thread's request on a one-request channel, unless that request outlasts the bound.
+        # Never under another thread's request on a one-request channel: past the bound that request closes it.
         turn = self._turn_for(channel)
-        taken = turn.acquire(timeout=DROP_TURN_SECONDS)
+        if not turn.acquire(timeout=DROP_TURN_SECONDS):
+            channel.close_when_free = True
+            return
         try:
             channel.close()
         finally:
-            if taken:
-                turn.release()
+            turn.release()
 
     def _send(self, channel, op, args, key):
         """One request: (True, result) or (False, error) for a reply bound to it; Unbound otherwise.
@@ -1079,19 +1086,26 @@ class SharedClient:
                 reply = channel.request(frame, timeout=self.remaining())
             else:
                 with self._waiting_for(self._turn_for(channel), 'held the channel'):
-                    if isinstance(channel, StdioChannel):
-                        try:
-                            channel.timeout = self.remaining()
-                        except Unbound as error:  # nothing written yet: the channel stays as it is
-                            raise Unsent(error.code, str(error)) from error
-                    reply = channel.request(frame)
+                    try:
+                        if isinstance(channel, StdioChannel):
+                            try:
+                                channel.timeout = self.remaining()
+                            except Unbound as error:  # nothing written yet: the channel stays as it is
+                                raise Unsent(error.code, str(error)) from error
+                        reply = channel.request(frame)
+                    finally:
+                        if getattr(channel, 'close_when_free', False):  # dropped while this request was on it
+                            channel.close()
         except Unbound:
             raise
         except KelmoError as error:
             raise Unbound(error.code, str(error)) from error
         except ValueError as error:
-            # A channel closed by another thread while this request waited for its turn: its pipe is gone.
+            # A channel closed by another thread: before the frame went out, nothing was written and a read may go
+            # again; after it, the request may have reached the server and is not sent again.
             self._drop(channel)
+            if getattr(channel, 'wrote', False):
+                raise Unbound('E_TRANSPORT', 'The shared-memory channel closed after the request was sent.') from error
             raise Closed('E_TRANSPORT', 'The shared-memory channel was closed before the request.') from error
         if (not isinstance(reply, dict) or set(reply) - REPLY_FIELDS or reply.get('protocol') != PROTOCOL
                 or type(reply.get('ok')) is not bool):
@@ -1271,7 +1285,14 @@ class SharedClient:
                              'successful contact and is not accepted until then.'}
 
     def local_status(self):
-        return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary()}
+        return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary_within(self._seconds_left())}
+
+    def _seconds_left(self):
+        """Seconds left before the active deadline, 0 once it has passed (never raises)."""
+        try:
+            return self.remaining()
+        except Unbound:
+            return 0.0
 
     def probe(self):
         """Verify a fresh channel's identity without flushing any queued write. The probe opens a channel of
@@ -1279,7 +1300,7 @@ class SharedClient:
         client's requests use."""
         began = time.monotonic()
         channel, hello = self._hello_channel()
-        if isinstance(channel, StdioChannel) and self._deadline is not None:
+        if hasattr(channel, 'grace') and self._deadline is not None:
             channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
         channel.close()
         return {'verified': True, 'authority_id': hello['authority_id'],
@@ -1619,7 +1640,7 @@ class ClientService:
 
     def status(self):
         server = self.client.call('status')
-        return dict(server, outbox=self.client.outbox.summary_within(self.client.remaining()))
+        return dict(server, outbox=self.client.outbox.summary_within(self.client._seconds_left()))
 
     def trace(self, operation_id):
         return self.client.call('trace', {'operation_id': operation_id})
