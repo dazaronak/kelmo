@@ -386,3 +386,22 @@ def test_a_disk_error_reading_the_pending_count_is_not_reported_as_a_held_outbox
         monkeypatch.undo()
         client.close()
     assert isinstance(answer, sqlite3.OperationalError), answer
+
+
+def test_status_reads_the_outbox_within_the_deadline_while_another_process_holds_the_file(profile):
+    client = SharedClient(profile, multiplex=True)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    other.execute('BEGIN EXCLUSIVE')
+    release = threading.Timer(6.0, other.rollback)
+    release.start()
+    try:
+        started = time.monotonic()
+        with client.deadline(1.0):
+            status = client.local_status()
+        assert time.monotonic() - started < 2.0, 'status waited for another process past its deadline'
+        assert status['outbox'] == {'busy': True}, status
+    finally:
+        release.cancel()
+        other.rollback()
+        other.close()
+        client.close()

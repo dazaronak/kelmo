@@ -316,11 +316,17 @@ class Outbox:
             self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
 
     def summary_within(self, seconds):
-        """The summary, or {'busy': True} when another caller holds the outbox longer than `seconds`."""
+        """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
+        longer than `seconds`."""
         if not self._serial.acquire(timeout=max(0.0, seconds)):
             return {'busy': True}
         try:
-            return self.summary()
+            with self.waiting(seconds):
+                return self.summary()
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise
+            return {'busy': True}
         finally:
             self._serial.release()
 
