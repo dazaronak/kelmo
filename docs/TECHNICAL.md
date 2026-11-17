@@ -368,7 +368,10 @@ content-addressed JSON references under `hub-context`. Those files retain the co
 source for the emitted pointer, including during offline delivery; their `pending` field
 is the framed pending block, one row for each note the delivery was given (every waiting
 note on the hub path, the 20 newest on the legacy path). A pending list whose ten-line
-block fits inline writes no such file, and the notes past ten show only as a count.
+block fits inline writes no such file, and the notes past ten show only as a count. The
+daily sweep that runs when a HOT set is installed removes one that no delivery has shown
+for 30 days; a delivery that only shows the unchanged marker does not count, and where no
+set is ever installed (legacy context without views) nothing is swept.
 
 ## Verification and context pitfalls
 

@@ -26,7 +26,8 @@ SWEEP_SECONDS = 86400
 # session may read the path days later.
 POINTED_RETAIN_SECONDS = 30 * 86400
 # The same sweep removes a session's delivery record (`hub-sessions/`, beside `hot/`) no delivery has written for
-# this long; that session, if it ever prompts again, gets the whole context once.
+# this long, and a context reference (`hub-context/`) no delivery has used for this long; that session, if it ever
+# prompts again, gets the whole context once.
 SESSION_RETAIN_SECONDS = 30 * 86400
 
 
@@ -171,14 +172,14 @@ def prune_sets(root, keep=None):
             os.rename(path, trash)
             shutil.rmtree(trash, ignore_errors=True)
             removed.append(path.name)
-    folder = root.parent / 'hub-sessions'
-    # Kelmo makes this folder itself; behind a link, or as a link, a file is not its own to remove.
-    for record in (() if folder.is_symlink() else folder.glob('*.json')):
-        try:
-            if not record.is_symlink() and now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
-                record.unlink()
-        except OSError:
-            continue
+    for folder in (root.parent / 'hub-sessions', root.parent / 'hub-context'):
+        # Kelmo makes these folders itself; behind a link, or as a link, a file is not its own to remove.
+        for record in (() if folder.is_symlink() else folder.glob('*.json')):
+            try:
+                if not record.is_symlink() and now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
+                    record.unlink()
+            except OSError:
+                continue
     return removed
 
 
@@ -513,9 +514,9 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
     if previous and previous != _hash(identity.encode('utf-8')):
         reserve += len(RESTART_WARNING)
     complete = provider != 'claude' or len(full) <= 10000 - reserve
+    reference = None
     if not complete:
         current = current() if callable(current) else current
-        reference = None
         def omitted_source(field):
             nonlocal reference
             if reference is None:
@@ -562,7 +563,18 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
                         and str(path) in context), None)
         if not sync_failed and settled:
             acknowledge(functools.partial(update['commit'], pointed))
+    if reference is not None and str(reference) in context:
+        _used(reference)
     return context
+
+
+def _used(reference):
+    """A delivery showed this reference's path: the sweep (prune_sets) counts its age from that use. A marker
+    that shows no path is no use."""
+    try:
+        os.utime(reference)
+    except OSError:
+        pass
 
 
 def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
@@ -575,6 +587,7 @@ def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
         return context
     reference = context_reference(root, {'context': context, 'pending': pending_block(pending),
                                          'generation': delivered.get('generation')})
+    _used(reference)
     pointer = ('Kelmo HOT exceeds the hook limit. Read the complete saved context and pending updates at '
                + str(reference) + ' (context and pending fields).')
     return '\n\n'.join(part for part in (warning, pointer, notice) if part)
