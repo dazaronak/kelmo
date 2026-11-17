@@ -194,7 +194,15 @@ class CoreLink:
                     break
                 if not data:
                     break
-                for header, body in reader.feed(data):
+                try:
+                    frames = reader.feed(data)
+                except KelmoError as error:
+                    # Bytes that are not a frame leave the stream with no next frame to find: the channel ends
+                    # as a closed one does, and the stop runs through _finish.
+                    print(f'kelmo core: the channel sent a bad frame ({error.code}: {error}); closing it',
+                          file=sys.stderr, flush=True)
+                    break
+                for header, body in frames:
                     self._dispatch(header, body)
         finally:
             self._finish()

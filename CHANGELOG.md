@@ -20,6 +20,10 @@ entry here.
 - `memory_search` and `memory_list` no longer scan every operation for each record they return. Each row looks up
   the record's operations by its archive id, and the journal now indexes that column too; on 20,000 operations
   one lookup went from about 1 ms to 0.006 ms, about 0.5 s saved on a 500-item `memory_list` page.
+- A core that receives bytes from `kelmod` that are not a frame (a length over the frame bound, a header that
+  does not parse or has a field of the wrong JSON type, a body nested too deeply) now ends its channel the
+  way a closed channel ends: it says why in `kelmod`'s log and asks
+  its work to stop. The error used to escape the channel's loop as a Python traceback.
 
 ## [0.3.2] - 2026-11-16
 
