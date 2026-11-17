@@ -162,7 +162,7 @@ def test_a_hook_with_writes_queued_does_not_outwait_its_deadline_behind_a_slow_h
     client = SharedClient(profile, channel_factory=lambda: SlowHelloChannel(profile.authority_id, entered, release),
                           multiplex=True)
     client.outbox.enqueue('remember', {'content': 'synthetic queued note'}, 'synthetic-key-1')
-    reader = threading.Thread(target=client._connect, daemon=True)  # how `kelmo status` opens the channel
+    reader = threading.Thread(target=client._connect, daemon=True)  # another caller opening the channel
     try:
         reader.start()
         assert entered.wait(5), 'the connect never started'
@@ -172,6 +172,29 @@ def test_a_hook_with_writes_queued_does_not_outwait_its_deadline_behind_a_slow_h
         waited = time.monotonic() - start
         assert waited < 2.0, f'the delivery waited {waited:.1f} s for another caller\'s hello'
         assert result['pending'] == 1, result
+    finally:
+        release.set()
+        reader.join(10)
+        client.close()
+
+
+def test_a_delivery_that_outwaits_another_callers_hello_names_the_cause_of_an_entry_with_none(profile):
+    """A delivery that gives up while another caller's hello does not answer leaves an entry with no refusal yet
+    showing E_TRANSPORT as the reason it waits, as when its own hello does not answer."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: SlowHelloChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    client.outbox.enqueue('remember', {'content': 'synthetic queued note'}, 'synthetic-key-3')
+    reader = threading.Thread(target=client._connect, daemon=True)
+    try:
+        reader.start()
+        assert entered.wait(5), 'the connect never started'
+        with client.deadline(0.5):
+            result = client.flush()
+        assert result['pending'] == 1, result
+        assert client.outbox.get('synthetic-key-3')['last_error'] == 'E_TRANSPORT', dict(
+            client.outbox.get('synthetic-key-3'))
     finally:
         release.set()
         reader.join(10)

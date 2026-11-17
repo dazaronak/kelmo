@@ -86,7 +86,8 @@ class Closed(Unsent):
 
 class Late(Unsent):
     """Nothing was written because the deadline passed while this request waited (for its deadline to be read,
-    or for another thread's write on a channel that carries several requests); the channel stays healthy."""
+    or for another thread's write on a channel that carries several requests). A channel that carries several
+    requests stays healthy; a one-request channel whose deadline passed is closed."""
 
 
 
@@ -1421,8 +1422,12 @@ class SharedClient:
                     # (the server's hello did not answer), an entry with no refusal is told why it still waits.
                     if channel is None:
                         self.outbox.note_if_unset(key, error.code)
-                elif not (isinstance(error, Unsent) and error.code == 'E_BUSY'):
-                    # A busy turn keeps no refusal either.
+                elif isinstance(error, Unsent) and error.code == 'E_BUSY':
+                    # A busy turn keeps no refusal either. A pass that gave up while another caller's hello did not
+                    # answer (no channel came up for it) tells an entry with no refusal why it still waits.
+                    if channel is None:
+                        self.outbox.note_if_unset(key, 'E_TRANSPORT')
+                else:
                     self.outbox.note(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break
