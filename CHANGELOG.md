@@ -17,6 +17,9 @@ entry here.
   operations and 160,000 events, reading one operation went from about 5.7 ms to 0.02 ms. Commands and passes
   that read many operations, such as the findings pass, the queue and the worker, gain the most. Building the
   index on a large journal takes a moment once; nothing else changes.
+- `memory_search` and `memory_list` no longer scan every operation for each record they return. Each row looks up
+  the record's operations by its archive id, and the journal now indexes that column too; on 20,000 operations
+  one lookup went from about 1 ms to 0.006 ms, about 0.5 s saved on a 500-item `memory_list` page.
 
 ## [0.3.2] - 2026-11-16
 
