@@ -422,8 +422,9 @@ class EdgeCore:
             record['retry_at'] = time.time() + pause
         self._compact_after = time.monotonic() + pause
         self._compaction = record
-        if state in ('too_large', 'stuck', 'error') or self._over_limit:
-            self._compaction_save(record)  # a pause of an hour, and a stopped rewrite, survive the core's recycles
+        if state in ('too_large', 'stuck', 'error') or self._over_limit or pause > BUSY_RETRY_SECONDS:
+            # A long pause (an hour, a reader's refusal) and a stopped rewrite survive the core's recycles.
+            self._compaction_save(record)
         elif self._saved:
             self._compaction_forget()  # done, or nothing to keep: a restart must not wait for the old pause
         return record

@@ -550,6 +550,8 @@ def test_a_rewrite_refused_by_a_reader_in_another_process_is_not_repeated_every_
         record = core._compaction
         assert record['state'] == 'busy', record
         assert record['retry_at'] - time.time() > 2, f'a refused rewrite is tried again a second later: {record}'
+        saved = json.loads((profile.state / 'compaction.json').read_text())
+        assert saved.get('retry_at') == record['retry_at'], f'the pause would not survive a recycle: {saved}'
     finally:
         reader.rollback()
         reader.close()
@@ -739,8 +741,9 @@ def test_a_saved_pause_too_large_for_a_float_does_not_stop_the_daemon(profile):
 
 
 def test_a_drain_step_counts_the_pages_it_gave_back_while_another_process_frees_pages(profile):
-    """Another process frees pages between a drain step and its count of the free list: the step still reports the
-    pages it gave back, so a working drain is never taken for a stuck one."""
+    """Another process tries to free pages between a drain step and its count of the free list: the step holds the
+    file, so nothing changes under it and it reports exactly the pages it gave back; a working drain is never taken
+    for a stuck one."""
     client = SharedClient(profile)
     outbox = client.outbox
     _settled_pieces(outbox, count=10)
