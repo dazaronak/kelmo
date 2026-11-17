@@ -6,7 +6,27 @@ import time
 
 from kelmo.client import SharedClient
 from kelmo.core import edge_core
-from kelmo.core.edge_core import EdgeCore
+from kelmo.core.edge_core import EdgeCore, OwnerLock
+
+
+class Answering:
+    """An authority that answers every request at once, so a pass that reaches the channel delivers."""
+
+    def __init__(self, authority):
+        self.authority = authority
+
+    def request(self, frame, timeout=None):
+        from kelmo.client import PROTOCOL
+        result = ({'authority_id': self.authority, 'operations': ['hello', 'session_append']}
+                  if frame['op'] == 'hello' else {'ok': True})
+        return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+    def close(self):
+        pass
+
+
+def _client(profile):
+    return SharedClient(profile, channel_factory=lambda: Answering(profile.authority_id), multiplex=True)
 
 
 def _passes(core, count, seconds=10):
@@ -20,7 +40,7 @@ def _passes(core, count, seconds=10):
 
 
 def test_a_pass_with_entries_pending_does_not_wait_for_a_held_owner(profile):
-    client = SharedClient(profile, multiplex=True)
+    client = _client(profile)
     core = EdgeCore(profile.root, client=client)
     _passes(core, 1)
     taken, release = threading.Event(), threading.Event()
@@ -62,7 +82,7 @@ def test_a_pass_with_entries_pending_does_not_wait_for_a_held_owner(profile):
 
 
 def test_a_pass_that_finds_the_owner_free_delivers_as_before(profile):
-    client = SharedClient(profile, multiplex=True)
+    client = _client(profile)
     core = EdgeCore(profile.root, client=client)
     _passes(core, 1)
     delivered = []
@@ -78,5 +98,52 @@ def test_a_pass_that_finds_the_owner_free_delivers_as_before(profile):
         client.outbox.enqueue('session_append', {'content': 'x', 'provider': 'claude'}, 'free-owner')
         _passes(core, 1)
         assert delivered, 'the pass did not try to deliver with the owner free'
+        assert client.outbox.get('free-owner')['state'] == 'delivered', client.outbox.get('free-owner')
     finally:
         core.close()
+
+
+def test_a_pass_whose_flush_lock_is_held_counts_pending_with_the_owner_released(profile):
+    """Another process holds the flush lock: the pass gives up, and the pending count it reports is read after the
+    owner is released, so a hook queued meanwhile does not wait for that read."""
+    from contextlib import contextmanager
+    client = _client(profile)
+    core = EdgeCore(profile.root, client=client)
+    _passes(core, 1)
+
+    @contextmanager
+    def held_elsewhere():
+        yield False
+
+    client._flush_lock = held_elsewhere
+    owner_held = []
+    real = client._pending_within
+
+    def pending_within():
+        owner_held.append(core._owner.held())
+        return real()
+
+    client._pending_within = pending_within
+    try:
+        client.outbox.enqueue('session_append', {'content': 'x', 'provider': 'claude'}, 'flush-lock-held')
+        owner_held.clear()
+        _passes(core, 1)
+        assert core._last['result'].get('stopped') == 'E_BUSY', core._last
+        assert owner_held and owner_held[-1] == 0, f'the pending count was read holding the owner: {owner_held}'
+    finally:
+        core.close()
+
+
+def test_a_one_try_acquire_refuses_while_a_caller_waits():
+    """Nobody holds the owner but a caller waits for it: a background pass's one try is refused, so it never takes
+    a turn a waiting hook or tool is owed."""
+    lock = OwnerLock()
+    with lock._condition:
+        lock._waiting[True] += 1  # a hook waiting, between the holder's release and its own wake-up
+    try:
+        assert not lock.acquire_if_idle(), 'a one-try acquire took the owner while a caller waited'
+    finally:
+        with lock._condition:
+            lock._waiting[True] -= 1
+    assert lock.acquire_if_idle()
+    lock.release()

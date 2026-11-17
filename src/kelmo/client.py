@@ -1360,27 +1360,32 @@ class SharedClient:
                 return {'delivered': 0, 'refused': [], 'pending': pending if self._multiplex else None,
                         'stopped': 'E_BUSY', 'reached': None}
             try:
-                return self._flush_owned()
+                result = self._flush_owned()
             finally:
                 self._lock.release()
-        try:
-            with self._lock:
-                return self._flush_owned()
-        except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
-            return {'delivered': 0, 'refused': [], 'pending': self._pending_within(), 'stopped': 'E_BUSY',
+        else:
+            try:
+                with self._lock:
+                    result = self._flush_owned()
+            except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
+                result = 'E_BUSY'
+        if isinstance(result, str):
+            # Stopped before delivering: the pending count is read with the owner released, so a caller queued for
+            # it does not wait for that read.
+            return {'delivered': 0, 'refused': [], 'pending': self._pending_within(), 'stopped': result,
                     'reached': None}
+        return result
 
     def _flush_owned(self):
-        """The delivery once the owner of the outbox is held: one flusher per client root across processes."""
+        """The delivery once the owner of the outbox is held: one flusher per client root across processes.
+        Returns the delivery's result, or the code it stopped on before delivering."""
         try:
             with self._flush_lock() as acquired:
                 if acquired:
                     return self._deliver()
-                stopped = 'E_BUSY'
+                return 'E_BUSY'
         except Unbound as error:  # the deadline passed before the lock was even tried
-            stopped = error.code
-        return {'delivered': 0, 'refused': [], 'pending': self._pending_within(),
-                'stopped': stopped, 'reached': None}
+            return error.code
 
     def _seconds_left(self):
         """Seconds left before the active deadline, 0 once it has passed (never raises)."""
