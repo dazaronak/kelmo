@@ -1185,6 +1185,15 @@ def _sealed(record, key, authority_id):
     return generation
 
 
+def _caller_key(key, outbox):
+    """A key the caller chose. `#resend` belongs to `kelmo client resend`, whose chains the server follows from a
+    refused key: a new key with it could answer that refusal with a note the client never linked to it. The key of
+    an entry already queued (a resend asked for its answer) is the caller's to repeat."""
+    if key is not None and '#resend' in str(key) and outbox.get(key) is None:
+        raise KelmoError('E_INPUT', 'A new idempotency key may not contain `#resend`; `kelmo client resend` uses it.')
+    return key
+
+
 class Busy(KelmoError):
     """The owner of the outbox did not free it within the caller's deadline. Nothing was done, unless the
     message names what was."""
@@ -2184,7 +2193,7 @@ class ClientService:
             args['new_work'] = new_work
         if pending is not None:
             args['pending'] = pending
-        key = idempotency_key or digest(canonical(['create', args]))
+        key = _caller_key(idempotency_key, self.client.outbox) or digest(canonical(['create', args]))
         result = self.client.submit('create', args, key)
         return self.wait(result, wait_timeout) if wait and 'operation' in result else result
 
@@ -2249,7 +2258,8 @@ class ClientService:
         if not isinstance(content, str):
             raise KelmoError('E_INPUT', 'Source must contain text within the one MiB intake limit.')
         # The same identity a local capture without a key derives from its input.
-        key = idempotency_key or digest(canonical(['capture', digest(content), filename, role, intent, supersedes]))
+        key = _caller_key(idempotency_key, self.client.outbox) or digest(
+            canonical(['capture', digest(content), filename, role, intent, supersedes]))
         return self.client.submit('capture', {'content': content, 'filename': filename, 'role': role,
                                               'promote': intent == 'promote', 'supersedes': supersedes}, key), key
 
@@ -2267,7 +2277,8 @@ class ClientService:
         args = {'targets': list(targets), 'kind': kind, 'summary': summary}
         if not apply:
             return self.client.call('register_preview', args)
-        return self.client.submit('register', args, idempotency_key or digest(canonical(['register', args])))
+        return self.client.submit('register', args,
+                                  _caller_key(idempotency_key, self.client.outbox) or digest(canonical(['register', args])))
 
     def page_index(self, projects=None):
         return self.client.call('pages', {'projects': projects})
@@ -2316,7 +2327,7 @@ class ClientService:
             checked = ActionUpdate.from_dict(update).to_dict()
         except (TypeError, ValueError) as error:
             raise KelmoError('E_INPUT', 'Provide a complete ActionUpdate with an exact evidence reference.') from error
-        return self.client.submit('state_apply', {'update': checked}, idempotency_key)
+        return self.client.submit('state_apply', {'update': checked}, _caller_key(idempotency_key, self.client.outbox))
 
     def graph_query(self, **kwargs):
         return self.client.call('graph_query', {'params': kwargs})

@@ -145,6 +145,12 @@ entry here.
   neither, every refused entry), and with `--apply` marks them `dismissed`. Status then counts them under
   `dismissed`. `kelmo client resend` no longer selects them, and the same request under its key is still
   answered with its refusal. Nothing is deleted.
+- `kelmo client dismiss` stops listing refusals the owner has read. A shared client kept every refused entry
+  in `kelmo client status` for good, so one that would never be resent stayed there. The command lists the
+  refused entries whose code matches `--code` or whose key matches `--key` (both repeatable; with neither,
+  every refused entry), and with `--apply` marks them `dismissed`. Status then counts them under `dismissed`.
+  `kelmo client resend` no longer selects them, and the same request under its key is still answered with its
+  refusal. Nothing is deleted.
 
 ### Changed
 
@@ -242,6 +248,18 @@ entry here.
     as a use; the one-line marker of an unchanged prompt does not.
   - The sweep skips a `hub-sessions/` or `hub-context/` folder that is a link, and any file there that is
     one.
+- A request submitted again under the key of a refusal that `kelmo client resend` sent again is answered as
+  the note it went out as: with that note's outcome, its refusal, or as queued under its new key. Before, the
+  old key always answered that the request was queued and would be delivered on the next contact, even after
+  the resent note had been delivered or refused. A client that no longer holds the old entry (a profile made
+  again under the same client id) gets the same answer from the server, which follows the resend chain itself:
+  the same request sent under `<key>#resendN` after the refusal. While the resent note is still running there,
+  the request stays queued; a resent note whose server process died before it settled is run again under its
+  own key and answers with its outcome. A refusal answered as a duplicate of a note under another key gets
+  from the server the answer of the last `<key>#resendN` it recorded (its outcome or its refusal), or the old
+  refusal when there is none. A new key a caller chooses (`--idempotency-key`, the tools' `idempotency_key`)
+  may no longer contain `#resend`, which resend uses; such a request is refused with `E_INPUT` and not queued.
+  The key of an entry already queued may still be repeated.
 
 ## [0.3.2] - 2026-11-16
 

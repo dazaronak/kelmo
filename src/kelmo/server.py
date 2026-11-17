@@ -7,6 +7,7 @@ the archive process re-issues the same Origins from the enrollment its parent se
 import base64
 import contextvars
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -1714,7 +1715,7 @@ class ClientSession:
                 if stored['fingerprint'] != fingerprint:
                     raise KelmoError('E_IDEMPOTENCY', 'The idempotency key already identifies a different request.')
                 if stored['state'] == 'finished':
-                    return dict(json.loads(stored['reply']), replayed=True)
+                    return self._replay(op, args, key, stored)
             if self._fenced():
                 raise KelmoError('E_FENCED', 'This server is fenced; writes stay queued until the cutover completes.')
             self.service.archive_api.assert_writer()
@@ -1722,7 +1723,7 @@ class ClientSession:
                 row, claimed = _ledger(journal.client_request_claim, request_key, self.client_id, op, fingerprint)
                 if claimed is None:
                     release()  # finished by another attempt meanwhile: the file goes, as after a settlement
-                    return dict(json.loads(row['reply']), replayed=True)
+                    return self._replay(op, args, key, row)
                 try:
                     outcome = {'ok': True, 'result': getattr(self, 'write_' + op)(key=key, **args)}
                 except KelmoError as error:
@@ -1745,6 +1746,37 @@ class ClientSession:
             # can settle it, so the refusal is retryable rather than a final answer.
             raise _verdict(KelmoError(_unsettled(error).code, 'The write did not settle; it is retried under '
                                                              'the same key.'), True) from error
+
+    def _replay(self, op, args, key, row):
+        """The stored reply of a finished request. A refusal that `kelmo client resend` sent again under
+        `<base>#resend<n>` answers as the last note of that chain, which this client's outbox may no longer know
+        (a profile made again under the same client id). The chain is the client's: the key cut at its first
+        `#resend`, then `#resend1`, `#resend2` and on while such a key is recorded (the client takes the lowest
+        number it finds free, so a number another note holds is passed over). A successor counts only when it
+        carries the same request (resend sends it unchanged) and was recorded after the refusal it resends. A successor still open is run under its own key: a live attempt of it is answered busy by the
+        row's lock, one abandoned by a process that is gone is run again, and its outcome answers."""
+        reply = json.loads(row['reply'])
+        if reply.get('ok') is not False:
+            return dict(reply, replayed=True)
+        base = key.partition('#resend')[0]
+        journal, before = self.service.journal, row
+        for successor in itertools.count(1):
+            successor_key = f'{base}#resend{successor}'
+            request_key = _request_digest([self.client_id, successor_key])
+            stored = journal.client_request(request_key)
+            if stored is None:
+                break
+            if (stored['op'] != before['op'] or stored['fingerprint'] != before['fingerprint']
+                    or stored['created_at'] <= (before['finished_at'] or before['created_at'])):
+                continue  # another note, or an earlier step of the chain (this key itself among them)
+            if stored['state'] != 'finished':
+                # Its effect may be done: never answered with the refusal it resent. The archive deduplicates the
+                # key, so running it again is safe.
+                return dict(self._mutate(op, args, successor_key), replayed=True)
+            before, reply = stored, json.loads(stored['reply'])
+            if reply.get('ok') is not False:
+                break
+        return dict(reply, replayed=True)
 
     @contextmanager
     def _request_lock(self, request_key):
