@@ -146,8 +146,12 @@ def test_close_is_idempotent_and_marks_the_channel_dead():
 
 def test_a_request_on_a_channel_whose_pipe_closed_leaves_no_waiter_behind():
     channel = MuxChannel(command(), timeout=2)
+
+    def closed(data, deadline):
+        raise ValueError('I/O operation on closed file.')  # the pipe closed under the write; the peer still runs
+
+    channel._write = closed
     try:
-        channel.process.stdin.close()
         with pytest.raises(ValueError):
             channel.request(request('after-close'))
         assert channel._waiters == {}, channel._waiters

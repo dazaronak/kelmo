@@ -352,12 +352,17 @@ class Outbox:
             left = max(0.0, limit - time.monotonic())
             self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
             try:
+                # One read transaction: only its first read waits for another process's lock on the file, so
+                # the bound holds for every query of the summary.
+                self.conn.execute('BEGIN')
                 return self.summary()
             except sqlite3.OperationalError as error:
                 if not sqlite_busy(error):
                     raise
                 return {'busy': True}
             finally:
+                if self.conn.in_transaction:
+                    self.conn.execute('ROLLBACK')
                 self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
         finally:
             self._serial.release()
@@ -1221,9 +1226,16 @@ class SharedClient:
         return channel, hello
 
     def call(self, op, args=None):
-        """A read: no outbox, and a transport failure is reported, never answered from the cache. It does not
-        wait for the owner of the outbox; on a channel that carries one request at a time it takes its turn."""
-        return self._read(op, args)
+        """A read: no outbox, and a transport failure is reported, never answered from the cache. Over a
+        channel that carries several requests it does not wait for the owner of the outbox; on one that carries
+        a single request it keeps the owner while it waits, so a hook queued meanwhile goes before a delivery.
+        `kelmo status` reads with `read_aside` instead."""
+        if self._multiplex:
+            channel = self._connect()
+            if getattr(channel, 'concurrent', False):
+                return self._read(op, args, channel)
+        with self._lock:
+            return self._read(op, args)
 
     def read_aside(self, op, args=None):
         """A read that must not make the client's writes wait for it (`kelmo status`): over the open kelmo/2
@@ -1331,12 +1343,11 @@ class SharedClient:
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                if isinstance(error, Closed) or (isinstance(error, Unsent) and error.code == 'E_BUSY'):
-                    # Another request held the channel past this pass's deadline, or the channel was closed or
-                    # dropped while this one waited for it: nothing reached the server.
-                    if attempted:
-                        self.outbox.attempt(key, -1)
-                else:
+                if isinstance(error, (Closed, Unsent)) and attempted:
+                    self.outbox.attempt(key, -1)  # refused here before a byte went out: no attempt
+                if not (isinstance(error, Closed) or (isinstance(error, Unsent) and error.code == 'E_BUSY')):
+                    # A busy turn, or a channel closed or dropped while this request waited for it, keeps no
+                    # refusal: another request held the channel, nothing about this entry failed.
                     self.outbox.note(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break

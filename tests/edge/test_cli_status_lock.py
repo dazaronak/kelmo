@@ -845,11 +845,18 @@ def test_a_delivery_refused_because_the_channel_was_busy_counts_no_attempt(profi
     entered, release = threading.Event(), threading.Event()
     client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
                           multiplex=True)
-    reader = threading.Thread(target=client.call, args=('status',), daemon=True)
+    held, done = threading.Event(), threading.Event()
+
+    def hold_the_turn():  # another request in flight on the one-request channel
+        with client._turn_for(channel):
+            held.set()
+            done.wait(10)
+
+    reader = threading.Thread(target=hold_the_turn, daemon=True)
     try:
-        client._connect()
+        channel = client._connect()
         reader.start()
-        assert entered.wait(5)
+        assert held.wait(5)
         client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'busy-one')
         with client.deadline(0.3):
             result = client.flush()
@@ -857,6 +864,7 @@ def test_a_delivery_refused_because_the_channel_was_busy_counts_no_attempt(profi
         entry = client.outbox.pending()[0]
         assert (entry['attempts'], entry['last_error']) == (0, None), entry
     finally:
+        done.set()
         release.set()
         reader.join(10)
         client.close()
@@ -1090,4 +1098,123 @@ def test_a_bounded_summary_counts_its_wait_for_the_outbox_against_its_bound(prof
         holder.join(10)
         other.rollback()
         other.close()
+        client.close()
+
+
+
+def test_a_read_on_a_one_request_channel_keeps_the_owner_so_an_urgent_hook_goes_before_a_delivery(profile):
+    """A tool read (`trace`) waits for the authority on a channel that carries one request at a time. It keeps the
+    owner of the outbox while it waits, as before this change, so a hook queued as urgent takes the owner when the
+    read ends, ahead of a delivery that waits for it; the hook is not held behind that delivery's own send."""
+    from kelmo.client import PROTOCOL, SharedClient
+    from kelmo.core.edge_core import EdgeCore
+    entered, release = threading.Event(), threading.Event()
+
+    class Channel:
+        def request(self, frame, timeout=None):
+            if frame['op'] == 'trace':
+                entered.set()
+                release.wait(10)
+            if frame['op'] == 'capture':
+                time.sleep(2.0)
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'trace', 'capture']}
+                      if frame['op'] == 'hello' else {'operation_id': 'op-1'} if frame['op'] == 'capture'
+                      else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            pass
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    reader = threading.Thread(target=lambda: client.call('trace', {'operation_id': 'op-0'}), daemon=True)
+
+    def deliver():
+        with client.deadline(8.0):
+            try:
+                client.flush()
+            except Exception:  # noqa: BLE001 - only the hook's wait is measured here
+                pass
+
+    delivery = threading.Thread(target=deliver, daemon=True)
+    try:
+        reader.start()
+        assert entered.wait(5), 'the read never reached the authority'
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'behind-the-read')
+        delivery.start()
+        time.sleep(0.3)  # the delivery asks for the outbox (or, without it, for the channel)
+        threading.Timer(0.5, release.set).start()
+        started = time.monotonic()
+        got = core._owner.acquire(timeout=2.5, urgent=True)
+        waited = time.monotonic() - started
+        if got:
+            core._owner.release()
+        assert got and waited < 1.5, f'the urgent hook waited {waited:.2f} s behind a delivery started after the read'
+    finally:
+        release.set()
+        reader.join(10)
+        delivery.join(10)
+        core.close()
+
+
+
+def test_a_bounded_summary_holds_its_bound_across_all_its_queries(profile):
+    """Another process takes the outbox file between the summary's queries, each time for half a second: the
+    summary reads under one transaction, so the file cannot be taken between its queries and it answers within
+    its bound."""
+    import sqlite3
+    from kelmo.client import SharedClient
+    client = SharedClient(profile, multiplex=True)
+    client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'counted')
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    seen = []
+
+    def between(statement):
+        if not statement.lstrip().upper().startswith('SELECT'):
+            return
+        seen.append(statement)
+        if len(seen) < 2:
+            return
+        try:
+            other.execute('BEGIN EXCLUSIVE')
+        except sqlite3.OperationalError:
+            return  # the summary's own read lock keeps the file
+        threading.Timer(0.5, other.rollback).start()
+
+    client.outbox.conn.set_trace_callback(between)
+    try:
+        started = time.monotonic()
+        summary = client.outbox.summary_within(1.0)
+        took = time.monotonic() - started
+        assert took < 1.3, f'the summary took {took:.2f} s for a bound of 1 s ({summary})'
+    finally:
+        client.outbox.conn.set_trace_callback(None)
+        time.sleep(0.6)
+        other.close()
+        client.close()
+
+
+def test_a_delivery_refused_here_before_it_was_sent_counts_no_attempt(profile, monkeypatch):
+    """The deadline passed after the channel was open and before the frame went out: nothing reached the server,
+    so the entry counts no attempt."""
+    from kelmo.client import SharedClient, Unsent
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    try:
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'unsent-one')
+
+        real = client._send
+
+        def refused(channel, op, *args, **kwargs):
+            if op != 'capture':
+                return real(channel, op, *args, **kwargs)  # the hello goes through: the channel is open
+            raise Unsent('E_TRANSPORT', 'The deadline passed before the request was sent.')
+
+        monkeypatch.setattr(client, '_send', refused)
+        client.flush()
+        entry = client.outbox.get('unsent-one')
+        assert entry['attempts'] == 0, entry
+    finally:
+        release.set()
         client.close()
