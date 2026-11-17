@@ -488,7 +488,7 @@ class Dreaming:
             try:
                 record = self.service.show(source['archive_id'])
             except KelmoError as error:
-                if error.code not in ('E_FORGOTTEN', 'E_NOT_FOUND'):
+                if error.code not in ('E_FORGOTTEN', 'E_PURGED', 'E_NOT_FOUND'):
                     raise
                 return 'evidence ' + source['archive_id'] + ' is no longer readable: ' + error.code
             if record['version'] != source['version'] or record.get('superseded_by'):

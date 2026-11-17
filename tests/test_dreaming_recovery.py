@@ -197,6 +197,46 @@ def test_link_citing_forgotten_evidence_settles_stale(world, monkeypatch):
     assert 'app-archive' not in world.registry()['pages'][NOTES]['links']
 
 
+def test_link_citing_purged_evidence_settles_stale(world, monkeypatch):
+    """A record an operator purged answers E_PURGED: like a forgotten one it is no evidence any more, so the
+    finding settles stale instead of staying open on that error at every later publish."""
+    finding = {
+        'kind': 'link',
+        'pages': [NOTES, OTHER],
+        'sources': [{'archive_id': world.seed.archive_id, 'version': world.seed.version}],
+        'reason': 'Seed evidence links notes and archive.',
+    }
+    real_edit = world.service.editor.edit
+    calls = 0
+
+    def failing_edit(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KelmoError('E_BUSY', 'editor is busy')
+        return real_edit(*args, **kwargs)
+
+    monkeypatch.setattr(world.service.editor, 'edit', failing_edit)
+    first_run = world.service.dreaming.run(
+        Scripted(ModelOutcome('proposal', {'findings': [finding]})),
+        origin=world.origins['editor'],
+        contexts=world.contexts(),
+    )
+    fp = first_run['new'][0]
+    assert world.service.dreaming._row(fp)['state'] == 'open'
+    real_show = world.service.show
+
+    def purged(archive_id, *args, **kwargs):
+        if archive_id == world.seed.archive_id:
+            raise KelmoError('E_PURGED', 'The record was purged.')
+        return real_show(archive_id, *args, **kwargs)
+
+    monkeypatch.setattr(world.service, 'show', purged)
+    result = world.service.dreaming.publish(fp, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'stale', result
+    assert 'E_PURGED' in world.service.dreaming._row(fp)['detail']['reason']
+
+
 def test_merge_finding_pages_either_order_recorded_once(world):
     finding_order1 = {
         'kind': 'merge',
