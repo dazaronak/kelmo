@@ -308,6 +308,84 @@ def test_a_give_back_the_busy_journal_refuses_for_a_moment_still_returns_the_req
     assert (job['state'], job['attempts']) == ('pending', 0), job
 
 
+def _stopped_tick(service, monkeypatch, release_busy):
+    from kelmo.daemon import tick
+    from kelmo.errors import Stopping
+    from kelmo.resolution import Resolution
+
+    def cut_by_the_stop(argv, payload, **kwargs):
+        raise Stopping()
+
+    monkeypatch.setattr('kelmo.daemon.execute', cut_by_the_stop)
+    monkeypatch.setattr(Resolution, 'release_busy', release_busy)
+    with pytest.raises(Stopping):
+        tick(service, ['/synthetic/executor'], max_attempts=3)
+    return Resolution(service).list()[0]
+
+
+def test_a_give_back_whose_busy_commit_left_its_transaction_open_still_returns_the_request(service, monkeypatch):
+    """A busy refusal at COMMIT leaves SQLite's transaction open; the next try must not start inside it."""
+    import sqlite3
+
+    from kelmo.resolution import Resolution
+    pending(service)
+    real = Resolution.release_busy
+    calls = []
+
+    def busy_commit_once(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            self.conn.execute('BEGIN IMMEDIATE')
+            raise sqlite3.OperationalError('database is locked')
+        return real(self, *args, **kwargs)
+
+    job = _stopped_tick(service, monkeypatch, busy_commit_once)
+    assert (job['state'], job['attempts']) == ('pending', 0), (job, len(calls))
+
+
+def test_a_give_back_refused_for_another_reason_is_not_tried_again(service, monkeypatch):
+    import sqlite3
+    pending(service)
+    calls = []
+
+    def disk_error(self, *args, **kwargs):
+        calls.append(1)
+        raise sqlite3.DatabaseError('synthetic disk I/O error')
+
+    _stopped_tick(service, monkeypatch, disk_error)
+    assert len(calls) == 1, calls
+
+
+def test_a_give_back_is_not_tried_again_past_its_share_of_the_stop(service, monkeypatch):
+    """Each busy refusal has already waited out the journal's own timeout: a retry starts only while the stop
+    still has room for one more wait."""
+    import sqlite3
+    pending(service)
+    monkeypatch.setattr('kelmo.daemon.GIVE_BACK_SECONDS', 0.0)
+    calls = []
+
+    def busy(self, *args, **kwargs):
+        calls.append(1)
+        raise sqlite3.OperationalError('database is locked')
+
+    _stopped_tick(service, monkeypatch, busy)
+    assert len(calls) == 1, calls
+
+
+def test_a_give_back_that_cannot_be_reported_still_raises_the_stop(service, monkeypatch):
+    import io
+    import sqlite3
+    pending(service)
+    closed = io.StringIO()
+    closed.close()
+
+    def disk_error(self, *args, **kwargs):
+        monkeypatch.setattr('sys.stderr', closed)  # gone by the time the give-back is reported
+        raise sqlite3.DatabaseError('synthetic disk I/O error')
+
+    _stopped_tick(service, monkeypatch, disk_error)
+
+
 def test_resolution_submit_rejects_symlinked_worker_lock(service, tmp_path):
     from kelmo.resolution import Resolution
     pending(service)

@@ -509,23 +509,42 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
 
 GIVE_BACK_TRIES = 3
 GIVE_BACK_PAUSE_SECONDS = 0.2
+# A busy refusal has already waited out the journal's own timeout (30 s); another try starts only this soon after
+# the first, so the give-back stays inside kelmod's drain deadline.
+GIVE_BACK_SECONDS = 35.0
 
 
 def _give_back(queue, request):
     """Returns a request the core's stop interrupted, uncharged. A journal busy past one wait is usually free a
-    moment later, so it is tried again a few times; one that still refuses leaves the claim to expire with its
-    lease. The stop stays a stop either way."""
+    moment later, so it is tried again while the stop has room; one that still refuses leaves the claim to
+    expire with its lease. The stop stays a stop either way."""
+    started = time.monotonic()
     for attempt in range(1, GIVE_BACK_TRIES + 1):
         try:
             queue.release_busy(request['id'], request['token'])
             return
         except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
-            if sqlite_busy(error) and attempt < GIVE_BACK_TRIES:
+            _end_open_transaction(queue)
+            if (sqlite_busy(error) and attempt < GIVE_BACK_TRIES
+                    and time.monotonic() - started < GIVE_BACK_SECONDS):
                 time.sleep(GIVE_BACK_PAUSE_SECONDS)
                 continue
-            print(f'kelmo worker: resolution {request["id"]} not given back at the stop: {type(error).__name__}',
-                  file=sys.stderr, flush=True)
+            try:
+                print(f'kelmo worker: resolution {request["id"]} not given back at the stop: '
+                      f'{type(error).__name__}', file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # no stderr to report on; the stop is still raised
             return
+
+
+def _end_open_transaction(queue):
+    """A busy refusal at COMMIT leaves SQLite's transaction open; the next try must not start inside it."""
+    conn = getattr(queue, 'conn', None)
+    try:
+        if conn is not None and conn.in_transaction:
+            conn.rollback()
+    except sqlite3.Error:
+        pass
 
 
 def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping, processed, skipped,
