@@ -108,6 +108,9 @@ entry here.
 - A Dreaming link finding whose cited evidence could not be read for a moment, because the archive was busy or
   its process restarted, is no longer settled `stale` for good. It stays open with the error's code and a later
   `publish` links the pages. Only evidence that was forgotten or is gone settles the finding `stale`.
+- The line `kelmo worker daemon` writes about operations held by another attempt no longer names an
+  operation the worker skipped only because the journal was busy. Such an entry under `skipped` in `kelmo
+  worker daemon --once` output now carries `"journal_busy": true`.
 
 ### Added
 

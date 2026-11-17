@@ -430,7 +430,7 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         except sqlite3.Error as error:
             if not sqlite_busy(error):
                 raise
-            skipped.append({'operation_id': operation['id'], 'error_code': 'E_BUSY'})
+            skipped.append({'operation_id': operation['id'], 'error_code': 'E_BUSY', 'journal_busy': True})
             continue
         if state == 'exhausted':
             failed_attempts.append({'operation_id': operation['id'], 'error_code': 'E_ATTEMPTS',
@@ -488,7 +488,7 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         except sqlite3.Error as error:
             if not sqlite_busy(error):
                 raise
-            skipped.append({'operation_id': operation_id, 'error_code': 'E_BUSY'})
+            skipped.append({'operation_id': operation_id, 'error_code': 'E_BUSY', 'journal_busy': True})
         except Stopping:
             break
     if not vault_failed and service.editor.vault_passed:
@@ -689,9 +689,10 @@ def run(service, config_path, *, once=False, open_service=None):
             if once:
                 return result
             # Only an operation another attempt holds: a refused resolution request names no operation, and a
-            # note skipped for the executor or the vault is held by nobody.
+            # note skipped for the executor, the vault or a busy journal is held by nobody.
             held = {item['operation_id'] for item in result.get('skipped', ())
-                    if 'operation_id' in item and item.get('error_code') in ('E_BUSY', 'E_CLAIM')}
+                    if 'operation_id' in item and item.get('error_code') in ('E_BUSY', 'E_CLAIM')
+                    and not item.get('journal_busy')}
             if held - reported:
                 # A claim left by a dead worker blocks its operation until the lease expires; say so.
                 print('kelmo worker: skipped operations held by another attempt: '
