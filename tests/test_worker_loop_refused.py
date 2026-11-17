@@ -48,6 +48,23 @@ def two_passes(service, tmp_path, monkeypatch):
     return passes, ended
 
 
+def passes_then_stop(service, tmp_path, monkeypatch, count):
+    """As `two_passes`, with the stop sent as pass `count + 1` starts, so `count` passes run their operations."""
+    config = tmp_path / 'executor.json'
+    config.write_text(json.dumps({'argv': saying(other_build_for_resolve()), 'poll_seconds': 0.1}),
+                      encoding='utf-8')
+    real, passes = daemon.tick, []
+
+    def counted(*args, **kwargs):
+        if len(passes) == count:
+            os.kill(os.getpid(), signal.SIGTERM)
+        passes.append(real(*args, **kwargs))
+        return passes[-1]
+
+    monkeypatch.setattr(daemon, 'tick', counted)
+    return passes, daemon.run(service, config)
+
+
 def request(service):
     return dict(service.journal.conn.execute('SELECT id, operation_id, state, attempts FROM resolutions').fetchone())
 
@@ -143,3 +160,38 @@ def test_the_held_line_never_names_an_operation_whose_run_met_a_busy_journal(ser
     lines = [line for line in capsys.readouterr().err.splitlines()
              if 'skipped operations held by another attempt' in line]
     assert not any(queued['id'] in line for line in lines), lines
+
+
+
+def test_a_dead_claim_met_first_behind_a_busy_journal_is_named_on_the_next_pass(service, tmp_path, monkeypatch,
+                                                                                capsys):
+    """A pass whose claim attempt on the operation finds the journal busy names nothing; the first pass whose
+    claim attempt gets the journal's write lock meets the dead claim and names it."""
+    import sqlite3
+    receipt = service.reconcile('A claimed fact.', 'projects/fixture/fixture.md')
+    held = service.capture(content({'result': 'not_found', 'search_id': receipt['search_id']},
+                                   text='A claimed fact.', key='fixture.claimed'), 'claimed.md', 'lead', 'promote')
+    with service.journal.conn:  # the unexpired claim of a worker this machine cannot see
+        service.journal.conn.execute('INSERT INTO claims (operation_id, token, expires_at, local_worker) '
+                                     'VALUES (?, ?, ?, 0)', (held['id'], 'gone-worker', 9999999999))
+    real, runs, first_pass = service.run, [], []
+
+    def busy_once(operation_id, *args, **kwargs):
+        if operation_id == held['id']:
+            runs.append(operation_id)
+            if len(runs) == 1:
+                raise sqlite3.OperationalError('database is locked')
+            first_pass.append(capsys.readouterr().err)  # what the first pass printed, read as the second claims
+        return real(operation_id, *args, **kwargs)
+
+    monkeypatch.setattr(service, 'run', busy_once)
+    capsys.readouterr()
+
+    passes, ended = passes_then_stop(service, tmp_path, monkeypatch, 2)
+
+    assert ended == {'stopped': True}, ended
+    assert len(runs) == 2 and first_pass, runs
+    marker = 'skipped operations held by another attempt'
+    assert not [line for line in first_pass[0].splitlines() if marker in line], 'the busy pass named an operation'
+    lines = [line for line in capsys.readouterr().err.splitlines() if marker in line]
+    assert len(lines) == 1 and held['id'] in lines[0], lines
