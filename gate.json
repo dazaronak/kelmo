@@ -118,6 +118,7 @@
       "runners": [
         {
           "label": "pytest tests",
+          "echo": "^(collected \\d+ cases in \\d+ shards|progress: )",
           "argv": [
             "$interpreter",
             "tools/pytest_shards.py",

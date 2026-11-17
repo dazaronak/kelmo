@@ -358,5 +358,43 @@ class TheBundledRunner(unittest.TestCase):
                     self.assertEqual(['synthetic cases'], report.unmeasured)
 
 
+    def test_a_runner_that_names_an_echo_pattern_shows_those_lines_while_it_runs(self):
+        """The source suite's shard runner prints its progress as each shard ends; the gate shows those lines as
+        they come instead of after the section, and still classifies the section by its counts line."""
+        import threading
+        import time
+        with tempfile.TemporaryDirectory() as scratch:
+            go = Path(scratch) / 'go'
+            child = ('import pathlib, sys, time\n'
+                     'print("progress: shard 1 of 2 ended", flush=True)\n'
+                     'end = time.monotonic() + 10\n'
+                     'while not pathlib.Path(%r).exists() and time.monotonic() < end:\n'
+                     '    time.sleep(0.02)\n'
+                     'print("2 passed, 0 failed")\n' % str(go))
+            entry = {'name': 'synthetic stream', 'kind': 'runner',
+                     'runners': [{'argv': [sys.executable, '-c', child], 'echo': r'^progress: '}],
+                     'counts': r'^(?P<passed>\d+) passed, (?P<failed>\d+) failed$'}
+            report = self.runner.Report()
+            stream = io.StringIO()
+            with redirect_stdout(stream):
+                running = threading.Thread(target=self.runner.run_runner, args=(entry, FOLDER, {}, report))
+                running.start()
+                end = time.monotonic() + 5
+                while 'progress: shard 1 of 2 ended' not in stream.getvalue() and time.monotonic() < end:
+                    time.sleep(0.02)
+                shown_while_running = 'progress: shard 1 of 2 ended' in stream.getvalue()
+                go.touch()
+                running.join(15)
+            self.assertTrue(shown_while_running, stream.getvalue())
+            self.assertEqual((1, 0), (report.n_pass, report.n_fail), stream.getvalue())
+
+    def test_the_source_suite_shows_the_shard_runner_progress_as_it_runs(self):
+        [runner] = section('the source suite')['runners']
+        echo = re.compile(runner.get('echo', '(?!)'))
+        self.assertTrue(echo.search('progress: shard 1 of 4 ended with exit 0, 10 of 40 cases done'))
+        self.assertTrue(echo.search('collected 40 cases in 4 shards'))
+        self.assertFalse(echo.search('40 passed in 12.00s (4 shards)'))
+
+
 if __name__ == '__main__':
     unittest.main()
