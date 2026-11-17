@@ -162,15 +162,7 @@ class CoreLink:
             header['origin'] = context.origin.to_header()
         future = Future()
         with self._state:
-            # Once the link stops, `_finish` has failed (or is about to fail) every call it knows; a call registered
-            # after its snapshot would wait for a reply that cannot come, so it is refused here, under the same lock.
-            stopping = self._stopping.is_set() or self._peer_gone.is_set()
-            if not stopping:
-                self._outgoing[call_id] = future
-        if stopping:
-            self._ask_owner_to_stop()  # the owner hears of the stop before this call fails
-            _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
-            return future
+            self._outgoing[call_id] = future
         try:
             data = wire.encode(header, body)
         except Exception as error:  # noqa: BLE001 - nothing was written: the call alone fails, whatever the encoder raised
@@ -181,7 +173,8 @@ class CoreLink:
             return future
         try:
             with self._write_lock:
-                # The stop may have begun, and failed this call, since it was registered: then nothing is written.
+                # Once the link stops, `_finish` has failed (or is about to fail) every call it knows, this one among
+                # them if it was registered before; a call written now would wait for a reply that cannot come.
                 refused = self._stopping.is_set() or self._peer_gone.is_set()
                 if not refused:
                     try:
@@ -203,7 +196,7 @@ class CoreLink:
         if refused:
             with self._state:
                 self._outgoing.pop(call_id, None)
-            self._ask_owner_to_stop()
+            self._ask_owner_to_stop()  # the owner hears of the stop before this call fails
             _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
         return future
 
