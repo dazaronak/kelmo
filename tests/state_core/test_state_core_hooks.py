@@ -111,9 +111,9 @@ def test_spooled_hooks_are_ingested_oldest_first_and_unreadable_frames_are_renam
     served = []
     serve_hook = core.serve_hook
 
-    def record(body):
+    def record(body, **options):
         served.append(body['payload']['order'])
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = record
     # Written in an order other than the names' order, so only the name sort can make the ingest order.
@@ -142,9 +142,9 @@ def test_a_capture_spooled_after_the_start_is_ingested_once_a_hook_is_served(wor
     served = []
     serve_hook = core.serve_hook
 
-    def record(body):
+    def record(body, **options):
         served.append(body['payload'].get('order'))
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = record
     (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
@@ -210,13 +210,13 @@ def test_a_capture_spooled_during_a_pass_is_ingested_after_a_hook_served_meanwhi
     inside = threading.Event()
     serve_hook = core.serve_hook
 
-    def record(body):
+    def record(body, **options):
         order = body['payload'].get('order')
         if order == 'first':
             inside.set()
             assert gate.wait(10)
         served.append(order)
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = record
     (spool / '00000000000000000001-101.json').write_text(capture_frame('first'))
@@ -254,16 +254,17 @@ def test_a_core_whose_channel_was_told_to_stop_starts_no_spool_pass_after_a_hook
 
 
 def test_a_spooled_capture_refused_every_time_does_not_hold_back_the_ones_behind_it(world_factory, core_factory):
-    """A capture refused as worth retrying, by the archive (E_FENCED with `retryable`) or locally (a transcript
-    read over its time, E_CAPTURE_RETRY), is skipped for the pass and the captures behind it run. The refusal is
-    worth retrying, so the file stays for a later pass however often it repeats, as the edge core keeps it."""
+    """A capture refused as worth retrying is skipped for the pass and the captures behind it run. A refusal the
+    server marked worth retrying (E_FENCED with `retryable`) stays for later passes however often it repeats, as
+    the edge core keeps it. A local one (a transcript read over even the spool pass's own budget, E_CAPTURE_RETRY)
+    would repeat on every pass while holding the writer: on its third try in this core it is set aside."""
     from kelmo.errors import KelmoError
     core = core_factory(world_factory().root)
     spool = core.root / '.state' / 'hook-spool'
     spool.mkdir(parents=True)
     serve_hook = core.serve_hook
 
-    def refused(body):
+    def refused(body, **options):
         order = body['payload'].get('order')
         if order == 'fenced':
             error = KelmoError('E_FENCED', 'Synthetic archive writer fenced.')
@@ -271,16 +272,19 @@ def test_a_spooled_capture_refused_every_time_does_not_hold_back_the_ones_behind
             raise error
         if order == 'slow':
             raise KelmoError('E_CAPTURE_RETRY', 'Synthetic transcript read over its time.')
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = refused
     (spool / '00000000000000000001-101.json').write_text(capture_frame('fenced'))
     (spool / '00000000000000000002-101.json').write_text(capture_frame('slow'))
     (spool / '00000000000000000003-101.json').write_text(capture_frame('behind'))
-    passes = [core.ingest_spool() for _ in range(4)]
+    passes = [core.ingest_spool() for _ in range(2)]
     assert passes[0]['ingested'] == 1, passes
     assert sorted(path.name for path in spool.iterdir()) == [
         '00000000000000000001-101.json', '00000000000000000002-101.json'], passes
+    passes += [core.ingest_spool() for _ in range(2)]
+    assert sorted(path.name for path in spool.iterdir()) == [
+        '00000000000000000001-101.json', '00000000000000000002-101.bad'], passes
 
 
 def test_a_spooled_capture_refused_for_good_is_set_aside(world_factory, core_factory):
@@ -291,10 +295,10 @@ def test_a_spooled_capture_refused_for_good_is_set_aside(world_factory, core_fac
     spool.mkdir(parents=True)
     serve_hook = core.serve_hook
 
-    def refused(body):
+    def refused(body, **options):
         if body['payload'].get('order') == 'bad':
             raise KelmoError('E_INPUT', 'Synthetic capture refused for good.')
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = refused
     (spool / '00000000000000000001-101.json').write_text(capture_frame('bad'))
@@ -311,11 +315,11 @@ def test_a_capture_refused_once_as_worth_retrying_runs_on_a_later_pass(world_fac
     serve_hook = core.serve_hook
     tries = []
 
-    def changed_once(body):
+    def changed_once(body, **options):
         tries.append(body['payload'].get('order'))
         if len(tries) == 1:
             raise KelmoError('E_CAPTURE_RETRY', 'Synthetic transcript changed while read.')
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = changed_once
     (spool / '00000000000000000001-101.json').write_text(capture_frame('changing'))
@@ -339,13 +343,13 @@ def test_a_pass_stopped_by_a_busy_journal_runs_again_when_a_hook_asked_meanwhile
     serve_hook = core.serve_hook
     busy = []
 
-    def busy_once(body):
+    def busy_once(body, **options):
         if body['payload'].get('order') == 'first' and not busy:
             busy.append(1)
             inside.set()
             assert gate.wait(10)
             raise KelmoError('E_BUSY', 'Synthetic busy journal.')
-        return serve_hook(body)
+        return serve_hook(body, **options)
 
     core.serve_hook = busy_once
     (spool / '00000000000000000001-101.json').write_text(capture_frame('first'))
@@ -454,3 +458,61 @@ def test_a_spool_pass_that_fails_ends_quietly_and_leaves_no_running_pass(world_f
     while list(spool.iterdir()) and time.monotonic() < limit:
         time.sleep(0.05)
     assert list(spool.iterdir()) == [], 'the next hook did not take the capture'
+
+
+def test_a_spool_pass_captures_with_a_budget_of_its_own(world_factory, core_factory):
+    """No caller waits for the spool pass, so a capture there gets a longer budget than a hook's 1.5 s."""
+    from kelmo.core.state_core import SPOOL_CAPTURE_SECONDS
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    seen = []
+    core.serve_hook = lambda body, **options: seen.append(options) or {}
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+    assert core.ingest_spool() == {'ingested': 1}
+    assert seen == [{'capture_budget': SPOOL_CAPTURE_SECONDS}], seen
+    assert 1.5 < SPOOL_CAPTURE_SECONDS <= 5.5, 'a hook capture waiting behind it must still answer inside 7 s'
+
+
+def test_a_capture_budget_given_to_a_hook_reaches_the_session_capture(world_factory, core_factory, monkeypatch):
+    from kelmo import session_control
+    core = core_factory(world_factory().root)
+    seen = []
+    monkeypatch.setattr(session_control, 'capture_hook',
+                        lambda root, provider, action, payload, **options: seen.append(options) or {})
+    body = json.loads(capture_frame('late'))
+    assert core.serve_hook(body, capture_budget=4.0) == {}
+    assert seen and seen[0].get('time_budget') == 4.0, seen
+    assert core.serve_hook(json.loads(capture_frame('live'))) == {}
+    assert 'time_budget' not in seen[1] or seen[1]['time_budget'] == 1.5, seen
+
+
+def test_a_stop_that_lands_while_the_spool_thread_starts_runs_no_pass(world_factory, core_factory, monkeypatch):
+    """admin.stop can mark the channel draining after the hook's stop check and before the thread starts: the
+    thread then serves nothing and leaves the spool as it is."""
+    import threading
+    import time
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
+    core._draining = threading.Event()
+    served = []
+    serve_hook = core.serve_hook
+    core.serve_hook = lambda body, **options: served.append(body['payload'].get('order')) or serve_hook(body)
+    real_start = threading.Thread.start
+
+    def stop_lands(thread):
+        if thread.name == 'hook-spool':
+            core._draining.set()
+        return real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, 'start', stop_lands)
+    live = {'action': 'session-stop', 'payload': {'order': 'live'},
+            'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), live) == {}
+    limit = time.monotonic() + 5
+    while core._spool is not None and time.monotonic() < limit:
+        time.sleep(0.05)
+    assert served == ['live'], served
+    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']

@@ -88,9 +88,9 @@ def inspect(root):
     return result
 
 
-def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
+def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,time_budget=1.5):
     """`internal_job` is what the hook's own process saw (None: this process's environment); `journal` lends the
-    state core's writer journal."""
+    state core's writer journal; `time_budget` bounds the transcript read (a hook's 1.5 s by default)."""
     if internal_job is None:
         internal_job=os.environ.get('KELMO_INTERNAL_JOB')=='1'
     if internal_job:
@@ -110,7 +110,7 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None):
     event={'session-stop':'Stop','session-checkpoint':'PreCompact','session-end':'SessionEnd'}[action]
     try:
         sessions.capture(provider,payload.get('session_id') or payload.get('thread_id'),source,selected,event,
-                         checkpoint_turns=config.sessions['checkpoint_turns'])
+                         checkpoint_turns=config.sessions['checkpoint_turns'],time_budget=time_budget)
         with sessions.journal.conn as db:
             db.execute('''CREATE TABLE IF NOT EXISTS session_native_events (
                 provider TEXT NOT NULL,event TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(provider,event))''')

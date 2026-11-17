@@ -42,9 +42,14 @@ SHARED_ATTRIBUTES = frozenset({'root', 'config', 'bindings', 'context_bindings'}
 DEFAULT_READERS = 4
 HANDLER_LANE = 32
 HOOK_LANE = 4
-# A spooled capture refused this many times as worth retrying, in one core process, is set aside as `*.bad`.
 # The pause before another spool pass when the last stopped on a busy journal while a hook asked for one.
 SPOOL_PAUSE_SECONDS = 1.0
+# A spooled capture answers no caller, so it reads its transcript for longer than a hook's 1.5 s; a hook capture
+# that waits for the writer behind it (5 + 1.5 s) still answers inside kelmod's 7 s.
+SPOOL_CAPTURE_SECONDS = 5.0
+# A spooled capture refused locally as worth retrying (its transcript read ran out of time, or changed while read)
+# on this many tries in one core process is set aside as `*.bad`; one the server marked worth retrying stays.
+SPOOL_TRIES = 3
 
 _FACADE = contextvars.ContextVar('kelmo_state_facade', default=None)
 
@@ -194,6 +199,7 @@ class StateCore:
         self._spool = None
         self._spool_lock = threading.Lock()
         self._spool_again = False
+        self._spool_tries = {}  # spool file name -> local refusals worth retrying it met in this core process
         # The channel's draining event (CoreLink sets it when admin.stop arrives, before it asks the core to stop).
         self._draining = None
         self._acks = {}
@@ -425,7 +431,8 @@ class StateCore:
         self._spool_waiting()
         return result
 
-    def serve_hook(self, body):
+    def serve_hook(self, body, *, capture_budget=None):
+        """`capture_budget`: seconds a session capture may read its transcript (a hook's own 1.5 s without it)."""
         from ..integration import hook
         from ..session_control import capture_hook
         if not isinstance(body, dict) or not isinstance(body.get('action'), str):
@@ -440,9 +447,10 @@ class StateCore:
             payload['cwd'] = frame['cwd']
         if action.startswith('session-'):
             with self.storage.baton.hold():
+                options = {} if capture_budget is None else {'time_budget': capture_budget}
                 result = capture_hook(self.root, provider, action, payload,
                                       internal_job=frame.get('internal_job') is True,
-                                      journal=self.storage.writer.journal)
+                                      journal=self.storage.writer.journal, **options)
         elif action in ('start', 'prompt'):
             if provider:
                 payload['kelmo_provider'] = provider
@@ -484,9 +492,11 @@ class StateCore:
     def ingest_spool(self):
         """Runs every capture `kelmod hook` spooled while no daemon answered (`.state/hook-spool/`), oldest
         first, removing each once it ran. Context hooks and files that are not hook frames are renamed `*.bad`.
-        A refusal worth retrying skips that capture for this pass, keeps it for a later one, and the pass goes on;
-        a refusal for good renames it `*.bad`. A busy journal or a failure that is not a refusal stops the pass,
-        and the captures stay for the next pass (the next start, or the next hook served)."""
+        Each capture reads its transcript within SPOOL_CAPTURE_SECONDS. A refusal worth retrying skips that capture
+        for this pass and the pass goes on: one the server marked so stays for later passes; a local one is renamed
+        `*.bad` on its SPOOL_TRIES-th try in this core. A refusal for good renames it `*.bad`. A busy journal or a
+        failure that is not a refusal stops the pass, and the captures stay for the next pass (the next start, or
+        the next hook served)."""
         from . import spool
         from .instance import state_dir
         if self._told_to_stop():
@@ -506,20 +516,24 @@ class StateCore:
                 spool.reject(path)
                 continue
             try:
-                self.serve_hook(body)
+                self.serve_hook(body, capture_budget=SPOOL_CAPTURE_SECONDS)
             except KelmoError as error:
                 if self._told_to_stop():
                     # The stop caused it (the archive no longer answers): the capture stays for the next pass.
                     return {'ingested': ingested, 'stopped': 'stopping'}
                 if error.code == 'E_BUSY':
                     return {'ingested': ingested, 'stopped': error.code}  # every capture would meet the same
-                # A refusal worth retrying (the archive fenced or unreachable for now, a transcript that changed
-                # while it was read) keeps the file for a later pass, as the edge core keeps it, without holding
-                # back the captures behind it; a refusal for good would repeat on every pass and is set aside.
+                # A refusal worth retrying keeps the file for a later pass without holding back the captures behind
+                # it. One the server marked so stays, as the edge core keeps it. A local one (a transcript read that
+                # ran out even the spool's budget, or one that changed while read) holds the writer on every try, so
+                # it is set aside after a few; a refusal for good would repeat on every pass and is set aside now.
                 from ..server import RETRYABLE
-                retryable = getattr(error, 'retryable', None)
-                retryable = error.code in RETRYABLE if retryable is None else retryable
-                if not retryable:
+                marked = getattr(error, 'retryable', None)
+                if marked is True:
+                    continue
+                tries = self._spool_tries[path.name] = self._spool_tries.get(path.name, 0) + 1
+                if marked is False or error.code not in RETRYABLE or tries >= SPOOL_TRIES:
+                    self._spool_tries.pop(path.name, None)
                     spool.reject(path)
                 continue
             except Exception as error:  # noqa: BLE001 - kept in the spool for the next pass; the core serves on
@@ -527,6 +541,7 @@ class StateCore:
                       file=sys.stderr)
                 return {'ingested': ingested, 'stopped': type(error).__name__}
             path.unlink(missing_ok=True)
+            self._spool_tries.pop(path.name, None)
             ingested += 1
         return {'ingested': ingested}
 
