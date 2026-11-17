@@ -6,6 +6,7 @@ so heartbeats are answered while a status probe waits.
 """
 import socket
 import threading
+import time
 import uuid
 
 from archive_core_support import Peer
@@ -577,3 +578,42 @@ def test_waking_a_closed_confined_channel_writes_into_no_reused_descriptor(tmp_p
         for descriptor in opened:
             os.close(descriptor)
         parent.close()
+
+
+def test_the_stop_flag_waits_for_a_write_already_past_its_check():
+    """A call passed the stop check and is writing when the reader reaches the channel's end: `_finish` sets the stop
+    only once that write is done, so no call checks the flag, finds it clear and writes after the stop."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    entered, go = threading.Event(), threading.Event()
+
+    class SlowSocket:
+        """The link's socket, whose write pauses until the test lets it go."""
+
+        def __init__(self, sock):
+            self._sock = sock
+
+        def __getattr__(self, name):
+            return getattr(self._sock, name)
+
+        def sendall(self, data):
+            entered.set()
+            go.wait(10)
+            return self._sock.sendall(data)
+
+    link.sock = SlowSocket(link.sock)
+    calling = threading.Thread(target=lambda: link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30)),
+                               daemon=True)
+    finishing = threading.Thread(target=link._finish, daemon=True)
+    try:
+        calling.start()
+        assert entered.wait(5), 'the call never reached its write'
+        finishing.start()
+        time.sleep(0.2)
+        assert not link._stopping.is_set(), 'the stop was set while a call that passed its check was still writing'
+    finally:
+        go.set()
+        calling.join(10)
+        finishing.join(10)
+        parent.close()
+    assert link._stopping.is_set()

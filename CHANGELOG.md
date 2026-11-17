@@ -16,9 +16,9 @@ entry here.
   closed it) as the stop's. The call used to fail before the core heard of the stop, so a promote note whose
   editor call met it could still be charged an attempt. A call that cannot be encoded, or whose write fails
   for another reason, fails alone and does not stop the core.
-- A call a core makes after its channel to kelmod began to close now fails at once, after the core heard of
-  the stop. It used to be sent and wait for a reply that could not come, holding the stop for that call's
-  deadline, about five minutes for an archive call.
+- A call a core makes once it is stopping (kelmod closed its channel, or a stop finished the core's work) now
+  fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not come,
+  holding the stop for that call's deadline, about five minutes for an archive call.
 
 ## [0.3.1] - 2026-11-15
 

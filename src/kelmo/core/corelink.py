@@ -80,6 +80,9 @@ class DescriptorChannel:
 # A write that fails with one of these means kelmod's end of the channel is gone; any other error (no buffer space)
 # fails that call alone.
 PEER_GONE = frozenset({errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF, errno.ESHUTDOWN})
+# How long the stop waits for a call already writing before it sets the stop flag: kelmod closed the channel, so
+# that write ends at once (it lands or fails); the bound is for a peer that keeps reading slowly.
+STOP_WRITE_WAIT_SECONDS = 5.0
 
 
 def _fail(future, error):
@@ -268,14 +271,24 @@ class CoreLink:
         for pool in self.pools.values():
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
-        self._stopping.set()
+        self._set_stopping()
         try:
             self.sock.shutdown(socket.SHUT_RD)
         except OSError:
             pass
 
+    def _set_stopping(self):
+        """Sets the stop flag under the write lock: a call that passed its stop check finishes its write first, and
+        every call after it sees the stop, so no frame is written once the flag is up."""
+        taken = self._write_lock.acquire(timeout=STOP_WRITE_WAIT_SECONDS)
+        try:
+            self._stopping.set()
+        finally:
+            if taken:
+                self._write_lock.release()
+
     def _finish(self):
-        self._stopping.set()
+        self._set_stopping()
         # The owner hears of the stop before its open calls fail, so it counts those failures as the stop's.
         self._ask_owner_to_stop()
         # Outgoing calls next: no reply can arrive any more, and a handler waiting on one would hold the pool.
