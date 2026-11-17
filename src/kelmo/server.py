@@ -1721,6 +1721,7 @@ class ClientSession:
             with self._request_lock(request_key) as release:
                 row, claimed = _ledger(journal.client_request_claim, request_key, self.client_id, op, fingerprint)
                 if claimed is None:
+                    release()  # finished by another attempt meanwhile: the file goes, as after a settlement
                     return dict(json.loads(row['reply']), replayed=True)
                 try:
                     outcome = {'ok': True, 'result': getattr(self, 'write_' + op)(key=key, **args)}
@@ -1777,8 +1778,8 @@ class ClientSession:
             if settled:
                 try:
                     path.unlink()
-                except FileNotFoundError:
-                    pass
+                except OSError:
+                    pass  # a file left behind only makes the next opener find the finished row
         finally:
             os.close(descriptor)
 
