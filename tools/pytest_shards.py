@@ -186,7 +186,7 @@ def main(args):
     if ran < len(ids):
         # Every dealt id is one collected item, and each item that ran named itself as it finished.
         failed = True
-        reports.append('ERROR the shards report %d outcome(s) for the %d case(s) they were dealt: '
+        reports.append('ERROR the shards report %d case(s) run for the %d case(s) they were dealt: '
                        '%d never ran or ran unreported'
                        % (ran, len(ids), len(ids) - ran))
     for line in reports:

@@ -54,7 +54,7 @@ class PytestShardsTests(unittest.TestCase):
             '        items[:] = [item for item in items if item.name != "test_b"]\n')
         done = self.shards(width='1')
         self.assertEqual(done.returncode, 1, done.stdout)
-        self.assertIn('report 3 outcome(s) for the 4 case(s) they were dealt: 1 never ran', done.stdout)
+        self.assertIn('report 3 case(s) run for the 4 case(s) they were dealt: 1 never ran', done.stdout)
 
     def test_a_shard_killed_before_its_cases_ran_counts_every_one_of_them_as_never_run(self):
         """Round robin over two shards deals test_a and test_c to the first; it dies before either runs."""
@@ -65,7 +65,7 @@ class PytestShardsTests(unittest.TestCase):
             '        os._exit(9)\n')
         done = self.shards(width='2')
         self.assertEqual(done.returncode, 1, done.stdout)
-        self.assertIn('report 2 outcome(s) for the 4 case(s) they were dealt: 2 never ran', done.stdout)
+        self.assertIn('report 2 case(s) run for the 4 case(s) they were dealt: 2 never ran', done.stdout)
 
     def test_a_shard_that_died_after_a_case_ran_does_not_say_its_cases_never_ran(self):
         """The first of two shards runs test_a, then dies before it reports."""
