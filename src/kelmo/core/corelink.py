@@ -116,6 +116,7 @@ class CoreLink:
         self.pools = {lane: ThreadPoolExecutor(max_workers=size, thread_name_prefix=f'lane-{lane}')
                       for lane, size in lanes.items()}
         self._write_lock = threading.Lock()
+        self._write_wait_ran_out = False  # a stop step found a write stuck past its bound; later steps do not wait
         self._open = {}  # call id -> Context, for cancels
         self._outgoing = {}  # call id -> Future
         self._state = threading.Lock()
@@ -298,12 +299,23 @@ class CoreLink:
         its stop check finishes its write first, and every call after it sees the stop. Only a write stuck past
         that bound (kelmod not reading) can end after the flag is up; its future fails all the same, failed by that
         call itself or by `_finish`."""
-        taken = self._write_lock.acquire(timeout=STOP_WRITE_WAIT_SECONDS)
+        taken = self._take_write_lock_for_stop(STOP_WRITE_WAIT_SECONDS)
         try:
             self._stopping.set()
         finally:
             if taken:
                 self._write_lock.release()
+
+    def _take_write_lock_for_stop(self, seconds):
+        """Takes the write lock for a step of the stop, waiting at most `seconds`. Once one step has waited its bound
+        out, the write in progress then is stuck (kelmod not reading), and the stop's later steps only try the lock:
+        one stuck write is waited for once, not once per step."""
+        if self._write_wait_ran_out:
+            return self._write_lock.acquire(blocking=False)
+        taken = self._write_lock.acquire(timeout=seconds)
+        if not taken:
+            self._write_wait_ran_out = True
+        return taken
 
     def _finish(self):
         self._set_stopping()
@@ -323,12 +335,15 @@ class CoreLink:
         # shutdown on a socket, which keeps the number; a confined channel has no shutdown(2), so its write goes on
         # until kelmod reads or goes. Either way the descriptor is closed by a thread of its own once that write lets
         # go, and this step does not wait for it.
-        if not self._write_lock.acquire(timeout=CLOSE_WAIT_SECONDS):
+        if not self._take_write_lock_for_stop(CLOSE_WAIT_SECONDS):
             try:
                 self.sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            threading.Thread(target=self._close_when_free, name='kelmo-corelink-close', daemon=True).start()
+            try:
+                threading.Thread(target=self._close_when_free, name='kelmo-corelink-close', daemon=True).start()
+            except RuntimeError:  # no thread to be had: the descriptor stays open for the process's exit
+                pass
             return
         try:
             self.sock.close()

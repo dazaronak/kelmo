@@ -700,7 +700,7 @@ def test_a_write_stuck_past_the_close_bound_still_ends_before_the_channel_closes
             events.append('written')
 
         def shutdown(self, how):
-            events.append('shutdown')
+            events.append(f'shutdown-{how}')
 
         def close(self):
             events.append('close')
@@ -728,6 +728,68 @@ def test_a_write_stuck_past_the_close_bound_still_ends_before_the_channel_closes
         assert not stopper.is_alive(), 'the stop waited past its bound for a stuck write'
         assert took < 1.5, f'the stop took {took:.2f} s with a 0.3 s close bound'
         assert 'close' not in events, f'the channel was closed under a write still in progress: {events}'
+        assert f'shutdown-{socket.SHUT_RDWR}' in events, f'the stuck write was not cut short: {events}'
+        release.set()
+        caller.join(10)
+        stop = time.monotonic() + 5
+        while 'close' not in events and time.monotonic() < stop:
+            time.sleep(0.02)
+        assert events.index('written') < events.index('close'), events
+    finally:
+        release.set()
+        parent.close()
+
+
+def test_an_admin_stop_waits_for_one_stuck_write_only_once(monkeypatch):
+    """`admin.stop` runs `_drain`, then the reader's `_finish`; each waits for the write lock before it sets the flag,
+    and `_finish` waits again before it closes. One write stuck through all of them (kelmod not reading) is waited
+    for once, at most CLOSE_WAIT_SECONDS, not once per step."""
+    from kelmo.core import corelink
+    monkeypatch.setattr(corelink, 'CLOSE_WAIT_SECONDS', 1.0)
+    monkeypatch.setattr(corelink, 'STOP_WRITE_WAIT_SECONDS', 1.0)
+    parent, child = socket.socketpair()
+    events, writing, release = [], threading.Event(), threading.Event()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    class Stuck:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def sendall(self, data):
+            events.append('write')
+            writing.set()
+            release.wait(15)
+            events.append('written')
+
+        def shutdown(self, how):
+            events.append(f'shutdown-{how}')
+
+        def close(self):
+            events.append('close')
+            self.sock.close()
+
+        def __getattr__(self, name):
+            return getattr(self.sock, name)
+
+    link.sock = Stuck(link.sock)
+    caller = threading.Thread(target=link._reply, args=(uuid.uuid4().hex, {'status': 'ok'}), daemon=True)
+
+    def stop_as_admin_stop_does():
+        link._drain()
+        link._finish()
+
+    stopper = threading.Thread(target=stop_as_admin_stop_does, daemon=True)
+    try:
+        caller.start()
+        assert writing.wait(5)
+        started = time.monotonic()
+        stopper.start()
+        stopper.join(6)
+        took = time.monotonic() - started
+        assert not stopper.is_alive(), 'the stop did not return while one write stayed stuck'
+        assert took < 1.8, f'the stop waited {took:.2f} s for one stuck write with a 1.0 s bound'
+        assert 'close' not in events, f'the channel was closed under a write still in progress: {events}'
+        assert f'shutdown-{socket.SHUT_RDWR}' in events, f'the stuck write was not cut short: {events}'
         release.set()
         caller.join(10)
         stop = time.monotonic() + 5
