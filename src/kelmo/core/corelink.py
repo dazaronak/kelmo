@@ -77,6 +77,9 @@ class DescriptorChannel:
                 pass
 
 
+# How long the stop waits for a write in progress before it closes the channel anyway.
+CLOSE_WAIT_SECONDS = 5.0
+
 # A write that fails with one of these means kelmod's end of the channel is gone; any other error (no buffer space)
 # fails that call alone.
 PEER_GONE = frozenset({errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF, errno.ESHUTDOWN})
@@ -315,10 +318,17 @@ class CoreLink:
         for pool in self.pools.values():
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
+        # Closed only once no write is on the descriptor: a number closed under a write could be reused by another
+        # open before that write runs. kelmod has closed its end, so a write in progress ends at once; the bound
+        # only keeps a stuck one from holding the stop.
+        taken = self._write_lock.acquire(timeout=CLOSE_WAIT_SECONDS)
         try:
             self.sock.close()
         except OSError:
             pass
+        finally:
+            if taken:
+                self._write_lock.release()
 
     def _dispatch(self, header, body):
         kind = header['kind']

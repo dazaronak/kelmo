@@ -626,6 +626,49 @@ def test_waking_a_closed_confined_channel_writes_into_no_reused_descriptor(tmp_p
     finally:
         for descriptor in opened:
             os.close(descriptor)
+
+
+def test_the_channel_is_closed_only_after_a_write_in_progress_has_ended():
+    """A descriptor closed under a write still in progress could be reused by another open before that write runs,
+    and the write would land in the wrong file: the stop closes the channel only once the write has ended."""
+    parent, child = socket.socketpair()
+    events, writing, release = [], threading.Event(), threading.Event()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    class Slow:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def sendall(self, data):
+            events.append('write')
+            writing.set()
+            release.wait(10)
+            events.append('written')
+            return self.sock.sendall(data)
+
+        def close(self):
+            events.append('close')
+            self.sock.close()
+
+        def __getattr__(self, name):
+            return getattr(self.sock, name)
+
+    link.sock = Slow(link.sock)
+    caller = threading.Thread(target=link.call, args=('archive.echo', {}, Context.local(uuid.uuid4().hex, 30)),
+                              daemon=True)
+    caller.start()
+    try:
+        assert writing.wait(5)
+        stopper = threading.Thread(target=link._finish, daemon=True)
+        stopper.start()
+        stopper.join(0.5)
+        assert 'close' not in events, events
+        release.set()
+        stopper.join(10)
+        caller.join(10)
+        assert events == ['write', 'written', 'close'], events
+    finally:
+        release.set()
         parent.close()
 
 
