@@ -97,6 +97,7 @@ def test_a_spooled_hook_left_behind_a_held_owner_is_replayed_a_second_later_unwo
         holder.start()
         assert taken.wait(5)
         path = _spool(core)
+        core._compact_after = time.monotonic() + 3600  # no compaction pause brings the deliverer back early
         before = core._last.get('at')
         core._wake.set()
         stop = time.monotonic() + 5
@@ -113,4 +114,36 @@ def test_a_spooled_hook_left_behind_a_held_owner_is_replayed_a_second_later_unwo
     finally:
         release.set()
         holder.join(10)
+        core.close()
+
+
+def test_a_replayed_hook_holds_the_owner_only_for_its_outbox_steps(profile):
+    """While a replayed hook reads and parses its transcript (no outbox step yet), a live hook gets the owner at
+    once; the replay then queues its piece and removes the file."""
+    core, ran = _core(profile)
+    parsing, go = threading.Event(), threading.Event()
+
+    def run_hook(body):
+        parsing.set()
+        go.wait(10)  # reading and parsing the transcript
+        with core.client._lock:
+            ran.append(body['action'])
+        return {}, []
+
+    core._run_hook = run_hook
+    try:
+        path = _spool(core)
+        core._wake.set()
+        assert parsing.wait(5), 'the spooled hook was never replayed'
+        got = core._owner.acquire(timeout=0.5, urgent=True)
+        if got:
+            core._owner.release()
+        go.set()
+        assert got, 'a live hook waited for a replayed hook that was still reading its transcript'
+        stop = time.monotonic() + 5
+        while path.exists() and time.monotonic() < stop:
+            time.sleep(0.05)
+        assert not path.exists() and ran == ['session-stop'], ran
+    finally:
+        go.set()
         core.close()

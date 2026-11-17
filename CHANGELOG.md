@@ -8,8 +8,9 @@ entry here.
 
 ### Changed
 
-- The edge daemon replays a hook that `kelmod hook` spooled only while nobody holds or waits for the outbox;
-  otherwise it leaves the file, and the rest, for a later pass. Before, a pass waited up to ten seconds per
+- The edge daemon replays a hook that `kelmod hook` spooled only while nobody holds or waits for the outbox,
+  and takes the outbox only for the steps that write to it, not while it reads the transcript; otherwise it
+  leaves the file, and the rest, for a pass a second later. Before, a pass waited up to ten seconds per
   spooled hook behind a caller that held the outbox.
 - The edge daemon's delivery pass no longer waits for a caller that holds the outbox. With writes pending, it
   takes the outbox only while nobody holds it or waits for it; otherwise it ends at once, leaving the writes
