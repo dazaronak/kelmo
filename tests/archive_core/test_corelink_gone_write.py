@@ -55,3 +55,35 @@ def test_with_no_reader_the_owner_still_hears_of_a_gone_kelmod_within_a_short_bo
     assert second.exception(0).code == 'E_TRANSPORT'
     assert heard == [True], 'the owner never heard of the stop'
     assert took < corelink.STOP_WRITE_WAIT_SECONDS, f'the call waited {took:.2f} s for a reader that never came'
+
+
+def test_a_call_made_from_a_reply_callback_leaves_the_later_replies_ahead_of_the_stop():
+    """Calls A and B were answered, then kelmod closed the channel. A's callback, run by the reader as it delivers
+    A's reply, makes call C, whose write finds kelmod gone: the owner still hears of the stop only after B's reply,
+    and C fails after that."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.hold_hello = True
+    peer = Peer(parent)
+    first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+    first_header, _ = peer.frame()
+    second = link.call('archive.echo', {'n': 2}, Context.local(uuid.uuid4().hex, 30))
+    second_header, _ = peer.frame()
+    nested = []
+    first.add_done_callback(
+        lambda _done: nested.append(link.call('archive.echo', {'n': 3}, Context.local(uuid.uuid4().hex, 30))))
+    _answer(peer, first_header, {'echo': 1})
+    _answer(peer, second_header, {'echo': 2})
+    parent.shutdown(socket.SHUT_RDWR)
+    parent.close()
+    heard = []
+    link.begin_stop = lambda: heard.append(second.done())
+    reader = threading.Thread(target=link.serve, daemon=True)
+    reader.start()
+    try:
+        assert second.result(10) == {'echo': 2}
+        reader.join(10)
+        assert heard == [True], f'the owner heard of the stop before the reply to call B arrived: {heard}'
+        assert len(nested) == 1 and nested[0].exception(10).code == 'E_TRANSPORT'
+    finally:
+        reader.join(10)

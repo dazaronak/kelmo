@@ -241,6 +241,8 @@ class CoreLink:
         if self._stopping.is_set() or self._peer_gone.is_set():
             # A call made once the link stops fails at once, whatever its body, and never queues behind an
             # earlier write that kelmod may no longer read.
+            if self._on_reader():
+                return self._leave_to_finish(uuid.uuid4().hex, Future())
             return self._refuse_stopped(Future())
         call_id = uuid.uuid4().hex
         header = {'v': wire.VERSION, 'kind': 'call', 'id': call_id, 'op': op, 'body_type': 'json',
@@ -277,13 +279,28 @@ class CoreLink:
                 # reached its end yet: the reader goes on to the channel's end, so replies kelmod sent before
                 # closing still arrive, and the core hears of the stop from it (or after a short bound) before this
                 # call fails, as it does for the calls the reader fails.
+                if self._on_reader():
+                    return self._leave_to_finish(call_id, future)
                 self._leave_stop_to_reader()
             _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
             return future
-        if refused:
+        if refused and not self._on_reader():  # the reader's own call stays open for `_finish` to fail
             with self._state:
                 self._outgoing.pop(call_id, None)
             self._refuse_stopped(future)
+        return future
+
+    def _on_reader(self):
+        """True on the reader thread before it reaches `_finish`: a call made there (from a reply's callback) cannot
+        wait for the reader to reach the channel's end."""
+        return self._reader_ident == threading.get_ident() and not self._stopping.is_set()
+
+    def _leave_to_finish(self, call_id, future):
+        """A call the reader made while kelmod is gone stays open: the reader goes on to deliver the replies queued
+        behind the one whose callback made it, then `_finish` asks the owner to stop and fails it, as it fails the
+        core's other open calls."""
+        with self._state:
+            self._outgoing[call_id] = future
         return future
 
     def _leave_stop_to_reader(self):
@@ -303,6 +320,7 @@ class CoreLink:
     # True while the core is still starting: serve() reads replies to the core's own calls but does not say
     # hello, so kelmod sends it no calls until say_hello().
     hold_hello = False
+    _reader_ident = None  # the thread running serve(), which reads the channel
 
     def say_hello(self):
         self.send({'v': wire.VERSION, 'kind': 'hello', 'id': uuid.uuid4().hex, 'body_type': 'json',
@@ -314,6 +332,7 @@ class CoreLink:
         # `kill -USR1 <core pid>` writes every thread's stack to the core's stderr (kelmod's log).
         faulthandler.register(signal.SIGUSR1, all_threads=True)
         reader = wire.FrameReader()
+        self._reader_ident = threading.get_ident()
         try:
             if not self.hold_hello:
                 try:
