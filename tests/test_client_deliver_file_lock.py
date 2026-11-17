@@ -169,3 +169,39 @@ def test_a_pass_waits_for_another_thread_in_the_outbox_no_longer_than_its_deadli
     finally:
         release.set()
         holder.join(10)
+
+
+def _reader(client):
+    """Another process reading the outbox: its read transaction lets a write begin but keeps it from committing."""
+    other = sqlite3.connect(client.profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    other.execute('BEGIN')
+    other.execute('SELECT COUNT(*) FROM entries').fetchone()
+    return other
+
+
+def test_an_attempt_whose_commit_a_reader_kept_back_is_never_counted_later(shared):
+    """The attempt's update ran but its commit timed out behind a reader: the pass ends without sending, and the
+    attempt does not reach the file later with the next write."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'reader-held')
+    other = _reader(client)
+    try:
+        result, _took = _flush_within(client, 0.5)
+        assert result['stopped'] == 'E_BUSY', result
+    finally:
+        other.rollback()
+        other.close()
+    client.outbox.enqueue('capture', dict(ARGS, filename='later.md'), 'a-later-write')
+    entry = client.outbox.get('reader-held')
+    assert (entry['state'], entry['attempts']) == ('pending', 0), entry
+
+
+def test_a_cut_recorded_behind_a_reader_counts_once(shared):
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'cut-behind-reader')
+    client.outbox.conn.execute('PRAGMA busy_timeout = 200')  # the outbox's normal wait, made short
+    other = _reader(client)
+    threading.Timer(1.0, lambda: (other.rollback(), other.close())).start()
+    assert client._record(client.outbox.cut, 'cut-behind-reader') == 1
+    assert client.outbox.conn.execute("SELECT cuts FROM entries WHERE idempotency_key='cut-behind-reader'"
+                                      ).fetchone()[0] == 1
