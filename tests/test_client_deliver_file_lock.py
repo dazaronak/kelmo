@@ -232,3 +232,41 @@ def test_a_pass_that_finds_the_file_busy_keeps_the_entrys_earlier_refusal(shared
     entry = client.outbox.get('busy-once')
     assert result['stopped'] == 'E_BUSY', result
     assert (entry['state'], entry['last_error']) == ('pending', 'E_EARLIER'), entry
+
+
+def test_an_attempt_that_waits_for_a_writer_and_then_a_reader_ends_by_its_deadline(shared):
+    """Another process holds the write lock for most of the deadline, and a third reads the file meanwhile: the
+    attempt's update waits for the writer and its commit for the reader, and both waits together stay within one
+    deadline."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'writer-then-reader')
+    writer = _holder(client, 'IMMEDIATE')
+    reader = _reader(client)
+    threading.Timer(0.6, lambda: (writer.rollback(), writer.close())).start()
+    try:
+        result, took = _flush_within(client, 1.0)
+    finally:
+        time.sleep(0.7)  # the writer is let go by its timer
+        reader.rollback()
+        reader.close()
+    assert took < 1.3, f'the pass took {took:.2f} s against its 1 s deadline'
+    assert result['stopped'] == 'E_BUSY', result
+    entry = client.outbox.get('writer-then-reader')
+    assert (entry['state'], entry['attempts']) == ('pending', 0), entry
+
+
+def test_a_pass_stopped_by_its_own_held_outbox_does_not_report_the_server_reached(shared):
+    """The channel is open but the outbox is held when the attempt is recorded: our queued writes did not go, so
+    the pass does not report a reached server (the session hook then serves the cache, not a context that may
+    predate them)."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'held-after-connect')
+
+    def attempt(key, *rest):
+        raise sqlite3.OperationalError('database is locked')
+
+    client.outbox.attempt = attempt
+    with client.deadline(5.0):
+        result = client.flush()
+    assert result['stopped'] == 'E_BUSY', result
+    assert result['reached'] is not True, result

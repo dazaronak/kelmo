@@ -198,6 +198,8 @@ class Outbox:
     def __init__(self, directory):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._serial = threading.RLock()
+        # When the current `waiting` ends (monotonic), so a transaction's later lock waits share its time.
+        self._wait_until = None
         # A note is queued even while a compaction holds the file: waiting a minute beats refusing it.
         self.conn = sqlite3.connect(directory / 'outbox.sqlite3', timeout=OUTBOX_WAIT_SECONDS,
                                     check_same_thread=False)
@@ -325,11 +327,20 @@ class Outbox:
         """Wait at most `seconds` for another connection's lock on the file inside, then as long as before
         (OUTBOX_WAIT_SECONDS outside any other `waiting`). Called with the outbox held."""
         previous = self.conn.execute('PRAGMA busy_timeout').fetchone()[0]
+        outer, self._wait_until = self._wait_until, time.monotonic() + max(0, seconds)
         self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
         try:
             yield
         finally:
+            self._wait_until = outer
             self.conn.execute(f'PRAGMA busy_timeout = {int(previous)}')
+
+    def _rest_of_wait(self):
+        """Inside `waiting`, the busy timeout cut to what is left of it: a write that waited for another writer's
+        lock waits for readers before its commit only as long as its wait has left."""
+        if self._wait_until is not None:
+            left = max(0.0, self._wait_until - time.monotonic())
+            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
 
     def summary_within(self, seconds):
         """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
@@ -414,7 +425,9 @@ class Outbox:
     @_serial
     def attempt(self, key):
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET attempts=attempts+1 WHERE idempotency_key=?', (key,))
+            self._rest_of_wait()
 
     @_serial
     def cut(self, key):
@@ -427,7 +440,9 @@ class Outbox:
     @_serial
     def note(self, key, code):
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=?', (code, key))
+            self._rest_of_wait()
 
     @_serial
     def settle(self, key, state, outcome):
@@ -1456,7 +1471,7 @@ class SharedClient:
             if entry is None:
                 break
             after, key, args = entry['seq'], entry['idempotency_key'], None
-            channel = None
+            channel, sending = None, False
             try:
                 channel = self._connect()
                 reached = True
@@ -1464,14 +1479,18 @@ class SharedClient:
                 # read before the attempt is counted, so an entry whose body could not be read counts none.
                 args = json.loads(self._before_send(self.outbox.body, after))
                 self._before_send(self.outbox.attempt, key)
+                sending = True
                 ok, value = self._send(channel, entry['op'], args, key)
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                if not (isinstance(error, Unsent) and error.code == 'E_BUSY'):
+                held = isinstance(error, Unsent) and error.code == 'E_BUSY'
+                if not held:
                     # A busy outbox here says nothing about the entry: it keeps the refusal it had.
                     self._note_if_free(key, error.code)
-                stopped, reached = error.code, bool(reached)
+                # Our own held outbox kept our queued writes back: no reached server, so the session hook serves
+                # the cache rather than a context that may predate them.
+                stopped, reached = error.code, bool(reached) and not (held and not sending)
                 break
             if ok:
                 self._record(self.outbox.settle, key, 'delivered', value)
