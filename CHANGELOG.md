@@ -19,9 +19,9 @@ entry here.
 - When more than ten notes wait, the start context, and the refresh that sends only a changed pending list,
   now end the block with a line naming a context file whose `pending` field holds the text of every waiting
   note, also when the context fits the hook limit. Notes past ten used to show only as "+N more", with no way
-  to read them. On the older path for vaults without hub views, the 20 newest notes are listed as before, and
-  a line now counts the older ones and names the file with all of them; the older notes used to be left out
-  without a count.
+  to read them. On the older path for vaults without hub views, a local vault's hook lists the 20 newest notes
+  as before, and a line now counts the older ones and names the file with all of them; the older notes used to
+  be left out without a count. A shared client on such a vault still gets the 20 newest with no count.
 
 ## [0.3.1] - 2026-11-15
 

@@ -432,6 +432,10 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
         # Notes past the block's ten rows, or a block that does not fit, are read from the reference file.
         def pending_pointer():
             return omitted_source('pending')
+        if complete and provider == 'claude':
+            # `full` left out the line that names that file; a context it tips over the limit is not complete.
+            line = f'\nThe text of all {len(pending)} pending notes: read ' + pending_pointer() + '.'
+            complete = len(full) + len(line) <= 10000 - reserve
     if not complete:
         current = current() if callable(current) else current
         if work:

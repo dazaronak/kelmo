@@ -160,6 +160,26 @@ def test_pending_notes_past_ten_have_a_path_to_their_text_when_the_context_fits(
     assert '- line 10 [alpha]' in saved and '- line 11 [alpha]' in saved, saved
 
 
+def test_a_claude_start_whose_note_line_tips_it_over_the_limit_still_gets_its_context(tmp_path):
+    """Eleven notes, and a context that fits the Claude limit without the line naming every note's text but not
+    with it: the hook still answers within the limit and names that text, instead of failing."""
+    import hashlib
+
+    from kelmo.hub_delivery import deliver, prepare
+    pending = [{'pending': f'line {index}', 'project': 'alpha'} for index in range(11)]
+    snap = snapshot(2, 1)
+    base = len(deliver(snap, 'alpha', '', pending, provider='codex', current=None, stale=False))
+    text = snap['files']['alpha.md']['text'] + '\n' + 'x' * (10000 - 40 - base - 1)
+    snap['files']['alpha.md'] = {'text': text, 'sha256': hashlib.sha256(text.encode()).hexdigest()}
+    full = len(deliver(snap, 'alpha', '', pending, provider='codex', current=None, stale=False))
+    assert 9900 < full <= 10000, full
+    config = SimpleNamespace(state=tmp_path / 'state')
+    context = prepare(config, {'session_id': 'one'}, snap, 'alpha', '', pending, provider='claude',
+                      current=tmp_path / 'hot', stale=False, acknowledge=lambda callback: None, action='start')
+    assert len(context) <= 10000, len(context)
+    assert '(pending field)' in context, context[-400:]
+
+
 def test_the_hooks_only_refresh_names_the_text_of_notes_past_ten(tmp_path):
     from kelmo.hub_delivery import prepare
     acks = []
