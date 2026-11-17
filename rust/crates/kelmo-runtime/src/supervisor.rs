@@ -283,7 +283,7 @@ async fn run_core(
                     } else {
                         None
                     };
-                    // Gone before kelmod writes about it, so nothing it still writes follows kelmod's line.
+                    // Killed before kelmod writes about it, so the core itself writes nothing after kelmod's line.
                     sys::kill_group(pid);
                     let _ = child.kill().await;
                     if !exited.is_some_and(|status| status.success()) {

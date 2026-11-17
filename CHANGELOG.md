@@ -17,8 +17,7 @@ entry here.
   cores write to the same log, Rust's own panic message, and an error that stops `kelmod` before it serves
   (the client quotes those to the user) are written as before. After a core is killed or fails, the next line
   starts on a fresh line, since the core may have died part way through one; a core killed at the end of its
-  drain time is now killed before `kelmod` writes that it was. The messages `kelmo` quotes from the log when
-  the daemon stops after it served carry the time too.
+  drain time is now killed before `kelmod` writes that it was, and that line says it was killed.
 
 ## [0.3.1] - 2026-11-15
 
