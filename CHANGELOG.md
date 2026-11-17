@@ -11,7 +11,7 @@ entry here.
 - The edge daemon's delivery pass no longer waits for a caller that holds the outbox. With writes pending, it
   takes the outbox only while nobody holds it or waits for it; otherwise it ends at once, leaving the writes
   to that caller, and looks again a second later. Before, it waited up to five seconds each pass behind a long
-  hook or a status read.
+  hook or tool call.
 - A shared client's outbox gives its free space back again. Settled transcript pieces drop their bytes but
   leave their pages in `outbox.sqlite3`; since Kelmo 0.2.0 the edge daemon owns the outbox and only `kelmo
   client flush` compacted it, so the file only grew. A new outbox now gives pages back in small steps (SQLite
