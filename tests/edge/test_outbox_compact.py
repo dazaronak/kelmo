@@ -736,3 +736,38 @@ def test_a_saved_pause_too_large_for_a_float_does_not_stop_the_daemon(profile):
         assert retry <= time.time() + edge_core.COMPACT_RETRY_SECONDS + 1, core._compaction
     finally:
         core.close()
+
+
+def test_a_drain_step_counts_the_pages_it_gave_back_while_another_process_frees_pages(profile):
+    """Another process frees pages between a drain step and its count of the free list: the step still reports the
+    pages it gave back, so a working drain is never taken for a stuck one."""
+    client = SharedClient(profile)
+    outbox = client.outbox
+    _settled_pieces(outbox, count=10)
+    for index in range(5):
+        outbox.enqueue('capture', {'content': 'y' * 400000, 'intent': 'archive'}, f'big-{index}')
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0)
+    counts = []
+
+    def between(statement):
+        if 'freelist_count' in statement:
+            counts.append(statement)
+            if len(counts) == 2:  # after the step, before it counts the free list again
+                try:
+                    with other:
+                        other.execute("DELETE FROM entries WHERE idempotency_key LIKE 'big-%'")
+                except sqlite3.OperationalError:
+                    pass  # the step holds the file: nothing can change under it
+
+    pages_before = outbox.compaction_state()[0]
+    outbox.conn.set_trace_callback(between)
+    try:
+        given, _left = outbox.vacuum_step(64)
+    finally:
+        outbox.conn.set_trace_callback(None)
+        other.close()
+    pages_after = outbox.compaction_state()[0]
+    try:
+        assert given == pages_before - pages_after, (given, pages_before, pages_after)
+    finally:
+        client.close()

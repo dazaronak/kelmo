@@ -304,12 +304,14 @@ class Outbox:
 
     @_serial
     def vacuum_step(self, pages=COMPACT_CHUNK_PAGES):
-        """Give back up to `pages` free pages of a converted file; another caller's lock ends it at once.
-        Returns (pages given back, free pages left)."""
-        before = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
-        with self.waiting(COMPACT_TRY_SECONDS):
+        """Give back up to `pages` free pages of a converted file; another caller's lock ends it at once. The step
+        and both counts of the free list are one transaction, so another process cannot change the list between
+        them. Returns (pages given back, free pages left)."""
+        with self.waiting(COMPACT_TRY_SECONDS), self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            before = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
             self.conn.execute(f'PRAGMA incremental_vacuum({int(pages)})').fetchall()
-        after = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+            after = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
         return before - after, after
 
     @contextmanager
