@@ -254,10 +254,9 @@ def test_a_core_whose_channel_was_told_to_stop_starts_no_spool_pass_after_a_hook
 
 
 def test_a_spooled_capture_refused_every_time_does_not_hold_back_the_ones_behind_it(world_factory, core_factory):
-    """A capture whose transcript read runs out of time on every try (E_CAPTURE_RETRY) is set aside as bad, as the
-    edge core does: kept at the head, it would stop every pass and the captures behind it would never run."""
-    import time
-
+    """A capture whose transcript read runs out of time (E_CAPTURE_RETRY) is skipped for the pass and the captures
+    behind it run; the refusal is worth retrying, so the file stays, and on its third try in this core it is set
+    aside as bad, as the edge core does, instead of being retried on every pass for good."""
     from kelmo.errors import KelmoError
     core = core_factory(world_factory().root)
     spool = core.root / '.state' / 'hook-spool'
@@ -272,10 +271,81 @@ def test_a_spooled_capture_refused_every_time_does_not_hold_back_the_ones_behind
     core.serve_hook = slow_transcript
     (spool / '00000000000000000001-101.json').write_text(capture_frame('slow'))
     (spool / '00000000000000000002-101.json').write_text(capture_frame('behind'))
+    passes = [core.ingest_spool() for _ in range(3)]
+    assert passes[0]['ingested'] == 1, passes
+    assert sorted(path.name for path in spool.iterdir()) == ['00000000000000000001-101.bad'], passes
+
+
+def test_a_capture_refused_once_as_worth_retrying_runs_on_a_later_pass(world_factory, core_factory):
+    """A transcript that changed while it was read is refused E_CAPTURE_RETRY once; the next pass takes it."""
+    from kelmo.errors import KelmoError
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    serve_hook = core.serve_hook
+    tries = []
+
+    def changed_once(body):
+        tries.append(body['payload'].get('order'))
+        if len(tries) == 1:
+            raise KelmoError('E_CAPTURE_RETRY', 'Synthetic transcript changed while read.')
+        return serve_hook(body)
+
+    core.serve_hook = changed_once
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('changing'))
+    core.ingest_spool()
+    assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json'], 'set aside on one refusal'
+    core.ingest_spool()
+    assert list(spool.iterdir()) == [], 'a later pass did not take the capture'
+
+
+def test_a_pass_stopped_by_a_busy_journal_runs_again_when_a_hook_asked_meanwhile(world_factory, core_factory):
+    """A hook served while a pass runs asks for another pass; that pass stopping on E_BUSY must not drop the ask,
+    or the capture spooled before that hook waits for the next hook served."""
+    import threading
+    import time
+
+    from kelmo.errors import KelmoError
+    core = core_factory(world_factory().root)
+    spool = core.root / '.state' / 'hook-spool'
+    spool.mkdir(parents=True)
+    gate, inside = threading.Event(), threading.Event()
+    serve_hook = core.serve_hook
+    busy = []
+
+    def busy_once(body):
+        if body['payload'].get('order') == 'first' and not busy:
+            busy.append(1)
+            inside.set()
+            assert gate.wait(10)
+            raise KelmoError('E_BUSY', 'Synthetic busy journal.')
+        return serve_hook(body)
+
+    core.serve_hook = busy_once
+    (spool / '00000000000000000001-101.json').write_text(capture_frame('first'))
     live = {'action': 'session-stop', 'payload': {'order': 'live'},
             'context': {'provider': 'claude', 'internal_job': True}}
     assert core.handle_hook(Context.local('hook', 30), live) == {}
+    assert inside.wait(10), 'the pass did not start'
+    again = {'action': 'session-stop', 'payload': {'order': 'again'},
+             'context': {'provider': 'claude', 'internal_job': True}}
+    assert core.handle_hook(Context.local('hook', 30), again) == {}
+    gate.set()
     limit = time.monotonic() + 10
-    while core._spool is not None and time.monotonic() < limit:
+    while list(spool.iterdir()) and time.monotonic() < limit:
         time.sleep(0.05)
-    assert sorted(path.name for path in spool.iterdir()) == ['00000000000000000001-101.bad']
+    assert list(spool.iterdir()) == [], 'the capture waits for the next hook after a busy pass dropped the ask'
+
+
+def test_a_core_told_to_stop_does_not_list_the_spool(world_factory, core_factory, monkeypatch):
+    """Listing the spool may remove stale temporary files; a core already told to stop leaves the spool as it is."""
+    import threading
+
+    from kelmo.core import spool as spool_module
+    core = core_factory(world_factory().root)
+    listed = []
+    monkeypatch.setattr(spool_module, 'entries', lambda directory: listed.append(directory) or [])
+    core._draining = threading.Event()
+    core._draining.set()
+    core.ingest_spool()
+    assert listed == [], 'a core told to stop listed the spool'
