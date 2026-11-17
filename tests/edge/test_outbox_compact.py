@@ -550,7 +550,8 @@ def test_a_rewrite_refused_by_a_reader_in_another_process_is_not_repeated_every_
         record = core._compaction
         assert record['state'] == 'busy', record
         assert record['retry_at'] - time.time() > 2, f'a refused rewrite is tried again a second later: {record}'
-        saved = json.loads((profile.state / 'compaction.json').read_text())
+        saved_path = profile.state / 'compaction.json'
+        saved = json.loads(saved_path.read_text()) if saved_path.exists() else {}
         assert saved.get('retry_at') == record['retry_at'], f'the pause would not survive a recycle: {saved}'
     finally:
         reader.rollback()
