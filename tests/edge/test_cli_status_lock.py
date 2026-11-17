@@ -178,6 +178,68 @@ def test_a_hook_with_writes_queued_does_not_outwait_its_deadline_behind_a_slow_h
         client.close()
 
 
+def test_a_write_on_a_one_request_channel_closed_under_it_stays_pending(profile):
+    """A one-request channel closed while a write waited for its turn raises ValueError on the closed pipe; the
+    delivery reports it as a transport failure and keeps the write, instead of failing the caller."""
+    from kelmo.client import PROTOCOL, SharedClient
+
+    class ClosedChannel:
+        def request(self, frame, timeout=None):
+            if frame['op'] == 'hello':
+                return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True,
+                        'result': {'authority_id': profile.authority_id, 'operations': ['hello', 'remember']}}
+            raise ValueError('I/O operation on closed file.')
+
+        def close(self):
+            pass
+
+    client = SharedClient(profile, channel_factory=ClosedChannel, multiplex=True)
+    client.outbox.enqueue('remember', {'content': 'synthetic queued note'}, 'synthetic-key-2')
+    try:
+        result = client.flush()
+    finally:
+        client.close()
+    assert result['stopped'] == 'E_TRANSPORT' and result['pending'] == 1, result
+
+
+def test_a_probe_hello_on_its_own_channel_does_not_hold_the_main_channel(profile):
+    """Requests take turns per channel: a probe waiting for its own channel's hello leaves the client's channel
+    free for a read."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    opened = []
+
+    class Channel:
+        def __init__(self):
+            self.first = not opened
+            opened.append(self)
+
+        def request(self, frame, timeout=None):
+            from kelmo.client import PROTOCOL
+            if frame['op'] == 'hello' and not self.first:
+                entered.set()
+                release.wait(10)
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+                      if frame['op'] == 'hello' else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            pass
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    try:
+        assert client.call('status') == {'ok': True}  # the client's own channel is open
+        probe = threading.Thread(target=client.probe, daemon=True)
+        probe.start()
+        assert entered.wait(5), 'the probe never opened its channel'
+        start = time.monotonic()
+        answer = client.call('status')
+        assert answer == {'ok': True} and time.monotonic() - start < 1.0, 'the read waited for the probe hello'
+    finally:
+        release.set()
+        client.close()
+
+
 def test_a_command_that_does_not_parse_is_not_a_status_read():
     """It goes on to the borrowed run, which refuses it under the owner lock with the command's own error."""
     for argv in (['no-such-command'], ['client', 'status', '--no-such-option']):

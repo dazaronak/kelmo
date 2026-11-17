@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
+import weakref
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -937,10 +938,15 @@ class SharedClient:
     def _connecting(self):
         return self._guard('_connect_lock', threading.RLock)
 
-    @property
-    def _turn(self):
-        """Held around one request on a channel that carries one at a time."""
-        return self._guard('_turn_lock', threading.RLock)
+    def _turn_for(self, channel):
+        """Held around one request on `channel` when it carries one at a time. Each channel has its own, so a
+        probe's hello on its own channel never holds the client's channel."""
+        turns = self._guard('_turns', weakref.WeakKeyDictionary)
+        with self._guard('_turns_lock', threading.Lock):
+            turn = turns.get(channel)
+            if turn is None:
+                turn = turns[channel] = threading.RLock()
+        return turn
 
     @contextmanager
     def _waiting_for(self, lock, what):
@@ -1020,7 +1026,7 @@ class SharedClient:
         if getattr(channel, 'concurrent', False):
             channel.close()
             return
-        with self._turn:  # never under another thread's request on a channel that carries one at a time
+        with self._turn_for(channel):  # never under another thread's request on a one-request channel
             channel.close()
 
     def _send(self, channel, op, args, key):
@@ -1047,7 +1053,7 @@ class SharedClient:
                 # Several threads share the channel: each request carries its own deadline.
                 reply = channel.request(frame, timeout=self.remaining())
             else:
-                with self._waiting_for(self._turn, 'held the channel'):
+                with self._waiting_for(self._turn_for(channel), 'held the channel'):
                     if isinstance(channel, StdioChannel):
                         channel.timeout = self.remaining()
                     reply = channel.request(frame)
@@ -1055,6 +1061,9 @@ class SharedClient:
             raise
         except KelmoError as error:
             raise Unbound(error.code, str(error)) from error
+        except ValueError as error:
+            # A channel closed by another thread while this request waited for its turn: its pipe is gone.
+            raise Unbound('E_TRANSPORT', 'The shared-memory channel was closed before the request.') from error
         if (not isinstance(reply, dict) or set(reply) - REPLY_FIELDS or reply.get('protocol') != PROTOCOL
                 or type(reply.get('ok')) is not bool):
             raise Unbound('E_TRANSPORT', 'The shared-memory reply is outside the protocol.')

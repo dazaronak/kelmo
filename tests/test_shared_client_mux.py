@@ -166,7 +166,7 @@ def test_a_kelmo_client_1_server_is_served_one_request_at_a_time(client_for):
     assert isinstance(client._channel, StdioChannel)
     assert client._legacy_until > time.monotonic()  # kelmo/2 is not offered again on every reconnect
 
-    with client._turn:  # a request in flight on the channel
+    with client._turn_for(client._channel):  # a request in flight on the channel
         read = in_thread(client.call, 'search', {'n': 2})
         read.thread.join(0.5)
         assert read.thread.is_alive(), 'a read on a one-request channel must wait for its turn'
