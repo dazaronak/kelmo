@@ -352,6 +352,8 @@ class EdgeCore:
             return self._compaction_done('busy', freed, min(COMPACT_RETRY_SECONDS, max(
                 BUSY_RETRY_SECONDS, BUSY_REWRITE_PAUSE_FACTOR * refused.seconds)))
         except _GaveWay:
+            if self._stopping.is_set():
+                return self._compaction_done('paused', freed, 0.0)  # rolled back for the stop: no pause to keep
             return self._compaction_done('paused', freed, BUSY_RETRY_SECONDS)  # rolled back; the next idle time
         except sqlite3.OperationalError as error:
             from ..errors import sqlite_busy
@@ -396,7 +398,7 @@ class EdgeCore:
                         started, gave_way = time.monotonic(), []
 
                         def a_caller_waits():  # the idle rewrite has no time bound: it gives way to any caller
-                            if self._owner.waited_for():
+                            if self._owner.waited_for() or self._stopping.is_set():  # and to a stop
                                 gave_way.append(True)
                             return bool(gave_way)
 

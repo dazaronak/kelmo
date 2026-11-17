@@ -826,6 +826,35 @@ def test_an_idle_rewrite_gives_way_to_a_caller_that_comes_meanwhile(legacy_edge,
     assert _until(lambda: got, 5) and got[0] < 1.0, f'the caller waited {got} for the outbox'
 
 
+def test_a_stop_during_an_idle_rewrite_stops_it_and_the_outbox_closes(legacy_edge, profile, monkeypatch, capsys):
+    """The idle rewrite has no time bound: a stop of the edge core that comes while it copies ends it (rolled back,
+    the file as it was), so the deliverer lets go and the client closes the outbox."""
+    before = _size(profile)
+    monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 1000.0)  # too large for the bound: idle only
+    monkeypatch.setattr(edge_core, 'COMPACT_RETRY_SECONDS', 0.0)
+    monkeypatch.setattr(client_module, 'COMPACT_PROGRESS_STEPS', 1)
+    core, client = legacy_edge()
+    assert core._compaction['state'] == 'too_large', core._compaction
+    started = []
+    real_state = client.outbox.compaction_state
+
+    def state_then_a_stop():
+        result = real_state()
+        if not started:  # the rewrite is about to copy: the daemon is told to stop now
+            started.append(True)
+            core._stopping.set()  # what close() does first
+        return result
+
+    client.outbox.compaction_state = state_then_a_stop
+    monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 0.0)
+    core._wake.set()
+    assert _until(lambda: started, 5), 'the idle pass never began the rewrite'
+    core.close()
+    assert _mode(profile) == 0 and _size(profile) == before, 'the idle rewrite ran on through the stop'
+    assert core._compaction['state'] == 'paused', core._compaction
+    assert 'did not close cleanly' not in capsys.readouterr().err
+
+
 def test_a_drain_step_whose_commit_a_reader_kept_back_leaves_the_outbox_usable(real_edge, profile):
     """Another process reads the outbox while a drain step runs: the step's write begins but its commit is refused.
     Nothing of it stays open on the connection: once the reader is gone, the next write succeeds."""
