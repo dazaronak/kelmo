@@ -321,3 +321,17 @@ def test_a_local_vault_sweeps_at_most_once_a_day(tmp_path):
         _old_set(hot, 200 + index, days=1)
     hook(SimpleNamespace(root=root), 'prompt', {})
     assert late in _sets(hot), 'a second sweep ran within a day'
+
+
+def test_a_local_hook_with_no_sweep_due_takes_no_set_lock(tmp_path, monkeypatch):
+    """Every prompt runs the hook: within the day after a sweep it does not take the set lock at all."""
+    from kelmo import hub_delivery
+    from kelmo.integration import hook
+    root, state = _local_vault(tmp_path)
+    (state / 'hot').mkdir(parents=True)
+    hook(SimpleNamespace(root=root), 'start', {})
+    locked = []
+    real = hub_delivery.fcntl.flock
+    monkeypatch.setattr(hub_delivery.fcntl, 'flock', lambda fd, op: locked.append(op) or real(fd, op))
+    hook(SimpleNamespace(root=root), 'prompt', {})
+    assert locked == [], locked
