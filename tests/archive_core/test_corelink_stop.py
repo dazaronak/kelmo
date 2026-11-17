@@ -630,7 +630,8 @@ def test_waking_a_closed_confined_channel_writes_into_no_reused_descriptor(tmp_p
 
 def test_the_channel_is_closed_only_after_a_write_in_progress_has_ended():
     """A descriptor closed under a write still in progress could be reused by another open before that write runs,
-    and the write would land in the wrong file: the stop closes the channel only once the write has ended."""
+    and the write would land in the wrong file: the stop closes the channel only once the write has ended. The write
+    here is a reply (an admin answer) that starts after the stop flag is up, while the stop waits for the owner."""
     parent, child = socket.socketpair()
     events, writing, release = [], threading.Event(), threading.Event()
     link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
@@ -654,13 +655,19 @@ def test_the_channel_is_closed_only_after_a_write_in_progress_has_ended():
             return getattr(self.sock, name)
 
     link.sock = Slow(link.sock)
-    caller = threading.Thread(target=link.call, args=('archive.echo', {}, Context.local(uuid.uuid4().hex, 30)),
-                              daemon=True)
-    caller.start()
-    try:
+    caller = threading.Thread(target=link._reply, args=(uuid.uuid4().hex, {'status': 'ok'}), daemon=True)
+    owner_wait = link._wait_for_owner
+
+    def reply_while_the_owner_stops():
+        caller.start()  # an admin reply begins after the stop flag is up, before the channel closes
         assert writing.wait(5)
-        stopper = threading.Thread(target=link._finish, daemon=True)
+        owner_wait()
+
+    link._wait_for_owner = reply_while_the_owner_stops
+    stopper = threading.Thread(target=link._finish, daemon=True)
+    try:
         stopper.start()
+        assert writing.wait(5)
         stopper.join(0.5)
         assert 'close' not in events, events
         release.set()
