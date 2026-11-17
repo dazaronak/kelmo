@@ -178,6 +178,17 @@ class _OwnerGate:
     def __exit__(self, *_):
         self._core._owner.release()
 
+    def acquire(self, blocking=True):
+        """`blocking=False` takes the owner lock only while nobody holds it or waits for it (a background pass,
+        which must never stand in a caller's way); otherwise as the context manager does."""
+        if not blocking:
+            return self._core._owner.acquire_if_idle()
+        self.__enter__()
+        return True
+
+    def release(self):
+        self._core._owner.release()
+
 
 class EdgeCore:
     def __init__(self, root, client=None):
@@ -327,8 +338,8 @@ class EdgeCore:
                 spool = {'ingested': 0, 'pending': None, 'stopped': type(error).__name__}
             try:
                 with self.client.deadline(DELIVER_SECONDS):
-                    # An outbox whose pending count another caller keeps from this pass ends it with E_BUSY: that
-                    # caller delivers. Once counted, the pass waits for the outbox up to DELIVER_SECONDS.
+                    # The pass takes the outbox with one try: while another caller holds it or waits for it, the
+                    # pass ends with E_BUSY and leaves the entries to that caller.
                     result = self.client.flush(wait_for_holder=False)
             except Exception as error:  # noqa: BLE001 - the next pass retries; the outbox keeps every entry
                 result = {'stopped': type(error).__name__, 'message': str(error)[:200]}

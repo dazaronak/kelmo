@@ -196,6 +196,10 @@ entry here.
   transcript piece's base and the reset of that transcript's sent position are recorded together; the
   transcript goes again from its start with the session's next event. A session start whose writes were held
   back this way gets the cached context, as when the server cannot be reached.
+- The edge daemon's delivery pass no longer waits for a caller that holds the outbox. With writes pending, it
+  takes the outbox only while nobody holds it or waits for it; otherwise it ends at once, leaving the writes
+  to that caller, and looks again a second later. Before, it waited up to five seconds each pass behind a long
+  hook or tool call.
 
 ## [0.3.2] - 2026-11-16
 
