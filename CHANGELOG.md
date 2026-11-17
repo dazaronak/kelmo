@@ -102,6 +102,9 @@ entry here.
   captures behind it: a refusal the server marked worth retrying keeps it for later passes, as the edge core
   keeps it, and a local one (a transcript read that ran out of time, or one that changed while it was read)
   sets it aside as `.bad` on its third try in one run of the core. It used to be set aside on the first.
+- A promoted note that met a database held by another writer while it went through the editor no longer fails
+  with `E_PROCESSING` and loses an attempt. It waits its turn as `E_BUSY`, uncharged, as it already did before
+  the editor call.
 
 ### Added
 

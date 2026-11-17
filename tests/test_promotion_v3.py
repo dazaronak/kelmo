@@ -260,3 +260,32 @@ def test_queue_retry_replays_finished_editor_request(world, monkeypatch):
         assert world.page(FEATURE).count('Retries replay the finished receipt.') == 1
         assert world.fact('app.export')['text'] == 'Exports run at 05:00.'
         assert world.outcome(first['id'])['disposition'] == 'applied'
+
+
+def test_a_busy_database_inside_the_promote_editor_call_charges_no_attempt(world, monkeypatch):
+    """Another writer holding the database while the promoted note goes through the editor is contention: the
+    operation waits its turn (E_BUSY), uncharged, and a later run publishes it."""
+    import sqlite3
+
+    from kelmo.editor import Editor
+    from kelmo.errors import KelmoError
+    real_edit = Editor.edit
+    calls = []
+
+    def locked_once(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError('database is locked')
+        return real_edit(self, *args, **kwargs)
+
+    monkeypatch.setattr(Editor, 'edit', locked_once)
+    content = note(world, [dict(fact_key='app.busy-promote', target=FEATURE, text='Promotes wait for a busy writer.',
+                                status='active', expected_revision=None)])
+    try:
+        first = promote(world, content)
+    except KelmoError as error:
+        first = error
+    assert not (isinstance(first, dict) and first.get('state') == 'failed'), first
+    assert isinstance(first, KelmoError) and first.code == 'E_BUSY', first
+    second = promote(world, content)
+    assert second['state'] == 'applied', second
