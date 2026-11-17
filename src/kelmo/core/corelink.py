@@ -100,7 +100,7 @@ class CoreLink:
         self._state = threading.Lock()
         self._stopping = threading.Event()
         self._draining = threading.Event()  # admin.stop came: new calls are refused, replies still delivered
-        self._owner_stop_lock = threading.Lock()
+        self._owner_stop_lock = threading.RLock()  # held while begin_stop runs: no caller passes it before then
         self._owner_stop_asked = False
         self.operations = sorted(handlers)
 
@@ -147,17 +147,25 @@ class CoreLink:
         with self._state:
             self._outgoing[call_id] = future
         try:
-            self.send(header, body)
+            data = wire.encode(header, body)
         except (OSError, ValueError, TypeError, KelmoError) as error:
+            # Nothing was written: the call alone fails, whatever the encoder raised.
             with self._state:
                 self._outgoing.pop(call_id, None)
-            if isinstance(error, OSError):
-                # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
-                # hears of the stop before this call fails, as it does for the calls the reader fails.
-                self._stopping.set()
-                self._ask_owner_to_stop()
             future.set_exception(error if isinstance(error, KelmoError)
-                                 else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+                                 else KelmoError('E_PROTOCOL', f'The call could not be encoded: {error}'))
+            return future
+        try:
+            with self._write_lock:
+                self.sock.sendall(data)
+        except OSError as error:
+            with self._state:
+                self._outgoing.pop(call_id, None)
+            # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
+            # hears of the stop before this call fails, as it does for the calls the reader fails.
+            self._stopping.set()
+            self._ask_owner_to_stop()
+            future.set_exception(KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------
@@ -195,16 +203,21 @@ class CoreLink:
             self._finish()
 
     def _ask_owner_to_stop(self):
-        """`begin_stop`, once."""
+        """`begin_stop`, once. A caller that comes while it runs returns only after it has run, so its own
+        failure is counted as the stop's too; `begin_stop` does not wait, so neither does that caller for long."""
         with self._owner_stop_lock:
             if self._owner_stop_asked:
                 return
             self._owner_stop_asked = True
-        if self.begin_stop is not None:
-            try:
-                self.begin_stop()
-            except Exception as error:  # noqa: BLE001 - the stop goes on
-                print(f'kelmo core: asking the core to stop failed ({type(error).__name__})', file=sys.stderr)
+            if self.begin_stop is not None:
+                try:
+                    self.begin_stop()
+                except Exception as error:  # noqa: BLE001 - the stop goes on
+                    try:
+                        print(f'kelmo core: asking the core to stop failed ({type(error).__name__})',
+                              file=sys.stderr)
+                    except (OSError, ValueError):
+                        pass
 
     def _wait_for_owner(self):
         if self.wait_stopped is not None:

@@ -105,6 +105,96 @@ def test_a_call_that_cannot_be_sent_on_a_closed_channel_tells_the_core_of_the_st
     assert future.exception().code == 'E_TRANSPORT'
 
 
+def test_the_core_hears_of_the_stop_before_the_unsent_call_is_failed(monkeypatch):
+    """The order inside `call`: the stop is asked for before the call's future is failed, not only before the
+    caller looks at it."""
+    import kelmo.core.corelink as corelink
+    parent, child = socket.socketpair()
+    order = []
+
+    class Recorded(corelink.Future):
+        def set_exception(self, error):
+            order.append('failed')
+            super().set_exception(error)
+
+    monkeypatch.setattr(corelink, 'Future', Recorded)
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    parent.close()
+    link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    assert order == ['stop', 'failed'], order
+
+
+def test_a_second_unsent_call_does_not_fail_before_the_core_has_heard_of_the_stop():
+    """Two calls meet the closed channel at once: the second must not fail while the first is still telling the
+    core of the stop, or the second's failure is counted as an ordinary one."""
+    parent, child = socket.socketpair()
+    order, entered, release = [], threading.Event(), threading.Event()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    def begin_stop():
+        entered.set()
+        release.wait(10)
+        order.append('stop')
+
+    link.begin_stop = begin_stop
+    parent.close()
+    first = threading.Thread(target=link.call, args=('archive.echo', {}, Context.local(uuid.uuid4().hex, 30)),
+                             daemon=True)
+    first.start()
+    assert entered.wait(5)
+
+    def second():
+        link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+        order.append('second failed')
+
+    other = threading.Thread(target=second, daemon=True)
+    other.start()
+    other.join(0.5)
+    release.set()
+    other.join(10)
+    first.join(10)
+    assert order == ['stop', 'second failed'], order
+
+
+def test_an_os_error_while_encoding_a_call_does_not_stop_the_core():
+    """Only a write that fails on the channel means kelmod is gone; an OSError raised while the body is encoded,
+    before anything is written, fails the call alone."""
+    parent, child = socket.socketpair()
+    order = []
+
+    class Odd(dict):
+        def values(self):
+            raise OSError('not a channel error')
+
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    try:
+        future = link.call('archive.echo', Odd(x=1), Context.local(uuid.uuid4().hex, 30))
+        assert future.exception() is not None
+        assert order == [], order
+    finally:
+        parent.close()
+
+
+def test_an_unsent_call_fails_though_the_stop_request_and_its_report_both_fail(monkeypatch):
+    """`begin_stop` raises and stderr is closed: the call still returns a failed future instead of raising."""
+    import io
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    def begin_stop():
+        raise RuntimeError('synthetic')
+
+    link.begin_stop = begin_stop
+    closed = io.StringIO()
+    closed.close()
+    monkeypatch.setattr('sys.stderr', closed)
+    parent.close()
+    future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    assert future.exception().code == 'E_TRANSPORT'
+
+
 def test_a_call_that_cannot_be_encoded_does_not_stop_the_core():
     parent, child = socket.socketpair()
     order = []
