@@ -187,6 +187,15 @@ entry here.
   client flush` reports `pending: null` when another caller kept the outbox for its whole bound, and the
   daemon looks at a held outbox again a second later. `kelmo client status` and `kelmo status` report the
   outbox busy instead of waiting for it past their deadline.
+- A delivery pass no longer waits a minute for another process that holds the outbox file, or for another
+  thread in the outbox. Before it sends an entry, its reads and the count of the attempt wait no longer than
+  the pass's deadline; then the pass ends with `stopped: E_BUSY`, the entry stays pending and counts no
+  attempt. The code of a retryable answer is noted only while the file is free in time. An answer the server
+  already gave is recorded if the file frees within the pass's deadline; otherwise the entry stays pending and
+  the next pass gets the same answer again under its key, with no second effect on the server. A refusal of a
+  transcript piece's base and the reset of that transcript's sent position are recorded together; the
+  transcript goes again from its start with the session's next event. A session start whose writes were held
+  back this way gets the cached context, as when the server cannot be reached.
 
 ## [0.3.2] - 2026-11-16
 

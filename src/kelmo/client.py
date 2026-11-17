@@ -201,6 +201,9 @@ def _serial(method):
     return guarded
 
 
+# What `_record` returns when the file stayed held past the pass's time left.
+_GAVE_UP = object()
+
 # What a failed read names when it knows no channel of its own: `_drop` then leaves the current one alone.
 _NO_CHANNEL = object()
 
@@ -211,6 +214,8 @@ class Outbox:
     def __init__(self, directory):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._serial = threading.RLock()
+        # When the current `waiting` ends (monotonic), so a transaction's later lock waits share its time.
+        self._wait_until = None
         # A note is queued even while a compaction holds the file: waiting a minute beats refusing it.
         self.conn = sqlite3.connect(directory / 'outbox.sqlite3', timeout=OUTBOX_WAIT_SECONDS,
                                     check_same_thread=False)
@@ -338,11 +343,20 @@ class Outbox:
         """Wait at most `seconds` for another connection's lock on the file inside, then as long as before
         (OUTBOX_WAIT_SECONDS outside any other `waiting`). Called with the outbox held."""
         previous = self.conn.execute('PRAGMA busy_timeout').fetchone()[0]
+        outer, self._wait_until = self._wait_until, time.monotonic() + max(0, seconds)
         self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
         try:
             yield
         finally:
+            self._wait_until = outer
             self.conn.execute(f'PRAGMA busy_timeout = {int(previous)}')
+
+    def _rest_of_wait(self):
+        """Inside `waiting`, the busy timeout cut to what is left of it: a write that waited for another writer's
+        lock waits for readers before its commit only as long as its wait has left."""
+        if self._wait_until is not None:
+            left = max(0.0, self._wait_until - time.monotonic())
+            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
 
     def record_skip(self, provider, event, native_id, reason, seconds=OUTBOX_FILE_TRY_SECONDS):
         """Records a session event this client deliberately did not capture. A skip is a record, never a
@@ -411,36 +425,51 @@ class Outbox:
     @_serial
     def attempt(self, key, count=1):
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET attempts=attempts+? WHERE idempotency_key=?', (count, key))
+            self._rest_of_wait()
 
     @_serial
     def cut(self, key):
-        """Counts one more cut under the entry and returns the count."""
+        """Counts one more cut under the entry and returns the count, read in the same transaction: a retry after
+        a busy file never counts one cut twice."""
         with self.conn:
             self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
-        return self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
+            cuts = self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
+            self._rest_of_wait()
+            return cuts
 
     @_serial
     def note(self, key, code):
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=?', (code, key))
+            self._rest_of_wait()
 
     @_serial
     def note_if_unset(self, key, code):
         """The code as the entry's pending reason only when it has none: a server's refusal is never replaced."""
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=? AND last_error IS NULL',
                               (code, key))
+            self._rest_of_wait()
 
     @_serial
-    def settle(self, key, state, outcome):
+    def settle(self, key, state, outcome, reset=None):
+        """Settles a pending entry; `reset` (provider, native id) also forgets that transcript's sent position in
+        the same transaction, so a refusal of its base and the reset of that position are recorded together or
+        not at all; the transcript then goes again from its start with the session's next event."""
         with self.conn:
             self.conn.execute("UPDATE entries SET state=?, outcome=?, settled_at=? "
                               "WHERE idempotency_key=? AND state='pending'",
                               (state, canonical(outcome), utc_now(), key))
+            if reset is not None:
+                self._reset_transcript(*reset)
             row = self.conn.execute('SELECT seq, op FROM entries WHERE idempotency_key=?', (key,)).fetchone()
             if row is not None and row['op'] in TRANSCRIPT_OPS:
                 self._shed_transcript_bytes(row['seq'])
+            self._rest_of_wait()
 
     @_serial
     def resend(self, codes, *, apply=False):
@@ -606,8 +635,11 @@ class Outbox:
         session starts from the beginning of the transcript. The restart count enters the next request keys,
         so the server applies the resent bytes instead of replaying the earlier answers for them."""
         with self.conn:
-            self.conn.execute("UPDATE transcripts SET sent_bytes=0, sent_sha256='', restarts=restarts+1 "
-                              "WHERE provider=? AND native_id=?", (provider, native_id))
+            self._reset_transcript(provider, native_id)
+
+    def _reset_transcript(self, provider, native_id):
+        self.conn.execute("UPDATE transcripts SET sent_bytes=0, sent_sha256='', restarts=restarts+1 "
+                          "WHERE provider=? AND native_id=?", (provider, native_id))
 
 
 class StdioChannel:
@@ -1674,44 +1706,102 @@ class SharedClient:
         finally:
             self.outbox._serial.release()
 
+    def _before_send(self, method, *args):
+        """An outbox read or write a pass makes before it sends, or a note it may skip: another thread in the
+        outbox, or another process's lock on the file, is waited for no longer than the active deadline, then
+        the pass ends with E_BUSY and nothing is sent."""
+        if not self.outbox._serial.acquire(timeout=self._seconds_left()):
+            raise Unsent('E_BUSY', 'Another caller held the outbox past this pass\'s deadline; the entry stays '
+                                   'pending.')
+        try:
+            with self.outbox.waiting(self._seconds_left()):
+                return method(*args)
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise  # a disk or I/O error is reported as itself
+            raise Unsent('E_BUSY', 'Another process held the outbox file past this pass\'s deadline; the entry '
+                                   'stays pending.') from error
+        finally:
+            self.outbox._serial.release()
+
+    def _record(self, method, *args):
+        """What a server's answer changes in the outbox (settle, cut): waited for no longer than the pass's time
+        left, as the steps before a send. Then `_GAVE_UP`: the entry stays pending, and the server, which keeps its
+        answer under the key, gives the same answer again on a later pass, with no second effect."""
+        try:
+            return self._before_send(method, *args)
+        except Unsent:
+            return _GAVE_UP
+
+    def _if_free(self, method, *args):
+        """A note or a correction of the attempt count, made only while the file is free within the deadline: the
+        entry stays pending either way, so a held file never keeps the pass past its deadline."""
+        try:
+            self._before_send(method, *args)
+        except Unsent:
+            pass  # the file is still held: the entry keeps what it had
+
+    def _note_if_free(self, key, code):
+        """The code of a retryable answer, noted only while the file is free within the deadline."""
+        self._if_free(self.outbox.note, key, code)
+
     def _deliver(self):
         """One pass over what was queued when it began, one entry in memory at a time: an entry queued
         meanwhile waits for the next pass, so a pass never chases a steady writer."""
         delivered, refused, stopped, reached = 0, [], None, None
-        high, after = self.outbox.last_seq(), 0
-        while (entry := self.outbox.next_pending(after, high)) is not None:
+        try:
+            high = self._before_send(self.outbox.last_seq)
+        except Unsent as error:
+            return {'delivered': 0, 'refused': [], 'pending': None, 'stopped': error.code, 'reached': None}
+        after = 0
+        while True:
+            try:
+                entry = self._before_send(self.outbox.next_pending, after, high)
+            except Unsent as error:
+                # Our own held outbox may hide a write of ours still queued: no reached server, as below.
+                stopped, reached = error.code, False if reached else reached
+                break
+            if entry is None:
+                break
             after, key, args = entry['seq'], entry['idempotency_key'], None
-            channel, attempted = None, False
+            channel, attempted, sending = None, False, False
             try:
                 channel = self._connect()
                 reached = True
-                self.outbox.attempt(key)
-                attempted = True
-                # The body is read only once a channel is open: a pass that reaches no server reads none.
-                args = json.loads(self.outbox.body(after))
+                # The body is read only once a channel is open: a pass that reaches no server reads none. It is
+                # read before the attempt is counted, so an entry whose body could not be read counts none.
+                args = json.loads(self._before_send(self.outbox.body, after))
+                self._before_send(self.outbox.attempt, key)
+                attempted = sending = True
                 ok, value = self._send(channel, entry['op'], args, key)
             except Unbound as error:
                 if channel is not None and (not isinstance(error, Unsent) or getattr(channel, 'ended', False)):
                     self._drop(channel)  # a local refusal leaves the channel healthy, unless it ended the channel
                 if isinstance(error, (Closed, Unsent)) and attempted:
-                    self.outbox.attempt(key, -1)  # refused here before a byte went out: no attempt
+                    self._if_free(self.outbox.attempt, key, -1)  # refused here before a byte went out: no attempt
+                held = isinstance(error, Unsent) and error.code == 'E_BUSY'
                 if isinstance(error, (Closed, Late)):
                     # A channel closed or dropped before the request, or a deadline that passed before it went out:
                     # nothing about this entry failed, so an earlier refusal stays. When no channel came up in time
                     # (the server's hello did not answer), an entry with no refusal is told why it still waits.
                     if channel is None:
-                        self.outbox.note_if_unset(key, error.code)
-                elif isinstance(error, Unsent) and error.code == 'E_BUSY':
-                    # A busy turn keeps no refusal either. A pass that gave up while another caller's hello did not
-                    # answer (no channel came up for it) tells an entry with no refusal why it still waits.
+                        self._if_free(self.outbox.note_if_unset, key, error.code)
+                elif held:
+                    # A busy turn or a busy outbox keeps no refusal either. A pass that gave up while another
+                    # caller's hello did not answer (no channel came up for it) tells an entry with no refusal why
+                    # it still waits.
                     if channel is None:
-                        self.outbox.note_if_unset(key, 'E_TRANSPORT')
+                        self._if_free(self.outbox.note_if_unset, key, 'E_TRANSPORT')
                 else:
-                    self.outbox.note(key, error.code)
-                stopped, reached = error.code, bool(reached)
+                    self._note_if_free(key, error.code)
+                # Our own held outbox kept our queued writes back: no reached server, so the session hook serves
+                # the cache rather than a context that may predate them.
+                stopped, reached = error.code, bool(reached) and not (held and not sending)
                 break
             if ok:
-                self.outbox.settle(key, 'delivered', value)
+                if self._record(self.outbox.settle, key, 'delivered', value) is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False  # our own held outbox: the entry stays pending
+                    break
                 delivered += 1
                 continue
             if value['cut']:
@@ -1720,8 +1810,12 @@ class SharedClient:
                 # delivered would hold every write behind it, so on its CUT_LIMIT-th cut it is refused with its
                 # effect unknown, as a cut write was before.
                 self._drop(channel)
-                if self.outbox.cut(key) < CUT_LIMIT:
-                    self.outbox.note(key, value['code'])
+                cuts = self._record(self.outbox.cut, key)
+                if cuts is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False
+                    break
+                if cuts < CUT_LIMIT:
+                    self._note_if_free(key, value['code'])
                     stopped = value['code']
                     break
                 value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is not sent '
@@ -1731,16 +1825,19 @@ class SharedClient:
                     # The bridge may have lost its server and ended: the next pass opens a new one. A server's
                     # own retryable E_TRANSPORT is no cut and leaves the write pending.
                     self._drop(channel)
-                self.outbox.note(key, value['code'])
+                self._note_if_free(key, value['code'])
                 stopped = value['code']
                 break
             outcome = {'code': value['code'], 'message': value['message']}
-            self.outbox.settle(key, 'refused', outcome)
-            if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
-                # The server does not hold the bytes this piece followed: the next capture starts over.
-                self.outbox.reset_transcript(args['provider'], args['native_id'])
+            # The server does not hold the bytes a refused piece followed: the next capture starts over, recorded
+            # with the refusal itself.
+            reset = ((args['provider'], args['native_id'])
+                     if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE' else None)
+            if self._record(self.outbox.settle, key, 'refused', outcome, reset) is _GAVE_UP:
+                stopped, reached = 'E_BUSY', False
+                break
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
-        return {'delivered': delivered, 'refused': refused, 'pending': self.outbox.pending_count(),
+        return {'delivered': delivered, 'refused': refused, 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': reached}
 
     def _entry_result(self, entry):
@@ -1759,8 +1856,8 @@ class SharedClient:
             raise KelmoError(outcome['code'], outcome['message'])
         return {'queued': True, 'accepted': False, 'op': entry['op'], 'idempotency_key': entry['idempotency_key'],
                 'pending_reason': entry['last_error'],
-                'next_step': 'Stored in the local outbox; it is delivered under the same key on the next '
-                             'successful contact and is not accepted until then.'}
+                'next_step': 'Stored in the local outbox; it is delivered, or the server\'s answer to it is '
+                             'recorded, under the same key on the next successful contact.'}
 
     def local_status(self):
         return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary_within(self._seconds_left())}
@@ -2272,7 +2369,8 @@ def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=No
                     # No open channel after the flush stopped (unreachable, lock held elsewhere, deadline,
                     # a dropped channel): the cache, not a second attempt.
                     unreachable = Unbound(flushed['stopped'], 'The shared kelmo server could not be reached '
-                                                              'in time, or the local outbox could not be read.')
+                                                              'in time, or the local outbox was busy or could not '
+                                                              'be read.')
                 delivered = client.context(payload.get('cwd'), unreachable=unreachable, binding=binding)
                 context = _session_context(client, payload, delivered, binding, provider, acknowledge, action)
         except (KelmoError, OSError, ValueError, sqlite3.Error) as error:
