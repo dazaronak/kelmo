@@ -489,10 +489,16 @@ def test_a_capture_budget_given_to_a_hook_reaches_the_session_capture(world_fact
 
 def test_a_stop_that_lands_while_the_spool_thread_starts_runs_no_pass(world_factory, core_factory, monkeypatch):
     """admin.stop can mark the channel draining after the hook's stop check and before the thread starts: the
-    thread then serves nothing and leaves the spool as it is."""
+    thread then neither lists the spool (listing may remove stale temporary files) nor serves anything."""
     import threading
     import time
+
+    from kelmo.core import spool as spool_module
     core = core_factory(world_factory().root)
+    real_entries = spool_module.entries
+    listed_by = []
+    monkeypatch.setattr(spool_module, 'entries', lambda directory: listed_by.append(
+        threading.current_thread().name) or real_entries(directory))
     spool = core.root / '.state' / 'hook-spool'
     spool.mkdir(parents=True)
     (spool / '00000000000000000001-101.json').write_text(capture_frame('late'))
@@ -515,4 +521,5 @@ def test_a_stop_that_lands_while_the_spool_thread_starts_runs_no_pass(world_fact
     while core._spool is not None and time.monotonic() < limit:
         time.sleep(0.05)
     assert served == ['live'], served
+    assert 'hook-spool' not in listed_by, listed_by
     assert [path.name for path in spool.iterdir()] == ['00000000000000000001-101.json']
