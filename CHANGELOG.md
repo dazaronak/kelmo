@@ -14,25 +14,26 @@ entry here.
   and waits at most half a second for another thread already reading it. Otherwise it answers at once with
   `"outbox": {"busy": true}`, where it used to answer `{"error": "The edge core is busy ..."}`, the same
   shape as a failed read. A failed read still answers `{"error": ...}`.
-- On an edge machine `kelmo status` and `kelmo client status` no longer hold the outbox while they wait
-  for the authority. A hook that arrived meanwhile waited for the whole command and could hand its session
-  a cached context marked unavailable; it now gets the outbox at once. `kelmo client status --probe`
-  checks the authority on a channel of its own and closes it, so it no longer replaces the channel the
-  client's requests use. `kelmo status` reads the authority over the open kelmo/2 channel, which carries
-  several requests at once, or else over a channel of its own, so a delivery never waits for its reply or
-  its hello. `kelmo client flush`, `resend` and the other commands (`trace`, `show`) still hold the outbox
-  for the whole command, and the tools' reads keep it while they wait on a channel that carries one
-  request at a time, so a hook queued meanwhile goes before a delivery. A delivery that needs the channel
-  while another caller is still connecting gives up at its own deadline, with its writes kept, instead of
-  waiting for that caller's hello; such a delivery, one that gave up because another request held the
-  channel, one whose deadline passed before its request went out, and one refused before a byte went out
-  (an operation the server does not offer, a frame over the limit) no longer counts as an attempt; the
-  busy and late ones no longer show a refusal as the entry's last. When the authority's hello, the
-  delivery's own or another caller's, does not answer in time, an entry with no refusal yet shows
-  `E_TRANSPORT` as the reason it waits. The stall warning names that reason as the "last reason". While another caller is reading or rewriting
-  the outbox, or another process holds its file, `kelmo status`, `kelmo client status` and the MCP tool
-  `memory_status` answer with `"outbox": {"busy": true}` instead of waiting past their deadline; during a
-  delivery, which leaves the file free, they report the counts.
+- On an edge machine `kelmo status` and `kelmo client status` no longer hold the outbox while they wait for
+  the authority. A hook that arrived meanwhile waited for the whole command and could hand its session a
+  cached context marked unavailable; it now gets the outbox at once. `kelmo client status --probe` checks the
+  authority on a channel of its own and closes it, so it no longer replaces the channel the client's requests
+  use. `kelmo status` reads the authority over the open kelmo/2 channel, which carries several requests at
+  once, or else over a channel of its own, so a delivery never waits for its reply or its hello. `kelmo client
+  flush`, `resend` and the other commands (`trace`, `show`) still hold the outbox for the whole command, and
+  the tools' reads keep it while they wait on a channel that carries one request at a time, so a hook queued
+  meanwhile goes before a delivery. A delivery that needs the channel while another caller is still connecting
+  gives up at its own deadline, with its writes kept, instead of waiting for that caller's hello; such a
+  delivery, one that gave up because another request held the channel, one whose deadline passed before its
+  request went out, and one refused before a byte went out (an operation the server does not offer, a frame
+  over the limit) no longer counts as an attempt; the busy and late ones no longer show a refusal as the
+  entry's last. When the authority's hello, the delivery's own or another caller's, does not answer in time,
+  an entry with no refusal yet shows `E_TRANSPORT` as the reason it waits. The stall warning names that reason
+  as the "last reason". On an edge machine, while another caller is reading or rewriting the outbox, or
+  another process holds its file, `kelmo status`, `kelmo client status` and the MCP tool `memory_status`
+  answer with `"outbox": {"busy": true}` instead of waiting past their deadline; during a delivery, which
+  leaves the file free, they report the counts. A client that runs without the edge daemon still waits for a
+  held file while it opens the outbox, as before.
 
 ## [0.3.1] - 2026-11-15
 
