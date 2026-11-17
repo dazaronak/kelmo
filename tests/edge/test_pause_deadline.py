@@ -18,6 +18,7 @@ from kelmo.errors import KelmoError
 
 OPERATION = 'op-synthetic-1'
 SLACK = 0.1  # starting the command's thread and joining it
+LOADED_SLACK = 0.6  # the same, with the threads starved of CPU under parallel shards; well below any hold here
 
 
 class Context:
@@ -184,7 +185,9 @@ def test_a_paused_cli_wait_that_cannot_take_the_outbox_back_fails_busy_inside_it
     assert isinstance(result, KelmoError), result
     assert (result.code, result.retryable) == ('E_BUSY', True)
     assert OPERATION in str(result)
-    assert ended < 0.6 + SLACK, ended
+    # It gives up at its deadline, not when the holder lets go 3 s later. The margin covers the command's thread
+    # starved of CPU next to three busy test shards on a 4-CPU runner (0.83 s seen there), not a later wait.
+    assert ended < 0.6 + LOADED_SLACK, ended
 
 
 def test_after_a_paused_caller_gives_up_the_outbox_is_free_for_the_next_caller(profile, monkeypatch):

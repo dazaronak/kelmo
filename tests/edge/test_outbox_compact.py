@@ -177,9 +177,10 @@ def test_a_held_outbox_leaves_compaction_to_a_pass_a_second_later(real_edge, pro
     assert core._deliverer.is_alive()
     wait = core._compaction.get('retry_at', 0.0) - time.time()
     assert wait <= edge_core.BUSY_RETRY_SECONDS + 0.1, core._compaction
-    time.sleep(max(0.0, wait) + 0.05)
-    _passes(core, 1)
-    assert _size(profile) < before // 4, 'the next pass did not compact'
+    # Not woken: the deliverer comes back on its own a second later. A wake during that pass would pause the
+    # compaction on purpose (a queued hook is delivered first), so the test only watches the file shrink.
+    assert _until(lambda: _size(profile) < before // 4, max(0.0, wait) + 5), \
+        f'the pass a second later did not compact: {core._compaction}'
 
 
 def test_a_pass_does_not_compact_while_a_hook_waits_for_the_outbox(real_edge, profile, monkeypatch):
@@ -603,9 +604,9 @@ def test_a_wall_clock_set_back_while_the_daemon_runs_does_not_stretch_a_short_pa
     shifted = type('Clock', (), {'time': staticmethod(lambda: real_time() - 86400.0),
                                  'monotonic': staticmethod(time.monotonic), 'sleep': staticmethod(time.sleep)})
     monkeypatch.setattr(edge_core, 'time', shifted)
-    time.sleep(edge_core.BUSY_RETRY_SECONDS + 0.1)
-    _passes(core, 1)
-    assert _size(profile) < before // 4, 'a clock set back a day kept the one-second pause for a day'
+    # Not woken, as in the held-outbox test above: the pass a second later must come and compact on its own.
+    assert _until(lambda: _size(profile) < before // 4, edge_core.BUSY_RETRY_SECONDS + 5), \
+        f'a clock set back a day kept the one-second pause for a day: {core._compaction}'
 
 
 def test_the_saved_compaction_pause_is_readable_by_its_owner_only(legacy_edge, profile, monkeypatch):
