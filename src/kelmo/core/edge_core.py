@@ -360,10 +360,10 @@ class EdgeCore:
             if sqlite_busy(error):
                 return self._compaction_done('busy', freed, BUSY_RETRY_SECONDS)
             if getattr(error, 'sqlite_errorcode', None) == sqlite3.SQLITE_INTERRUPT:
-                # Slower than predicted: rolled back, the file stays as it was. It waits an hour, and from then on
-                # for idle, like a file too large to rewrite while calls come.
+                # Slower than predicted: rolled back, the file stays as it was. From then on it waits for idle, like
+                # a file too large to rewrite while calls come, where the rewrite has no time bound.
                 self._over_limit = True
-                return self._compaction_done('too_large', freed, COMPACT_RETRY_SECONDS)
+                return self._compaction_done('too_large', freed, self._until_idle())
             return self._compaction_done('error', freed, COMPACT_RETRY_SECONDS, error)
         except Exception as error:  # noqa: BLE001 - an outbox that cannot be compacted still delivers
             if self._stopping.is_set():

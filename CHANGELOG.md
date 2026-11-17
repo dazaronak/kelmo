@@ -18,8 +18,8 @@ entry here.
   predicted to take under a second; a rewrite whose copy phase runs past a quarter of a second is stopped and
   rolled back, and the file stays as it was. A larger one is rewritten once the daemon has served no call for
   ten minutes, and that rewrite is stopped and rolled back as soon as a hook waits for the outbox; it is
-  looked at again as soon as such a quiet spell can have passed; one whose rewrite was stopped waits an hour
-  first, then for such a quiet spell. A step that frees nothing and a failure (a full disk, say) wait an hour
+  looked at again as soon as such a quiet spell can have passed. An outbox whose bounded rewrite was stopped
+  waits for such a quiet spell too. A step that frees nothing and a failure (a full disk, say) wait an hour
   before the next try, also across a restart of the daemon (`compaction.json` next to the outbox, readable by
   its owner only; a saved pause never waits longer than an hour, and a running daemon times its pauses on a
   clock that is never set back, so a wall clock set back does not stretch them). A rewrite refused because
@@ -30,7 +30,12 @@ entry here.
   still compacts there, unless another process holds the file, and leaves it to the next flush then. `kelmo
   client flush` reports `pending: null` when another caller kept the outbox for its whole bound, and the
   daemon looks at a held outbox again a second later. `kelmo client status` and `kelmo status` report the
-  outbox busy instead of waiting for it past their deadline.  ## [0.3.2] - 2026-11-16  ### Added
+  outbox busy instead of waiting for it past their deadline.
+
+## [0.3.2] - 2026-11-16
+
+### Added
+
 - The owner is told when a Dreaming run fails, or when the findings pass keeps reading nothing while archived
   notes it has not read wait behind its cursor; before, both went to the worker log only. This covers the
   daemon's daily run and the runs of the timer `kelmo dream schedule` writes, and a daily run that cannot

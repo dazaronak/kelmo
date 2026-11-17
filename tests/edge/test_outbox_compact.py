@@ -262,6 +262,7 @@ def test_a_paused_compaction_survives_a_restart_of_the_edge_core(legacy_edge, pr
     before = _size(profile)
     monkeypatch.setattr(edge_core, 'COMPACT_COPY_SECONDS', 0.0)
     monkeypatch.setattr(client_module, 'COMPACT_PROGRESS_STEPS', 1)
+    monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 3600.0)  # a stopped rewrite then waits for idle an hour away
     core, client = legacy_edge()
     record = json.loads((profile.state / 'compaction.json').read_text())
     assert record['state'] == 'too_large' and record['retry_at'] > time.time() + 600, record
@@ -454,6 +455,18 @@ def test_a_compaction_statement_does_not_wait_for_another_process_that_took_the_
 def test_an_old_outbox_over_the_bound_is_converted_at_the_first_idle_moment_not_an_hour_later(
         legacy_edge, profile, monkeypatch):
     monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 1000.0)
+    monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 1.5)
+    core, client = legacy_edge()
+    assert core._compaction['state'] == 'too_large', core._compaction
+    assert core._compaction['retry_at'] - time.time() <= 1.6, core._compaction
+    assert _until(lambda: core._compaction.get('state') == 'done', 8), core._compaction
+    assert _mode(profile) == 2, 'the idle pass did not convert the old outbox'
+
+
+def test_an_old_outbox_whose_rewrite_was_stopped_is_converted_at_the_first_idle_moment_not_an_hour_later(
+        legacy_edge, profile, monkeypatch):
+    monkeypatch.setattr(edge_core, 'COMPACT_COPY_SECONDS', 0.0)
+    monkeypatch.setattr(client_module, 'COMPACT_PROGRESS_STEPS', 1)
     monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 1.5)
     core, client = legacy_edge()
     assert core._compaction['state'] == 'too_large', core._compaction
