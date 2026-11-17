@@ -418,12 +418,14 @@ pub fn start(
     let port = match listener.local_addr() {
         Ok(address) => address.port(),
         Err(error) => {
-            eprintln!("kelmod: the HTTP endpoint has no address: {error}");
+            kelmo_runtime::logln!("kelmod: the HTTP endpoint has no address: {error}");
             return tokio::spawn(async {});
         }
     };
     if let Err(error) = publish(&gateway.runtime, port, &settings.tools) {
-        eprintln!("kelmod: cannot publish the endpoint in the runtime directory: {error}");
+        kelmo_runtime::logln!(
+            "kelmod: cannot publish the endpoint in the runtime directory: {error}"
+        );
     }
     let shutdown = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()

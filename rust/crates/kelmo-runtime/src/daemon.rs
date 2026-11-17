@@ -117,7 +117,7 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
     };
     let open_files = crate::sys::raise_open_files(OPEN_FILES);
     if open_files < MIN_OPEN_FILES {
-        eprintln!(
+        crate::logln!(
             "kelmod: the open-file limit is {open_files}; connections past it wait for a free descriptor"
         );
     }
@@ -244,15 +244,15 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
             ended = &mut router_task => {
                 router_lost = true;
                 match ended {
-                    Err(error) if error.is_panic() => eprintln!("kelmod: the router panicked; stopping"),
-                    _ => eprintln!("kelmod: the router stopped before a shutdown; stopping"),
+                    Err(error) if error.is_panic() => crate::logln!("kelmod: the router panicked; stopping"),
+                    _ => crate::logln!("kelmod: the router stopped before a shutdown; stopping"),
                 }
                 break EXIT_ROUTER;
             }
             _ = stall_check.tick() => {
                 let age = beat.age();
                 if !router_alive(age, ROUTER_STALL) {
-                    eprintln!("kelmod: the router has handled no event for {} ms; stopping", age.as_millis());
+                    crate::logln!("kelmod: the router has handled no event for {} ms; stopping", age.as_millis());
                     router_lost = true;
                     break EXIT_ROUTER;
                 }
@@ -267,7 +267,7 @@ pub async fn serve_with(spec: Spec, ephemeral: bool, front: Option<Prepare>) -> 
                 if ping.is_some_and(|interval| router_alive(age, interval)) {
                     notify("WATCHDOG=1");
                 } else {
-                    eprintln!("kelmod: the router has handled no event for {} ms; no watchdog ping", age.as_millis());
+                    crate::logln!("kelmod: the router has handled no event for {} ms; no watchdog ping", age.as_millis());
                 }
             }
             idle = async {

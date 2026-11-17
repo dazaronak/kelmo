@@ -964,7 +964,7 @@ impl Router {
         // A core already told to stop is draining: its supervisor kills it at the end of its drain time, so a
         // kill now would only cut the drain short.
         if let Some(hard) = state.hard.filter(|hard| bytes > *hard && !state.stop_sent) {
-            eprintln!(
+            crate::logln!(
                 "kelmod: core {} uses {} MiB, over its hard budget of {} MiB; killing and restarting it",
                 state.name,
                 bytes >> 20,
@@ -976,7 +976,7 @@ impl Router {
         if let Some(soft) = state.soft.filter(|soft| bytes > *soft) {
             match state.over_soft_since {
                 None => {
-                    eprintln!(
+                    crate::logln!(
                         "kelmod: core {} uses {} MiB, over its soft budget of {} MiB; asking it to trim",
                         state.name,
                         bytes >> 20,
@@ -1005,7 +1005,7 @@ impl Router {
                         pinned = pinned.min(hard / 10 * 9);
                     }
                     if pinned > soft {
-                        eprintln!(
+                        crate::logln!(
                             "kelmod: core {} uses {} MiB right after a planned restart, over its soft budget of \
                              {} MiB; a restart does not bring it down, so its soft budget is pinned at {} MiB \
                              until kelmod restarts (spec {} MiB, hard {})",
@@ -1109,7 +1109,7 @@ impl Router {
         state.recycle_deadline = None;
         state.recycle_retry_at = Some(Instant::now() + RECYCLE_RETRY);
         if !state.recycle_declined {
-            eprintln!(
+            crate::logln!(
                 "kelmod: core {} declined a recycle ({reason}); keeping it",
                 state.name
             );
@@ -1120,7 +1120,7 @@ impl Router {
 
     fn graceful_restart(&mut self, core: usize) {
         let state = &mut self.cores[core];
-        eprintln!(
+        crate::logln!(
             "kelmod: core {} is still over its soft budget ({} MiB) after a trim and agreed to a recycle; \
              stopping and restarting it",
             state.name,
@@ -1163,7 +1163,7 @@ impl Router {
                 lane.limit > 0 && abandoned >= lane.limit
             });
             if let Some((lane, _)) = stuck {
-                eprintln!(
+                crate::logln!(
                     "kelmod: every slot of lane {lane} of core {} is held by a call past its deadline; \
                      killing and restarting it",
                     state.name
@@ -1256,7 +1256,7 @@ impl Router {
                     continue;
                 }
                 if state.pings.len() as u32 >= self.spec.heartbeat_misses {
-                    eprintln!(
+                    crate::logln!(
                         "kelmod: core {} left {} heartbeats unanswered; killing and restarting it",
                         state.name,
                         state.pings.len()

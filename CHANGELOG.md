@@ -242,6 +242,16 @@ entry here.
   to read them. On the older path for vaults without hub views, a local vault's hook lists the 20 newest notes
   as before, and a line now counts the older ones and names the file with all of them; the older notes used to
   be left out without a count. A shared client on such a vault still gets the 20 newest with no count.
+- Each line `kelmod` itself writes to its log while it serves (core failures and restarts, recycles, memory
+  budgets, stops, the HTTP endpoint) now begins with the UTC time, in the form `2025-11-16T07:40:00.250Z
+  kelmod: ...`, so a recycle can be dated from the log. A line break or other control character inside such a
+  message is written escaped, as `\n` or `\u{1b}`, and a backslash as `\\`. The line is handed to the log in
+  one write, so a core writing to the same log does not split it as a rule. A line that cannot be written is
+  dropped and the daemon goes on; after one cut part way, the next line starts on a fresh line. Lines the
+  cores write to the same log, Rust's own panic message, and an error that stops `kelmod` before it serves
+  (the client quotes those to the user) are written as before. After a core is killed or fails, the next line
+  starts on a fresh line, since the core may have died part way through one; a core killed at the end of its
+  drain time is now killed before `kelmod` writes that it was, and that line says it was killed.
 
 ## [0.3.2] - 2026-11-16
 

@@ -67,6 +67,8 @@ def main(argv):
             return
         if op == "admin.stop" and core == "state":
             marker(scratch, "state.admin-stop").touch()
+            if "--cut-stderr-at-stop" in options:
+                os.write(2, b"core output cut short")  # as a stack dump killed part way leaves it
             if "--hold-admin-stop" in options:
                 release = marker(scratch, "state.release-admin-stop")
                 while not release.exists():
