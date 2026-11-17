@@ -1571,6 +1571,10 @@ class KeysInFlight:
             with self._lock:
                 self._keys.discard(key)
 
+    def running(self, key):
+        with self._lock:
+            return key in self._keys
+
     def __len__(self):
         with self._lock:
             return len(self._keys)
@@ -1748,25 +1752,51 @@ class ClientSession:
 
     def _replay(self, key, row):
         """The stored reply of a finished request. A refusal that `kelmo client resend` sent again under
-        `<key>#resend<n>` answers as the last note of that chain, which this client's outbox may no longer
-        know (a profile made again under the same client id); a resend still running is answered busy."""
+        `<base>#resend<n>` (the client cuts the key at its first `#resend`) answers as the last note of that
+        chain, which this client's outbox may no longer know (a profile made again under the same client id).
+        A successor counts only when it is the same operation and was recorded after the refusal it resends; a
+        successor whose attempt is still running is answered busy, one abandoned by a process that is gone is
+        passed over."""
         reply = json.loads(row['reply'])
-        if reply.get('ok') is False:
-            base, mark, number = key.partition('#resend')
-            if not (mark and number.isdigit()):
-                base, number = key, '0'
-            journal, after = self.service.journal, None
-            for successor in itertools.count(int(number) + 1):
-                stored = journal.client_request(_request_digest([self.client_id, f'{base}#resend{successor}']))
-                if stored is None:
-                    break
-                after = stored
-            if after is not None:
-                if after['state'] != 'finished':
-                    raise KelmoError('E_BUSY', 'The note this request was resent as is still running; it stays '
-                                              'queued.')
-                reply = json.loads(after['reply'])
+        if reply.get('ok') is not False:
+            return dict(reply, replayed=True)
+        base, mark, number = key.partition('#resend')
+        start = int(number) if mark and number.isdigit() else 0
+        journal, before = self.service.journal, row
+        for successor in itertools.count(start + 1):
+            request_key = _request_digest([self.client_id, f'{base}#resend{successor}'])
+            stored = journal.client_request(request_key)
+            if (stored is None or stored['op'] != before['op']
+                    or stored['created_at'] < (before['finished_at'] or before['created_at'])):
+                break
+            if stored['state'] != 'finished':
+                if self._attempt_running(request_key):
+                    raise KelmoError('E_BUSY', 'The note this request was resent as is still running; it '
+                                              'stays queued.')
+                break
+            before, reply = stored, json.loads(stored['reply'])
+            if reply.get('ok') is not False:
+                break
         return dict(reply, replayed=True)
+
+    def _attempt_running(self, request_key):
+        """Whether a live attempt holds this request now: the state core's table of keys in flight, or the row's
+        lock file locked by a process that is still there."""
+        if self.keys_in_flight is not None:
+            return self.keys_in_flight.running(request_key)
+        import fcntl
+        path = self.service.config.internal('.state/client-requests/' + request_key + '.lock')
+        try:
+            descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return False
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(descriptor)
+        return False
 
     @contextmanager
     def _request_lock(self, request_key):
