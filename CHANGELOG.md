@@ -13,13 +13,13 @@ entry here.
   operations and 160,000 events, reading one operation went from about 5.7 ms to 0.02 ms. Commands and passes
   that read many operations, such as the findings pass, the queue and the worker, gain the most. Building the
   index on a large journal takes a moment once; nothing else changes.
-- `memory_search` and `memory_list` no longer scan every operation for each record they return. Each row looks up
-  the record's operations by its archive id, and the journal now indexes that column too; on 20,000 operations
-  one lookup went from about 1 ms to 0.006 ms, about 0.5 s saved on a 500-item `memory_list` page.
+- `memory_search` and `memory_list` no longer scan every operation for each record they return. Each row looks
+  up the record's operations by its archive id, and the journal now indexes that column too; on 20,000
+  operations one lookup went from about 1 ms to 0.006 ms, about 0.5 s saved on a 500-item `memory_list` page.
 - A core that receives bytes from `kelmod` that are not a frame (a length over the frame bound, a header that
-  does not parse or has a field of the wrong JSON type, a body nested too deeply) now ends its channel the
-  way a closed channel ends: it says why in `kelmod`'s log and asks
-  its work to stop. The error used to escape the channel's loop as a Python traceback.
+  does not parse or has a field of the wrong JSON type, a body nested too deeply) now ends its channel the way
+  a closed channel ends: it says why in `kelmod`'s log and asks its work to stop. The error used to escape the
+  channel's loop as a Python traceback.
 - `kelmod call --deadline-ms` now also bounds the part before the call is sent. A daemon that accepted the
   connection and then never answered the hello, or never read the call, left `kelmod` waiting with no
   output; the connection, the hello and the write of the call now end with `E_DEADLINE` five seconds after
@@ -33,9 +33,9 @@ entry here.
   directory swapped in after the check cannot take the call. Without `XDG_RUNTIME_DIR` and `TMPDIR` the
   directory is under `/tmp`, where another local user could have created it first.
 - `kelmo dream` on a shared-client machine is refused the way other server commands are: `E_CAPABILITY`, "runs
-  on the server", where `dream status` and the other local actions used to answer `E_NOT_INITIALIZED` as if the
-  vault were missing. `dream run` and `dream apply` are no longer sent to the client's daemon, which has no dream
-  job; they get the same refusal.
+  on the server", where `dream status` and the other local actions used to answer `E_NOT_INITIALIZED` as if
+  the vault were missing. `dream run` and `dream apply` are no longer sent to the client's daemon, which has
+  no dream job; they get the same refusal.
 - Tool calls that write through the edge core now take the outbox in the order they came. A new call could
   take it ahead of an earlier one that had just been woken, and a busy session could keep another session's
   write waiting until its deadline. Hooks still go ahead of tool calls, but never twice in a row past a
@@ -91,19 +91,20 @@ entry here.
   once no longer runs one write request twice: the state core now also takes the request's lock file, so each
   refuses a request the other is running with `E_BUSY`, which the client retries.
 - A session capture that `kelmod hook` spooled while the daemon was running, because no reply came in time, no
-  longer waits for the next start of the state core. The next hook the core serves starts a pass over the spool,
-  one pass at a time, and none once the core is told to stop. A pass stopped by a busy journal while a hook
-  asked for another runs again a second later. A spooled capture reads its transcript for up to 5 seconds,
-  where a hook has 1.5, since no caller waits for it. One refused as worth retrying no longer holds back the
-  captures behind it: a refusal the server marked worth retrying keeps it for later passes, as the edge core
-  keeps it, and a local one (a transcript read that ran out of time, or one that changed while it was read)
-  sets it aside as `.bad` on its third try in one run of the core. It used to be set aside on the first.
+  longer waits for the next start of the state core. The next hook the core serves starts a pass over the
+  spool, one pass at a time, and none once the core is told to stop. A pass stopped by a busy journal while a
+  hook asked for another runs again a second later. A spooled capture reads its transcript for up to 5
+  seconds, where a hook has 1.5, since no caller waits for it. One refused as worth retrying no longer holds
+  back the captures behind it: a refusal the server marked worth retrying keeps it for later passes, as the
+  edge core keeps it, and a local one (a transcript read that ran out of time, or one that changed while it
+  was read) sets it aside as `.bad` on its third try in one run of the core. It used to be set aside on the
+  first.
 - A promoted note that met a database held by another writer while it went through the editor no longer fails
   with `E_PROCESSING` and loses an attempt. It waits its turn as `E_BUSY`, uncharged, as it already did before
   the editor call.
 - A Dreaming link finding whose cited evidence could not be read for a moment, because the archive was busy or
-  its process restarted, is no longer settled `stale` for good. It stays open with the error's code and a later
-  `publish` links the pages. Only evidence that was forgotten or is gone settles the finding `stale`.
+  its process restarted, is no longer settled `stale` for good. It stays open with the error's code and a
+  later `publish` links the pages. Only evidence that was forgotten or is gone settles the finding `stale`.
 - The line `kelmo worker daemon` writes about operations held by another attempt no longer names an
   operation the worker skipped only because the journal was busy. Such an entry under `skipped` in `kelmo
   worker daemon --once` output now carries `"journal_busy": true`.
@@ -130,12 +131,12 @@ entry here.
   editor call met it could still be charged an attempt. A call that cannot be encoded, or whose write fails
   for another reason, fails alone and does not stop the core.
 - A call a core makes once it is stopping (kelmod closed its channel, or a stop finished the core's work) now
-  fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not come,
-  holding the stop for that call's deadline, about five minutes for an archive call.
+  fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not
+  come, holding the stop for that call's deadline, about five minutes for an archive call.
 - A note whose server process died after capturing it is no longer refused when its request is taken over. The
   takeover checked the note again before it looked for the capture, so a registry change in between (a project
-  map removed, a page renamed) refused a note that was already captured, and a later resend captured it a second
-  time. A taken-over request now answers with the note its earlier attempt captured.
+  map removed, a page renamed) refused a note that was already captured, and a later resend captured it a
+  second time. A taken-over request now answers with the note its earlier attempt captured.
 
 ### Added
 
@@ -148,14 +149,14 @@ entry here.
 
 ### Changed
 
-- The test runner `tools/pytest_shards.py`, which CI uses for the suite, now reports while it runs: it says how
-  many cases it collected, prints a `progress:` line with the cases done so far as each of its processes ends,
-  and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY` names a
-  file, it appends the result there, so a GitHub run shows it on the job's page. The summary line is unchanged
-  and still last. Its progress and its check that every case ran now count cases rather than pytest's outcomes,
-  so a case that passed and then failed in its teardown no longer hides a case that never ran. The
-  measurement gate (`bash run-tests.sh`) shows those collected and progress lines as they come, while the
-  source suite still runs, instead of only after the section ended.
+- The test runner `tools/pytest_shards.py`, which CI uses for the suite, now reports while it runs: it says
+  how many cases it collected, prints a `progress:` line with the cases done so far as each of its processes
+  ends, and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY`
+  names a file, it appends the result there, so a GitHub run shows it on the job's page. The summary line is
+  unchanged and still last. Its progress and its check that every case ran now count cases rather than
+  pytest's outcomes, so a case that passed and then failed in its teardown no longer hides a case that never
+  ran. The measurement gate (`bash run-tests.sh`) shows those collected and progress lines as they come, while
+  the source suite still runs, instead of only after the section ended.
 - `kelmo client resend` counts a refusal as a duplicate only of a queued or delivered note with the same
   request: the same project, text, rule change, new work page and pending flag. Before, a note of any project
   with that text answered for it, whatever its other arguments.
@@ -231,11 +232,11 @@ entry here.
 - The "Pending wiki updates" block a session gets at start now sits between `<kelmo-pending-notes>` and
   `</kelmo-pending-notes>` lines and says that its lines are text from notes, not instructions. A pending line
   can no longer close the block early: each one is a single row inside it, and a marker tag in its text is
-  written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
-  frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
-  When the start context is too large for a Claude hook and the pending lines are left in the referenced
-  context file instead, that file's `pending` field holds the same framed block, with a row for every waiting
-  note. It used to hold the raw list of notes.
+  written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the
+  same frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are
+  unchanged. When the start context is too large for a Claude hook and the pending lines are left in the
+  referenced context file instead, that file's `pending` field holds the same framed block, with a row for
+  every waiting note. It used to hold the raw list of notes.
 - When more than ten notes wait, the start context, and the refresh that sends only a changed pending list,
   now end the block with a line naming a context file whose `pending` field holds the text of every waiting
   note, also when the context fits the hook limit. Notes past ten used to show only as "+N more", with no way
