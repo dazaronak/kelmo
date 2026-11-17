@@ -142,3 +142,14 @@ def test_close_is_idempotent_and_marks_the_channel_dead():
     channel.close()
     channel.close()
     assert not channel.alive
+
+
+def test_a_request_on_a_channel_whose_pipe_closed_leaves_no_waiter_behind():
+    channel = MuxChannel(command(), timeout=2)
+    try:
+        channel.process.stdin.close()
+        with pytest.raises(ValueError):
+            channel.request(request('after-close'))
+        assert channel._waiters == {}, channel._waiters
+    finally:
+        channel.close()

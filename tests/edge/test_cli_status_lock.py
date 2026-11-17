@@ -612,3 +612,146 @@ def test_a_command_that_does_not_parse_is_not_a_status_read():
             answer = error
         assert answer is False, (argv, answer)
 
+
+def test_dropping_a_failed_channel_does_not_wait_past_its_deadline_for_a_caller_still_connecting(profile):
+    """Another caller holds the connect for a slow hello: a status whose request failed returns within its own
+    deadline, and the failed channel is never handed out again."""
+    from kelmo.client import SharedClient
+    factory, _opened = _channels(profile, lambda: {'ok': True})
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    connecting, release = threading.Event(), threading.Event()
+
+    def slow_hello():
+        with client._connecting:
+            connecting.set()
+            release.wait(10)
+
+    try:
+        failed = client._connect()
+        holder = threading.Thread(target=slow_hello, daemon=True)
+        holder.start()
+        assert connecting.wait(5)
+        start = time.monotonic()
+        with client.deadline(1.0):
+            client._drop(failed)
+        assert time.monotonic() - start < 2.0, 'the drop waited past its deadline for the hello of another caller'
+        release.set()
+        holder.join(10)
+        assert client._connect() is not failed, 'the failed channel was handed out again'
+        assert failed.closed
+    finally:
+        release.set()
+        client.close()
+
+
+def test_client_status_reports_the_outbox_busy_while_another_process_holds_the_file(profile):
+    import sqlite3
+    from kelmo.client import SharedClient
+    factory, _opened = _channels(profile, lambda: {'ok': True})
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    other.execute('BEGIN EXCLUSIVE')
+    release = threading.Timer(6.0, other.rollback)
+    release.start()
+    try:
+        start = time.monotonic()
+        with client.deadline(1.0):
+            status = client.local_status()
+        assert time.monotonic() - start < 2.0, 'client status waited for another process past its deadline'
+        assert status['outbox'] == {'busy': True}, status
+    finally:
+        release.cancel()
+        other.rollback()
+        other.close()
+        client.close()
+
+
+def test_a_drop_that_marks_the_channel_as_its_request_ends_still_gets_it_closed(profile, monkeypatch):
+    """The request on the channel checks the mark just before the drop sets it, then lets the channel go: the channel
+    is still closed, by whichever of the two sees the mark with the channel free."""
+    import kelmo.client as client_module
+    from kelmo.client import PROTOCOL, SharedClient
+    monkeypatch.setattr(client_module, 'DROP_TURN_SECONDS', 0.2)
+    checked, marked = threading.Event(), threading.Event()
+
+    class Channel:
+        closed = False
+        _mark = False
+
+        @property
+        def close_when_free(self):
+            value = self._mark
+            if threading.current_thread().name == 'status-reader' and not checked.is_set():  # its own check
+                checked.set()
+                marked.wait(5)
+            return value
+
+        @close_when_free.setter
+        def close_when_free(self, value):
+            self._mark = value
+            marked.set()
+
+        def request(self, frame, timeout=None):
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+                      if frame['op'] == 'hello' else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            self.closed = True
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    try:
+        channel = client._connect()
+        reader = threading.Thread(target=client.call, args=('status',), name='status-reader', daemon=True)
+        reader.start()
+        assert checked.wait(5)
+        client._drop(channel)
+        reader.join(10)
+        assert channel.closed, 'the marked channel was never closed'
+    finally:
+        marked.set()
+        client.close()
+
+
+def test_a_channel_closed_when_its_request_ends_waits_no_longer_than_that_request_may(profile, monkeypatch):
+    """The drop came from a caller with no deadline; the request that closes the channel bounds the close's grace
+    by its own deadline, so it does not wait seconds for the process to exit."""
+    import kelmo.client as client_module
+    from kelmo.client import PROTOCOL, SharedClient
+    monkeypatch.setattr(client_module, 'DROP_TURN_SECONDS', 0.2)
+    entered, release, graces = threading.Event(), threading.Event(), []
+
+    class Channel:
+        closed = False
+        grace = 5
+
+        def request(self, frame, timeout=None):
+            if frame['op'] != 'hello' and not entered.is_set():
+                entered.set()
+                release.wait(10)
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+                      if frame['op'] == 'hello' else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            graces.append(self.grace)
+            self.closed = True
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+
+    def read():
+        with client.deadline(2.0):
+            client.call('status')
+
+    try:
+        channel = client._connect()
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        assert entered.wait(5)
+        client._drop(channel)  # no deadline on this caller
+        release.set()
+        reader.join(10)
+        assert channel.closed and graces and graces[0] <= 2.0, graces
+    finally:
+        release.set()
+        client.close()

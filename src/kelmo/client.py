@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .config import CLIENT_FILE, ClientProfile
 from .core import wire
-from .errors import KelmoError
+from .errors import KelmoError, sqlite_busy
 from .server import NATIVE_ID, PROTOCOL, PipeReader, encode_frame
 
 # Only an unreachable or foreign server falls back to the labelled cache.
@@ -347,11 +347,20 @@ class Outbox:
         return [item for _, item in sorted(items, key=lambda pair: pair[0])]
 
     def summary_within(self, seconds):
-        """The summary, or {'busy': True} when another caller holds the outbox longer than `seconds`."""
+        """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
+        longer than `seconds`."""
         if not self._serial.acquire(timeout=max(0.0, seconds)):
             return {'busy': True}
         try:
-            return self.summary()
+            self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
+            try:
+                return self.summary()
+            except sqlite3.OperationalError as error:
+                if not sqlite_busy(error):
+                    raise
+                return {'busy': True}
+            finally:
+                self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
         finally:
             self._serial.release()
 
@@ -595,6 +604,10 @@ class MuxChannel:
             self._waiters[call_id] = waiter
         try:
             self._write(data, deadline)
+        except ValueError:  # the pipe was closed before the frame: nothing written, the caller may go again
+            with self._state_lock:
+                self._waiters.pop(call_id, None)
+            raise
         except OSError as error:
             self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
             self.grace = 0
@@ -1037,8 +1050,18 @@ class SharedClient:
     def _drop(self, failed=None):
         """Closes the open channel. With `failed`, the channel a request just failed on: one that carries
         several requests stays while it is alive and answering (one request's deadline is not the channel's
-        end), and a channel another thread has already replaced is left alone."""
-        with self._connecting:
+        end), and a channel another thread has already replaced is left alone. A caller with a failed channel
+        waits for another thread's connect no longer than its deadline: the channel is then marked so that no
+        caller is handed it again."""
+        if failed is None:
+            self._connecting.acquire()
+        elif not self._connecting.acquire(timeout=self._seconds_left()):
+            if getattr(failed, 'concurrent', False) and failed.alive and not failed.stalled:
+                return
+            failed.dropped = True
+            self._close_channel(failed)
+            return
+        try:
             channel = self._channel
             if channel is None or (failed is not None and channel is not failed):
                 return
@@ -1046,18 +1069,38 @@ class SharedClient:
                     and not channel.stalled):
                 return
             self._channel = None
-        if isinstance(channel, StdioChannel) and self._deadline is not None:
+        finally:
+            self._connecting.release()
+        self._close_channel(channel)
+
+    def _close_channel(self, channel):
+        """Closes a dropped channel, never under another thread's request on a one-request channel: past the
+        bound that request closes it when it ends."""
+        if hasattr(channel, 'grace') and self._deadline is not None:
             channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
         if getattr(channel, 'concurrent', False):
             channel.close()
             return
-        # Never under another thread's request on a one-request channel: past the bound that request closes it.
         turn = self._turn_for(channel)
         if not turn.acquire(timeout=DROP_TURN_SECONDS):
             channel.close_when_free = True
+            self._close_if_marked(channel)  # the request may have let it go between the wait and the mark
             return
         try:
             channel.close()
+        finally:
+            turn.release()
+
+    def _close_if_marked(self, channel):
+        """Closes a channel marked to be closed once free, if nobody's request is on it now."""
+        if not getattr(channel, 'close_when_free', False):
+            return
+        turn = self._turn_for(channel)
+        if not turn.acquire(blocking=False):
+            return  # a request is on it: that request closes it when it ends
+        try:
+            if not getattr(channel, 'closed', False):
+                channel.close()
         finally:
             turn.release()
 
@@ -1085,17 +1128,23 @@ class SharedClient:
                 # Several threads share the channel: each request carries its own deadline.
                 reply = channel.request(frame, timeout=self.remaining())
             else:
-                with self._waiting_for(self._turn_for(channel), 'held the channel'):
-                    try:
-                        if isinstance(channel, StdioChannel):
-                            try:
-                                channel.timeout = self.remaining()
-                            except Unbound as error:  # nothing written yet: the channel stays as it is
-                                raise Unsent(error.code, str(error)) from error
-                        reply = channel.request(frame)
-                    finally:
-                        if getattr(channel, 'close_when_free', False):  # dropped while this request was on it
-                            channel.close()
+                try:
+                    with self._waiting_for(self._turn_for(channel), 'held the channel'):
+                        try:
+                            if isinstance(channel, StdioChannel):
+                                try:
+                                    channel.timeout = self.remaining()
+                                except Unbound as error:  # nothing written yet: the channel stays as it is
+                                    raise Unsent(error.code, str(error)) from error
+                            reply = channel.request(frame)
+                        finally:
+                            if getattr(channel, 'close_when_free', False):  # dropped while this request was on it
+                                if hasattr(channel, 'grace'):
+                                    channel.grace = max(0, min(channel.grace, self._seconds_left()))
+                                channel.close()
+                                channel.close_when_free = False  # closed: the check after the turn has nothing to do
+                finally:
+                    self._close_if_marked(channel)  # marked just after the check above
         except Unbound:
             raise
         except KelmoError as error:
@@ -1128,6 +1177,8 @@ class SharedClient:
         # its own deadline.
         with self._waiting_for(self._connecting, 'was connecting'):
             channel = self._channel
+            if channel is not None and getattr(channel, 'dropped', False):
+                self._channel = channel = None  # dropped by a caller that could not wait for the connect
             if channel is not None and getattr(channel, 'concurrent', False) and not channel.alive:
                 # It ended between two requests: the next one starts a new channel, as after a failed request.
                 self._channel = channel = None
