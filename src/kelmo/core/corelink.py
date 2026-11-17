@@ -145,6 +145,9 @@ PEER_GONE = frozenset({errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBAD
 # How long the stop waits for a call already writing before it sets the stop flag: kelmod closed the channel, so
 # that write ends at once (it lands or fails); the bound is for a peer that keeps reading slowly.
 STOP_WRITE_WAIT_SECONDS = 5.0
+# How long a call whose write found kelmod gone waits for the reader to reach the channel's end before it asks
+# the owner to stop itself: replies kelmod sent before closing reach their calls first.
+GONE_READER_WAIT_SECONDS = 1.0
 
 
 def _fail(future, error):
@@ -271,10 +274,10 @@ class CoreLink:
                 self._outgoing.pop(call_id, None)
             if isinstance(error, BrokenFrame) or (isinstance(error, OSError) and error.errno in PEER_GONE):
                 # The channel to kelmod is gone, or now carries a frame cut short, though the reader may not have
-                # reached its end yet: the core hears of the stop before this call fails, as it does for the calls
-                # the reader fails. The reader itself goes on to the channel's end, so replies kelmod sent before
-                # closing still arrive.
-                self._ask_owner_to_stop()
+                # reached its end yet: the reader goes on to the channel's end, so replies kelmod sent before
+                # closing still arrive, and the core hears of the stop from it (or after a short bound) before this
+                # call fails, as it does for the calls the reader fails.
+                self._leave_stop_to_reader()
             _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
             return future
         if refused:
@@ -283,8 +286,15 @@ class CoreLink:
             self._refuse_stopped(future)
         return future
 
+    def _leave_stop_to_reader(self):
+        """kelmod is gone for writing: wait briefly for the reader to deliver what kelmod sent before closing and
+        reach the channel's end (`_finish` asks the owner to stop), then ask the owner, once, in any case."""
+        if not self._stopping.is_set():
+            self._stopping.wait(GONE_READER_WAIT_SECONDS)
+        self._ask_owner_to_stop()
+
     def _refuse_stopped(self, future):
-        self._ask_owner_to_stop()  # the owner hears of the stop before the call fails
+        self._leave_stop_to_reader()  # the owner hears of the stop before the call fails
         _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
         return future
 

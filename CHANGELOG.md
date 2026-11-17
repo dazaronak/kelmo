@@ -76,6 +76,7 @@ entry here.
 
 ### Changed
 
+- A core whose call finds kelmod gone now lets the replies kelmod sent before closing reach their calls before the core is told to stop (it waits up to a second for the channel's end). Before, a task whose reply was still in the channel could meet the stop first, and a write without a key ran again at the next start.
 - A batch whose notes together propose more than 30 facts is committed. A batch proposal may carry 30 facts
   for each of its notes, but the check that runs right before the commit applied one note's ceiling of 30
   to all of them together. Such a commit was refused as a whole (`E_UNION` with `E_FACT_CHECK`), the note
