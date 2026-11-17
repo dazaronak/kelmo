@@ -75,6 +75,7 @@ class DescriptorChannel:
         os.set_blocking(fd, True)  # sendall's write loop expects a write to wait, not to fail with EAGAIN
         self._wake_read, self._wake_write = os.pipe()
         self._closed = False
+        self._write_ended = False  # a write shutdown: replies on their way are read before the wake ends it
 
     def recv(self, size):
         import select
@@ -84,6 +85,8 @@ class DescriptorChannel:
         while True:
             ready = dict(poller.poll())
             if self._wake_read in ready:
+                if self._write_ended and self.fd in ready:
+                    return os.read(self.fd, size)  # a reply that came with the drain's end is still read
                 return b''
             if self.fd in ready:
                 return os.read(self.fd, size)  # POLLHUP or POLLERR: read returns b'' or raises OSError
@@ -102,9 +105,13 @@ class DescriptorChannel:
         if how == socket.SHUT_WR:
             # No half-close without shutdown(2): writes already stop on `_peer_gone`; kelmod's reader would wait for
             # the rest of a cut frame for good, so the whole channel ends after the drain.
+            self._write_ended = True
             timer = threading.Timer(CONFINED_DRAIN_SECONDS, self._wake)
             timer.daemon = True
-            timer.start()
+            try:
+                timer.start()
+            except RuntimeError:  # no thread to be had: the channel ends now rather than never
+                self._wake()
             return
         self._wake()
 

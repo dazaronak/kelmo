@@ -178,3 +178,20 @@ def test_a_confined_channel_whose_frame_was_cut_ends_so_kelmod_sees_the_end(monk
         monkeypatch.undo()
         parent.close()
         reader.join(5)
+
+
+def test_a_reply_ready_when_the_drain_ends_is_still_read(monkeypatch):
+    """The drain's wake and a reply are ready at once: the reply is read first, then the channel ends."""
+    import time
+    monkeypatch.setattr(corelink, 'CONFINED_DRAIN_SECONDS', 0.0)
+    parent, child = socket.socketpair()
+    channel = corelink.DescriptorChannel(child.detach())
+    try:
+        parent.sendall(b'reply')
+        channel.shutdown(socket.SHUT_WR)
+        time.sleep(0.2)  # the drain has ended: its wake is written while the reply waits
+        assert channel.recv(5) == b'reply', 'the drain ended the channel over a reply ready at the same moment'
+        assert channel.recv(5) == b'', 'the channel did not end after the reply'
+    finally:
+        channel.close()
+        parent.close()
