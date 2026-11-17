@@ -8,10 +8,6 @@ entry here.
 
 ### Fixed
 
-- A resolution request whose model call the core's stop ended is given back at once, without being
-  charged an attempt. It used to stay claimed until its lease ran out, with the attempt counted. If the
-  journal cannot be written at that moment, the request still waits out its lease and the attempt counts,
-  as before; the stop is reported either way.
 - Reading one operation from the journal no longer scans every event ever recorded. The journal gets an index
   on its events by operation and stage the first time a writer opens it; on a synthetic journal of 20,000
   operations and 160,000 events, reading one operation went from about 5.7 ms to 0.02 ms. Commands and passes
@@ -149,36 +145,9 @@ entry here.
   neither, every refused entry), and with `--apply` marks them `dismissed`. Status then counts them under
   `dismissed`. `kelmo client resend` no longer selects them, and the same request under its key is still
   answered with its refusal. Nothing is deleted.
-- `kelmo client dismiss` stops listing refusals the owner has read. A shared client kept every refused entry
-  in `kelmo client status` for good, so one that would never be resent stayed there. The command lists the
-  refused entries whose code matches `--code` or whose key matches `--key` (both repeatable; with neither,
-  every refused entry), and with `--apply` marks them `dismissed`. Status then counts them under `dismissed`.
-  `kelmo client resend` no longer selects them, and the same request under its key is still answered with its
-  refusal. Nothing is deleted.
 
 ### Changed
 
-- The "Pending wiki updates" block a session gets at start now sits between `<kelmo-pending-notes>` and
-  `</kelmo-pending-notes>` lines and says that its lines are text from notes, not instructions. A pending line
-  can no longer close the block early: each one is a single row inside it, and a marker tag in its text is
-  written with `&lt;`. Both delivery paths, and the refresh that sends only a changed pending list, use the same
-  frame. Project labels, the "retrying" mark, the ten-row limit with "+N more" and the digest are unchanged.
-  When the start context is too large for a Claude hook and the pending lines are left in the referenced
-  context file instead, that file's `pending` field holds the same framed block, with a row for each note the
-  path was given: every waiting note on the hub path, the 20 newest on the older path for vaults without hub
-  views. It used to hold the raw list of notes. When the ten-line block itself fits, no such file is written
-  and the notes past ten still show only as a count, as before.
-- The test runner `tools/pytest_shards.py`, which CI uses for the suite, now reports while it runs: it says how
-  many cases it collected, prints a `progress:` line with the cases done so far as each of its processes ends,
-  and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY` names a
-  file, it appends the result there, so a GitHub run shows it on the job's page. The summary line is unchanged
-  and still last.
-- The test runner `tools/pytest_shards.py`, which CI uses for the suite, now reports while it runs: it says how
-  many cases it collected, prints a `progress:` line with the cases done so far as each of its processes ends,
-  and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY` names a
-  file, it appends the result there, so a GitHub run shows it on the job's page. The summary line is unchanged
-  and still last. Its progress and its check that every case ran now count cases rather than pytest's outcomes,
-  so a case that passed and then failed in its teardown no longer hides a case that never ran.
 - The test runner `tools/pytest_shards.py`, which CI uses for the suite, now reports while it runs: it says how
   many cases it collected, prints a `progress:` line with the cases done so far as each of its processes ends,
   and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY` names a
@@ -187,11 +156,6 @@ entry here.
   so a case that passed and then failed in its teardown no longer hides a case that never ran. The
   measurement gate (`bash run-tests.sh`) shows those collected and progress lines as they come, while the
   source suite still runs, instead of only after the section ended.
-- A request submitted again under the key of a refusal that `kelmo client resend` sent again is answered as
-  the note it went out as: with that note's outcome, its refusal, or as queued under its new key. Before, the
-  old key always answered that the request was queued and would be delivered on the next contact, even after
-  the resent note had been delivered or refused. A client that no longer holds the old entry still gets the
-  old refusal from the server.
 - `kelmo client resend` counts a refusal as a duplicate only of a queued or delivered note with the same
   request: the same project, text, rule change, new work page and pending flag. Before, a note of any project
   with that text answered for it, whatever its other arguments.
