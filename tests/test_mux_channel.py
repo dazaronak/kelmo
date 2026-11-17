@@ -279,4 +279,116 @@ def test_a_pipe_that_closes_before_a_byte_of_the_frame_goes_out_refuses_it_as_cl
         assert not channel.alive, 'a channel whose peer is gone stayed in use'
     finally:
         monkeypatch.undo()
+
+
+def test_close_does_not_close_the_pipe_under_a_write_in_progress():
+    """The peer stopped reading, so a large request waits inside `_write` for room in the pipe. The close takes the
+    pipe away only once that write has stopped, within about one poll slice: its number is never closed under it
+    (another open could take the number and receive the rest of the frame)."""
+    channel = MuxChannel(command('--stop-reading'), timeout=5)
+    failures = []
+
+    def write_big():
+        try:
+            channel.request(request('big', blob='x' * (1 << 20)))
+        except KelmoError as error:
+            failures.append(error.code)
+
+    writer = threading.Thread(target=write_big, daemon=True)
+    try:
+        writer.start()
+        stop = time.monotonic() + 5
+        while not channel._write_lock.locked() and time.monotonic() < stop:
+            time.sleep(0.01)
+        assert channel._write_lock.locked(), 'the request never started writing'
+        time.sleep(0.2)  # the pipe is full: the write waits for room
+        channel.grace = 0
+        started = time.monotonic()
+        channel.close()
+        took = time.monotonic() - started
+        still_writing = channel._write_lock.locked()
+        assert not still_writing, 'the pipe was closed while a write was still in progress on it'
+        assert took < 0.5, f'the close waited {took:.2f} s for the write'
+        writer.join(5)
+        assert failures == ['E_TRANSPORT'], failures
+    finally:
+        channel.grace = 0
+        channel.close()
+
+
+def test_a_close_during_the_wait_for_room_stops_the_write_before_its_next_byte(monkeypatch):
+    """A close sets its flag while the write waits for room in the pipe, and the pipe then has room: the write stops
+    without writing, rather than writing once more before it looks at the flag again."""
+    import kelmo.client as client_module
+    channel = MuxChannel(command(), timeout=2)
+    descriptor = channel.process.stdin.fileno()
+    real_write, writes = os.write, []
+
+    class ClosingSelector:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def register(self, *_):
+            pass
+
+        def select(self, _timeout):
+            channel._closed = True  # a close began while the write waited
+            return [('ready', 2)]
+
+    def write(fd, data):
+        if fd == descriptor:
+            writes.append(len(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(client_module.selectors, 'DefaultSelector', ClosingSelector)
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('close-in-the-wait'))
+        except Exception:  # noqa: BLE001, S110 - only whether a byte went out matters here
+            pass
+        monkeypatch.undo()
+        assert writes == [], f'the write went on after the close began: {writes}'
+    finally:
+        monkeypatch.undo()
+        channel._closed = False
+        channel.close()
+
+
+def test_a_close_that_lands_between_the_look_and_the_write_lets_no_byte_out_after_it(monkeypatch):
+    """A close begins after the write looked at the flag and before it wrote: no byte goes out once the close has
+    set its flag; the write either goes before the flag is set or not at all."""
+    import kelmo.client as client_module
+    channel = MuxChannel(command(), timeout=2)
+    channel.grace = 0
+    descriptor = channel.process.stdin.fileno()
+    real_write, after_close, closer = os.write, [], []
+
+    def write(fd, data):
+        if fd == descriptor and not closer:
+            thread = threading.Thread(target=channel.close, daemon=True)
+            closer.append(thread)
+            thread.start()  # the close begins now, after the write's last look at the flag
+            stop = time.monotonic() + 0.5
+            while not channel._closed and time.monotonic() < stop:
+                time.sleep(0.005)
+        if fd == descriptor and channel._closed:
+            after_close.append(len(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('close-before-the-write'))
+        except Exception:  # noqa: BLE001, S110 - only whether a byte went out after the flag matters here
+            pass
+        monkeypatch.undo()
+        assert after_close == [], f'bytes went out after the close set its flag: {after_close}'
+    finally:
+        monkeypatch.undo()
+        for thread in closer:
+            thread.join(5)
         channel.close()

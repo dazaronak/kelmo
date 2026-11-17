@@ -609,6 +609,9 @@ class MuxChannel:
     # Requests in a row that ran out of time with no reply to anyone in between: the channel is then taken
     # for stuck and replaced, although its process still runs.
     STALL_TIMEOUTS = 3
+    # How long a write waits for room in the pipe before it looks again whether the channel was closed: the close
+    # takes the pipe only from a writer that has stopped, so it waits about this long for one.
+    WRITE_POLL_SECONDS = 0.05
 
     def __init__(self, command, timeout):
         self.timeout = timeout
@@ -617,6 +620,7 @@ class MuxChannel:
         self._state_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._flag_lock = threading.Lock()  # around setting `_closed` and each os.write that checked it
         self._waiters = {}
         self._hello = threading.Event()
         self._hello_result = None
@@ -762,31 +766,48 @@ class MuxChannel:
         }
 
     def _write(self, data, deadline):
-        """The whole frame within the deadline, the wait for another thread's write included. A deadline missed
-        before any byte went out raises E_TRANSPORT with `partial` False; the channel stays usable."""
-        if not self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
-            error.partial = False
-            raise error
-        written = 0
+        """Writes one frame within the deadline, the wait for another thread's write included. A deadline missed
+        before any byte went out raises E_TRANSPORT with `partial` False; the channel stays usable. The pipe's
+        descriptor is used only under the write lock, which `close` takes before it closes the pipe, so no byte goes
+        to a number another open may have taken; a close stops the write between two looks at the pipe."""
+        view = memoryview(data)
+        written, held = 0, False
         try:
+            held = self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+            if not held:
+                error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
+                error.partial = False
+                raise error
+            if self._closed:
+                raise ValueError('The channel was closed before the frame.')
             descriptor = self.process.stdin.fileno()
-            view = memoryview(data)
             with selectors.DefaultSelector() as selector:
                 selector.register(descriptor, selectors.EVENT_WRITE)
                 while view:
+                    if self._closed:
+                        if not written:
+                            raise ValueError('The channel was closed before the frame.')
+                        error = KelmoError('E_TRANSPORT', 'The channel was closed during the request.')
+                        error.partial = True
+                        raise error
                     remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not selector.select(remaining):
+                    if remaining <= 0:
                         error = KelmoError('E_TRANSPORT',
                                            'The channel did not accept the request before its deadline.')
                         error.partial = written > 0
                         raise error
-                    try:
-                        count = os.write(descriptor, view)
-                        written += count
-                        view = view[count:]
-                    except BlockingIOError:
-                        continue
+                    if not selector.select(min(remaining, self.WRITE_POLL_SECONDS)) or self._closed:
+                        continue  # a close that came during the wait is seen at the top, before another byte
+                    with self._flag_lock:
+                        # `close` sets the flag under this lock: once it is set, no byte goes out.
+                        if self._closed:
+                            continue
+                        try:
+                            count = os.write(descriptor, view)
+                        except BlockingIOError:
+                            continue
+                    written += count
+                    view = view[count:]
         except (ValueError, OSError) as error:
             if not written:
                 raise  # closed before the frame: nothing written
@@ -795,7 +816,8 @@ class MuxChannel:
             partial.partial = True
             raise partial from error
         finally:
-            self._write_lock.release()
+            if held:
+                self._write_lock.release()
 
     def _read(self):
         reader = wire.FrameReader()
@@ -849,23 +871,25 @@ class MuxChannel:
         with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
+            with self._flag_lock:  # waits at most for one non-blocking os.write in progress
+                self._closed = True
             self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
-            if self.process.poll() is None:
+            # A write in progress sees `_closed` within WRITE_POLL_SECONDS and lets the lock go.
+            with self._write_lock:
                 try:
                     self.process.stdin.close()
                 except (OSError, ValueError):
                     pass
+            if self.process.poll() is None:
                 try:
                     self.process.wait(timeout=self.grace)
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait()
-            for stream in (self.process.stdin, self.process.stdout):
-                try:
-                    stream.close()
-                except (OSError, ValueError):
-                    pass
+            try:
+                self.process.stdout.close()
+            except (OSError, ValueError):
+                pass
 
 
 def _git(cwd, *args, deadline=None):
