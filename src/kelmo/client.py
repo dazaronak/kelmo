@@ -1344,9 +1344,9 @@ class SharedClient:
         """Deliver pending entries in order. A bound refusal the server calls final settles its entry; a
         retryable one, or no verdict at all (launcher, channel, hello, a reply bound to no request), leaves
         it and everything after it pending and stops. `reached` says whether a channel was open. `pending`
-        is None when the outbox stayed held. Without `wait_for_holder`, an outbox whose pending count another
-        caller keeps from being read within the pre-check's bound ends the call with `E_BUSY`, leaving the
-        delivery to that caller; once counted, the delivery waits for the owner of the outbox as usual."""
+        is None when the outbox stayed held. Without `wait_for_holder` (a background pass), the outbox is taken
+        with one try: an outbox another caller holds, or waits for, ends the call with `E_BUSY` at once, leaving
+        the delivery to that caller."""
         if self._multiplex:
             pending = self._pending_within()
             if pending == 0:
@@ -1355,17 +1355,30 @@ class SharedClient:
                 return {'delivered': 0, 'refused': [], 'pending': 0, 'stopped': None, 'reached': None}
             if pending is None and not wait_for_holder:
                 return {'delivered': 0, 'refused': [], 'pending': None, 'stopped': 'E_BUSY', 'reached': None}
+        if not wait_for_holder:
+            if not self._lock.acquire(blocking=False):
+                return {'delivered': 0, 'refused': [], 'pending': pending if self._multiplex else None,
+                        'stopped': 'E_BUSY', 'reached': None}
+            try:
+                return self._flush_owned()
+            finally:
+                self._lock.release()
         try:
             with self._lock:
-                try:
-                    with self._flush_lock() as acquired:
-                        if acquired:
-                            return self._deliver()
-                        stopped = 'E_BUSY'
-                except Unbound as error:  # the deadline passed before the lock was even tried
-                    stopped = error.code
+                return self._flush_owned()
         except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
-            stopped = 'E_BUSY'
+            return {'delivered': 0, 'refused': [], 'pending': self._pending_within(), 'stopped': 'E_BUSY',
+                    'reached': None}
+
+    def _flush_owned(self):
+        """The delivery once the owner of the outbox is held: one flusher per client root across processes."""
+        try:
+            with self._flush_lock() as acquired:
+                if acquired:
+                    return self._deliver()
+                stopped = 'E_BUSY'
+        except Unbound as error:  # the deadline passed before the lock was even tried
+            stopped = error.code
         return {'delivered': 0, 'refused': [], 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': None}
 
