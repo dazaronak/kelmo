@@ -1571,10 +1571,6 @@ class KeysInFlight:
             with self._lock:
                 self._keys.discard(key)
 
-    def running(self, key):
-        with self._lock:
-            return key in self._keys
-
     def __len__(self):
         with self._lock:
             return len(self._keys)
@@ -1756,8 +1752,8 @@ class ClientSession:
         (a profile made again under the same client id). The chain is the client's: the key cut at its first
         `#resend`, numbered from 1 after any number the client does not write itself. A successor counts only
         when it carries the same request (resend sends it unchanged) and was recorded after the refusal it
-        resends. A successor whose attempt is still running is answered busy; one abandoned by a process that is
-        gone is run again under its own key, and its outcome answers."""
+        resends. A successor still open is run under its own key: a live attempt of it is answered busy by the
+        row's lock, one abandoned by a process that is gone is run again, and its outcome answers."""
         reply = json.loads(row['reply'])
         if reply.get('ok') is not False:
             return dict(reply, replayed=True)
@@ -1773,9 +1769,6 @@ class ClientSession:
                     or stored['created_at'] <= (before['finished_at'] or before['created_at'])):
                 break
             if stored['state'] != 'finished':
-                if self._attempt_running(request_key):
-                    raise KelmoError('E_BUSY', 'The note this request was resent as is still running; it '
-                                              'stays queued.')
                 # Its effect may be done: never answered with the refusal it resent. The archive deduplicates the
                 # key, so running it again is safe.
                 return dict(self._mutate(op, args, successor_key), replayed=True)
@@ -1783,25 +1776,6 @@ class ClientSession:
             if reply.get('ok') is not False:
                 break
         return dict(reply, replayed=True)
-
-    def _attempt_running(self, request_key):
-        """Whether a live attempt holds this request now: the state core's table of keys in flight, or the row's
-        lock file locked by a process that is still there."""
-        if self.keys_in_flight is not None:
-            return self.keys_in_flight.running(request_key)
-        import fcntl
-        path = self.service.config.internal('.state/client-requests/' + request_key + '.lock')
-        try:
-            descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            return False
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        finally:
-            os.close(descriptor)
-        return False
 
     @contextmanager
     def _request_lock(self, request_key):
