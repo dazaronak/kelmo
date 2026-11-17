@@ -283,6 +283,23 @@ entry here.
     as a use; the one-line marker of an unchanged prompt does not.
   - The sweep skips a `hub-sessions/` or `hub-context/` folder that is a link, and any file there that is
     one.
+- A shared client cleans up its own files. Each publication installed a new set of HOT files under the
+  client's `hot/`, and nothing there, in `cache/`, `hub-sessions/` or `hub-context/` was ever removed, so
+  the state directory only grew. When it installs a HOT set, the client now sweeps them at most once a day:
+  - HOT sets older than two days go. The eight newest whatever their age (the current set among them),
+    every set a cached context names, and every set a session's delivery gave a path into while that
+    session's record is younger than 30 days stay; a set installed again counts as new. A local vault runs
+    the same daily sweep from its start and prompt hooks, also when its context fits and no set is
+    installed. An offline delivery whose set was removed says that no cached generation is left.
+  - A cached context no delivery, online or from the cache, has used for 30 days goes, and with it the
+    hold on its set. That binding has no offline fallback until its next delivery.
+  - A session's delivery record no delivery has written for 30 days goes. Such a session, if it resumes,
+    gets the whole context once, after a notice that Kelmo has no record of what it was given and that a
+    restart clears facts removed or contradicted since.
+  - A saved context reference no delivery has shown for 30 days goes. A delivery that shows it again counts
+    as a use; the one-line marker of an unchanged prompt does not.
+  - The sweep skips a `hub-sessions/` or `hub-context/` folder that is a link, and any file there that is
+    one.
 
 ## [0.3.2] - 2026-11-16
 

@@ -434,17 +434,21 @@ def session_state(root, payload, provider):
 
 
 RESTART_WARNING = 'Kelmo context changed. Restart the session if removed or contradicted facts remain in context.\n\n'
+# A resumed session whose delivery record is gone (the sweep removes a record unwritten for 30 days): what it was
+# given before is unknown, so it is told so instead of silently getting the whole context as a new session does.
+RESUME_WARNING = ('Kelmo has no record of the context this resumed session was given. Restart the session if '
+                  'removed or contradicted facts remain in context.\n\n')
 
 
 def refresh(state_path, bundle, *, verified, stale=False, compacted=False, identity=None, core=None,
-            marker='', pending_only=''):
+            marker='', pending_only='', resumed=False):
     """Return context and a zero-argument acknowledgement to invoke after successful output.
 
     The session record holds the digest of the last delivered identity and, when `core` is given,
     of the identity without its pending block. A verified, unchanged bundle is replaced by `marker`
     (empty by default). A verified bundle whose only change is the pending block is replaced by
     `pending_only` when given. The restart warning precedes a bundle whose core changed; a pending
-    block alone removes or contradicts nothing.
+    block alone removes or contradicts nothing. A `resumed` session with no record gets RESUME_WARNING first.
     """
     state_path = Path(state_path)
     digest = _hash((bundle if identity is None else identity).encode('utf-8'))
@@ -466,6 +470,8 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
         context = bundle
         if context and previous and changed and core_changed:
             context = RESTART_WARNING + context
+        elif context and previous is None and resumed:
+            context = RESUME_WARNING + context
 
     def commit(pointed=None):
         """`pointed`: the set this delivery's answer gave a path into; a marker that gives none keeps the
@@ -533,8 +539,11 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
         except (OSError, ValueError, AttributeError):
             pass
     reserve = sum(len(part) + 2 for part in (repair, notice) if part)
+    resumed = action == 'start' and payload.get('source') == 'resume'
     if previous and previous != _hash(identity.encode('utf-8')):
         reserve += len(RESTART_WARNING)
+    elif previous is None and resumed and state is not None and acknowledge is not None:
+        reserve += len(RESUME_WARNING)
     complete = provider != 'claude' or len(full) <= 10000 - reserve
     reference = None
     if not complete:
@@ -576,6 +585,7 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
                 repair, notice) if part)
         update = refresh(state, context, verified=verified, stale=stale,
                          compacted=action == 'start' or payload.get('source') in ('compact', 'compaction'),
+                         resumed=resumed,
                          identity=identity, core=core_identity,
                          marker=unchanged_marker(snapshot, project, installed) if hook_mode else '',
                          pending_only=pending_only)
