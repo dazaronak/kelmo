@@ -509,8 +509,8 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
 
 GIVE_BACK_TRIES = 3
 GIVE_BACK_PAUSE_SECONDS = 0.2
-# A busy refusal has already waited out the journal's own timeout (30 s); another try starts only this soon after
-# the first, so the give-back stays inside kelmod's drain deadline.
+# The give-back's share of kelmod's drain deadline. Another try starts only when one more try as long as the last
+# (a busy refusal waits out the journal's own 30 s timeout) still ends inside it.
 GIVE_BACK_SECONDS = 35.0
 
 
@@ -520,13 +520,15 @@ def _give_back(queue, request):
     expire with its lease. The stop stays a stop either way."""
     started = time.monotonic()
     for attempt in range(1, GIVE_BACK_TRIES + 1):
+        tried = time.monotonic()
         try:
             queue.release_busy(request['id'], request['token'])
             return
         except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
             _end_open_transaction(queue)
+            now = time.monotonic()
             if (sqlite_busy(error) and attempt < GIVE_BACK_TRIES
-                    and time.monotonic() - started < GIVE_BACK_SECONDS):
+                    and now - started + GIVE_BACK_PAUSE_SECONDS + (now - tried) < GIVE_BACK_SECONDS):
                 time.sleep(GIVE_BACK_PAUSE_SECONDS)
                 continue
             try:

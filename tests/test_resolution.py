@@ -372,6 +372,29 @@ def test_a_give_back_is_not_tried_again_past_its_share_of_the_stop(service, monk
     assert len(calls) == 1, calls
 
 
+def test_a_give_back_whose_busy_refusal_waited_out_the_journal_is_not_tried_again(service, monkeypatch):
+    """A busy refusal that took the journal's whole 30 s wait leaves no room in the stop for a second such wait:
+    another try would run past kelmod's drain deadline and the core would be killed in it."""
+    import sqlite3
+    import time
+    import types
+    pending(service)
+    now = [1000.0]
+    clock = types.SimpleNamespace(**{name: getattr(time, name) for name in dir(time) if not name.startswith('_')})
+    clock.monotonic = lambda: now[0]
+    clock.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+    monkeypatch.setattr('kelmo.daemon.time', clock)
+    calls = []
+
+    def busy_after_the_journal_wait(self, *args, **kwargs):
+        calls.append(1)
+        now[0] += 30.0  # the journal's own busy timeout ran out
+        raise sqlite3.OperationalError('database is locked')
+
+    _stopped_tick(service, monkeypatch, busy_after_the_journal_wait)
+    assert len(calls) == 1, calls
+
+
 def test_a_give_back_that_cannot_be_reported_still_raises_the_stop(service, monkeypatch):
     import io
     import sqlite3
