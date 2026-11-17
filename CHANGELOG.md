@@ -13,7 +13,9 @@ entry here.
   and says how many of the collected cases passed before its summary line. When `GITHUB_STEP_SUMMARY` names a
   file, it appends the result there, so a GitHub run shows it on the job's page. The summary line is unchanged
   and still last. Its progress and its check that every case ran now count cases rather than pytest's outcomes,
-  so a case that passed and then failed in its teardown no longer hides a case that never ran.
+  so a case that passed and then failed in its teardown no longer hides a case that never ran. The
+  measurement gate (`bash run-tests.sh`) shows those collected and progress lines as they come, while the
+  source suite still runs, instead of only after the section ended.
 
 ## [0.3.1] - 2026-11-15
 

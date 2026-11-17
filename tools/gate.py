@@ -301,12 +301,14 @@ def die(message):
     raise SystemExit(2)
 
 
-def run_child(argv, cwd, env=None):
+def run_child(argv, cwd, env=None, echo=None):
     """Every child of the gate runs with stdin closed: a tool that reads stdin must not inherit a terminal.
     Each one also gets a process group of its own, which is what lets the runner kill the tool and everything
     that tool started when a section runs past its limit: a child left in the runner's own group could only be
     killed together with the runner. A section that names `env` hands the child the values it asked for on top
-    of this process's own, which is how a prerequisite the gate probed reaches the script that needs it."""
+    of this process's own, which is how a prerequisite the gate probed reaches the script that needs it. `echo`,
+    a compiled pattern, shows the lines of the child's output it matches as they come (a long suite's progress)
+    while every line is still kept for the section's verdict."""
     try:
         proc = subprocess.Popen([str(part) for part in argv], cwd=str(cwd), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
@@ -315,7 +317,10 @@ def run_child(argv, cwd, env=None):
         raise MissingProgram(argv, exc)
     CHILDREN.append(proc)
     try:
-        stdout, stderr = proc.communicate()
+        if echo is None:
+            stdout, stderr = proc.communicate()
+        else:
+            stdout, stderr = _echoed(proc, echo)
     except SectionTimeout:
         for stream in (proc.stdout, proc.stderr):
             if stream is not None:
@@ -325,6 +330,33 @@ def run_child(argv, cwd, env=None):
     finally:
         CHILDREN.remove(proc)
     return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+
+def _echoed(proc, echo):
+    """Reads both streams to their ends, each on a thread of its own so neither pipe fills, and prints each line
+    the pattern matches as soon as it arrives. Returns the two texts, as communicate() would."""
+    import threading
+    kept = {'out': [], 'err': []}
+    lock = threading.Lock()
+
+    def drain(stream, name):
+        try:
+            for line in stream:
+                kept[name].append(line)
+                if echo.search(line.rstrip('\n')):
+                    with lock:
+                        print('       %s' % line.rstrip('\n'), flush=True)
+        except (OSError, ValueError):
+            pass  # the stream was closed under it: the section ran past its limit
+
+    readers = [threading.Thread(target=drain, args=(proc.stdout, 'out'), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, 'err'), daemon=True)]
+    for reader in readers:
+        reader.start()
+    proc.wait()
+    for reader in readers:
+        reader.join()
+    return ''.join(kept['out']), ''.join(kept['err'])
 
 
 PROGRAM_NEEDS = ('command', 'python', 'bash32', 'file', 'env-program')  # the capabilities that resolve to a program
@@ -506,6 +538,12 @@ def load_gate(folder):
                 die('%s section %s is a runner section with no runners list' % (path, section['name']))
             for entry in runners:
                 argv = entry.get('argv') if isinstance(entry, dict) else None
+                if isinstance(entry, dict) and 'echo' in entry:
+                    try:
+                        re.compile(entry['echo'])
+                    except (re.error, TypeError) as exc:
+                        die('%s section %s names echo %r, which is not a regex: %s'
+                            % (path, section['name'], entry['echo'], exc))
                 check_argv(path, section, gate, argv, folder,
                            child_dir(folder, entry, path, section['name']))
         if section['kind'] == 'command':
@@ -1114,9 +1152,10 @@ def run_runner(section, folder, needs, report):
     for entry in section.get('runners', []):
         raw = entry['argv']
         label = entry.get('label') or ' '.join(raw)
+        echo = re.compile(entry['echo']) if entry.get('echo') else None
         try:
             result = run_child(resolve_argv(raw, needs), child_dir(folder, entry),
-                               env=resolve_env(section, needs))
+                               env=resolve_env(section, needs), echo=echo)
         except MissingProgram as exc:
             report.fail(label, 'names %s, which this machine cannot run: %s' % (exc.argv[0], exc.error))
             continue
