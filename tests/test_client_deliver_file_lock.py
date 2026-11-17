@@ -118,9 +118,11 @@ def test_an_answer_the_file_cannot_take_in_time_is_answered_again_under_its_key_
 
 
 def test_an_answer_is_recorded_though_the_file_stays_held_past_the_outbox_wait(shared):
-    """The file stays held for a second within the pass's deadline: the answer is recorded once the file is free,
-    never left pending to be sent again."""
+    """The file stays held for a second, longer than the outbox's own wait (made short here) and within the pass's
+    deadline: the answer is recorded once the file is free, never left pending to be sent again."""
     client = shared.client()
+    # The outbox's own wait made short: an answer recorded outside the pass's bounded wait would fail at 0.2 s.
+    client.outbox.conn.execute('PRAGMA busy_timeout = 200')
     client.outbox.enqueue('capture', ARGS, 'answered-long-held')
     real = client._send
 
@@ -224,6 +226,8 @@ def test_an_attempt_whose_commit_a_reader_kept_back_is_never_counted_later(share
 def test_a_cut_recorded_behind_a_reader_counts_once(shared):
     client = shared.client()
     client.outbox.enqueue('capture', ARGS, 'cut-behind-reader')
+    # The outbox's own wait made short: a cut recorded outside `_record`'s bounded wait would fail at 0.2 s.
+    client.outbox.conn.execute('PRAGMA busy_timeout = 200')
     other = _reader(client)
     threading.Timer(1.0, lambda: (other.rollback(), other.close())).start()
     assert client._record(client.outbox.cut, 'cut-behind-reader') == 1
@@ -317,6 +321,8 @@ def test_an_answer_that_cannot_be_recorded_within_the_deadline_ends_the_pass_and
     E_BUSY and leaves the entry pending, so the server answers its key again on a later pass, instead of waiting for
     as long as that process holds the file."""
     client = shared.client()
+    # The outbox's own wait made short: only the pass's deadline decides how long the answer waits.
+    client.outbox.conn.execute('PRAGMA busy_timeout = 100')
     client.outbox.enqueue('capture', ARGS, 'answered-never-recorded')
     real, holders = client._send, []
 

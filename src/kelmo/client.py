@@ -1554,8 +1554,8 @@ class SharedClient:
             raise KelmoError(outcome['code'], outcome['message'])
         return {'queued': True, 'accepted': False, 'op': entry['op'], 'idempotency_key': entry['idempotency_key'],
                 'pending_reason': entry['last_error'],
-                'next_step': 'Stored in the local outbox; it is delivered under the same key on the next '
-                             'successful contact and is not accepted until then.'}
+                'next_step': 'Stored in the local outbox; it is delivered, or the server\'s answer to it is '
+                             'recorded, under the same key on the next successful contact.'}
 
     def local_status(self):
         return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary_within(self._seconds_left())}
