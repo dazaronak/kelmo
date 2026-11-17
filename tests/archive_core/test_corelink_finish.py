@@ -4,7 +4,7 @@ import socket
 import threading
 import time
 import uuid
-from concurrent.futures import Future, wait
+from concurrent.futures import wait
 
 import pytest
 
@@ -88,16 +88,18 @@ def test_a_call_made_after_the_socket_closed_fails_with_e_transport():
         parent.close()
 
 
-def test_a_call_whose_send_fails_after_the_swap_returns_its_failed_future():
+def test_a_call_whose_send_fails_after_the_swap_returns_its_failed_future(monkeypatch):
+    import kelmo.core.corelink as corelink
     parent, child = socket.socketpair()
     link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    real = corelink.wire.encode
 
-    def send(header, body=None):
-        # The channel finishes between the registration and the send, then the send fails.
+    def encode(header, body):
+        # The channel finishes between the registration and the send.
         link._finish()
-        raise OSError('the channel is closed')
+        return real(header, body)
 
-    link.send = send
+    monkeypatch.setattr(corelink.wire, 'encode', encode)
     try:
         try:
             future = call(link)
@@ -108,30 +110,12 @@ def test_a_call_whose_send_fails_after_the_swap_returns_its_failed_future():
         parent.close()
 
 
-def test_a_send_failure_racing_the_finish_returns_one_failed_future(monkeypatch):
-    """The channel finishes on the reader thread while the send path handles its own failure: the finish has
-    taken the call and checks it, and the send path checks it too. Exactly one of them fails it."""
-    import kelmo.core.corelink as corelink
+def test_a_send_failure_racing_the_finish_returns_one_failed_future():
+    """The channel finishes on another thread while the send path handles its own failure: whichever of them
+    fails the call first, the other's try changes nothing and raises nothing."""
     parent, child = socket.socketpair()
     link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
-    swapped, checked = threading.Event(), threading.Event()
-    armed, errors = {'caller': False, 'finisher': True}, []
-
-    class RacingFuture(Future):
-        def done(self):
-            if threading.current_thread() is finisher and armed['finisher']:
-                armed['finisher'] = False
-                swapped.set()  # the finish has taken the open calls and is about to fail this one
-                checked.wait(2)  # the send path looks at the call in this window
-                return False
-            if threading.current_thread() is not finisher and armed['caller']:
-                armed['caller'] = False
-                checked.set()
-                deadline = time.monotonic() + 2
-                while not super().done() and time.monotonic() < deadline:
-                    time.sleep(0.01)  # the finish fails the call first
-                return False
-            return super().done()
+    errors = []
 
     def finish():
         try:
@@ -141,17 +125,13 @@ def test_a_send_failure_racing_the_finish_returns_one_failed_future(monkeypatch)
 
     finisher = threading.Thread(target=finish, daemon=True)
 
-    def send(header, body=None):
-        finisher.start()
-        assert swapped.wait(5)
-        armed['caller'] = True
+    def write(data):
+        finisher.start()  # it takes the write lock once this failed write lets it go
         raise OSError('the channel is closed')
 
-    monkeypatch.setattr(corelink, 'Future', RacingFuture)
-    link.send = send
+    link._write_locked = write
     try:
         future = call(link)
-        armed['caller'] = False
         assert failure(future, 5) == 'E_TRANSPORT'
         finisher.join(10)
         assert errors == [], 'the finish failed on a call the send path had already failed'

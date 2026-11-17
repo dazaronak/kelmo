@@ -1,0 +1,197 @@
+"""A core's write to kelmod that fails part-way through a frame ends the channel: a frame never follows a broken
+one. A write that fails before any byte went out fails its call alone."""
+import errno
+import socket
+import threading
+import uuid
+
+from kelmo.core import corelink, wire
+from kelmo.core.context import Context
+from kelmo.core.corelink import CoreLink
+
+
+class HalfThenFull(socket.socket):
+    """A real socket whose first send writes half the frame and whose next send fails with no buffer space."""
+    sends = 0
+
+    def send(self, data, *args):
+        type(self).sends += 1
+        if type(self).sends == 1:
+            return super().send(bytes(data[:len(data) // 2]), *args)
+        raise OSError(errno.ENOBUFS, 'No buffer space available')
+
+
+class FullOnce(socket.socket):
+    """A real socket whose first send fails with nothing written; later sends write normally."""
+    failed = False
+
+    def send(self, data, *args):
+        if not type(self).failed:
+            type(self).failed = True
+            raise OSError(errno.ENOBUFS, 'No buffer space available')
+        return super().send(data, *args)
+
+
+def _link(cls):
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    raw = link.sock
+    link.sock = cls(raw.family, raw.type, fileno=raw.detach())
+    return parent, link
+
+
+def _drain(parent, seconds=1.0):
+    return _drain_to_end(parent, seconds)[0]
+
+
+def _drain_to_end(parent, seconds=1.0):
+    """What kelmod's end reads within `seconds`, and whether it read the end of the stream."""
+    parent.settimeout(seconds)
+    data = b''
+    try:
+        while chunk := parent.recv(65536):
+            data += chunk
+    except TimeoutError:
+        return data, False
+    return data, True
+
+
+def test_a_frame_cut_part_way_ends_the_channel_and_no_frame_follows_it():
+    HalfThenFull.sends = 0
+    parent, link = _link(HalfThenFull)
+    order = []
+    link.begin_stop = lambda: order.append('stop')
+    try:
+        first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+        order.append('failed' if first.done() and first.exception() is not None else 'waiting')
+        second = link.call('archive.echo', {'n': 2}, Context.local(uuid.uuid4().hex, 30))
+        assert second.done() and second.exception().code == 'E_TRANSPORT', 'a call after the broken frame was written and waits for a reply'
+        assert order[:2] == ['stop', 'failed'], order
+        assert HalfThenFull.sends == 2, f'a call after the broken frame wrote again ({HalfThenFull.sends} sends)'
+        received, ended = _drain_to_end(parent)
+        assert ended, 'kelmod did not see the end of the channel after the broken frame'
+        whole = len(wire.encode({'v': wire.VERSION, 'kind': 'call', 'id': uuid.uuid4().hex, 'op': 'archive.echo',
+                                 'body_type': 'json', 'deadline_ms': 1}, {'n': 1}))
+        assert len(received) < whole, 'kelmod received more than the broken frame'
+    finally:
+        parent.close()
+        link.sock.close()
+
+
+def test_a_write_that_fails_before_any_byte_fails_its_call_alone():
+    FullOnce.failed = False
+    parent, link = _link(FullOnce)
+    stops = []
+    link.begin_stop = lambda: stops.append('stop')
+    try:
+        first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+        assert first.done() and first.exception().code == 'E_TRANSPORT', 'the unsent call was left waiting'
+        link.call('archive.echo', {'n': 2}, Context.local(uuid.uuid4().hex, 30))
+        assert stops == [] and not link._stopping.is_set(), stops
+        header, body = wire.decode(_drain(parent))
+        assert (header['op'], body) == ('archive.echo', {'n': 2}), (header, body)
+    finally:
+        parent.close()
+        link.sock.close()
+
+
+def test_a_confined_channel_frame_cut_part_way_ends_the_channel(monkeypatch):
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), confined=True, handlers={}, lanes={'read': 1})
+    channel = link.sock
+    order, writes = [], []
+    link.begin_stop = lambda: order.append('stop')
+    real_write = corelink.os.write
+
+    def write(fd, data):
+        if fd != channel.fd:
+            return real_write(fd, data)
+        writes.append(len(data))
+        if len(writes) == 1:
+            return real_write(fd, bytes(data[:len(data) // 2]))
+        raise OSError(errno.ENOBUFS, 'No buffer space available')
+
+    monkeypatch.setattr(corelink.os, 'write', write)
+    try:
+        first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+        order.append('failed' if first.done() and first.exception() is not None else 'waiting')
+        link.call('archive.echo', {'n': 2}, Context.local(uuid.uuid4().hex, 30))
+        assert order[:2] == ['stop', 'failed'], order
+        assert len(writes) == 2, f'a call after the broken frame wrote again ({writes})'
+    finally:
+        monkeypatch.undo()
+        parent.close()
+        channel.close()
+
+
+def test_a_confined_channel_ended_for_writing_still_reads_the_replies_on_their_way():
+    """A frame cut short ends a confined channel for writing only: a reply kelmod already sent is still read."""
+    parent, child = socket.socketpair()
+    channel = corelink.DescriptorChannel(child.detach())
+    try:
+        parent.sendall(b'reply')
+        channel.shutdown(socket.SHUT_WR)
+        assert channel.recv(5) == b'reply', 'the reader took the write shutdown for the end of the channel'
+        channel.shutdown(socket.SHUT_RDWR)
+        assert channel.recv(5) == b'', 'a full shutdown still wakes the reader'
+    finally:
+        channel.close()
+        parent.close()
+
+
+def test_a_confined_channel_whose_frame_was_cut_ends_so_kelmod_sees_the_end(monkeypatch):
+    """A confined core cannot half-close its descriptor, and kelmod's reader waits for the rest of a cut frame: the
+    channel still ends shortly after the cut, so kelmod sees the end of the stream and starts the core again."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), confined=True, handlers={}, lanes={'read': 1})
+    link.hold_hello = True  # the test plays kelmod's side by hand
+    channel = link.sock
+    writes = []
+    real_write = corelink.os.write
+
+    def write(fd, data):
+        if fd != channel.fd:
+            return real_write(fd, data)
+        writes.append(len(data))
+        if len(writes) == 1:
+            return real_write(fd, bytes(data[:len(data) // 2]))
+        raise OSError(errno.ENOBUFS, 'No buffer space available')
+
+    monkeypatch.setattr(corelink.os, 'write', write)
+    reader = threading.Thread(target=link.serve, daemon=True)
+    reader.start()
+    ended = False
+    try:
+        first = link.call('archive.echo', {'n': 1}, Context.local(uuid.uuid4().hex, 30))
+        assert first.exception(5).code == 'E_TRANSPORT'
+        parent.settimeout(5)
+        try:
+            while parent.recv(65536):
+                pass
+            ended = True
+        except TimeoutError:
+            pass
+        assert ended, 'kelmod never saw the end of a confined channel whose frame was cut'
+        reader.join(5)
+        assert not reader.is_alive(), 'the core kept serving a channel whose frame was cut'
+    finally:
+        monkeypatch.undo()
+        parent.close()
+        reader.join(5)
+
+
+def test_a_reply_ready_when_the_drain_ends_is_still_read(monkeypatch):
+    """The drain's wake and a reply are ready at once: the reply is read first, then the channel ends."""
+    import time
+    monkeypatch.setattr(corelink, 'CONFINED_DRAIN_SECONDS', 0.0)
+    parent, child = socket.socketpair()
+    channel = corelink.DescriptorChannel(child.detach())
+    try:
+        parent.sendall(b'reply')
+        channel.shutdown(socket.SHUT_WR)
+        time.sleep(0.2)  # the drain has ended: its wake is written while the reply waits
+        assert channel.recv(5) == b'reply', 'the drain ended the channel over a reply ready at the same moment'
+        assert channel.recv(5) == b'', 'the channel did not end after the reply'
+    finally:
+        channel.close()
+        parent.close()

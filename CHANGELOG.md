@@ -119,6 +119,23 @@ entry here.
   its generation. A transcript file that the client replaces, while its old spool is still there, starts a
   new generation as before. The journal still records the spool's inode, so sessions recorded by an older
   server go on as before, and a server rolled back to an older build continues them too.
+- A core whose call finds kelmod gone now lets the replies kelmod sent before closing reach their calls before
+  the core is told to stop (it waits up to a second for the channel's end). Before, a task whose reply was
+  still in the channel could meet the stop first, and a write without a key ran again at the next start.
+- A core whose write to kelmod fails part-way through a frame no longer goes on writing after the broken
+  frame. Its channel ends for writing at once: a core that runs background work (the state core) hears of the
+  stop before the call fails, every later call fails and every later reply is dropped without a byte
+  written, and kelmod sees the channel end instead of a frame that goes on. A confined core, which cannot
+  half-close its channel, reads the replies on their way for about a second more, then stops reading and
+  closes the channel once its running handlers have finished. A write that fails before any byte went out,
+  with an error that does not say kelmod is gone, still fails that call alone.
+- The state core now counts a call to another core that fails on the write to kelmod's channel (kelmod has
+  closed it) as the stop's. The call used to fail before the core heard of the stop, so a promote note whose
+  editor call met it could still be charged an attempt. A call that cannot be encoded, or whose write fails
+  for another reason, fails alone and does not stop the core.
+- A call a core makes once it is stopping (kelmod closed its channel, or a stop finished the core's work) now
+  fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not come,
+  holding the stop for that call's deadline, about five minutes for an archive call.
 
 ### Added
 
