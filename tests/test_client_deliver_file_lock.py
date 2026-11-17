@@ -70,10 +70,19 @@ def test_a_pass_whose_attempt_cannot_be_recorded_in_time_sends_nothing(shared):
     assert (entry['state'], entry['attempts']) == ('pending', 0), entry
 
 
-def test_an_answer_the_file_cannot_take_in_time_is_answered_again_under_its_key_with_no_second_effect(shared):
+def test_an_answer_the_file_cannot_take_in_time_is_answered_again_under_its_key_with_no_second_effect(
+        shared, monkeypatch):
     """The server answered; another process then holds the file past the pass's deadline: the pass ends within its
     deadline with the entry pending, and the next pass gets the server's stored answer under the same key, so the
     entry is delivered with the first answer and the server's effect happened once."""
+    from kelmo.server import ClientSession
+    effects, write_capture = [], ClientSession.write_capture
+
+    def counted(self, **kwargs):
+        effects.append(kwargs.get('key'))
+        return write_capture(self, **kwargs)
+
+    monkeypatch.setattr(ClientSession, 'write_capture', counted)
     client = shared.client()
     client.outbox.enqueue('capture', ARGS, 'answered-late')
     holders, answers = [], []
@@ -104,14 +113,14 @@ def test_an_answer_the_file_cannot_take_in_time_is_answered_again_under_its_key_
     entry = client.outbox.get('answered-late')
     assert entry['state'] == 'delivered', (entry, result)
     assert len(answers) == 2 and answers[0] == answers[1], answers  # the stored answer, not a second effect
+    assert effects == ['answered-late'], effects  # the server ran the capture once
     assert json.loads(entry['outcome']) == answers[0][1], entry
 
 
 def test_an_answer_is_recorded_though_the_file_stays_held_past_the_outbox_wait(shared):
-    """The file stays held longer than the outbox's own wait for a lock (shortened here): the answer is still
-    recorded once the file is free, never left pending to be sent again."""
+    """The file stays held for a second within the pass's deadline: the answer is recorded once the file is free,
+    never left pending to be sent again."""
     client = shared.client()
-    client.outbox.conn.execute('PRAGMA busy_timeout = 200')  # the outbox's normal wait, made short
     client.outbox.enqueue('capture', ARGS, 'answered-long-held')
     real = client._send
 
@@ -215,7 +224,6 @@ def test_an_attempt_whose_commit_a_reader_kept_back_is_never_counted_later(share
 def test_a_cut_recorded_behind_a_reader_counts_once(shared):
     client = shared.client()
     client.outbox.enqueue('capture', ARGS, 'cut-behind-reader')
-    client.outbox.conn.execute('PRAGMA busy_timeout = 200')  # the outbox's normal wait, made short
     other = _reader(client)
     threading.Timer(1.0, lambda: (other.rollback(), other.close())).start()
     assert client._record(client.outbox.cut, 'cut-behind-reader') == 1
@@ -309,7 +317,6 @@ def test_an_answer_that_cannot_be_recorded_within_the_deadline_ends_the_pass_and
     E_BUSY and leaves the entry pending, so the server answers its key again on a later pass, instead of waiting for
     as long as that process holds the file."""
     client = shared.client()
-    client.outbox.conn.execute('PRAGMA busy_timeout = 100')  # the outbox's normal wait, made short
     client.outbox.enqueue('capture', ARGS, 'answered-never-recorded')
     real, holders = client._send, []
 
@@ -318,7 +325,7 @@ def test_an_answer_that_cannot_be_recorded_within_the_deadline_ends_the_pass_and
         if op == 'capture':
             other = _holder(client, 'IMMEDIATE')
             holders.append(other)
-            threading.Timer(3.0, lambda: (other.rollback(), other.close())).start()  # lets go well past the ceiling
+            threading.Timer(3.0, lambda: (other.rollback(), other.close())).start()  # lets go well past the deadline
         return answer
 
     client._send = send
@@ -332,3 +339,37 @@ def test_an_answer_that_cannot_be_recorded_within_the_deadline_ends_the_pass_and
     assert took < 2.0, f'the pass waited {took:.2f} s to record an answer past its 0.5 s deadline'
     assert result['stopped'] == 'E_BUSY' and result['delivered'] == 0, result
     assert client.outbox.get('answered-never-recorded')['state'] == 'pending'
+
+
+def test_an_answer_held_by_a_writer_then_a_reader_still_ends_the_pass_within_its_deadline(shared):
+    """After the server answered, another process holds the file's write lock for most of the pass's time left,
+    and a reader then keeps the commit back: the settle's commit waits only for what is left of the deadline, so the
+    pass ends with E_BUSY on time and the entry stays pending for the server's stored answer."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'writer-then-reader')
+    others = []
+    real = client._send
+
+    def send(channel, op, args, key, *rest, **kwargs):
+        answer = real(channel, op, args, key, *rest, **kwargs)
+        if op == 'capture' and not others:
+            writer = _holder(client, 'IMMEDIATE')
+            reader = _reader(client)
+            others.extend([writer, reader])
+            threading.Timer(0.7, writer.rollback).start()
+            threading.Timer(3.0, reader.rollback).start()
+        return answer
+
+    client._send = send
+    try:
+        result, took = _flush_within(client, 1.0)
+        assert took < 1.5, f'the pass waited {took:.2f} s to record an answer past its 1 s deadline'
+        assert result['stopped'] == 'E_BUSY' and result['reached'] is not True, result
+    finally:
+        time.sleep(max(0.0, 3.2 - took))  # both holders have let go
+        for other in others:
+            other.close()
+    assert client.outbox.get('writer-then-reader')['state'] == 'pending'
+    with client.deadline(5.0):  # the refused commit left no transaction open: the next pass records the answer
+        client.flush()
+    assert client.outbox.get('writer-then-reader')['state'] == 'delivered'

@@ -438,7 +438,9 @@ class Outbox:
         a busy file never counts one cut twice."""
         with self.conn:
             self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
-            return self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
+            cuts = self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
+            self._rest_of_wait()
+            return cuts
 
     @_serial
     def note(self, key, code):
@@ -460,6 +462,7 @@ class Outbox:
             row = self.conn.execute('SELECT seq, op FROM entries WHERE idempotency_key=?', (key,)).fetchone()
             if row is not None and row['op'] in TRANSCRIPT_OPS:
                 self._shed_transcript_bytes(row['seq'])
+            self._rest_of_wait()
 
     @_serial
     def resend(self, codes, *, apply=False):
@@ -2034,7 +2037,8 @@ def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=No
                     # No open channel after the flush stopped (unreachable, lock held elsewhere, deadline,
                     # a dropped channel): the cache, not a second attempt.
                     unreachable = Unbound(flushed['stopped'], 'The shared kelmo server could not be reached '
-                                                              'in time, or the local outbox could not be read.')
+                                                              'in time, or the local outbox was busy or could not '
+                                                              'be read.')
                 delivered = client.context(payload.get('cwd'), unreachable=unreachable, binding=binding)
                 context = _session_context(client, payload, delivered, binding, provider, acknowledge, action)
         except (KelmoError, OSError, ValueError, sqlite3.Error) as error:
