@@ -243,8 +243,8 @@ def served_while_fenced(args):
     return field is not None and getattr(args, field, None) in allowed
 
 
-# Standard output and error are process-wide: two borrowed parses at once silence them one after the other, or the
-# second would restore the first one's buffer.
+# Standard output is process-wide: two borrowed parses at once silence it one after the other, or the second would
+# restore the first one's buffer. A parse error raises UsageError (`interface.Parser.error`) without printing.
 _SILENCED = threading.Lock()
 
 
@@ -281,26 +281,10 @@ def _dispatch_borrowed(service, args, commands, sources, stdin):
         _BORROWED_SERVICE.reset(token)
 
 
-def _refuse_quietly(parser):
-    """Makes `parser` and its subcommands raise UsageError instead of printing to standard error: the edge core
-    logs there from other threads, so a parse must not swap it."""
-    import argparse
-
-    def refuse(message):
-        raise UsageError(message)
-
-    parser.error = refuse
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for sub in action.choices.values():
-                _refuse_quietly(sub)
-
-
 def borrowed_read_only(argv):
     """True for `status` and `client status`: they read the outbox and ask the server, and change neither, so the
     edge core runs them without holding the outbox; the reads take it only where they touch it."""
     parser, _commands = build_parser(__version__)
-    _refuse_quietly(parser)
     try:
         with _SILENCED, redirect_stdout(io.StringIO()):
             args = parser.parse_args(argv)

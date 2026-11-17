@@ -10,21 +10,23 @@ entry here.
 
 - The edge core's status no longer gets ahead of a hook waiting for the outbox. Status read the outbox
   only after a zero-timeout turn at the owner lock, and right after a hook had held it, that turn could
-  come before the next hook's. It now reads the outbox only while nobody holds the lock or waits for it.
-  Otherwise it answers at once with `"outbox": {"busy": true}`, where it used to answer
-  `{"error": "The edge core is busy ..."}`, the same shape as a failed read. A failed read still answers
-  `{"error": ...}`.
+  come before the next hook's. It now reads the outbox only while nobody holds the lock or waits for it,
+  and waits at most half a second for another thread already reading it. Otherwise it answers at once with
+  `"outbox": {"busy": true}`, where it used to answer `{"error": "The edge core is busy ..."}`, the same
+  shape as a failed read. A failed read still answers `{"error": ...}`.
 - On an edge machine `kelmo status` and `kelmo client status` no longer hold the outbox while they wait
   for the authority. A hook that arrived meanwhile waited for the whole command and could hand its session
-  a cached context marked unavailable; it now gets the outbox at once. `kelmo client status --probe` checks
-  the authority on a channel of its own and closes it, so it no longer replaces the channel the client's
-  requests use. `kelmo client flush` and `resend` still hold the outbox for the whole command. Against an
-  authority that answers `kelmo-client/1`, whose channel carries one request at a time, a read now waits
-  for its turn on the channel instead of holding the outbox. A delivery that needs the channel while
-  another caller is still connecting gives up at its own deadline, with its writes kept, instead of waiting
-  for that caller's hello. While another caller is reading or rewriting the outbox, or another process
-  holds its file, `kelmo status` and `kelmo client status` answer with `"outbox": {"busy": true}` instead
-  of waiting past their deadline; during a delivery, which leaves the file free, they report the counts.
+  a cached context marked unavailable; it now gets the outbox at once. `kelmo client status --probe`
+  checks the authority on a channel of its own and closes it, so it no longer replaces the channel the
+  client's requests use. `kelmo client flush` and `resend` still hold the outbox for the whole command.
+  Against an authority that answers `kelmo-client/1`, whose channel carries one request at a time, a read
+  now waits for its turn on the channel instead of holding the outbox. A delivery that needs the channel
+  while another caller is still connecting gives up at its own deadline, with its writes kept, instead of
+  waiting for that caller's hello; such a delivery, and one that gave up because another request held the
+  channel, no longer counts as an attempt or shows `E_BUSY` as the entry's last refusal. While another
+  caller is reading or rewriting the outbox, or another process holds its file, `kelmo status` and `kelmo
+  client status` answer with `"outbox": {"busy": true}` instead of waiting past their deadline; during a
+  delivery, which leaves the file free, they report the counts.
 
 ## [0.3.1] - 2026-11-15
 

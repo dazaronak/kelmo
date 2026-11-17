@@ -84,10 +84,6 @@ class Closed(Unsent):
     the channel is already dropped, and a read may go again over a new one."""
 
 
-# How long dropping a one-request channel waits for a request still on it; past it, that request closes the
-# channel when it ends, so a descriptor is never closed under a read in flight.
-DROP_TURN_SECONDS = 1.0
-
 
 def _atomic_write(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -280,9 +276,9 @@ class Outbox:
         return [dict(row) for row in self.conn.execute("SELECT * FROM entries WHERE state='pending' ORDER BY seq")]
 
     @_serial
-    def attempt(self, key):
+    def attempt(self, key, count=1):
         with self.conn:
-            self.conn.execute('UPDATE entries SET attempts=attempts+1 WHERE idempotency_key=?', (key,))
+            self.conn.execute('UPDATE entries SET attempts=attempts+? WHERE idempotency_key=?', (count, key))
 
     @_serial
     def note(self, key, code):
@@ -630,7 +626,7 @@ class MuxChannel:
                 cancel = {'v': wire.VERSION, 'kind': 'cancel', 'id': call_id, 'body_type': 'json'}
                 try:
                     self._write(wire.encode(cancel, None), time.monotonic() + 0.05)
-                except OSError:
+                except (OSError, ValueError):  # ValueError: another thread closed the pipe meanwhile
                     self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
                     self.grace = 0
                     self.close()
@@ -1074,15 +1070,15 @@ class SharedClient:
         self._close_channel(channel)
 
     def _close_channel(self, channel):
-        """Closes a dropped channel, never under another thread's request on a one-request channel: past the
-        bound that request closes it when it ends."""
+        """Closes a dropped channel, never under another thread's request on a one-request channel: that request
+        closes it when it ends, so the drop does not wait for it (a delivery drops under the owner of the outbox)."""
         if hasattr(channel, 'grace') and self._deadline is not None:
             channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
         if getattr(channel, 'concurrent', False):
             channel.close()
             return
         turn = self._turn_for(channel)
-        if not turn.acquire(timeout=DROP_TURN_SECONDS):
+        if not turn.acquire(blocking=False):
             channel.close_when_free = True
             self._close_if_marked(channel)  # the request may have let it go between the wait and the mark
             return
@@ -1101,6 +1097,7 @@ class SharedClient:
         try:
             if not getattr(channel, 'closed', False):
                 channel.close()
+            channel.close_when_free = False  # a stdio channel keeps no `closed` flag: the mark says it is done
         finally:
             turn.release()
 
@@ -1123,6 +1120,9 @@ class SharedClient:
             encode_frame(frame)
         except KelmoError as error:
             raise Unsent(error.code, str(error)) from error
+        if getattr(channel, 'dropped', False):
+            # Marked by a caller that could not wait for the connect, after `_connect` handed it out.
+            raise Closed('E_TRANSPORT', 'The shared-memory channel was dropped before the request.')
         try:
             if getattr(channel, 'concurrent', False):
                 # Several threads share the channel: each request carries its own deadline.
@@ -1294,16 +1294,22 @@ class SharedClient:
         delivered, refused, stopped, reached = 0, [], None, None
         for entry in self.outbox.pending():
             key = entry['idempotency_key']
-            channel = None
+            channel, attempted = None, False
             try:
                 channel = self._connect()
                 reached = True
                 self.outbox.attempt(key)
+                attempted = True
                 ok, value = self._send(channel, entry['op'], json.loads(entry['args']), key)
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                self.outbox.note(key, error.code)
+                if isinstance(error, Unsent) and error.code == 'E_BUSY':
+                    # Another request held the channel past this pass's deadline: nothing reached the server.
+                    if attempted:
+                        self.outbox.attempt(key, -1)
+                else:
+                    self.outbox.note(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break
             if ok:

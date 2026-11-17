@@ -30,6 +30,8 @@ DELIVER_SECONDS = 5.0
 DELIVER_INTERVAL = 30.0
 # Bound of a hook that is not a SessionStart or prompt hook (those carry their own, shorter deadline).
 HOOK_SECONDS = 3.0
+# How long `kelmo daemon status` waits for another thread inside the outbox.
+STATUS_OUTBOX_SECONDS = 0.5
 # Bound of one spooled hook replayed by the deliverer.
 SPOOL_HOOK_SECONDS = 10.0
 
@@ -370,7 +372,8 @@ class EdgeCore:
             outbox = {'busy': True}
         else:
             try:
-                outbox = self.client.outbox.summary()
+                # A status command may be inside the outbox past another process's lock: wait for it briefly.
+                outbox = self.client.outbox.summary_within(STATUS_OUTBOX_SECONDS)
             except Exception as error:  # noqa: BLE001 - status reports, never fails
                 outbox = {'error': str(error)[:200]}
             finally:

@@ -669,9 +669,7 @@ def test_client_status_reports_the_outbox_busy_while_another_process_holds_the_f
 def test_a_drop_that_marks_the_channel_as_its_request_ends_still_gets_it_closed(profile, monkeypatch):
     """The request on the channel checks the mark just before the drop sets it, then lets the channel go: the channel
     is still closed, by whichever of the two sees the mark with the channel free."""
-    import kelmo.client as client_module
     from kelmo.client import PROTOCOL, SharedClient
-    monkeypatch.setattr(client_module, 'DROP_TURN_SECONDS', 0.2)
     checked, marked = threading.Event(), threading.Event()
 
     class Channel:
@@ -716,9 +714,7 @@ def test_a_drop_that_marks_the_channel_as_its_request_ends_still_gets_it_closed(
 def test_a_channel_closed_when_its_request_ends_waits_no_longer_than_that_request_may(profile, monkeypatch):
     """The drop came from a caller with no deadline; the request that closes the channel bounds the close's grace
     by its own deadline, so it does not wait seconds for the process to exit."""
-    import kelmo.client as client_module
     from kelmo.client import PROTOCOL, SharedClient
-    monkeypatch.setattr(client_module, 'DROP_TURN_SECONDS', 0.2)
     entered, release, graces = threading.Event(), threading.Event(), []
 
     class Channel:
@@ -755,3 +751,140 @@ def test_a_channel_closed_when_its_request_ends_waits_no_longer_than_that_reques
     finally:
         release.set()
         client.close()
+
+
+class WritesChannel:
+    """A kelmo-client/1 channel that offers `capture` too; `status` waits until released."""
+
+    def __init__(self, authority, entered, release):
+        self.authority, self.entered, self.release, self.frames = authority, entered, release, []
+
+    def request(self, frame, timeout=None):
+        from kelmo.client import PROTOCOL
+        self.frames.append(frame)
+        if frame['op'] == 'hello':
+            result = {'authority_id': self.authority, 'operations': ['hello', 'status', 'capture']}
+        elif frame['op'] == 'status':
+            self.entered.set()
+            self.release.wait(10)
+            result = {'ok': True}
+        else:
+            result = {'operation_id': 'op-1'}
+        return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+    def close(self):
+        pass
+
+
+def test_dropping_a_one_request_channel_under_another_request_does_not_wait_for_that_request(profile):
+    """A delivery drops the channel under the owner of the outbox; a status request on it closes it when it ends,
+    so the drop marks it and returns instead of holding the owner meanwhile."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    reader = threading.Thread(target=client.call, args=('status',), daemon=True)
+    try:
+        channel = client._connect()
+        reader.start()
+        assert entered.wait(5)
+        start = time.monotonic()
+        client._close_channel(channel)
+        assert time.monotonic() - start < 0.5, 'the drop waited for the request on the channel'
+        assert channel.close_when_free, 'the channel was not marked for its request to close'
+    finally:
+        release.set()
+        reader.join(10)
+        client.close()
+
+
+def test_a_channel_marked_to_close_once_free_is_closed_once(profile):
+    """A stdio channel has no `closed` flag: the mark itself is cleared, so a later caller does not close it again."""
+    from kelmo.client import SharedClient
+    closes = []
+
+    class Channel:
+        def request(self, frame, timeout=None):
+            raise AssertionError('no request is made here')
+
+        def close(self):
+            closes.append(1)
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    try:
+        channel = Channel()
+        channel.close_when_free = True
+        client._close_if_marked(channel)
+        client._close_if_marked(channel)
+        assert closes == [1], closes
+    finally:
+        client.close()
+
+
+def test_a_channel_dropped_after_the_connect_handed_it_out_carries_no_request(profile):
+    """A caller that could not wait for the connect marks the channel dropped just after `_connect` checked it: the
+    request is refused before a byte is written, so a read goes again over a new channel."""
+    from kelmo.client import Closed, SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    try:
+        channel = client._connect()
+        channel.dropped = True
+        with pytest.raises(Closed):
+            client._send(channel, 'status', {}, None)
+        assert [frame['op'] for frame in channel.frames] == ['hello'], channel.frames
+    finally:
+        release.set()
+        client.close()
+
+
+def test_a_delivery_refused_because_the_channel_was_busy_counts_no_attempt(profile):
+    """Nothing reached the server: the entry's attempts and last refusal stay as they were."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    reader = threading.Thread(target=client.call, args=('status',), daemon=True)
+    try:
+        client._connect()
+        reader.start()
+        assert entered.wait(5)
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'busy-one')
+        with client.deadline(0.3):
+            result = client.flush()
+        assert result['stopped'] == 'E_BUSY', result
+        entry = client.outbox.pending()[0]
+        assert (entry['attempts'], entry['last_error']) == (0, None), entry
+    finally:
+        release.set()
+        reader.join(10)
+        client.close()
+
+
+def test_daemon_status_answers_while_another_caller_holds_the_outbox_connection(profile):
+    """`kelmo daemon status` has five seconds: it does not wait for a thread inside the outbox (a status command
+    reading it past another process's lock)."""
+    from kelmo.client import SharedClient
+    from kelmo.core.edge_core import EdgeCore
+    client = SharedClient(profile, multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        start = time.monotonic()
+        status = core.status()
+        assert time.monotonic() - start < 2.0, 'daemon status waited for the outbox connection'
+        assert status['outbox'] == {'busy': True}, status
+    finally:
+        release.set()
+        holder.join(10)
+        core.close()

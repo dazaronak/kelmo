@@ -51,7 +51,7 @@ def summaries(client, outcome=None):
             raise outcome
         return outcome if outcome is not None else {'pending': 0}
 
-    client.outbox = SimpleNamespace(summary=summary)
+    client.outbox = SimpleNamespace(summary=summary, summary_within=lambda _seconds: summary())
     return calls
 
 

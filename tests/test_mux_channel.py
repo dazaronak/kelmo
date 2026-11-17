@@ -153,3 +153,23 @@ def test_a_request_on_a_channel_whose_pipe_closed_leaves_no_waiter_behind():
         assert channel._waiters == {}, channel._waiters
     finally:
         channel.close()
+
+
+def test_a_cancel_that_finds_the_pipe_closed_still_ends_the_call_on_its_deadline():
+    channel = MuxChannel(command(), timeout=0.3)
+    real, writes = channel._write, []
+
+    def write(data, deadline):
+        writes.append(data)
+        if len(writes) > 1:
+            raise ValueError('I/O operation on closed file.')
+        return real(data, deadline)
+
+    channel._write = write
+    try:
+        with pytest.raises(KelmoError) as raised:
+            channel.request(request('slow', delay=2))
+        assert raised.value.code == 'E_TRANSPORT' and len(writes) == 2, (raised.value, writes)
+        assert not channel.alive, 'a channel whose pipe closed under the cancel stayed in use'
+    finally:
+        channel.close()
