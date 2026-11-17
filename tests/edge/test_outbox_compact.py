@@ -472,9 +472,9 @@ def test_after_a_stopped_rewrite_the_old_outbox_waits_for_idle_instead_of_the_bo
     rewrites = []
     real = client.outbox.convert
 
-    def convert(copy_seconds=None):
+    def convert(copy_seconds=None, **kwargs):
         rewrites.append(copy_seconds)
-        return real(copy_seconds=copy_seconds)
+        return real(copy_seconds=copy_seconds, **kwargs)
 
     monkeypatch.setattr(client.outbox, 'convert', convert)
     _passes(core, 1)
@@ -775,3 +775,60 @@ def test_a_drain_step_counts_the_pages_it_gave_back_while_another_process_frees_
         assert given == pages_before - pages_after, (given, pages_before, pages_after)
     finally:
         client.close()
+
+
+def test_an_idle_rewrite_gives_way_to_a_caller_that_comes_meanwhile(legacy_edge, profile, monkeypatch):
+    """The one-time rewrite of an old outbox too large for the bound runs at idle with no time bound of its own: a
+    caller that comes for the outbox while it copies stops it (rolled back, the file as it was), gets the outbox at
+    once, and the rewrite waits for the next idle time."""
+    before = _size(profile)
+    monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 1000.0)  # too large for the bound: idle only
+    monkeypatch.setattr(edge_core, 'COMPACT_RETRY_SECONDS', 0.0)
+    monkeypatch.setattr(client_module, 'COMPACT_PROGRESS_STEPS', 1)
+    core, client = legacy_edge()
+    assert core._compaction['state'] == 'too_large', core._compaction
+    got, started = [], []
+    real_state = client.outbox.compaction_state
+
+    def caller():
+        asked = time.monotonic()
+        if core._owner.acquire(timeout=5, urgent=True):
+            got.append(time.monotonic() - asked)
+            core._owner.release()
+
+    def state_then_a_caller():
+        result = real_state()
+        if not started:  # the rewrite is about to copy: a hook comes for the outbox now
+            started.append(True)
+            threading.Thread(target=caller, daemon=True).start()
+            assert _until(lambda: core._owner._waiting[True] > 0, 2), 'the caller never waited'
+        return result
+
+    client.outbox.compaction_state = state_then_a_caller
+    monkeypatch.setattr(edge_core, 'IDLE_SECONDS', 0.0)
+    _passes(core, 1)
+    assert started, 'the idle pass never began the rewrite'
+    assert _mode(profile) == 0 and _size(profile) == before, 'the idle rewrite ran to its end with a caller waiting'
+    assert core._compaction['state'] == 'paused', core._compaction
+    assert _until(lambda: got, 5) and got[0] < 1.0, f'the caller waited {got} for the outbox'
+
+
+def test_a_drain_step_whose_commit_a_reader_kept_back_leaves_the_outbox_usable(real_edge, profile):
+    """Another process reads the outbox while a drain step runs: the step's write begins but its commit is refused.
+    Nothing of it stays open on the connection: once the reader is gone, the next write succeeds."""
+    core, client = real_edge
+    _settled_pieces(client.outbox)
+    before = _size(profile)
+    reader = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    reader.execute('BEGIN')
+    reader.execute('SELECT COUNT(*) FROM entries').fetchone()
+    try:
+        _passes(core, 1)
+        assert _size(profile) == before, 'compacted while another process read the outbox'
+        assert core._last['result']['compaction']['state'] == 'busy', core._last['result']
+        assert not client.outbox.conn.in_transaction, 'the refused drain left a transaction open'
+    finally:
+        reader.rollback()
+        reader.close()
+    client.outbox.enqueue('session_append', {'content': 'z', 'provider': 'claude'}, 'after-the-refused-drain')
+    assert [entry['idempotency_key'] for entry in client.outbox.pending()] == ['after-the-refused-drain']

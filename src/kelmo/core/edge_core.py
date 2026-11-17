@@ -65,6 +65,10 @@ class _RewriteRefused(Exception):
         self.seconds = seconds
 
 
+class _GaveWay(Exception):
+    """An idle rewrite stopped because a caller came for the outbox while it copied."""
+
+
 class OwnerLock:
     """A reentrant lock shared by urgent and ordinary callers, which take turns while both wait: an urgent
     caller goes first, but never twice in a row past a waiting ordinary one. A hook is urgent (a session waits
@@ -115,6 +119,10 @@ class OwnerLock:
                 return False
             self._holder, self._count = threading.get_ident(), 1
             return True
+
+    def waited_for(self):
+        """True while any caller waits for the lock; read without the condition (a background job's peek)."""
+        return any(self._waiting.values())
 
     def held(self):
         """How many times the calling thread holds the lock: 0 when another thread or nobody does."""
@@ -319,9 +327,10 @@ class EdgeCore:
 
     def _compact(self):
         """Gives the outbox's free pages back after a pass that left nothing pending. An old file is rewritten once
-        (when its predicted rewrite fits COMPACT_MAX_SECONDS, or at idle when it does not); a converted one is
-        drained in steps of COMPACT_CHUNK_PAGES, each taken only while nobody holds or waits for the outbox, so a
-        waiter waits at most one step. Records and returns the outcome."""
+        (when its predicted rewrite fits COMPACT_MAX_SECONDS, or at idle when it does not, stopping as soon as a
+        caller waits for the outbox); a converted one is drained in steps of COMPACT_CHUNK_PAGES, each taken only
+        while nobody holds or waits for the outbox, so a waiter waits at most one step. Records and returns the
+        outcome."""
         from ..client import COMPACT_CHUNK_PAGES, COMPACT_TRY_SECONDS, _compaction_due
         freed, now = 0, time.time()
         try:
@@ -342,6 +351,8 @@ class EdgeCore:
         except _RewriteRefused as refused:
             return self._compaction_done('busy', freed, min(COMPACT_RETRY_SECONDS, max(
                 BUSY_RETRY_SECONDS, BUSY_REWRITE_PAUSE_FACTOR * refused.seconds)))
+        except _GaveWay:
+            return self._compaction_done('paused', freed, BUSY_RETRY_SECONDS)  # rolled back; the next idle time
         except sqlite3.OperationalError as error:
             from ..errors import sqlite_busy
             if self._stopping.is_set():
@@ -382,11 +393,20 @@ class EdgeCore:
                         idle = time.monotonic() - self._last_call >= IDLE_SECONDS
                         if not fits and not idle:
                             return 'too_large', 0
-                        started = time.monotonic()
+                        started, gave_way = time.monotonic(), []
+
+                        def a_caller_waits():  # the idle rewrite has no time bound: it gives way to any caller
+                            if self._owner.waited_for():
+                                gave_way.append(True)
+                            return bool(gave_way)
+
                         try:
-                            given = outbox.convert(copy_seconds=COMPACT_COPY_SECONDS if fits else None)
+                            given = outbox.convert(copy_seconds=COMPACT_COPY_SECONDS if fits else None,
+                                                   stop_when=None if fits else a_caller_waits)
                         except sqlite3.OperationalError as error:
                             from ..errors import sqlite_busy
+                            if gave_way:
+                                raise _GaveWay() from error
                             if sqlite_busy(error):
                                 raise _RewriteRefused(time.monotonic() - started) from error
                             raise

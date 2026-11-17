@@ -284,17 +284,23 @@ class Outbox:
                      for name in ('page_count', 'freelist_count', 'page_size', 'auto_vacuum'))
 
     @_serial
-    def convert(self, copy_seconds=None):
+    def convert(self, copy_seconds=None, stop_when=None):
         """Rewrite the file once in incremental mode, giving back every free page; any other caller's lock ends
         it at once. With `copy_seconds`, a rewrite whose copy phase runs longer is stopped and rolled back
         (SQLITE_INTERRUPT): its copy back into the file and its commit cannot be stopped, so the bound is on the
-        part that can. Returns the bytes given back."""
+        part that can. `stop_when`, a callable, stops the copy the same way once it answers true. Returns the
+        bytes given back."""
         with self.waiting(COMPACT_TRY_SECONDS):
             pages, _free, size, _mode = self.compaction_state()
             self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+            checks = []
             if copy_seconds is not None:
                 limit = time.monotonic() + copy_seconds
-                self.conn.set_progress_handler(lambda: time.monotonic() >= limit, COMPACT_PROGRESS_STEPS)
+                checks.append(lambda: time.monotonic() >= limit)
+            if stop_when is not None:
+                checks.append(stop_when)
+            if checks:
+                self.conn.set_progress_handler(lambda: any(check() for check in checks), COMPACT_PROGRESS_STEPS)
             try:
                 self.conn.execute('VACUUM')
             finally:
