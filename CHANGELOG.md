@@ -8,17 +8,22 @@ entry here.
 
 ### Fixed
 
-- A promote note whose editor call fails because the core is stopping now waits for the next start
-  without being charged an attempt, as a stop met earlier in the same run already did, also when the editor
-  answers busy. It used to be staged failed and charged: retried later for a transient code, needing a
-  manual retry otherwise.
+- A core whose write to kelmod fails part-way through a frame no longer goes on writing after the broken
+  frame. Its channel ends for writing at once: the core hears of the stop before the call fails, every later
+  call or reply fails without a byte written, and kelmod sees the channel end instead of a frame that goes on.
+  A write that fails before any byte went out, with an error that does not say kelmod is gone, still fails
+  that call alone.
+- A promote note whose editor call fails because the core is stopping now waits for the next start without
+  being charged an attempt, as a stop met earlier in the same run already did, also when the editor answers
+  busy. It used to be staged failed and charged: retried later for a transient code, needing a manual retry
+  otherwise.
 - The state core now counts a call to another core that fails on the write to kelmod's channel (kelmod has
   closed it) as the stop's. The call used to fail before the core heard of the stop, so a promote note whose
   editor call met it could still be charged an attempt. A call that cannot be encoded, or whose write fails
   for another reason, fails alone and does not stop the core.
 - A call a core makes once it is stopping (kelmod closed its channel, or a stop finished the core's work) now
-  fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not come,
-  holding the stop for that call's deadline, about five minutes for an archive call.
+  fails at once, after the core heard of the stop. It used to be sent and wait for a reply that could not
+  come, holding the stop for that call's deadline, about five minutes for an archive call.
 
 ## [0.3.1] - 2026-11-15
 

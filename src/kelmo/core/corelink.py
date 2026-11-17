@@ -29,6 +29,34 @@ from .context import Context
 CHANNEL_FD = 3
 
 
+class BrokenFrame(OSError):
+    """A write that failed after part of its frame went out: the stream now holds a frame cut short, and no frame
+    may follow it on that channel."""
+
+    def __init__(self, cause):
+        super().__init__(getattr(cause, 'errno', None), f'The frame was cut short: {cause}')
+
+
+_SOCKET = socket.socket  # the class itself, taken at import: a sandboxed core may have socket.socket replaced
+
+
+def write_frame(sock, data):
+    """Writes one whole frame. A socket's `sendall` does not say how much it wrote before an error, so a socket is
+    written with `send`; a write that fails after part of the frame went out raises BrokenFrame. Any other channel
+    object writes through its own `sendall` (DescriptorChannel raises BrokenFrame itself)."""
+    if not isinstance(sock, _SOCKET):
+        sock.sendall(data)
+        return
+    view, sent = memoryview(data), 0
+    while sent < len(view):
+        try:
+            sent += sock.send(view[sent:])
+        except OSError as error:
+            if sent:
+                raise BrokenFrame(error) from error
+            raise
+
+
 class DescriptorChannel:
     """The channel as a plain descriptor, for a core inside the Linux sandbox: its seccomp policy refuses every
     socket syscall (`getsockopt` already, which `socket.socket(fileno=...)` makes), while read, write and poll on
@@ -54,9 +82,14 @@ class DescriptorChannel:
                 return os.read(self.fd, size)  # POLLHUP or POLLERR: read returns b'' or raises OSError
 
     def sendall(self, data):
-        view = memoryview(data)
-        while view:
-            view = view[os.write(self.fd, view):]
+        view, sent = memoryview(data), 0
+        while sent < len(view):
+            try:
+                sent += os.write(self.fd, view[sent:])
+            except OSError as error:
+                if sent:
+                    raise BrokenFrame(error) from error
+                raise
 
     def shutdown(self, _how):
         try:
@@ -137,16 +170,24 @@ class CoreLink:
     def send(self, header, body=None):
         data = wire.encode(header, body)
         with self._write_lock:
-            self._write_marking_gone(data)
+            self._write_locked(data)
 
-    def _write_marking_gone(self, data):
-        """Writes under the write lock; a write that finds kelmod gone marks it, so no call tries to write after
-        it."""
+    def _write_locked(self, data):
+        """Writes one frame; the caller holds `_write_lock`. A frame cut short (BrokenFrame) or a gone peer ends the
+        channel for writing: nothing is written after it, and kelmod sees the channel end instead of a frame that
+        goes on."""
+        if self._peer_gone.is_set():
+            raise OSError(errno.EPIPE, 'The channel to kelmod ended for writing.')
         try:
-            self.sock.sendall(data)
+            write_frame(self.sock, data)
         except OSError as error:
-            if error.errno in PEER_GONE:
-                self._peer_gone.set()
+            if isinstance(error, BrokenFrame) or error.errno in PEER_GONE:
+                self._peer_gone.set()  # under the write lock: no write after this one
+            if isinstance(error, BrokenFrame):
+                try:
+                    self.sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
             raise
 
     def _reply(self, call_id, body=None, error=None):
@@ -158,7 +199,7 @@ class CoreLink:
                 'code': 'E_PROCESSING', 'retryable': False, 'message': f'The reply could not be encoded: {failure}'}))
         try:
             with self._write_lock:
-                self._write_marking_gone(data)
+                self._write_locked(data)
         except OSError:
             pass
 
@@ -198,14 +239,15 @@ class CoreLink:
                 # them if it was registered before; a call written now would wait for a reply that cannot come.
                 refused = self._stopping.is_set() or self._peer_gone.is_set()
                 if not refused:
-                    self._write_marking_gone(data)
+                    self._write_locked(data)
         except Exception as error:  # noqa: BLE001 - a failed write fails this call; only a gone peer stops the core
             with self._state:
                 self._outgoing.pop(call_id, None)
-            if isinstance(error, OSError) and error.errno in PEER_GONE:
-                # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
-                # hears of the stop before this call fails, as it does for the calls the reader fails. The reader
-                # itself goes on to the channel's end, so replies kelmod sent before closing still arrive.
+            if isinstance(error, BrokenFrame) or (isinstance(error, OSError) and error.errno in PEER_GONE):
+                # The channel to kelmod is gone, or now carries a frame cut short, though the reader may not have
+                # reached its end yet: the core hears of the stop before this call fails, as it does for the calls
+                # the reader fails. The reader itself goes on to the channel's end, so replies kelmod sent before
+                # closing still arrive.
                 self._ask_owner_to_stop()
             _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
             return future
