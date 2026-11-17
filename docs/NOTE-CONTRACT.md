@@ -118,8 +118,9 @@ same request this client sent under `<key>#resendN` after the refusal. While
 the note it went out as is still running there, the request stays queued; one
 whose server process died before it settled is run again under its own key,
 and its outcome is the answer. A refusal that resend answered as a duplicate
-of another note is not linked on the server, so without the entry that
-request gets the old refusal. Keys ending in `#resend` and a number are left to `client resend`.
+of another note is linked on the server only when that note went out under
+`<key>#resendN`; otherwise, without the entry, that request gets the old
+refusal. The server reads keys ending in `#resend` and a number as resends.
 A refusal that will not be resent stays in `kelmo client status` until it is
 dismissed. `kelmo client dismiss` lists the refused entries whose code matches
 `--code` or whose key matches `--key` (both repeatable; with neither, every

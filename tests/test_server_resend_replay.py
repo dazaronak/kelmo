@@ -237,3 +237,45 @@ def test_a_suffix_key_recorded_at_the_instant_of_the_refusal_is_not_its_resend(s
     refused = _answer(lambda: first.submit('create', ARGS, 'old'))
     again = shared.client(root=tmp_path / 'client-mac-a-again')
     assert _answer(lambda: again.submit('create', ARGS, 'old')) == refused
+
+
+def test_a_resend_that_skipped_a_number_another_note_holds_is_still_found(shared, monkeypatch, tmp_path):
+    """Another note already holds `old#resend1`, so `client resend` sends the refusal as `old#resend2`; the server
+    passes over the note that is not the resend and answers with the one that is."""
+    first = shared.client()
+    other = dict(ARGS, content='Another note sent first under the first resend key.')
+    assert isinstance(_answer(lambda: first.submit('create', other, 'old#resend1')), dict)
+    _refuse_first(monkeypatch)
+    _answer(lambda: first.submit('create', ARGS, 'old'))
+    assert [item['resend_as'] for item in first.outbox.resend(('E_INPUT',), apply=True)] == ['old#resend2']
+    assert first.flush()['delivered'] == 1
+    sent = _answer(lambda: first.submit('create', ARGS, 'old#resend2'))
+    again = shared.client(root=tmp_path / 'client-mac-a-again')
+    assert _answer(lambda: again.submit('create', ARGS, 'old')) == sent
+
+
+def test_a_resend_numbered_below_the_old_key_is_found(shared, monkeypatch, tmp_path):
+    """`old#resend5` written by hand is resent as `old#resend1`, the lowest number the client finds free."""
+    _refuse_first(monkeypatch)
+    first = shared.client()
+    _answer(lambda: first.submit('create', ARGS, 'old#resend5'))
+    assert [item['resend_as'] for item in first.outbox.resend(('E_INPUT',), apply=True)] == ['old#resend1']
+    assert first.flush()['delivered'] == 1
+    sent = _answer(lambda: first.submit('create', ARGS, 'old#resend1'))
+    again = shared.client(root=tmp_path / 'client-mac-a-again')
+    assert _answer(lambda: again.submit('create', ARGS, 'old#resend5')) == sent
+
+
+def test_a_duplicate_under_a_resend_key_answers_the_old_key_as_the_client_with_the_entry_does(shared, monkeypatch,
+                                                                                            tmp_path):
+    """The same request was sent again by hand under `old#resend1`; `client resend` then names that note as the
+    refusal's duplicate. A client that still holds the old entry answers it as that note, and so does the server."""
+    _refuse_first(monkeypatch)
+    first = shared.client()
+    _answer(lambda: first.submit('create', ARGS, 'old'))
+    assert isinstance(_answer(lambda: first.submit('create', ARGS, 'old#resend1')), dict)
+    resent = first.outbox.resend(('E_INPUT',), apply=True)
+    assert [(item['resend_as'], item.get('duplicate')) for item in resent] == [('old#resend1', True)]
+    held = _answer(lambda: first.submit('create', ARGS, 'old'))
+    again = shared.client(root=tmp_path / 'client-mac-a-again')
+    assert _answer(lambda: again.submit('create', ARGS, 'old')) == held

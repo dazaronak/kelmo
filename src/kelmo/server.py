@@ -1750,24 +1750,24 @@ class ClientSession:
         """The stored reply of a finished request. A refusal that `kelmo client resend` sent again under
         `<base>#resend<n>` answers as the last note of that chain, which this client's outbox may no longer know
         (a profile made again under the same client id). The chain is the client's: the key cut at its first
-        `#resend`, numbered from 1 after any number the client does not write itself. A successor counts only
-        when it carries the same request (resend sends it unchanged) and was recorded after the refusal it
-        resends. A successor still open is run under its own key: a live attempt of it is answered busy by the
+        `#resend`, then `#resend1`, `#resend2` and on while such a key is recorded (the client takes the lowest
+        number it finds free, so a number another note holds is passed over). A successor counts only when it
+        carries the same request (resend sends it unchanged) and was recorded after the refusal it resends. A successor still open is run under its own key: a live attempt of it is answered busy by the
         row's lock, one abandoned by a process that is gone is run again, and its outcome answers."""
         reply = json.loads(row['reply'])
         if reply.get('ok') is not False:
             return dict(reply, replayed=True)
-        base, mark, number = key.partition('#resend')
-        written = mark and number.isdigit() and number == str(int(number)) and int(number) >= 1
-        start = int(number) if written else 0
+        base = key.partition('#resend')[0]
         journal, before = self.service.journal, row
-        for successor in itertools.count(start + 1):
+        for successor in itertools.count(1):
             successor_key = f'{base}#resend{successor}'
             request_key = _request_digest([self.client_id, successor_key])
             stored = journal.client_request(request_key)
-            if (stored is None or stored['op'] != before['op'] or stored['fingerprint'] != before['fingerprint']
-                    or stored['created_at'] <= (before['finished_at'] or before['created_at'])):
+            if stored is None:
                 break
+            if (stored['op'] != before['op'] or stored['fingerprint'] != before['fingerprint']
+                    or stored['created_at'] <= (before['finished_at'] or before['created_at'])):
+                continue  # another note, or an earlier step of the chain (this key itself among them)
             if stored['state'] != 'finished':
                 # Its effect may be done: never answered with the refusal it resent. The archive deduplicates the
                 # key, so running it again is safe.
