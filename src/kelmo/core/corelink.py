@@ -68,7 +68,8 @@ class DescriptorChannel:
         if self._closed:
             return
         self._closed = True
-        fds, self.fd = (self.fd, self._wake_read, self._wake_write), -1  # a late write fails with EBADF
+        fds = (self.fd, self._wake_read, self._wake_write)
+        self.fd = self._wake_write = -1  # a late write or wake fails with EBADF, never into a reused number
         for fd in fds:
             try:
                 os.close(fd)
@@ -147,7 +148,8 @@ class CoreLink:
 
     def call(self, op, body, context, *, lane=None, key=None):
         """Calls another core through kelmod. Returns a Future of the reply body; a refusal raises KelmoError
-        from `result()` with its code and its `retryable` verdict."""
+        from `result()` with its code and its `retryable` verdict, and a call that could not be sent or answered
+        (the channel to kelmod closing or gone) fails with E_TRANSPORT."""
         call_id = uuid.uuid4().hex
         header = {'v': wire.VERSION, 'kind': 'call', 'id': call_id, 'op': op, 'body_type': 'json',
                   'deadline_ms': max(1, context.remaining_ms())}
@@ -178,7 +180,15 @@ class CoreLink:
             return future
         try:
             with self._write_lock:
-                self.sock.sendall(data)
+                # The stop may have begun, and failed this call, since it was registered: then nothing is written.
+                refused = self._stopping.is_set()
+                if not refused:
+                    try:
+                        self.sock.sendall(data)
+                    except OSError as error:
+                        if error.errno in PEER_GONE:
+                            self._stopping.set()  # under the write lock: no call after this one tries to write
+                        raise
         except Exception as error:  # noqa: BLE001 - a failed write fails this call; only a gone peer stops the core
             with self._state:
                 self._outgoing.pop(call_id, None)
@@ -188,6 +198,12 @@ class CoreLink:
                 # itself goes on to the channel's end, so replies kelmod sent before closing still arrive.
                 self._ask_owner_to_stop()
             _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+            return future
+        if refused:
+            with self._state:
+                self._outgoing.pop(call_id, None)
+            self._ask_owner_to_stop()
+            _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------

@@ -475,3 +475,105 @@ def test_a_call_made_once_the_link_is_stopping_fails_at_once_without_being_sent(
         assert leaked == b'', 'the call was written to a stopping channel'
     finally:
         parent.close()
+
+
+def test_a_call_failed_by_the_stop_before_its_write_is_not_written():
+    """The call was registered, then the stop failed it (the reader reached the channel's end) before the call took
+    the write lock: the frame is never written, since its reply would go nowhere."""
+    import kelmo.core.corelink as corelink
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    real = link._write_lock
+
+    class StopFirst:
+        def __enter__(self):
+            link._stopping.set()  # what `_finish` does, then it fails every open call
+            with link._state:
+                pending, link._outgoing = list(link._outgoing.values()), {}
+            for future in pending:
+                corelink._fail(future, corelink.KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
+            return real.__enter__()
+
+        def __exit__(self, *exc):
+            return real.__exit__(*exc)
+
+    link._write_lock = StopFirst()
+    try:
+        future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+        assert future.exception().code == 'E_TRANSPORT'
+        parent.setblocking(False)
+        try:
+            leaked = parent.recv(65536)
+        except BlockingIOError:
+            leaked = b''
+        assert leaked == b'', 'a call the stop had already failed was written'
+    finally:
+        parent.close()
+
+
+def test_a_call_after_one_that_found_kelmod_gone_does_not_try_to_write():
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    real, writes = link.sock, []
+
+    class Counted:
+        def sendall(self, data):
+            writes.append(len(data))
+            return real.sendall(data)
+
+        def close(self):
+            real.close()
+
+    link.sock = Counted()
+    parent.close()
+    first = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    second = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    try:
+        assert first.exception().code == 'E_TRANSPORT' and second.exception().code == 'E_TRANSPORT'
+        assert len(writes) == 1, f'{len(writes)} writes: the call after kelmod was found gone still wrote'
+    finally:
+        real.close()
+
+
+def test_a_call_refused_while_stopping_tells_the_core_before_its_future_fails(monkeypatch):
+    import kelmo.core.corelink as corelink
+    parent, child = socket.socketpair()
+    order = []
+
+    class Recorded(corelink.Future):
+        def set_exception(self, error):
+            order.append('failed')
+            super().set_exception(error)
+
+    monkeypatch.setattr(corelink, 'Future', Recorded)
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    link._stopping.set()
+    try:
+        link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+        assert order == ['stop', 'failed'], order
+    finally:
+        parent.close()
+
+
+def test_waking_a_closed_confined_channel_writes_into_no_reused_descriptor(tmp_path):
+    import os
+    from kelmo.core.corelink import DescriptorChannel
+    parent, child = socket.socketpair()
+    channel = DescriptorChannel(child.detach())
+    wake = channel._wake_write
+    channel.close()
+    opened = []
+    try:
+        for index in range(16):  # take the freed numbers back, the wake pipe's write end among them
+            opened.append(os.open(tmp_path / f'file-{index}', os.O_WRONLY | os.O_CREAT, 0o600))
+            if opened[-1] == wake:
+                break
+        assert wake in opened, 'the descriptor number was not reused in this process'
+        channel.shutdown(socket.SHUT_RD)
+        sizes = {index: os.path.getsize(tmp_path / f'file-{index}') for index in range(len(opened))}
+        assert not any(sizes.values()), f'the wake byte went into a reused descriptor: {sizes}'
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+        parent.close()
