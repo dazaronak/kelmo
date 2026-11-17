@@ -478,6 +478,55 @@ def test_a_call_made_once_the_link_is_stopping_fails_at_once_without_being_sent(
         parent.close()
 
 
+def test_a_call_whose_body_cannot_be_encoded_fails_as_a_stopped_call_once_the_link_is_stopping():
+    """Criterion 1 holds whatever the body: once the link stops, a call fails with E_TRANSPORT at once, before its
+    body is even encoded."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: None
+    link._stopping.set()
+    try:
+        future = link.call('archive.echo', {'x': object()}, Context.local(uuid.uuid4().hex, 30))
+        assert future.done()
+        assert future.exception().code == 'E_TRANSPORT', future.exception().code
+    finally:
+        parent.close()
+
+
+def test_a_call_made_once_the_link_is_stopping_does_not_wait_for_an_earlier_write():
+    """An earlier call still holds the write lock (kelmod stopped reading) when the link stops: a new call fails at
+    once instead of queueing behind that write."""
+    import threading
+    import time
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: None
+    held, release = threading.Event(), threading.Event()
+
+    def writer():
+        with link._write_lock:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    assert held.wait(5)
+    link._stopping.set()
+    timer = threading.Timer(3.0, release.set)
+    timer.start()
+    try:
+        started = time.monotonic()
+        future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+        took = time.monotonic() - started
+        assert took < 1.0, f'the call waited {took:.2f} s behind an earlier write on a stopping link'
+        assert future.exception().code == 'E_TRANSPORT'
+    finally:
+        release.set()
+        timer.cancel()
+        thread.join(10)
+        parent.close()
+
+
 def test_a_call_failed_by_the_stop_before_its_write_is_not_written():
     """The call was registered, then the stop failed it (the reader reached the channel's end) before the call took
     the write lock: the frame is never written, since its reply would go nowhere."""

@@ -154,6 +154,10 @@ class CoreLink:
         """Calls another core through kelmod. Returns a Future of the reply body; a refusal raises KelmoError
         from `result()` with its code and its `retryable` verdict, and a call that could not be sent or answered
         (the channel to kelmod closing or gone) fails with E_TRANSPORT."""
+        if self._stopping.is_set() or self._peer_gone.is_set():
+            # A call made once the link stops fails at once, whatever its body, and never queues behind an
+            # earlier write that kelmod may no longer read.
+            return self._refuse_stopped(Future())
         call_id = uuid.uuid4().hex
         header = {'v': wire.VERSION, 'kind': 'call', 'id': call_id, 'op': op, 'body_type': 'json',
                   'deadline_ms': max(1, context.remaining_ms())}
@@ -199,8 +203,12 @@ class CoreLink:
         if refused:
             with self._state:
                 self._outgoing.pop(call_id, None)
-            self._ask_owner_to_stop()  # the owner hears of the stop before this call fails
-            _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
+            self._refuse_stopped(future)
+        return future
+
+    def _refuse_stopped(self, future):
+        self._ask_owner_to_stop()  # the owner hears of the stop before the call fails
+        _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------
