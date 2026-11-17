@@ -666,3 +666,27 @@ def test_the_stop_flag_waits_for_a_write_already_past_its_check():
         finishing.join(10)
         parent.close()
     assert link._stopping.is_set()
+
+
+def test_a_call_after_a_reply_that_found_kelmod_gone_does_not_try_to_write():
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    real, writes = link.sock, []
+
+    class Counted:
+        def sendall(self, data):
+            writes.append(len(data))
+            return real.sendall(data)
+
+        def close(self):
+            real.close()
+
+    link.sock = Counted()
+    parent.close()
+    link._reply(uuid.uuid4().hex, {})  # a handler's reply finds kelmod gone
+    call = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    try:
+        assert call.exception().code == 'E_TRANSPORT'
+        assert len(writes) == 1, f'{len(writes)} writes: the call after a reply found kelmod gone still wrote'
+    finally:
+        real.close()

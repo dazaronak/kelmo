@@ -133,7 +133,17 @@ class CoreLink:
     def send(self, header, body=None):
         data = wire.encode(header, body)
         with self._write_lock:
+            self._write_marking_gone(data)
+
+    def _write_marking_gone(self, data):
+        """Writes under the write lock; a write that finds kelmod gone marks it, so no call tries to write after
+        it."""
+        try:
             self.sock.sendall(data)
+        except OSError as error:
+            if error.errno in PEER_GONE:
+                self._peer_gone.set()
+            raise
 
     def _reply(self, call_id, body=None, error=None):
         try:
@@ -144,7 +154,7 @@ class CoreLink:
                 'code': 'E_PROCESSING', 'retryable': False, 'message': f'The reply could not be encoded: {failure}'}))
         try:
             with self._write_lock:
-                self.sock.sendall(data)
+                self._write_marking_gone(data)
         except OSError:
             pass
 
@@ -184,12 +194,7 @@ class CoreLink:
                 # them if it was registered before; a call written now would wait for a reply that cannot come.
                 refused = self._stopping.is_set() or self._peer_gone.is_set()
                 if not refused:
-                    try:
-                        self.sock.sendall(data)
-                    except OSError as error:
-                        if error.errno in PEER_GONE:
-                            self._peer_gone.set()  # under the write lock: no call after this one tries to write
-                        raise
+                    self._write_marking_gone(data)
         except Exception as error:  # noqa: BLE001 - a failed write fails this call; only a gone peer stops the core
             with self._state:
                 self._outgoing.pop(call_id, None)
