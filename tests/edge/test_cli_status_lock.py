@@ -888,3 +888,206 @@ def test_daemon_status_answers_while_another_caller_holds_the_outbox_connection(
         release.set()
         holder.join(10)
         core.close()
+
+
+
+def test_a_hook_gets_the_outbox_while_status_waits_and_a_delivery_needs_the_channel(profile):
+    """kelmo-client/1 carries one request at a time. While `kelmo status` waits for its reply, a delivery takes the
+    outbox and needs the channel; status reads over a channel of its own, so the delivery is not held behind it and
+    a hook gets the outbox within a second."""
+    from kelmo.client import SharedClient
+    from kelmo.core.edge_core import EdgeCore
+    entered, release = threading.Event(), threading.Event()
+    channels = []
+
+    def factory():
+        channels.append(WritesChannel(profile.authority_id, entered, release))
+        return channels[-1]
+
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    context = SimpleNamespace(remaining=lambda: 30.0, check=lambda: None)
+    status = threading.Thread(target=lambda: core.handle_cli(context, {'argv': ['status', '--vault',
+                                                                               str(profile.root)]}), daemon=True)
+
+    def deliver():
+        with core.client.deadline(5.0):
+            try:
+                core.client.flush()
+            except Exception:  # noqa: BLE001 - only the hook's wait is measured here
+                pass
+
+    delivery = threading.Thread(target=deliver, daemon=True)
+    try:
+        status.start()
+        assert entered.wait(5), 'status never reached the authority'
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'pending-one')
+        delivery.start()
+        time.sleep(0.3)  # the delivery takes the outbox and asks for a channel
+        start = time.monotonic()
+        got = core._owner.acquire(timeout=1.0, urgent=True)
+        waited = time.monotonic() - start
+        if got:
+            core._owner.release()
+        assert got and waited < 1.0, f'the hook waited {waited:.2f} s behind a delivery held by status'
+    finally:
+        release.set()
+        status.join(10)
+        delivery.join(10)
+        core.close()
+
+
+def test_a_status_read_on_a_cold_channel_holds_no_connect_a_delivery_waits_for(profile):
+    """No channel is open yet and the authority answers a hello slowly: `kelmo status` connects on a channel of its
+    own, so a delivery's connect does not wait for that hello."""
+    from kelmo.client import PROTOCOL, SharedClient
+    entered, release, opened = threading.Event(), threading.Event(), []
+
+    class Channel:
+        def __init__(self, slow):
+            self.slow, self.frames = slow, []
+
+        def request(self, frame, timeout=None):
+            self.frames.append(frame['op'])
+            if frame['op'] == 'hello' and self.slow:
+                entered.set()
+                release.wait(10)
+            result = ({'authority_id': profile.authority_id, 'operations': ['hello', 'status', 'capture']}
+                      if frame['op'] == 'hello' else {'operation_id': 'op-1'} if frame['op'] == 'capture'
+                      else {'ok': True})
+            return {'protocol': PROTOCOL, 'request_id': frame['request_id'], 'ok': True, 'result': result}
+
+        def close(self):
+            pass
+
+    def factory():
+        opened.append(Channel(slow=not opened))
+        return opened[-1]
+
+    from kelmo.client import ClientService
+    client = SharedClient(profile, channel_factory=factory, multiplex=True)
+    reader = threading.Thread(target=lambda: ClientService(client).status(), daemon=True)
+    try:
+        reader.start()
+        assert entered.wait(5), 'status never connected'
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'cold-one')
+        started = time.monotonic()
+        with client.deadline(3.0):
+            result = client.flush()
+        assert time.monotonic() - started < 1.0, 'the delivery waited for the status hello'
+        assert result['delivered'] == 1, result
+    finally:
+        release.set()
+        reader.join(10)
+        client.close()
+
+
+def test_a_direct_close_clears_the_mark_so_the_channel_is_closed_once(profile):
+    from kelmo.client import SharedClient
+    closes = []
+
+    class Channel:
+        def request(self, frame, timeout=None):
+            raise AssertionError('no request is made here')
+
+        def close(self):
+            closes.append(1)
+
+    client = SharedClient(profile, channel_factory=Channel, multiplex=True)
+    try:
+        channel = Channel()
+        channel.close_when_free = True  # marked earlier by a drop that could not get the turn
+        client._close_channel(channel)
+        client._close_if_marked(channel)
+        assert closes == [1], closes
+    finally:
+        client.close()
+
+
+def test_a_mark_seen_before_another_caller_closed_the_channel_does_not_close_it_again(profile):
+    from kelmo.client import SharedClient
+    closes = []
+    client = SharedClient(profile, multiplex=True)
+
+    class Channel:
+        _mark = True
+        inner = False
+
+        @property
+        def close_when_free(self):
+            value = self._mark
+            if value and not Channel.inner:
+                Channel.inner = True
+                client._close_if_marked(self)  # another caller closes it right after this one read the mark
+            return value
+
+        @close_when_free.setter
+        def close_when_free(self, value):
+            self._mark = value
+
+        def close(self):
+            closes.append(1)
+
+    try:
+        client._close_if_marked(Channel())
+        assert closes == [1], closes
+    finally:
+        client.close()
+
+
+def test_a_channel_dropped_while_a_delivery_waited_for_its_turn_carries_no_request(profile):
+    """The delivery checked the channel, then waited for the turn; a drop marked the channel meanwhile. Nothing is
+    written on it, and the entry counts no attempt and keeps no transport refusal."""
+    from kelmo.client import SharedClient
+    entered, release = threading.Event(), threading.Event()
+    client = SharedClient(profile, channel_factory=lambda: WritesChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    try:
+        channel = client._connect()
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'dropped-one')
+        turn = client._turn_for(channel)
+        turn.acquire()
+        results = []
+        delivery = threading.Thread(target=lambda: results.append(client.flush()), daemon=True)
+        delivery.start()
+        time.sleep(0.3)  # the delivery waits for the turn
+        channel.dropped = True
+        turn.release()
+        delivery.join(10)
+        assert [frame['op'] for frame in channel.frames] == ['hello'], channel.frames
+        entry = client.outbox.get('dropped-one')
+        assert (entry['attempts'], entry['last_error']) == (0, None), entry
+    finally:
+        release.set()
+        client.close()
+
+
+def test_a_bounded_summary_counts_its_wait_for_the_outbox_against_its_bound(profile):
+    """Half the bound went to waiting for another thread in the outbox; another process then holds the file: the
+    summary answers busy within its bound, not after the bound again."""
+    import sqlite3
+    from kelmo.client import SharedClient
+    client = SharedClient(profile, multiplex=True)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    held = threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            held.set()
+            other.execute('BEGIN EXCLUSIVE')
+            time.sleep(0.6)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        started = time.monotonic()
+        summary = client.outbox.summary_within(1.0)
+        took = time.monotonic() - started
+        assert summary == {'busy': True}, summary
+        assert took < 1.3, f'the summary took {took:.2f} s for a bound of 1 s'
+    finally:
+        holder.join(10)
+        other.rollback()
+        other.close()
+        client.close()

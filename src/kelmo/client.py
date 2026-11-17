@@ -345,10 +345,12 @@ class Outbox:
     def summary_within(self, seconds):
         """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
         longer than `seconds`."""
+        limit = time.monotonic() + max(0.0, seconds)
         if not self._serial.acquire(timeout=max(0.0, seconds)):
             return {'busy': True}
         try:
-            self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
+            left = max(0.0, limit - time.monotonic())
+            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
             try:
                 return self.summary()
             except sqlite3.OperationalError as error:
@@ -1084,6 +1086,7 @@ class SharedClient:
             return
         try:
             channel.close()
+            channel.close_when_free = False  # marked earlier: closed now, nobody closes it again
         finally:
             turn.release()
 
@@ -1095,13 +1098,15 @@ class SharedClient:
         if not turn.acquire(blocking=False):
             return  # a request is on it: that request closes it when it ends
         try:
+            if not getattr(channel, 'close_when_free', False):
+                return  # another caller closed it between the look above and the turn
             if not getattr(channel, 'closed', False):
                 channel.close()
             channel.close_when_free = False  # a stdio channel keeps no `closed` flag: the mark says it is done
         finally:
             turn.release()
 
-    def _send(self, channel, op, args, key):
+    def _send(self, channel, op, args, key, *, server=None):
         """One request: (True, result) or (False, error) for a reply bound to it; Unbound otherwise.
 
         Only a reply naming this request ID carries a server verdict, and its refusal must say whether it
@@ -1112,7 +1117,8 @@ class SharedClient:
             frame['idempotency_key'] = key
         if op != 'hello':
             # Version skew: an operation the connected server does not advertise is never delivered.
-            offered = self.server.get('operations') if isinstance(self.server, dict) else None
+            server = self.server if server is None else server
+            offered = server.get('operations') if isinstance(server, dict) else None
             if not isinstance(offered, list) or op not in offered:
                 raise Unsent('E_CAPABILITY', f'The connected shared kelmo server does not offer `{op}`; '
                                              'nothing was sent and a queued write stays pending.')
@@ -1130,6 +1136,8 @@ class SharedClient:
             else:
                 try:
                     with self._waiting_for(self._turn_for(channel), 'held the channel'):
+                        if getattr(channel, 'dropped', False):  # marked while this request waited for the turn
+                            raise Closed('E_TRANSPORT', 'The shared-memory channel was dropped before the request.')
                         try:
                             if isinstance(channel, StdioChannel):
                                 try:
@@ -1216,6 +1224,25 @@ class SharedClient:
         """A read: no outbox, and a transport failure is reported, never answered from the cache. It does not
         wait for the owner of the outbox; on a channel that carries one request at a time it takes its turn."""
         return self._read(op, args)
+
+    def read_aside(self, op, args=None):
+        """A read that must not make the client's writes wait for it (`kelmo status`): over the open kelmo/2
+        channel, which carries several requests at once, when there is one; otherwise over a channel of its own,
+        closed after, so it holds neither the connect nor the turn of the channel a delivery needs."""
+        channel = self._channel
+        if (channel is not None and getattr(channel, 'concurrent', False) and channel.alive
+                and not getattr(channel, 'dropped', False)):
+            return self._read(op, args, channel=channel)
+        channel, hello = self._hello_channel()
+        try:
+            ok, value = self._send(channel, op, args or {}, None, server=hello)
+        finally:
+            if hasattr(channel, 'grace'):
+                channel.grace = max(0, min(channel.grace, self._seconds_left()))
+            channel.close()
+        if ok:
+            return value
+        raise KelmoError(value['code'], value['message'])
 
     def _read(self, op, args, channel=None):
         given = channel is not None
@@ -1304,8 +1331,9 @@ class SharedClient:
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                if isinstance(error, Unsent) and error.code == 'E_BUSY':
-                    # Another request held the channel past this pass's deadline: nothing reached the server.
+                if isinstance(error, Closed) or (isinstance(error, Unsent) and error.code == 'E_BUSY'):
+                    # Another request held the channel past this pass's deadline, or the channel was closed or
+                    # dropped while this one waited for it: nothing reached the server.
                     if attempted:
                         self.outbox.attempt(key, -1)
                 else:
@@ -1696,7 +1724,7 @@ class ClientService:
                                                   'selected': list(selected)})
 
     def status(self):
-        server = self.client.call('status')
+        server = self.client.read_aside('status')
         return dict(server, outbox=self.client.outbox.summary_within(self.client._seconds_left()))
 
     def trace(self, operation_id):

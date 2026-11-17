@@ -18,10 +18,12 @@ entry here.
   for the authority. A hook that arrived meanwhile waited for the whole command and could hand its session
   a cached context marked unavailable; it now gets the outbox at once. `kelmo client status --probe`
   checks the authority on a channel of its own and closes it, so it no longer replaces the channel the
-  client's requests use. `kelmo client flush` and `resend` still hold the outbox for the whole command.
-  Against an authority that answers `kelmo-client/1`, whose channel carries one request at a time, a read
-  now waits for its turn on the channel instead of holding the outbox. A delivery that needs the channel
-  while another caller is still connecting gives up at its own deadline, with its writes kept, instead of
+  client's requests use. `kelmo status` reads the authority over the open kelmo/2 channel, which carries
+  several requests at once, or else over a channel of its own, so a delivery never waits for its reply or
+  its hello. `kelmo client flush` and `resend` still hold the outbox for the whole command. Against an
+  authority that answers `kelmo-client/1`, whose channel carries one request at a time, a read now waits
+  for its turn on the channel instead of holding the outbox. A delivery that needs the channel while
+  another caller is still connecting gives up at its own deadline, with its writes kept, instead of
   waiting for that caller's hello; such a delivery, and one that gave up because another request held the
   channel, no longer counts as an attempt or shows `E_BUSY` as the entry's last refusal. While another
   caller is reading or rewriting the outbox, or another process holds its file, `kelmo status` and `kelmo
