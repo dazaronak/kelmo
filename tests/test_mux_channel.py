@@ -238,3 +238,14 @@ def test_a_frame_whose_pipe_closes_after_part_of_it_went_out_ends_the_channel(mo
     finally:
         monkeypatch.undo()
         channel.close()
+
+
+def test_a_request_on_a_closed_channel_is_refused_as_closed():
+    """A channel another thread closed before this request: nothing of it was written, so it is refused as Closed,
+    which a delivery counts as no attempt and a read sends again on a new channel."""
+    from kelmo.client import Closed
+    channel = MuxChannel(command(), timeout=1)
+    channel.close()
+    with pytest.raises(KelmoError) as refused:
+        channel.request(request('after-close'))
+    assert isinstance(refused.value, Closed), type(refused.value)

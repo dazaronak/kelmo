@@ -445,6 +445,7 @@ class StdioChannel:
         # The client sets `timeout` before each request, so one deadline bounds every reply.
         self.timeout = timeout
         self.grace = 5
+        self.ended = False  # set by close: a channel its own deadline ended is dropped by the client
         try:
             self.process = subprocess.Popen(list(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, close_fds=True)
@@ -456,10 +457,10 @@ class StdioChannel:
         os.set_blocking(self.process.stdin.fileno(), False)
 
     def request(self, frame):
-        # A frame too large to encode is refused here (E_LIMIT) before a byte is written, so the
-        # healthy channel stays open.
-        data = encode_frame(frame)
+        # The deadline starts before the frame is encoded, so a slow encode counts against it. A frame too large to
+        # encode is refused here (E_LIMIT) before a byte is written, so the healthy channel stays open.
         deadline = time.monotonic() + self.timeout
+        data = encode_frame(frame)
         self.wrote = False  # set once the frame is out: a closed pipe after it is not "nothing written"
         try:
             self._write(data, deadline)
@@ -473,6 +474,9 @@ class StdioChannel:
             # A channel that missed its deadline or broke framing is ended now, never waited for.
             self.grace = 0
             self.close()
+            if not self.wrote and getattr(error, 'partial', None) is False:
+                # Not a byte of the frame went out before the deadline: the request is unsent.
+                raise Late('E_TRANSPORT', 'The channel did not take the request before its deadline.') from error
             raise KelmoError('E_TRANSPORT', str(error)) from error
 
     def _write(self, data, deadline):
@@ -480,18 +484,24 @@ class StdioChannel:
         frame cut short is never followed by another on the same stream."""
         descriptor = self.process.stdin.fileno()
         view = memoryview(data)
+        written = 0
         with selectors.DefaultSelector() as selector:
             selector.register(descriptor, selectors.EVENT_WRITE)
             while view:
                 left = deadline - time.monotonic()
                 if left <= 0 or not selector.select(left):
-                    raise KelmoError('E_TRANSPORT', 'The channel did not accept the request before its deadline.')
+                    error = KelmoError('E_TRANSPORT', 'The channel did not accept the request before its deadline.')
+                    error.partial = written > 0
+                    raise error
                 try:
-                    view = view[os.write(descriptor, view):]
+                    count = os.write(descriptor, view)
+                    written += count
+                    view = view[count:]
                 except BlockingIOError:
                     continue
 
     def close(self):
+        self.ended = True
         if self.process.poll() is None:
             try:
                 self.process.stdin.close()
@@ -586,8 +596,8 @@ class MuxChannel:
     def request(self, frame, timeout=None):
         duration = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + max(0.0, duration)
-        if not self.alive:
-            raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.')
+        if not self.alive:  # closed before this request: nothing of it is written
+            raise Closed('E_TRANSPORT', 'The shared-memory channel closed.')
         call_id = uuid.uuid4().hex
         has_key = 'idempotency_key' in frame
         key = frame.get('idempotency_key')
@@ -608,7 +618,7 @@ class MuxChannel:
         waiter = {'event': threading.Event(), 'header': None, 'body': None, 'error': None}
         with self._state_lock:
             if self._failed or self._closed:
-                raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.')
+                raise Closed('E_TRANSPORT', 'The shared-memory channel closed.')
             self._waiters[call_id] = waiter
         try:
             self._write(data, deadline)
@@ -1060,6 +1070,11 @@ class SharedClient:
             raise Unbound('E_TRANSPORT', 'The deadline passed before the shared kelmo server answered.')
         return min(self.profile.timeout_seconds, left)
 
+    def _deadline_passed(self):
+        """True once the active deadline has passed; never without one."""
+        deadline = self._deadline
+        return deadline is not None and time.monotonic() >= deadline
+
     def _left_before_send(self):
         """Seconds left before the active deadline, read before any byte of a request is written: a deadline that
         already passed is `Late`, so a queued write keeps its attempts and its earlier refusal."""
@@ -1234,7 +1249,7 @@ class SharedClient:
         except Unbound:
             raise
         except KelmoError as error:
-            raise Unbound(error.code, str(error)) from error
+            raise (Late if self._deadline_passed() else Unbound)(error.code, str(error)) from error
         except OSError as error:
             raise Unbound('E_TRANSPORT', 'The configured shared-memory channel could not be started.') from error
         try:
@@ -1244,10 +1259,13 @@ class SharedClient:
             if not isinstance(hello, dict) or hello.get('authority_id') != self.profile.authority_id:
                 raise Unbound('E_AUTHORITY', 'The channel reached a different memory authority than '
                                              'this client is pinned to; nothing was sent.')
-        except BaseException:
+        except BaseException as error:
             if isinstance(channel, StdioChannel):
                 channel.grace = 0
             channel.close()
+            if isinstance(error, Unbound) and not isinstance(error, Unsent) and self._deadline_passed():
+                # The hello ran out of the deadline: nothing of a queued write was sent.
+                raise Late(error.code, str(error)) from error
             raise
         return channel, hello
 
@@ -1270,7 +1288,10 @@ class SharedClient:
         channel = self._channel
         if (channel is not None and getattr(channel, 'concurrent', False) and channel.alive
                 and not getattr(channel, 'dropped', False)):
-            return self._read(op, args, channel=channel)
+            try:
+                return self._read(op, args, channel=channel)
+            except Closed:
+                pass  # closed under this read before it went out: once more, on a channel of its own
         channel, hello = self._hello_channel()
         try:
             ok, value = self._send(channel, op, args or {}, None, server=hello)
@@ -1296,8 +1317,8 @@ class SharedClient:
                 channel = self._connect()
                 ok, value = self._send(channel, op, args or {}, None)
         except Unbound as error:
-            if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
-                self._drop(channel)
+            if channel is not None and (not isinstance(error, Unsent) or getattr(channel, 'ended', False)):
+                self._drop(channel)  # a local refusal leaves the channel healthy, unless it ended the channel
             raise
         if ok:
             return value
@@ -1367,8 +1388,8 @@ class SharedClient:
                 attempted = True
                 ok, value = self._send(channel, entry['op'], json.loads(entry['args']), key)
             except Unbound as error:
-                if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
-                    self._drop(channel)
+                if channel is not None and (not isinstance(error, Unsent) or getattr(channel, 'ended', False)):
+                    self._drop(channel)  # a local refusal leaves the channel healthy, unless it ended the channel
                 if isinstance(error, (Closed, Unsent)) and attempted:
                     self.outbox.attempt(key, -1)  # refused here before a byte went out: no attempt
                 if not (isinstance(error, (Closed, Late)) or (isinstance(error, Unsent) and error.code == 'E_BUSY')):

@@ -1305,3 +1305,60 @@ def test_a_delivery_whose_deadline_passes_before_its_channel_is_connected_keeps_
     finally:
         release.set()
         client.close()
+
+
+def test_a_status_read_whose_shared_channel_closed_under_it_goes_again_on_its_own(profile):
+    """The open kelmo/2 channel is closed under a status read before the read went out: the read goes again on a
+    channel of its own instead of failing."""
+    from kelmo.client import Closed, SharedClient
+    entered, release = threading.Event(), threading.Event()
+    release.set()
+
+    class ClosedUnderIt:
+        concurrent, alive, stalled = True, True, False
+
+        def request(self, frame, timeout=None):
+            raise Closed('E_TRANSPORT', 'closed by another thread before the request')
+
+        def close(self):
+            pass
+
+    client = SharedClient(profile, channel_factory=lambda: OneAtATimeChannel(profile.authority_id, entered, release),
+                          multiplex=True)
+    client._channel = ClosedUnderIt()
+    client.server = {'authority_id': profile.authority_id, 'operations': ['hello', 'status']}
+    try:
+        with client.deadline(5.0):
+            try:
+                value = client.read_aside('status')
+            except Exception as error:  # noqa: BLE001 - the kind of failure is what this test checks
+                value = error
+        assert value == {'ok': True}, repr(value)
+    finally:
+        client.close()
+
+
+def test_a_hello_that_runs_past_the_deadline_keeps_the_entrys_refusal(profile):
+    """The channel's hello outlasts the pass's deadline: nothing of the entry was sent, so it keeps its earlier
+    refusal and counts no attempt."""
+    from kelmo.client import SharedClient
+    from kelmo.errors import KelmoError
+
+    class SlowHello:
+        def request(self, frame, timeout=None):
+            time.sleep(0.5)
+            raise KelmoError('E_TRANSPORT', 'The hello timed out.')
+
+        def close(self):
+            pass
+
+    client = SharedClient(profile, channel_factory=SlowHello, multiplex=True)
+    try:
+        client.outbox.enqueue('capture', {'content': 'note', 'intent': 'archive'}, 'slow-hello')
+        client.outbox.note('slow-hello', 'E_EARLIER')
+        with client.deadline(0.3):
+            client.flush()
+        entry = client.outbox.pending()[0]
+        assert (entry['attempts'], entry['last_error']) == (0, 'E_EARLIER'), entry
+    finally:
+        client.close()
