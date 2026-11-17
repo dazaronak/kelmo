@@ -10,9 +10,10 @@ entry here.
 
 - A core whose write to kelmod fails part-way through a frame no longer goes on writing after the broken
   frame. Its channel ends for writing at once: a core that runs background work (the state core) hears of the
-  stop before the call fails, every later call or reply fails without a byte written, and kelmod sees the
-  channel end instead of a frame that goes on. A confined core, which cannot half-close its channel, reads the
-  replies on their way for a second more and then ends it whole. A write that fails before any byte went out,
+  stop before the call fails, every later call fails and every later reply is dropped without a byte
+  written, and kelmod sees the channel end instead of a frame that goes on. A confined core, which cannot
+  half-close its channel, reads the replies on their way for about a second more, then stops reading and
+  closes the channel once its running handlers have finished. A write that fails before any byte went out,
   with an error that does not say kelmod is gone, still fails that call alone.
 - A promote note whose editor call fails because the core is stopping now waits for the next start
   without being charged an attempt, as a stop met earlier in the same run already did, also when the editor
