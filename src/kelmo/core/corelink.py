@@ -13,13 +13,14 @@ asked to stop first, so the failures of its open calls count as the stop's, then
     link = CoreLink.from_descriptor(3, handlers={'state.status': (status, 'read')}, lanes={'read': 4})
     link.serve()          # blocks until the core has drained after admin.stop, or kelmod closed the channel
 """
+import errno
 import os
 import socket
 import sys
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 
 from ..errors import KelmoError
 from . import wire
@@ -73,6 +74,19 @@ class DescriptorChannel:
                 os.close(fd)
             except OSError:
                 pass
+
+
+# A write that fails with one of these means kelmod's end of the channel is gone; any other error (no buffer space)
+# fails that call alone.
+PEER_GONE = frozenset({errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF, errno.ESHUTDOWN})
+
+
+def _fail(future, error):
+    """Fails `future` unless the stop already failed it (the reader reached the channel's end first)."""
+    try:
+        future.set_exception(error)
+    except InvalidStateError:
+        pass
 
 
 class CoreLink:
@@ -152,8 +166,8 @@ class CoreLink:
             # Nothing was written: the call alone fails, whatever the encoder raised.
             with self._state:
                 self._outgoing.pop(call_id, None)
-            future.set_exception(error if isinstance(error, KelmoError)
-                                 else KelmoError('E_PROTOCOL', f'The call could not be encoded: {error}'))
+            _fail(future, error if isinstance(error, KelmoError)
+                  else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
             return future
         try:
             with self._write_lock:
@@ -161,11 +175,12 @@ class CoreLink:
         except OSError as error:
             with self._state:
                 self._outgoing.pop(call_id, None)
-            # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
-            # hears of the stop before this call fails, as it does for the calls the reader fails.
-            self._stopping.set()
-            self._ask_owner_to_stop()
-            future.set_exception(KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+            if error.errno in PEER_GONE:
+                # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
+                # hears of the stop before this call fails, as it does for the calls the reader fails.
+                self._stopping.set()
+                self._ask_owner_to_stop()
+            _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------
@@ -205,6 +220,7 @@ class CoreLink:
     def _ask_owner_to_stop(self):
         """`begin_stop`, once. A caller that comes while it runs returns only after it has run, so its own
         failure is counted as the stop's too; `begin_stop` does not wait, so neither does that caller for long."""
+        failure = None
         with self._owner_stop_lock:
             if self._owner_stop_asked:
                 return
@@ -213,11 +229,12 @@ class CoreLink:
                 try:
                     self.begin_stop()
                 except Exception as error:  # noqa: BLE001 - the stop goes on
-                    try:
-                        print(f'kelmo core: asking the core to stop failed ({type(error).__name__})',
-                              file=sys.stderr)
-                    except (OSError, ValueError):
-                        pass
+                    failure = error
+        if failure is not None:  # reported outside the lock: a stuck stderr holds no other caller
+            try:
+                print(f'kelmo core: asking the core to stop failed ({type(failure).__name__})', file=sys.stderr)
+            except (OSError, ValueError):
+                pass
 
     def _wait_for_owner(self):
         if self.wait_stopped is not None:

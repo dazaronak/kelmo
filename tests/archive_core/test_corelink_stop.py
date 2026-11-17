@@ -173,6 +173,7 @@ def test_an_os_error_while_encoding_a_call_does_not_stop_the_core():
         future = link.call('archive.echo', Odd(x=1), Context.local(uuid.uuid4().hex, 30))
         assert future.exception() is not None
         assert order == [], order
+        assert future.exception().code == 'E_TRANSPORT', 'an encoder error that is not a KelmoError fails as before'
     finally:
         parent.close()
 
@@ -281,3 +282,57 @@ def test_heartbeats_are_answered_while_a_status_probe_waits():
         release.set()
         parent.close()
         serving.join(30)
+
+
+def test_a_local_write_error_with_kelmod_still_there_does_not_stop_the_core():
+    """Only an error that says the peer is gone stops the core; a local one (no buffer space) fails the call
+    alone, as before."""
+    import errno
+    parent, child = socket.socketpair()
+    order = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+
+    class Full:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def sendall(self, _data):
+            raise OSError(errno.ENOBUFS, 'No buffer space available')
+
+        def __getattr__(self, name):
+            return getattr(self.sock, name)
+
+    link.sock = Full(link.sock)
+    try:
+        future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+        assert future.exception().code == 'E_TRANSPORT'
+        assert order == [] and not link._stopping.is_set(), order
+    finally:
+        parent.close()
+
+
+def test_an_unsent_call_already_failed_by_the_stop_returns_its_failed_future(monkeypatch):
+    """The reader's end of the channel fails every open call; a call whose write fails just after that returns its
+    failed future instead of raising InvalidStateError."""
+    parent, child = socket.socketpair()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    parent.close()
+
+    class FailedFirst:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def sendall(self, data):
+            with link._state:
+                pending = list(link._outgoing.values())
+            for future in pending:  # as `_finish` does when the reader reaches the end first
+                future.set_exception(RuntimeError('failed by the stop'))
+            return self.sock.sendall(data)
+
+        def __getattr__(self, name):
+            return getattr(self.sock, name)
+
+    link.sock = FailedFirst(link.sock)
+    future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    assert future.exception() is not None
