@@ -1,4 +1,5 @@
 """Black-box coverage for concurrent kelmo/2 requests over one client process."""
+import os
 import sys
 import threading
 import time
@@ -142,3 +143,140 @@ def test_close_is_idempotent_and_marks_the_channel_dead():
     channel.close()
     channel.close()
     assert not channel.alive
+
+
+def test_a_request_on_a_channel_whose_pipe_closed_leaves_no_waiter_behind():
+    channel = MuxChannel(command(), timeout=2)
+
+    def closed(data, deadline):
+        raise ValueError('I/O operation on closed file.')  # the pipe closed under the write; the peer still runs
+
+    channel._write = closed
+    try:
+        with pytest.raises(ValueError):
+            channel.request(request('after-close'))
+        assert channel._waiters == {}, channel._waiters
+    finally:
+        channel.close()
+
+
+def test_a_cancel_that_finds_the_pipe_closed_still_ends_the_call_on_its_deadline():
+    channel = MuxChannel(command(), timeout=0.3)
+    real, writes = channel._write, []
+
+    def write(data, deadline):
+        writes.append(data)
+        if len(writes) > 1:
+            raise ValueError('I/O operation on closed file.')
+        return real(data, deadline)
+
+    channel._write = write
+    try:
+        with pytest.raises(KelmoError) as raised:
+            channel.request(request('slow', delay=2))
+        assert raised.value.code == 'E_TRANSPORT' and len(writes) == 2, (raised.value, writes)
+        assert not channel.alive, 'a channel whose pipe closed under the cancel stayed in use'
+    finally:
+        channel.close()
+
+
+def test_a_request_that_cannot_take_the_write_lock_before_its_deadline_is_unsent():
+    """Another thread's write holds the pipe past this request's deadline: nothing of this frame was written, so it
+    fails as unsent, on its deadline, and the channel stays in use."""
+    from kelmo.client import Unsent
+    channel = MuxChannel(command(), timeout=0.3)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with channel._write_lock:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        started = time.monotonic()
+        with pytest.raises(KelmoError) as refused:
+            channel.request(request('behind-a-write'))
+        took = time.monotonic() - started
+        assert took < 1.0, f'the request waited {took:.2f} s for the write lock past its 0.3 s deadline'
+        assert isinstance(refused.value, Unsent), type(refused.value)
+        assert channel.alive and channel._waiters == {}, channel._waiters
+    finally:
+        release.set()
+        holder.join(10)
+        channel.close()
+
+
+def test_a_frame_whose_pipe_closes_after_part_of_it_went_out_ends_the_channel(monkeypatch):
+    """The pipe closes under a frame after some of its bytes went out: the peer may hold a prefix, so the request
+    fails as a transport error and the channel is not used again, never as an unsent request that may go again."""
+    import kelmo.client as client_module
+    channel = MuxChannel(command(), timeout=2)
+    descriptor = channel.process.stdin.fileno()
+    real, calls = os.write, []
+
+    def write(fd, data):
+        if fd != descriptor:
+            return real(fd, data)
+        calls.append(len(data))
+        if len(calls) == 1:
+            return real(fd, bytes(data[:1]))  # one byte of the frame reaches the peer
+        raise ValueError('I/O operation on closed file.')
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('cut-mid-frame'))
+            outcome = None
+        except Exception as error:  # noqa: BLE001 - the kind of failure is what this test checks
+            outcome = error
+        monkeypatch.undo()
+        assert isinstance(outcome, KelmoError), f'a frame cut after {calls} reached the caller as {outcome!r}'
+        assert not channel.alive, 'a channel that may hold a prefix of a frame stayed in use'
+    finally:
+        monkeypatch.undo()
+        channel.close()
+
+
+def test_a_request_on_a_closed_channel_is_refused_as_closed():
+    """A channel another thread closed before this request: nothing of it was written, so it is refused as Closed,
+    which a delivery counts as no attempt and a read sends again on a new channel."""
+    from kelmo.client import Closed
+    channel = MuxChannel(command(), timeout=1)
+    channel.close()
+    with pytest.raises(KelmoError) as refused:
+        channel.request(request('after-close'))
+    assert isinstance(refused.value, Closed), type(refused.value)
+
+
+def test_a_pipe_that_closes_before_a_byte_of_the_frame_goes_out_refuses_it_as_closed(monkeypatch):
+    """The peer exited after the channel's checks and before the frame's first byte: nothing was written, so the
+    request is refused as Closed (no attempt, no refusal kept) and the channel is not used again."""
+    import errno
+
+    import kelmo.client as client_module
+    from kelmo.client import Closed
+    channel = MuxChannel(command(), timeout=2)
+    descriptor = channel.process.stdin.fileno()
+    real = os.write
+
+    def write(fd, data):
+        if fd != descriptor:
+            return real(fd, data)
+        raise BrokenPipeError(errno.EPIPE, 'Broken pipe')
+
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('gone-before-frame'))
+            outcome = None
+        except Exception as error:  # noqa: BLE001 - the kind of failure is what this test checks
+            outcome = error
+        monkeypatch.undo()
+        assert isinstance(outcome, Closed), f'a frame never written reached the caller as {outcome!r}'
+        assert not channel.alive, 'a channel whose peer is gone stayed in use'
+    finally:
+        monkeypatch.undo()
+        channel.close()

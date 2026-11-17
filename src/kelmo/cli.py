@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 
@@ -251,6 +252,11 @@ def served_while_fenced(args):
     return field is not None and getattr(args, field, None) in allowed
 
 
+# Standard output is process-wide: two borrowed parses at once silence it one after the other, or the second would
+# restore the first one's buffer. A parse error raises UsageError (`interface.Parser.error`) without printing.
+_SILENCED = threading.Lock()
+
+
 def run_borrowed(service, argv, sources=None, stdin=None, *, fenced=False, lease=None):
     """`state.cli` in the state core: parse and dispatch one CLI call over the core's own Service. `fenced`:
     the server profile is fenced, so only commands that change nothing are run. `lease(reads_only)`, when
@@ -258,7 +264,7 @@ def run_borrowed(service, argv, sources=None, stdin=None, *, fenced=False, lease
     need not wait for the writer, which a Dreaming pass can hold for minutes."""
     parser, commands = build_parser(__version__)
     try:
-        with redirect_stdout(io.StringIO()):
+        with _SILENCED, redirect_stdout(io.StringIO()):
             args = parser.parse_args(argv)
     except SystemExit as error:
         raise UsageError('Invalid command arguments.') from error
@@ -284,12 +290,24 @@ def _dispatch_borrowed(service, args, commands, sources, stdin):
         _BORROWED_SERVICE.reset(token)
 
 
+def borrowed_read_only(argv):
+    """True for `status` and `client status`: they read the outbox and ask the server, and change neither, so the
+    edge core runs them without holding the outbox; the reads take it only where they touch it."""
+    parser, _commands = build_parser(__version__)
+    try:
+        with _SILENCED, redirect_stdout(io.StringIO()):
+            args = parser.parse_args(argv)
+    except (SystemExit, UsageError):  # the borrowed run refuses it with its own error
+        return False
+    return args.command == 'status' or (args.command == 'client' and getattr(args, 'action', None) == 'status')
+
+
 def run_borrowed_client(client, argv, sources=None, stdin=None, *, root=None):
     """`edge.cli` in the edge core: parse and dispatch one CLI call over the core's own SharedClient, for the
     core's own client root only."""
     parser, commands = build_parser(__version__)
     try:
-        with redirect_stdout(io.StringIO()):
+        with _SILENCED, redirect_stdout(io.StringIO()):
             args = parser.parse_args(argv)
     except SystemExit as error:
         raise UsageError('Invalid command arguments.') from error

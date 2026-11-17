@@ -15,7 +15,7 @@ import inspect
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -31,6 +31,8 @@ DELIVER_SECONDS = 5.0
 DELIVER_INTERVAL = 30.0
 # Bound of a hook that is not a SessionStart or prompt hook (those carry their own, shorter deadline).
 HOOK_SECONDS = 3.0
+# How long `kelmo daemon status` waits for another thread inside the outbox.
+STATUS_OUTBOX_SECONDS = 0.5
 # Bound of one spooled hook replayed by the deliverer.
 SPOOL_HOOK_SECONDS = 10.0
 
@@ -148,7 +150,7 @@ class EdgeCore:
         self.client = client or SharedClient(ClientProfile.load(self.root), multiplex=True)
         self._tools = None
         # The outbox is one connection and a delivery is one ordered pass: one caller at a time owns it, handlers
-        # and the deliverer alike. Reads do not take it.
+        # and the deliverer alike. A read over a channel that carries several requests does not take it.
         self._owner = OwnerLock()
         self._urgent = threading.local()
         self.client._lock = _OwnerGate(self)
@@ -387,7 +389,7 @@ class EdgeCore:
 
     def handle_cli(self, context, body):
         """One installed-CLI call on this client root, over the core's own SharedClient."""
-        from ..cli import run_borrowed_client
+        from ..cli import borrowed_read_only, run_borrowed_client
         argv = body.get('argv') if isinstance(body, dict) else None
         if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
             raise KelmoError('E_PROTOCOL', 'edge.cli carries {argv: [strings]}.')
@@ -398,7 +400,9 @@ class EdgeCore:
                            for pair in sources.values())):
             raise KelmoError('E_PROTOCOL', 'edge.cli sources are {name: [content, filename]}, stdin a string.')
         # A CLI command may read and rewrite the outbox in several steps (resend, flush): it holds it throughout.
-        with self.owned(context.remaining()), self.serving(context):
+        # A status command only reads it, and holding it across its wait for the server would keep a hook out.
+        held = nullcontext() if borrowed_read_only(argv) else self.owned(context.remaining())
+        with held, self.serving(context):
             result = run_borrowed_client(self.client, argv, sources, stdin, root=self.root)
         self.wake()
         return result
@@ -408,13 +412,15 @@ class EdgeCore:
                 'edge.cli': (self.handle_cli, 'handler'), 'edge.ack': (self.handle_ack, 'hook')}
 
     def status(self):
-        # Status runs on the frame reader: it reads the outbox only while nobody holds or waits for it, so it never
-        # waits for the client and never goes ahead of a queued hook; otherwise it reports the outbox busy.
+        # admin.status runs on a thread of its own and must answer at once: it reads the outbox only while nobody
+        # holds or waits for it, so it never waits for the client and never goes ahead of a queued hook; otherwise
+        # it reports the outbox busy.
         if not self._owner.acquire_if_idle():
             outbox = {'busy': True}
         else:
             try:
-                outbox = self.client.outbox.summary()
+                # A status command may be inside the outbox past another process's lock: wait for it briefly.
+                outbox = self.client.outbox.summary_within(STATUS_OUTBOX_SECONDS)
             except Exception as error:  # noqa: BLE001 - status reports, never fails
                 outbox = {'error': str(error)[:200]}
             finally:
