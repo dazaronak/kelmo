@@ -552,3 +552,102 @@ def test_a_rewrite_refused_by_a_reader_in_another_process_is_not_repeated_every_
     finally:
         reader.rollback()
         reader.close()
+
+
+
+def test_a_pass_that_found_the_outbox_held_comes_back_a_second_later_unwoken(real_edge, monkeypatch):
+    """The pending count could not be read (another caller held the outbox): the deliverer looks again a second
+    later instead of after the whole delivery interval."""
+    core, client = real_edge
+    real = client._pending_within
+    calls = []
+
+    def held_once():
+        calls.append(1)
+        return None if len(calls) == 1 else real()
+
+    monkeypatch.setattr(client, '_pending_within', held_once)
+    _passes(core, 1)
+    assert core._last['result'].get('stopped') == 'E_BUSY', core._last
+    before = core._last['at']
+    assert _until(lambda: core._last.get('at') != before, edge_core.BUSY_RETRY_SECONDS + 1.5), \
+        'no pass came back after the held outbox without a wake'
+
+
+def test_a_wall_clock_set_back_while_the_daemon_runs_does_not_stretch_a_short_pause(real_edge, profile,
+                                                                                    monkeypatch):
+    core, client = real_edge
+    _settled_pieces(client.outbox)
+    before = _size(profile)
+    with core.owned(1.0):
+        _passes(core, 1)
+    assert core._compaction['state'] == 'busy', core._compaction
+    real_time = time.time
+    shifted = type('Clock', (), {'time': staticmethod(lambda: real_time() - 86400.0),
+                                 'monotonic': staticmethod(time.monotonic), 'sleep': staticmethod(time.sleep)})
+    monkeypatch.setattr(edge_core, 'time', shifted)
+    time.sleep(edge_core.BUSY_RETRY_SECONDS + 0.1)
+    _passes(core, 1)
+    assert _size(profile) < before // 4, 'a clock set back a day kept the one-second pause for a day'
+
+
+def test_the_saved_compaction_pause_is_readable_by_its_owner_only(legacy_edge, profile, monkeypatch):
+    import os
+    monkeypatch.setattr(edge_core, 'CONVERSION_SECONDS_PER_MB', 1000.0)
+    core, client = legacy_edge()
+    assert core._compaction['state'] == 'too_large', core._compaction
+    mode = os.stat(profile.state / 'compaction.json').st_mode & 0o777
+    assert mode == 0o600, oct(mode)
+
+
+def test_a_client_on_its_own_does_not_wait_for_another_process_to_compact(profile):
+    """`kelmo client flush` without an edge core: another process holds the outbox file; the compaction is left
+    for the next flush instead of waiting for the lock."""
+    client = SharedClient(profile, multiplex=True)
+    _settled_pieces(client.outbox)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    other.execute('BEGIN EXCLUSIVE')
+    timer = threading.Timer(3.0, other.rollback)
+    timer.start()
+    try:
+        started = time.monotonic()
+        given = client.outbox.compact()
+        took = time.monotonic() - started
+        assert given == 0 and took < 1.0, (given, took)
+    finally:
+        timer.cancel()
+        try:
+            other.rollback()
+        except sqlite3.ProgrammingError:
+            pass
+        other.close()
+        client.close()
+
+
+def test_a_bounded_summary_counts_its_wait_for_the_outbox_against_its_bound(profile):
+    """Half the bound went to waiting for another thread in the outbox; another process then holds the file: the
+    summary answers busy within its bound, not after the bound again."""
+    client = SharedClient(profile, multiplex=True)
+    other = sqlite3.connect(profile.state / 'outbox.sqlite3', timeout=0, check_same_thread=False)
+    held = threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            held.set()
+            other.execute('BEGIN EXCLUSIVE')
+            time.sleep(0.6)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        started = time.monotonic()
+        summary = client.outbox.summary_within(1.0)
+        took = time.monotonic() - started
+        assert summary == {'busy': True}, summary
+        assert took < 1.3, f'the summary took {took:.2f} s for a bound of 1 s'
+    finally:
+        holder.join(10)
+        other.rollback()
+        other.close()
+        client.close()

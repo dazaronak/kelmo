@@ -13,7 +13,6 @@ import argparse
 import inspect
 import json
 import math
-import os
 import sqlite3
 import sys
 import threading
@@ -178,6 +177,10 @@ class EdgeCore:
         self._saved = bool(self._compaction)
         # A bounded rewrite of this old file was stopped for being slow: it waits for idle from then on.
         self._over_limit = self._compaction.get('over_limit') is True
+        # Pauses are timed on the monotonic clock in this process, so a wall clock set back does not stretch them;
+        # `retry_at` (wall clock) is what survives a restart.
+        self._compact_after = time.monotonic() + max(0.0, self._compaction.get('retry_at', 0.0) - time.time())
+        self._busy_after = 0.0
         self._wake.set()  # the first pass ingests what was spooled while no daemon ran
         self._deliverer = threading.Thread(target=self._deliver_loop, name='deliverer', daemon=True)
         self._deliverer.start()
@@ -283,9 +286,10 @@ class EdgeCore:
     def _deliver_loop(self):
         while not self._stopping.is_set():
             interval = DELIVER_INTERVAL
-            retry_at = self._compaction.get('retry_at', 0.0) - time.time()
-            if 0 < retry_at < interval:
-                interval = retry_at  # a compaction paused for a second comes back without being woken
+            now = time.monotonic()
+            for after in (self._compact_after, self._busy_after):
+                if 0 < after - now < interval:
+                    interval = after - now  # a pause of a second comes back without being woken
             self._wake.wait(interval)
             self._wake.clear()
             if self._stopping.is_set():
@@ -302,7 +306,9 @@ class EdgeCore:
                     result = self.client.flush(wait_for_holder=False)
             except Exception as error:  # noqa: BLE001 - the next pass retries; the outbox keeps every entry
                 result = {'stopped': type(error).__name__, 'message': str(error)[:200]}
-            if result.get('pending') == 0 and time.time() >= self._compaction.get('retry_at', 0.0):
+            # An outbox another caller held is looked at again a second later, woken or not.
+            self._busy_after = time.monotonic() + BUSY_RETRY_SECONDS if result.get('stopped') == 'E_BUSY' else 0.0
+            if result.get('pending') == 0 and time.monotonic() >= self._compact_after:
                 result = dict(result, compaction=self._compact())
             self._last = {'at': time.time(), 'result': result, 'spool': spool}
             if (result.get('pending') and result.get('stopped') is None) or (
@@ -409,6 +415,7 @@ class EdgeCore:
             record['error'] = f'{type(error).__name__}: {str(error)[:200]}'
         if pause:
             record['retry_at'] = time.time() + pause
+        self._compact_after = time.monotonic() + pause
         self._compaction = record
         if state in ('too_large', 'stuck', 'error') or self._over_limit:
             self._compaction_save(record)  # a pause of an hour, and a stopped rewrite, survive the core's recycles
@@ -435,11 +442,9 @@ class EdgeCore:
         return record
 
     def _compaction_save(self, record):
-        path = self._compaction_path()
-        temporary = path.with_name(path.name + '.tmp')
+        from ..client import _atomic_write
         try:
-            temporary.write_text(json.dumps(record))
-            os.replace(temporary, path)
+            _atomic_write(self._compaction_path(), json.dumps(record).encode())  # 0600, like the outbox's other files
         except OSError:
             return  # the pause then lasts this process only
         self._saved = True

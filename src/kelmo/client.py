@@ -258,14 +258,22 @@ class Outbox:
         Settled transcript entries drop their bytes but SQLite keeps the pages. An old file is rewritten once,
         which also makes it give pages back in steps from then on; a converted one is drained. A busy file is left
         for the next flush. Returns the bytes given back, 0 when nothing was due."""
-        pages, free, size, mode = self.compaction_state()
+        try:
+            # Another process's lock on the file leaves the compaction to the next flush instead of being waited for.
+            with self.waiting(COMPACT_TRY_SECONDS):
+                pages, free, size, mode = self.compaction_state()
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise
+            return 0
         if not _compaction_due(pages, free, size, min_free_bytes):
             return 0
         try:
             if mode != 2:
                 self.convert()
             else:
-                self.conn.execute('PRAGMA incremental_vacuum').fetchall()
+                with self.waiting(COMPACT_TRY_SECONDS):
+                    self.conn.execute('PRAGMA incremental_vacuum').fetchall()
         except sqlite3.OperationalError:
             return 0
         return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
@@ -319,10 +327,11 @@ class Outbox:
     def summary_within(self, seconds):
         """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
         longer than `seconds`."""
+        limit = time.monotonic() + max(0.0, seconds)
         if not self._serial.acquire(timeout=max(0.0, seconds)):
             return {'busy': True}
         try:
-            with self.waiting(seconds):
+            with self.waiting(max(0.0, limit - time.monotonic())):  # one bound for both waits
                 return self.summary()
         except sqlite3.OperationalError as error:
             if not sqlite_busy(error):
