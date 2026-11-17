@@ -59,7 +59,7 @@ def hook(service, action, payload, *, acknowledge=None):
                 registry = (reader.registry(Generation.from_dict(delivered['generation']))
                             if reader is not None and 'generation' in delivered else None)
                 pending_items, pending_warning = _pending(service, delivered['project'], registry)
-                context = legacy_delivery(config.state, delivered, pending_items[-20:],
+                context = legacy_delivery(config.state, delivered, pending_items,
                                           provider=payload.get('kelmo_provider', 'claude'), action=action,
                                           notice=pending_warning)
         except (KelmoError, OSError, ValueError) as error:

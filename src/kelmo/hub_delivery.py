@@ -213,14 +213,21 @@ def context_reference(root, data):
     return path
 
 
-def pending_text(pending):
-    """The pending block agents see: at most ten rows, then a count, under a digest of the whole set."""
+PENDING_ROWS = 10
+
+
+def pending_text(pending, more=None):
+    """The pending block agents see: at most ten rows, then a count, under a digest of the whole set. `more`
+    (a callable) names where the text of every note is when some are cut; it is called only then."""
     from .hot import frame_pending, pending_row
     pending = pending or []
-    lines = [pending_row(item) for item in pending[:10]]
-    if len(pending) > 10:
-        lines.append(f'+{len(pending) - 10} more')
-    return frame_pending('Pending wiki updates (digest ' + _hash(_encoded(pending)) + '):', lines) if pending else ''
+    lines = [pending_row(item) for item in pending[:PENDING_ROWS]]
+    if len(pending) > PENDING_ROWS:
+        lines.append(f'+{len(pending) - PENDING_ROWS} more')
+    text = frame_pending('Pending wiki updates (digest ' + _hash(_encoded(pending)) + '):', lines) if pending else ''
+    if len(pending) > PENDING_ROWS and more is not None:
+        text += (f'\nThe text of all {len(pending)} pending notes: read ' + more() + '.')
+    return text
 
 
 def header_line(snapshot, stale=False):
@@ -244,7 +251,7 @@ MANDATORY_OMITTED = ('Mandatory pages exceed the hook limit and are not repeated
 def assemble(header, mandatory, hub, work, pending, *, provider, pointer, work_pointer=None, mandatory_pointer=None, pending_pointer=None, limit=10000):
     pending = pending or []
     pending_digest = _hash(_encoded(pending))
-    pending_block = pending_text(pending)
+    pending_block = pending_text(pending, more=pending_pointer if callable(pending_pointer) else None)
     full = '\n\n'.join(part for part in (header, mandatory, hub, work, pending_block) if part)
     if provider != 'claude' or len(full) <= limit:
         return full
@@ -410,24 +417,26 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
     if previous and previous != _hash(identity.encode('utf-8')):
         reserve += len(RESTART_WARNING)
     complete = provider != 'claude' or len(full) <= 10000 - reserve
+    reference = None
+
+    def omitted_source(field):
+        nonlocal reference
+        if reference is None:
+            from .hot import pending_block
+            reference = context_reference(config.state, {
+                'generation': snapshot['generation'], 'enrollment_revision': snapshot['enrollment_revision'],
+                'manifest_sha256': snapshot['manifest_sha256'], 'project': project, 'stale': stale,
+                'work': work, 'work_path': work_path, 'pending': pending_block(pending)})
+        return str(reference) + ' (' + field + ' field)'
+    if pending and (not complete or len(pending) > PENDING_ROWS):
+        # Notes past the block's ten rows, or a block that does not fit, are read from the reference file.
+        def pending_pointer():
+            return omitted_source('pending')
     if not complete:
         current = current() if callable(current) else current
-        reference = None
-        def omitted_source(field):
-            nonlocal reference
-            if reference is None:
-                from .hot import pending_block
-                reference = context_reference(config.state, {
-                    'generation': snapshot['generation'], 'enrollment_revision': snapshot['enrollment_revision'],
-                    'manifest_sha256': snapshot['manifest_sha256'], 'project': project, 'stale': stale,
-                    'work': work, 'work_path': work_path, 'pending': pending_block(pending)})
-            return str(reference) + ' (' + field + ' field)'
         if work:
             def work_pointer():
                 return omitted_source('work')
-        if pending:
-            def pending_pointer():
-                return omitted_source('pending')
     else:
         current = None
     context = deliver(snapshot, project, work, pending, provider=provider, current=current, stale=stale,
@@ -446,7 +455,8 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
         pending_only = ''
         if hook_mode:
             pending_only = '\n\n'.join(part for part in (
-                header_line(snapshot, stale), pending_text(pending) or 'Pending wiki updates: none remain.',
+                header_line(snapshot, stale), pending_text(pending, more=pending_pointer)
+                or 'Pending wiki updates: none remain.',
                 repair, notice) if part)
         update = refresh(state, context, verified=verified, stale=stale,
                          compacted=action == 'start' or payload.get('source') in ('compact', 'compaction'),
@@ -459,12 +469,22 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
     return context
 
 
+LEGACY_PENDING_ROWS = 20
+
+
 def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
-    """Budget the complete legacy response once, preserving every omitted byte."""
+    """Budget the complete legacy response once, preserving every omitted byte. The newest twenty pending
+    notes are listed; older ones are counted and their text is in the reference file."""
     from .hot import pending_block
     warning = ('Kelmo context refreshed; restart if earlier facts were removed or contradicted.'
                if action == 'prompt' else '')
-    context = '\n\n'.join(part for part in (warning, delivered['context'], pending_block(pending), notice) if part)
+    pending = list(pending or ())
+    listed = pending_block(pending[-LEGACY_PENDING_ROWS:])
+    if len(pending) > LEGACY_PENDING_ROWS:
+        older = context_reference(root, {'pending': pending_block(pending), 'generation': delivered.get('generation')})
+        listed += (f'\n{len(pending) - LEGACY_PENDING_ROWS} older pending notes are not listed; the text of all '
+                   f'{len(pending)}: read {older} (pending field).')
+    context = '\n\n'.join(part for part in (warning, delivered['context'], listed, notice) if part)
     if provider != 'claude' or len(context) <= 10000:
         return context
     reference = context_reference(root, {'context': context, 'pending': pending_block(pending),
