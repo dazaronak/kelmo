@@ -27,7 +27,7 @@ from pathlib import Path
 
 from .config import CLIENT_FILE, ClientProfile
 from .core import wire
-from .errors import KelmoError
+from .errors import KelmoError, sqlite_busy
 from .server import NATIVE_ID, PROTOCOL, PipeReader, encode_frame
 
 # Only an unreachable or foreign server falls back to the labelled cache.
@@ -141,6 +141,16 @@ def prepare_profile(root, authority_id, command, *, sessions=None, timeout_secon
 
 COMPACT_MIN_FREE_BYTES = 16 * 1048576
 OUTBOX_WAIT_SECONDS = 60
+# How long a compaction statement waits for another connection's lock on the outbox file: a short try, then the
+# compaction is left to a later pass.
+COMPACT_TRY_SECONDS = 0.01
+# Pages one incremental step gives back: about 11 ms of work measured on a 246.7 MB file.
+COMPACT_CHUNK_PAGES = 256
+# SQLite steps between two looks at the clock while a conversion runs.
+COMPACT_PROGRESS_STEPS = 1000
+# How long a delivery waits for the outbox file before the owner of the outbox: a writer holds it for
+# milliseconds, a rewrite longer.
+OUTBOX_FILE_TRY_SECONDS = 0.5
 REFUSED_SHOWN = 20
 
 
@@ -161,6 +171,11 @@ def outbox_stall_warning(summary, clock=None):
     return (f"{summary['pending']} write(s) have waited {int(age // 60)} min to reach the server behind "
             f"{head['op']} {head['idempotency_key']} (last refusal {head.get('last_error') or 'none'}); "
             'check the server for a stuck lock or a stopped worker, then run kelmo client flush.')
+
+
+def _compaction_due(pages, free, size, min_free_bytes=COMPACT_MIN_FREE_BYTES):
+    """More than half of the file, and at least `min_free_bytes`, is free pages."""
+    return free * size >= min_free_bytes and free * 2 > pages
 
 
 def _serial(method):
@@ -188,6 +203,9 @@ class Outbox:
                                     check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA synchronous=FULL')
+        if self.conn.execute('PRAGMA page_count').fetchone()[0] == 0:
+            # A new outbox gives its free pages back in steps (`vacuum_step`), never by rewriting the whole file.
+            self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
         with self.conn:
             # Another process may be opening the same older outbox: the schema is read and brought up to date
             # under one write lock, so a column is added once.
@@ -234,20 +252,77 @@ class Outbox:
 
     @_serial
     def compact(self, min_free_bytes=COMPACT_MIN_FREE_BYTES):
-        """Rewrite the file when more than half of it, and at least `min_free_bytes`, is free pages.
+        """Give back the free pages when more than half of the file, and at least `min_free_bytes`, is free; for
+        a client that runs on its own (`kelmo client flush` without an edge core), where nobody shares the outbox.
 
-        Settled transcript entries drop their bytes but SQLite keeps the pages, so the file only grows.
-        A busy file is left for the next flush.
-        Returns the bytes given back, 0 when nothing was due."""
-        pages, free, size = (self.conn.execute(f'PRAGMA {name}').fetchone()[0]
-                             for name in ('page_count', 'freelist_count', 'page_size'))
-        if free * size < min_free_bytes or free * 2 < pages:
+        Settled transcript entries drop their bytes but SQLite keeps the pages. An old file is rewritten once,
+        which also makes it give pages back in steps from then on; a converted one is drained. A busy file is left
+        for the next flush. Returns the bytes given back, 0 when nothing was due."""
+        pages, free, size, mode = self.compaction_state()
+        if not _compaction_due(pages, free, size, min_free_bytes):
             return 0
         try:
-            self.conn.execute('VACUUM')
+            if mode != 2:
+                self.convert()
+            else:
+                self.conn.execute('PRAGMA incremental_vacuum').fetchall()
         except sqlite3.OperationalError:
             return 0
         return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
+
+    @_serial
+    def compaction_state(self):
+        """(page_count, freelist_count, page_size, auto_vacuum) of the file."""
+        return tuple(self.conn.execute(f'PRAGMA {name}').fetchone()[0]
+                     for name in ('page_count', 'freelist_count', 'page_size', 'auto_vacuum'))
+
+    @_serial
+    def convert(self, copy_seconds=None):
+        """Rewrite the file once in incremental mode, giving back every free page; any other caller's lock ends
+        it at once. With `copy_seconds`, a rewrite whose copy phase runs longer is stopped and rolled back
+        (SQLITE_INTERRUPT): its copy back into the file and its commit cannot be stopped, so the bound is on the
+        part that can. Returns the bytes given back."""
+        pages, _free, size, _mode = self.compaction_state()
+        with self.waiting(COMPACT_TRY_SECONDS):
+            self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+            if copy_seconds is not None:
+                limit = time.monotonic() + copy_seconds
+                self.conn.set_progress_handler(lambda: time.monotonic() >= limit, COMPACT_PROGRESS_STEPS)
+            try:
+                self.conn.execute('VACUUM')
+            finally:
+                # Cleared before the busy timeout is set back, which the handler would interrupt too.
+                self.conn.set_progress_handler(None, 0)
+        return max(0, pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
+
+    @_serial
+    def vacuum_step(self, pages=COMPACT_CHUNK_PAGES):
+        """Give back up to `pages` free pages of a converted file; another caller's lock ends it at once.
+        Returns (pages given back, free pages left)."""
+        before = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+        with self.waiting(COMPACT_TRY_SECONDS):
+            self.conn.execute(f'PRAGMA incremental_vacuum({int(pages)})').fetchall()
+        after = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+        return before - after, after
+
+    @contextmanager
+    def waiting(self, seconds):
+        """Wait at most `seconds` for another connection's lock on the file inside, then OUTBOX_WAIT_SECONDS
+        again. Called with the outbox held."""
+        self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
+        try:
+            yield
+        finally:
+            self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
+
+    def summary_within(self, seconds):
+        """The summary, or {'busy': True} when another caller holds the outbox longer than `seconds`."""
+        if not self._serial.acquire(timeout=max(0.0, seconds)):
+            return {'busy': True}
+        try:
+            return self.summary()
+        finally:
+            self._serial.release()
 
     @_serial
     def record_skip(self, provider, event, native_id, reason):
@@ -1242,14 +1317,20 @@ class SharedClient:
                     time.sleep(0.05)
             yield True
 
-    def flush(self):
+    def flush(self, *, wait_for_holder=True):
         """Deliver pending entries in order. A bound refusal the server calls final settles its entry; a
         retryable one, or no verdict at all (launcher, channel, hello, a reply bound to no request), leaves
-        it and everything after it pending and stops. `reached` says whether a channel was open."""
-        if self._multiplex and not self.outbox.pending_count():
-            # Nothing to deliver: a read that only wants its own writes sent first does not wait for the
-            # owner of the outbox. Whoever is delivering holds entries that are still pending.
-            return {'delivered': 0, 'refused': [], 'pending': 0, 'stopped': None, 'reached': None}
+        it and everything after it pending and stops. `reached` says whether a channel was open. `pending`
+        is None when the outbox stayed held. Without `wait_for_holder`, an outbox another caller keeps ends the
+        call at once with `E_BUSY`, leaving the delivery to that caller."""
+        if self._multiplex:
+            pending = self._pending_within()
+            if pending == 0:
+                # Nothing to deliver: a read that only wants its own writes sent first does not wait for the
+                # owner of the outbox. Whoever is delivering holds entries that are still pending.
+                return {'delivered': 0, 'refused': [], 'pending': 0, 'stopped': None, 'reached': None}
+            if pending is None and not wait_for_holder:
+                return {'delivered': 0, 'refused': [], 'pending': None, 'stopped': 'E_BUSY', 'reached': None}
         try:
             with self._lock:
                 try:
@@ -1261,8 +1342,31 @@ class SharedClient:
                     stopped = error.code
         except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
             stopped = 'E_BUSY'
-        return {'delivered': 0, 'refused': [], 'pending': self.outbox.pending_count(),
+        return {'delivered': 0, 'refused': [], 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': None}
+
+    def _seconds_left(self):
+        """Seconds left before the active deadline, 0 once it has passed (never raises)."""
+        try:
+            return self.remaining()
+        except Unbound:
+            return 0.0
+
+    def _pending_within(self):
+        """The number of pending entries, waiting for the outbox only briefly and never past the active deadline.
+        None when another caller keeps it (a rewrite in this process, or another process's lock on the file)."""
+        wait = min(OUTBOX_FILE_TRY_SECONDS, self._seconds_left())
+        if not self.outbox._serial.acquire(timeout=wait):
+            return None
+        try:
+            with self.outbox.waiting(wait):
+                return self.outbox.pending_count()
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise  # a disk or I/O error is reported as itself
+            return None
+        finally:
+            self.outbox._serial.release()
 
     def _deliver(self):
         """One pass over what was queued when it began, one entry in memory at a time: an entry queued
@@ -1330,7 +1434,7 @@ class SharedClient:
                              'successful contact and is not accepted until then.'}
 
     def local_status(self):
-        return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary()}
+        return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary_within(self._seconds_left())}
 
     def probe(self):
         """Verify a fresh channel's identity without flushing any queued write."""
@@ -1682,7 +1786,8 @@ class ClientService:
                                                   'selected': list(selected)})
 
     def status(self):
-        return dict(self.client.call('status'), outbox=self.client.outbox.summary())
+        server = self.client.call('status')
+        return dict(server, outbox=self.client.outbox.summary_within(self.client._seconds_left()))
 
     def trace(self, operation_id):
         return self.client.call('trace', {'operation_id': operation_id})
@@ -1904,6 +2009,12 @@ def dispatch(root, args, read_source, client=None):
             if args.action == 'flush':
                 # The detached flusher, outside any hook deadline, also gives back the space settled
                 # transcript pieces left behind.
+                # Under an edge core its deliverer gives the space back in steps, never under this command's
+                # hold on the outbox; a client running on its own compacts here.
+                edge = getattr(client, 'compactor', None)
+                if edge is not None:
+                    edge.wake()
+                    return dict(client.flush(), compacted=0)
                 return dict(client.flush(), compacted=client.outbox.compact())
             if args.action == 'resend':
                 items = client.outbox.resend(tuple(args.code or ('E_INPUT',)), apply=args.apply)

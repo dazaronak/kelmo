@@ -101,7 +101,7 @@ class Authority:
         with self._lock:
             return {}
 
-    def flush(self):
+    def flush(self, *, wait_for_holder=True):
         self.flushed.set()
         return {'reached': True, 'stopped': None, 'pending': 0, 'delivered': 0}
 

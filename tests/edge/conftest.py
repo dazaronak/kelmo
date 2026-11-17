@@ -56,7 +56,7 @@ class FakeClient:
     def remaining(self):
         return self.wait_seconds
 
-    def flush(self):
+    def flush(self, *, wait_for_holder=True):
         self.flushed.set()
         return {'reached': True, 'stopped': None, 'pending': 0, 'delivered': 0}
 

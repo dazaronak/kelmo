@@ -6,6 +6,23 @@ entry here.
 
 ## [Unreleased]
 
+### Changed
+
+- A shared client's outbox gives its free space back again. Settled transcript pieces drop their bytes but
+  leave their pages in `outbox.sqlite3`; since Kelmo 0.2.0 the edge daemon owns the outbox and only `kelmo
+  client flush` compacted it, so the file only grew. A new outbox now gives pages back in small steps (SQLite
+  incremental vacuum): a delivery pass that leaves nothing to send frees 256 pages at a time once more than
+  half of the file, and at least 16 MiB, is free, and stops at once for a hook that waits for the outbox, a
+  hook that queued something, or another process that holds the file; the next pass a second later goes on. An
+  outbox made by an earlier release is rewritten once into that mode, on the first pass with nothing to send,
+  when its rewrite is predicted to take under a second; a rewrite slower than predicted is stopped and the
+  file stays as it was. A larger one is rewritten once the daemon has served no call for ten minutes. A
+  rewrite left for idle, a step that frees nothing and a failure (a full disk, say) wait an hour before the
+  next try, also across a restart of the daemon (`compaction.json` next to the outbox). The daemon's status
+  shows the last outcome under `compaction`. Under the daemon `kelmo client flush` no longer rewrites the file
+  and reports `compacted: 0`; a client run on its own still compacts there. `kelmo client status` and `kelmo
+  status` report the outbox busy instead of waiting for it past their deadline.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added

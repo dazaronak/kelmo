@@ -11,6 +11,9 @@ time, a hook before a tool.
 """
 import argparse
 import inspect
+import json
+import os
+import sqlite3
 import sys
 import threading
 import time
@@ -28,6 +31,19 @@ HOOK_LANE = 4
 DELIVER_SECONDS = 5.0
 # How often the deliverer tries on its own when nothing woke it (a write queued while the authority was down).
 DELIVER_INTERVAL = 30.0
+# An old outbox is rewritten once (to give pages back in steps from then on) when its predicted rewrite fits this
+# bound, on the first pass with nothing pending: a waiter at the outbox waits at most about this long, once.
+COMPACT_MAX_SECONDS = 1.0
+# A rewrite's cost per MB of live data, the whole rewrite: the upper end measured (9 to 12 ms).
+CONVERSION_SECONDS_PER_MB = 0.012
+# Where the rewrite is stopped and rolled back when the machine is slower than predicted: about a quarter of the
+# rewrite is its copy phase, the only part that can be stopped.
+COMPACT_COPY_SECONDS = 0.25
+# An old outbox too large for the bound is rewritten once at idle: no call served for this long.
+IDLE_SECONDS = 600.0
+# How soon a pass compacts again after it found the outbox held or gave way to a waiter, and after a failure.
+BUSY_RETRY_SECONDS = 1.0
+COMPACT_RETRY_SECONDS = 3600.0
 # Bound of a hook that is not a SessionStart or prompt hook (those carry their own, shorter deadline).
 HOOK_SECONDS = 3.0
 # Bound of one spooled hook replayed by the deliverer.
@@ -142,6 +158,9 @@ class EdgeCore:
         self._wake = threading.Event()
         self._stopping = threading.Event()
         self._last = {'at': None, 'result': None}
+        self._last_call = time.monotonic()
+        self.client.compactor = self  # `kelmo client flush` leaves the compaction to the deliverer
+        self._compaction = self._compaction_load()
         self._wake.set()  # the first pass ingests what was spooled while no daemon ran
         self._deliverer = threading.Thread(target=self._deliver_loop, name='deliverer', daemon=True)
         self._deliverer.start()
@@ -168,11 +187,13 @@ class EdgeCore:
         left = context.remaining() if cap is None else min(cap, context.remaining())
         previous = getattr(self._urgent, 'value', False)
         self._urgent.value = urgent
+        self._last_call = time.monotonic()
         try:
             with self.client.deadline(max(0.001, left)):
                 yield self.client
         finally:
             self._urgent.value = previous
+            self._last_call = time.monotonic()
 
     # Acknowledgements of HOT deliveries, run when `kelmod hook` reports that the session printed the context.
     ACK_SECONDS = 60.0
@@ -244,7 +265,11 @@ class EdgeCore:
 
     def _deliver_loop(self):
         while not self._stopping.is_set():
-            self._wake.wait(DELIVER_INTERVAL)
+            interval = DELIVER_INTERVAL
+            retry_at = self._compaction.get('retry_at', 0.0) - time.time()
+            if 0 < retry_at < interval:
+                interval = retry_at  # a compaction paused for a second comes back without being woken
+            self._wake.wait(interval)
             self._wake.clear()
             if self._stopping.is_set():
                 return
@@ -255,13 +280,116 @@ class EdgeCore:
                 spool = {'ingested': 0, 'pending': None, 'stopped': type(error).__name__}
             try:
                 with self.client.deadline(DELIVER_SECONDS):
-                    result = self.client.flush()
+                    # An outbox another caller keeps ends the pass at once: that caller delivers.
+                    result = self.client.flush(wait_for_holder=False)
             except Exception as error:  # noqa: BLE001 - the next pass retries; the outbox keeps every entry
                 result = {'stopped': type(error).__name__, 'message': str(error)[:200]}
+            if result.get('pending') == 0 and time.time() >= self._compaction.get('retry_at', 0.0):
+                result = dict(result, compaction=self._compact())
             self._last = {'at': time.time(), 'result': result, 'spool': spool}
             if (result.get('pending') and result.get('stopped') is None) or (
                     spool.get('pending') and spool.get('stopped') is None):
                 self._wake.set()  # more queued than one pass carried
+
+    # --- compaction ------------------------------------------------------------------------------------
+
+    def _compact(self):
+        """Gives the outbox's free pages back after a pass that left nothing pending. An old file is rewritten once
+        (when its predicted rewrite fits COMPACT_MAX_SECONDS, or at idle when it does not); a converted one is
+        drained in steps of COMPACT_CHUNK_PAGES, each taken only while nobody holds or waits for the outbox, so a
+        waiter waits at most one step. Records and returns the outcome."""
+        from ..client import COMPACT_CHUNK_PAGES, COMPACT_TRY_SECONDS, _compaction_due
+        freed, now = 0, time.time()
+        try:
+            outbox = self.client.outbox
+            while True:
+                if self._stopping.is_set() or (freed and self._wake.is_set()):
+                    return self._compaction_done('paused', freed, BUSY_RETRY_SECONDS)  # a hook queued: deliver first
+                step = self._compaction_step(outbox, COMPACT_TRY_SECONDS, COMPACT_CHUNK_PAGES, _compaction_due,
+                                             draining=bool(freed))
+                if step is None:
+                    return self._compaction_done('busy', freed, BUSY_RETRY_SECONDS)
+                state, given = step
+                freed += given
+                if state != 'more':
+                    return self._compaction_done(state, freed, COMPACT_RETRY_SECONDS
+                                                 if state in ('too_large', 'stuck') else 0.0)
+        except sqlite3.OperationalError as error:
+            from ..errors import sqlite_busy
+            if sqlite_busy(error):
+                return self._compaction_done('busy', freed, BUSY_RETRY_SECONDS)
+            if getattr(error, 'sqlite_errorcode', None) == sqlite3.SQLITE_INTERRUPT:
+                # Slower than predicted: rolled back, the file stays as it was; converted at idle instead.
+                return self._compaction_done('too_large', freed, COMPACT_RETRY_SECONDS)
+            return self._compaction_done('error', freed, COMPACT_RETRY_SECONDS, error)
+        except Exception as error:  # noqa: BLE001 - an outbox that cannot be compacted still delivers
+            return self._compaction_done('error', freed, COMPACT_RETRY_SECONDS, error)
+        finally:
+            self._compaction['at'] = now
+
+    def _compaction_step(self, outbox, try_seconds, chunk, due, *, draining=False):
+        """One statement under the outbox, taken only while idle: ('more', bytes) after a drain step that left free
+        pages, ('done' | 'nothing' | 'too_large' | 'stuck', bytes) at the end, None when the outbox was held. A
+        drain once begun (`draining`) goes on to an empty freelist."""
+        if not self._owner.acquire_if_idle():
+            return None
+        try:
+            if not outbox._serial.acquire(timeout=try_seconds):
+                return None
+            try:
+                with outbox.waiting(try_seconds):
+                    if outbox.pending_count():  # a hook queued since the flush: deliver first
+                        return 'nothing', 0
+                pages, free, size, mode = outbox.compaction_state()
+                if mode != 2:
+                    live_mb = (pages - free) * size / 1e6
+                    fits = live_mb * CONVERSION_SECONDS_PER_MB <= COMPACT_MAX_SECONDS
+                    idle = time.monotonic() - self._last_call >= IDLE_SECONDS
+                    if not fits and not idle:
+                        return 'too_large', 0
+                    return 'done', outbox.convert(copy_seconds=COMPACT_COPY_SECONDS if fits else None)
+                if not free:
+                    return ('done' if draining else 'nothing'), 0
+                if not draining and free < chunk and not due(pages, free, size):
+                    return 'nothing', 0
+                given, left = outbox.vacuum_step(chunk)
+                if not given:
+                    return 'stuck', 0
+                return ('more' if left else 'done'), given * size
+            finally:
+                outbox._serial.release()
+        finally:
+            self._owner.release()
+
+    def _compaction_done(self, state, freed, pause, error=None):
+        record = {'state': state, 'freed': freed}
+        if error is not None:
+            record['error'] = f'{type(error).__name__}: {str(error)[:200]}'
+        if pause:
+            record['retry_at'] = time.time() + pause
+        self._compaction = record
+        if state in ('too_large', 'stuck', 'error'):
+            self._compaction_save(record)  # a pause of an hour survives the edge core's recycles
+        return record
+
+    def _compaction_path(self):
+        return Path(self.client.profile.state) / 'compaction.json'
+
+    def _compaction_load(self):
+        try:
+            record = json.loads(self._compaction_path().read_text())
+        except (OSError, ValueError):
+            return {}
+        return record if isinstance(record, dict) and isinstance(record.get('retry_at', 0.0), (int, float)) else {}
+
+    def _compaction_save(self, record):
+        path = self._compaction_path()
+        temporary = path.with_name(path.name + '.tmp')
+        try:
+            temporary.write_text(json.dumps(record))
+            os.replace(temporary, path)
+        except OSError:
+            pass  # the pause then lasts this process only
 
     # --- handlers --------------------------------------------------------------------------------------
 
@@ -403,17 +531,23 @@ class EdgeCore:
                 outbox = {'error': str(error)[:200]}
             finally:
                 self._owner.release()
-        return {'authority_id': self.client.profile.authority_id, 'outbox': outbox, 'last_delivery': self._last}
+        return {'authority_id': self.client.profile.authority_id, 'outbox': outbox, 'last_delivery': self._last,
+                'compaction': dict(self._compaction)}
 
     def trim(self):
         import gc
         gc.collect()
 
     def close(self):
+        from ..client import Busy
         self._stopping.set()
         self._wake.set()
         self._deliverer.join(timeout=DELIVER_SECONDS + 1)
-        self.client.close()
+        try:
+            with self.client.deadline(2.0):
+                self.client.close()
+        except (Busy, KelmoError) as error:  # a stop never fails on the outbox; the next start opens it again
+            print(f'kelmo edge core: the client did not close cleanly ({error})', file=sys.stderr, flush=True)
 
 
 def main(argv=None):
