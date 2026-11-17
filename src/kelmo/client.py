@@ -700,12 +700,12 @@ class MuxChannel:
         before any byte went out raises E_TRANSPORT with `partial` False; the channel stays usable. The pipe's
         descriptor is used only under the write lock, which `close` takes before it closes the pipe, so no byte goes
         to a number another open may have taken; a close stops the write between two looks at the pipe."""
+        view = memoryview(data)
+        written = 0
         if not self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
             error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
             error.partial = False
             raise error
-        view = memoryview(data)
-        written = 0
         try:
             if self._closed:
                 raise ValueError('The channel was closed before the frame.')
@@ -725,8 +725,8 @@ class MuxChannel:
                                            'The channel did not accept the request before its deadline.')
                         error.partial = written > 0
                         raise error
-                    if not selector.select(min(remaining, self.WRITE_POLL_SECONDS)):
-                        continue
+                    if not selector.select(min(remaining, self.WRITE_POLL_SECONDS)) or self._closed:
+                        continue  # a close that came during the wait is seen at the top, before another byte
                     try:
                         count = os.write(descriptor, view)
                         written += count

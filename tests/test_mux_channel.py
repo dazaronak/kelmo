@@ -314,3 +314,45 @@ def test_close_does_not_close_the_pipe_under_a_write_in_progress():
     finally:
         channel.grace = 0
         channel.close()
+
+
+def test_a_close_during_the_wait_for_room_stops_the_write_before_its_next_byte(monkeypatch):
+    """A close sets its flag while the write waits for room in the pipe, and the pipe then has room: the write stops
+    without writing, rather than writing once more before it looks at the flag again."""
+    import kelmo.client as client_module
+    channel = MuxChannel(command(), timeout=2)
+    descriptor = channel.process.stdin.fileno()
+    real_write, writes = os.write, []
+
+    class ClosingSelector:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def register(self, *_):
+            pass
+
+        def select(self, _timeout):
+            channel._closed = True  # a close began while the write waited
+            return [('ready', 2)]
+
+    def write(fd, data):
+        if fd == descriptor:
+            writes.append(len(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(client_module.selectors, 'DefaultSelector', ClosingSelector)
+    monkeypatch.setattr(client_module.os, 'write', write)
+    try:
+        try:
+            channel.request(request('close-in-the-wait'))
+        except Exception:  # noqa: BLE001, S110 - only whether a byte went out matters here
+            pass
+        monkeypatch.undo()
+        assert writes == [], f'the write went on after the close began: {writes}'
+    finally:
+        monkeypatch.undo()
+        channel._closed = False
+        channel.close()
