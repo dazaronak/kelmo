@@ -137,13 +137,13 @@ def test_a_pass_whose_flush_lock_is_held_counts_pending_with_the_owner_released(
 def test_a_one_try_acquire_refuses_while_a_caller_waits():
     """Nobody holds the owner but a caller waits for it: a background pass's one try is refused, so it never takes
     a turn a waiting hook or tool is owed."""
-    lock = OwnerLock()
+    lock, ticket = OwnerLock(), object()
     with lock._condition:
-        lock._waiting[True] += 1  # a hook waiting, between the holder's release and its own wake-up
+        lock._waiting[True].append(ticket)  # a hook waiting, between the holder's release and its own wake-up
     try:
         assert not lock.acquire_if_idle(), 'a one-try acquire took the owner while a caller waited'
     finally:
         with lock._condition:
-            lock._waiting[True] -= 1
+            lock._waiting[True].remove(ticket)
     assert lock.acquire_if_idle()
     lock.release()
