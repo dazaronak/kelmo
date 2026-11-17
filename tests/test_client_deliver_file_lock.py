@@ -93,3 +93,79 @@ def test_an_answer_the_server_gave_is_recorded_even_after_the_deadline(shared):
             other.close()
     entry = client.outbox.get('answered-late')
     assert entry['state'] == 'delivered', (entry, result)
+    assert entry['attempts'] == 1, entry
+
+
+def test_an_answer_is_recorded_though_the_file_stays_held_past_the_outbox_wait(shared):
+    """The file stays held longer than the outbox's own wait for a lock (shortened here): the answer is still
+    recorded once the file is free, never left pending to be sent again."""
+    client = shared.client()
+    client.outbox.conn.execute('PRAGMA busy_timeout = 200')  # the outbox's normal wait, made short
+    client.outbox.enqueue('capture', ARGS, 'answered-long-held')
+    real = client._send
+
+    def send(channel, op, args, key, *rest, **kwargs):
+        answer = real(channel, op, args, key, *rest, **kwargs)
+        if op == 'capture':
+            other = _holder(client, 'IMMEDIATE')
+            threading.Timer(1.0, lambda: (other.rollback(), other.close())).start()
+        return answer
+
+    client._send = send
+    try:
+        with client.deadline(5.0):
+            client.flush()
+    except sqlite3.OperationalError as error:
+        raise AssertionError(f'the answer was dropped when the outbox wait ran out: {error}') from error
+    entry = client.outbox.get('answered-long-held')
+    assert entry['state'] == 'delivered', entry
+
+
+def test_a_retryable_answer_while_the_file_is_held_ends_the_pass_within_its_deadline(shared):
+    """The server answers retryable; noting the code needs the file, which another process holds: the note is
+    skipped rather than waited for, and the pass ends within its deadline."""
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'retryable-held')
+    holders = []
+    real = client._send
+
+    def send(channel, op, args, key, *rest, **kwargs):
+        if op != 'capture':
+            return real(channel, op, args, key, *rest, **kwargs)
+        other = _holder(client, 'IMMEDIATE')
+        holders.append(other)
+        threading.Timer(3.0, other.rollback).start()
+        return False, {'code': 'E_BUSY', 'message': 'busy', 'retryable': True, 'cut': False}
+
+    client._send = send
+    try:
+        result, took = _flush_within(client, 1.0)
+        assert took < 2.0, f'the pass waited {took:.2f} s to note a retryable answer past its 1 s deadline'
+        assert result['stopped'] == 'E_BUSY', result
+    finally:
+        time.sleep(3.2)
+        for other in holders:
+            other.close()
+
+
+def test_a_pass_waits_for_another_thread_in_the_outbox_no_longer_than_its_deadline(shared):
+    client = shared.client()
+    client.outbox.enqueue('capture', ARGS, 'thread-held')
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with client.outbox._serial:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    try:
+        holder.start()
+        assert held.wait(5)
+        threading.Timer(3.0, release.set).start()
+        result, took = _flush_within(client, 1.0)
+        assert took < 2.0, f'the pass waited {took:.2f} s for another thread in the outbox'
+        assert result['stopped'] == 'E_BUSY', result
+    finally:
+        release.set()
+        holder.join(10)

@@ -8,13 +8,14 @@ entry here.
 
 ### Changed
 
-- A delivery pass no longer waits a minute for another process that holds the outbox file. Before it sends an
-  entry, its reads and the count of the attempt wait for the file no longer than the pass's deadline; then the
-  pass ends with `stopped: E_BUSY`, the entry stays pending and counts no attempt. An answer the server
+- A delivery pass no longer waits a minute for another process that holds the outbox file, or for another
+  thread in the outbox. Before it sends an entry, its reads and the count of the attempt wait no longer than
+  the pass's deadline; then the pass ends with `stopped: E_BUSY`, the entry stays pending and counts no
+  attempt. The code of a retryable answer is noted only while the file is free in time. An answer the server
   already gave is still recorded, however long the file stays held.
 - A shared client's outbox gives its free space back again. Settled transcript pieces drop their bytes but
   leave their pages in `outbox.sqlite3`; since Kelmo 0.2.0 the edge daemon owns the outbox and only `kelmo
-  client flush` compacted it, so the file only grew. A new outbox now gives pages back in small steps (SQLite
+client flush` compacted it, so the file only grew. A new outbox now gives pages back in small steps (SQLite
   incremental vacuum): a delivery pass that leaves nothing to send frees them 256 pages at a time as soon as
   that many are free, and stops at once for a hook that waits for the outbox, a hook that queued something, or
   another process that holds the file; the next pass a second later goes on. An outbox made by an earlier
@@ -74,7 +75,7 @@ entry here.
   after a zero-timeout turn at the owner lock, and right after a hook had held it, that turn could come before
   the next hook's. It now reads the outbox only while nobody holds the lock or waits for it. Otherwise it
   answers at once with `"outbox": {"busy": true}`, where it used to answer `{"error": "The edge core is busy
-  ..."}`, the same shape as a failed read. A failed read still answers `{"error": ...}`.
+..."}`, the same shape as a failed read. A failed read still answers `{"error": ...}`.
 - `kelmo forget` on a created note that still waits for the editor now withdraws it, and so does a failed one
   that `kelmo queue retry` could queue again. `kelmo dream apply` and the worker never publish it, and it
   drops out of the pending block a session gets at start and out of the waiting count of `kelmo dream status`.

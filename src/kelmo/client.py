@@ -418,10 +418,11 @@ class Outbox:
 
     @_serial
     def cut(self, key):
-        """Counts one more cut under the entry and returns the count."""
+        """Counts one more cut under the entry and returns the count, read in the same transaction: a retry after
+        a busy file never counts one cut twice."""
         with self.conn:
             self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
-        return self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
+            return self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
 
     @_serial
     def note(self, key, code):
@@ -1401,18 +1402,41 @@ class SharedClient:
             self.outbox._serial.release()
 
     def _before_send(self, method, *args):
-        """An outbox read or write a pass makes before it sends: another process's lock on the file is waited for
-        no longer than the active deadline, then the pass ends with E_BUSY and nothing is sent. What follows a
-        server's answer (settle, cut, reset) keeps the outbox's own wait: an answer is never dropped."""
-        with self.outbox._serial:
+        """An outbox read or write a pass makes before it sends, or a note it may skip: another thread in the
+        outbox, or another process's lock on the file, is waited for no longer than the active deadline, then
+        the pass ends with E_BUSY and nothing is sent."""
+        if not self.outbox._serial.acquire(timeout=self._seconds_left()):
+            raise Unsent('E_BUSY', 'Another caller held the outbox past this pass\'s deadline; the entry stays '
+                                   'pending.')
+        try:
+            with self.outbox.waiting(self._seconds_left()):
+                return method(*args)
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise  # a disk or I/O error is reported as itself
+            raise Unsent('E_BUSY', 'Another process held the outbox file past this pass\'s deadline; the entry '
+                                   'stays pending.') from error
+        finally:
+            self.outbox._serial.release()
+
+    def _record(self, method, *args):
+        """What a server's answer changes in the outbox (settle, cut, reset) is recorded whatever the wait: a
+        lock on the file that outlasts the outbox's own wait is waited for again, so an answer is never
+        dropped."""
+        while True:
             try:
-                with self.outbox.waiting(self._seconds_left()):
-                    return method(*args)
+                return method(*args)
             except sqlite3.OperationalError as error:
                 if not sqlite_busy(error):
                     raise  # a disk or I/O error is reported as itself
-                raise Unsent('E_BUSY', 'Another process held the outbox file past this pass\'s deadline; the entry '
-                                       'stays pending.') from error
+
+    def _note_if_free(self, key, code):
+        """The code of a retryable answer, noted only while the file is free within the deadline: the entry
+        stays pending either way, so a held file never keeps the pass past its deadline."""
+        try:
+            self._before_send(self.outbox.note, key, code)
+        except Unsent:
+            pass  # the file is still held: the entry keeps its earlier note
 
     def _deliver(self):
         """One pass over what was queued when it began, one entry in memory at a time: an entry queued
@@ -1444,14 +1468,11 @@ class SharedClient:
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                try:
-                    self._before_send(self.outbox.note, key, error.code)
-                except Unsent:
-                    pass  # the file is still held: the entry keeps its earlier note
+                self._note_if_free(key, error.code)
                 stopped, reached = error.code, bool(reached)
                 break
             if ok:
-                self.outbox.settle(key, 'delivered', value)
+                self._record(self.outbox.settle, key, 'delivered', value)
                 delivered += 1
                 continue
             if value['cut']:
@@ -1460,8 +1481,8 @@ class SharedClient:
                 # delivered would hold every write behind it, so on its CUT_LIMIT-th cut it is refused with its
                 # effect unknown, as a cut write was before.
                 self._drop(channel)
-                if self.outbox.cut(key) < CUT_LIMIT:
-                    self.outbox.note(key, value['code'])
+                if self._record(self.outbox.cut, key) < CUT_LIMIT:
+                    self._note_if_free(key, value['code'])
                     stopped = value['code']
                     break
                 value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is not sent '
@@ -1471,14 +1492,14 @@ class SharedClient:
                     # The bridge may have lost its server and ended: the next pass opens a new one. A server's
                     # own retryable E_TRANSPORT is no cut and leaves the write pending.
                     self._drop(channel)
-                self.outbox.note(key, value['code'])
+                self._note_if_free(key, value['code'])
                 stopped = value['code']
                 break
             outcome = {'code': value['code'], 'message': value['message']}
-            self.outbox.settle(key, 'refused', outcome)
+            self._record(self.outbox.settle, key, 'refused', outcome)
             if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
                 # The server does not hold the bytes this piece followed: the next capture starts over.
-                self.outbox.reset_transcript(args['provider'], args['native_id'])
+                self._record(self.outbox.reset_transcript, args['provider'], args['native_id'])
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
         return {'delivered': delivered, 'refused': refused, 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': reached}
