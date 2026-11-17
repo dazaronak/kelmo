@@ -191,7 +191,12 @@ def test_an_attempt_whose_commit_a_reader_kept_back_is_never_counted_later(share
     finally:
         other.rollback()
         other.close()
-    client.outbox.enqueue('capture', dict(ARGS, filename='later.md'), 'a-later-write')
+    try:
+        client.outbox.enqueue('capture', dict(ARGS, filename='later.md'), 'a-later-write')
+        later = None
+    except sqlite3.OperationalError as error:  # a transaction left open by the refused commit
+        later = error
+    assert later is None, f'the next write failed: {later!r}'
     entry = client.outbox.get('reader-held')
     assert (entry['state'], entry['attempts']) == ('pending', 0), entry
 
