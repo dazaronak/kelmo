@@ -452,7 +452,8 @@ class Outbox:
     @_serial
     def settle(self, key, state, outcome, reset=None):
         """Settles a pending entry; `reset` (provider, native id) also forgets that transcript's sent position in
-        the same transaction, so a refusal of its base and the restart are recorded together or not at all."""
+        the same transaction, so a refusal of its base and the reset of that position are recorded together or
+        not at all; the transcript then goes again from its start with the session's next event."""
         with self.conn:
             self.conn.execute("UPDATE entries SET state=?, outcome=?, settled_at=? "
                               "WHERE idempotency_key=? AND state='pending'",

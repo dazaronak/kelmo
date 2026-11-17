@@ -13,9 +13,10 @@ entry here.
   the pass's deadline; then the pass ends with `stopped: E_BUSY`, the entry stays pending and counts no
   attempt. The code of a retryable answer is noted only while the file is free in time. An answer the server
   already gave is recorded if the file frees within the pass's deadline; otherwise the entry stays pending and
-  the next pass gets the same answer again under its key, with no second effect on the server. A refusal of
-  a transcript piece's base and the restart of that transcript are recorded together. A session start whose
-  writes were held back this way gets the cached context, as when the server cannot be reached.
+  the next pass gets the same answer again under its key, with no second effect on the server. A refusal of a
+  transcript piece's base and the reset of that transcript's sent position are recorded together; the
+  transcript goes again from its start with the session's next event. A session start whose writes were held
+  back this way gets the cached context, as when the server cannot be reached.
 - A shared client's outbox gives its free space back again. Settled transcript pieces drop their bytes but
   leave their pages in `outbox.sqlite3`; since Kelmo 0.2.0 the edge daemon owns the outbox and only `kelmo
   client flush` compacted it, so the file only grew. A new outbox now gives pages back in small steps (SQLite
