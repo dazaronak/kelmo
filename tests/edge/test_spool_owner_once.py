@@ -147,3 +147,71 @@ def test_a_replayed_hook_holds_the_owner_only_for_its_outbox_steps(profile):
     finally:
         go.set()
         core.close()
+
+
+def test_a_real_replayed_capture_that_finds_the_owner_taken_while_it_read_is_left_for_a_later_pass(
+        profile, tmp_path, monkeypatch):
+    """The real hook: the transcript is read with the owner free, another caller takes the owner before the piece
+    is queued, and the replay gives the file back at once instead of waiting; once the owner is free it queues."""
+    from kelmo import client as client_module
+    root = tmp_path / 'provider'
+    root.mkdir()
+    transcript = root / 'session.jsonl'
+    transcript.write_bytes(json.dumps({'type': 'user', 'message': {'content': 'A synthetic source.'}}).encode()
+                           + b'\n')
+    profile.sessions['claude'] = (str(root),)
+    client = SharedClient(profile, multiplex=True)
+    core = EdgeCore(profile.root, client=client)
+    core._compact_after = time.monotonic() + 3600
+    stop = time.monotonic() + 10
+    while core._last.get('at') is None and time.monotonic() < stop:  # the deliverer's first pass is over
+        time.sleep(0.02)
+    taken, release = threading.Event(), threading.Event()
+
+    def hold():
+        core._owner.acquire()
+        taken.set()
+        release.wait(30)
+        core._owner.release()
+
+    holder = threading.Thread(target=hold, daemon=True)
+    read = client_module._stable_read
+    first = []
+
+    def stable_read(source):
+        result = read(source)
+        if not first:  # the first read only: another caller takes the owner before the piece is queued
+            first.append(True)
+            holder.start()
+            assert taken.wait(5)
+        return result
+
+    monkeypatch.setattr(client_module, '_stable_read', stable_read)
+    frame = dict(FRAME, payload={'session_id': 'synthetic-session', 'transcript_path': str(transcript)})
+    spool = core.spool_directory()
+    spool.mkdir(parents=True, exist_ok=True)
+    path = spool / NAME
+    path.write_text(json.dumps(frame), encoding='utf-8')
+    try:
+        started = time.monotonic()
+        result = core.ingest_spool()
+        took = time.monotonic() - started
+        assert took < 1.0, f'the replayed capture waited {took:.2f} s for the owner'
+        assert result == {'ingested': 0, 'pending': 1, 'stopped': 'E_BUSY'}, result
+        assert path.exists(), 'the spooled hook was not left for a later pass'
+        queued = client.outbox.conn.execute("SELECT count(*) FROM entries WHERE op='session_append'").fetchone()[0]
+        assert queued == 0, 'the refused replay queued a piece'
+        release.set()
+        holder.join(10)
+        core._wake.set()  # the deliverer, or the next pass, replays it now that the owner is free
+        stop = time.monotonic() + 5
+        while path.exists() and time.monotonic() < stop:
+            time.sleep(0.05)
+        assert not path.exists(), 'the spooled hook was not replayed once the owner was free'
+        queued = client.outbox.conn.execute("SELECT count(*) FROM entries WHERE op='session_append'").fetchone()[0]
+        assert queued == 1, queued
+    finally:
+        release.set()
+        if holder.is_alive():
+            holder.join(10)
+        core.close()
