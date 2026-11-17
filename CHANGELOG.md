@@ -16,20 +16,20 @@ entry here.
   another process that holds the file; the next pass a second later goes on. An outbox made by an earlier
   release is rewritten once into that mode, on the first pass with nothing to send, when its rewrite is
   predicted to take under a second; a rewrite whose copy phase runs past a quarter of a second is stopped and
-  rolled back, and the file stays as it was. A larger one, or one whose rewrite was stopped, is rewritten once
-  the daemon has served no call for ten minutes, looked at again as soon as such a quiet spell can have
-  passed. A stopped rewrite, a step that frees nothing and a failure (a full disk, say) wait an hour before
-  the next try, also across a restart of the daemon (`compaction.json` next to the outbox, readable by its
-  owner only; a saved pause never waits longer than an hour, and a running daemon times its pauses on a clock
-  that is never set back, so a wall clock set back does not stretch them). A rewrite refused because another
-  process was reading the file waits a hundred times as long as that try took. A session event Kelmo skips (a
-  headless run, Kelmo's own job) is left out of the skip records when the outbox stays busy for half a second.
-  The daemon's status shows the last outcome under `compaction`. Under the daemon `kelmo client flush` no
-  longer rewrites the file and reports `compacted: 0`; a client run on its own still compacts there, unless
-  another process holds the file, and leaves it to the next flush then. `kelmo client flush` reports `pending:
-  null` when another caller kept the outbox for its whole bound, and the daemon looks at a held outbox again a
-  second later. `kelmo client status` and `kelmo status` report the outbox busy instead of waiting for it past
-  their deadline.
+  rolled back, and the file stays as it was. A larger one is rewritten once the daemon has served no call for
+  ten minutes, looked at again as soon as such a quiet spell can have passed; one whose rewrite was stopped
+  waits an hour first, then for such a quiet spell. A step that frees nothing and a failure (a full disk, say)
+  wait an hour before the next try, also across a restart of the daemon (`compaction.json` next to the outbox,
+  readable by its owner only; a saved pause never waits longer than an hour, and a running daemon times its
+  pauses on a clock that is never set back, so a wall clock set back does not stretch them). A rewrite refused
+  because another process was reading the file waits a hundred times as long as that try took, an hour at
+  most. A session event Kelmo skips (a headless run, Kelmo's own job) is left out of the skip records when the
+  outbox stays busy for half a second. The daemon's status shows the last outcome under `compaction`. Under
+  the daemon `kelmo client flush` no longer rewrites the file and reports `compacted: 0`; a client run on its
+  own still compacts there, unless another process holds the file, and leaves it to the next flush then.
+  `kelmo client flush` reports `pending: null` when another caller kept the outbox for its whole bound, and
+  the daemon looks at a held outbox again a second later. `kelmo client status` and `kelmo status` report the
+  outbox busy instead of waiting for it past their deadline.
 
 ## [0.3.2] - 2026-11-16
 

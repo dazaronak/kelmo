@@ -699,3 +699,40 @@ def test_an_over_limit_mark_is_dropped_once_the_outbox_is_converted(real_edge, p
     _passes(core, 1)
     assert core._over_limit is False, core._compaction
     assert not (profile.state / 'compaction.json').exists(), 'a converted outbox kept saving an over-limit pause'
+
+
+def test_a_pass_that_ends_busy_with_nothing_left_to_send_still_compacts(real_edge, profile, monkeypatch):
+    """Another caller delivered the last entry while the pass waited for the outbox: nothing is pending."""
+    core, client = real_edge
+    _settled_pieces(client.outbox)
+    before = _size(profile)
+    monkeypatch.setattr(client, 'flush', lambda **_: {'delivered': 0, 'pending': 0, 'stopped': 'E_BUSY'})
+    _passes(core, 1)
+    assert _size(profile) < before // 4, 'a pass with nothing pending kept the free pages'
+
+
+def test_a_rewrite_refused_by_a_long_reader_waits_an_hour_at_most(real_edge, monkeypatch):
+    core, _client = real_edge
+
+    def refused(*_args, **_kwargs):
+        raise edge_core._RewriteRefused(40.0)
+
+    monkeypatch.setattr(core, '_compaction_step', refused)
+    record = core._compact()
+    wait = record.get('retry_at', 0.0) - time.time()
+    assert wait <= edge_core.COMPACT_RETRY_SECONDS + 1, f'a refused rewrite waits {wait:.0f} s'
+
+
+def test_a_saved_pause_too_large_for_a_float_does_not_stop_the_daemon(profile):
+    profile.state.mkdir(parents=True, exist_ok=True)
+    (profile.state / 'compaction.json').write_text(json.dumps({'state': 'stuck', 'retry_at': 10 ** 400}))
+    client = SharedClient(profile, multiplex=True)
+    try:
+        core = EdgeCore(profile.root, client=client)
+    except (OverflowError, ValueError) as error:
+        raise AssertionError(f'the daemon did not start over its saved pause: {error!r}') from error
+    try:
+        retry = core._compaction.get('retry_at', 0.0)
+        assert retry <= time.time() + edge_core.COMPACT_RETRY_SECONDS + 1, core._compaction
+    finally:
+        core.close()

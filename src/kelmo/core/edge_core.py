@@ -336,15 +336,12 @@ class EdgeCore:
                 state, given = step
                 freed += given
                 if state == 'too_large':
-                    # Waits for idle: looked at again the first moment the daemon can have been idle long enough.
-                    quiet = time.monotonic() - self._last_call
-                    return self._compaction_done(state, freed, min(COMPACT_RETRY_SECONDS,
-                                                                   max(0.0, IDLE_SECONDS - quiet)))
+                    return self._compaction_done(state, freed, self._until_idle())
                 if state != 'more':
                     return self._compaction_done(state, freed, COMPACT_RETRY_SECONDS if state == 'stuck' else 0.0)
         except _RewriteRefused as refused:
-            return self._compaction_done('busy', freed, max(BUSY_RETRY_SECONDS,
-                                                            BUSY_REWRITE_PAUSE_FACTOR * refused.seconds))
+            return self._compaction_done('busy', freed, min(COMPACT_RETRY_SECONDS, max(
+                BUSY_RETRY_SECONDS, BUSY_REWRITE_PAUSE_FACTOR * refused.seconds)))
         except sqlite3.OperationalError as error:
             from ..errors import sqlite_busy
             if self._stopping.is_set():
@@ -352,7 +349,8 @@ class EdgeCore:
             if sqlite_busy(error):
                 return self._compaction_done('busy', freed, BUSY_RETRY_SECONDS)
             if getattr(error, 'sqlite_errorcode', None) == sqlite3.SQLITE_INTERRUPT:
-                # Slower than predicted: rolled back, the file stays as it was; from now on it waits for idle.
+                # Slower than predicted: rolled back, the file stays as it was. It waits an hour, and from then on
+                # for idle, like a file too large to rewrite while calls come.
                 self._over_limit = True
                 return self._compaction_done('too_large', freed, COMPACT_RETRY_SECONDS)
             return self._compaction_done('error', freed, COMPACT_RETRY_SECONDS, error)
@@ -408,6 +406,12 @@ class EdgeCore:
         finally:
             self._owner.release()
 
+    def _until_idle(self):
+        """The pause of a rewrite that waits for idle: looked at again the first moment the daemon can have been
+        idle long enough, an hour at most."""
+        quiet = time.monotonic() - self._last_call
+        return min(COMPACT_RETRY_SECONDS, max(0.0, IDLE_SECONDS - quiet))
+
     def _compaction_done(self, state, freed, pause, error=None):
         record = {'state': state, 'freed': freed}
         if self._over_limit:
@@ -438,7 +442,11 @@ class EdgeCore:
         if isinstance(retry, bool) or not isinstance(retry, (int, float)):
             return {}
         latest = time.time() + COMPACT_RETRY_SECONDS
-        if not math.isfinite(retry) or retry > latest:
+        try:
+            finite = math.isfinite(retry)
+        except OverflowError:  # an integer too large for a float
+            finite = False
+        if not finite or retry > latest:
             record = dict(record, retry_at=latest)  # saved under a wall clock since set back: an hour at most
         return record
 
