@@ -1719,14 +1719,14 @@ class ClientSession:
                 if stored['fingerprint'] != fingerprint:
                     raise KelmoError('E_IDEMPOTENCY', 'The idempotency key already identifies a different request.')
                 if stored['state'] == 'finished':
-                    return self._replay(key, stored)
+                    return self._replay(op, args, key, stored)
             if self._fenced():
                 raise KelmoError('E_FENCED', 'This server is fenced; writes stay queued until the cutover completes.')
             self.service.archive_api.assert_writer()
             with self._request_lock(request_key) as release:
                 row, claimed = _ledger(journal.client_request_claim, request_key, self.client_id, op, fingerprint)
                 if claimed is None:
-                    return self._replay(key, row)
+                    return self._replay(op, args, key, row)
                 try:
                     outcome = {'ok': True, 'result': getattr(self, 'write_' + op)(key=key, **args)}
                 except KelmoError as error:
@@ -1750,30 +1750,35 @@ class ClientSession:
             raise _verdict(KelmoError(_unsettled(error).code, 'The write did not settle; it is retried under '
                                                              'the same key.'), True) from error
 
-    def _replay(self, key, row):
+    def _replay(self, op, args, key, row):
         """The stored reply of a finished request. A refusal that `kelmo client resend` sent again under
-        `<base>#resend<n>` (the client cuts the key at its first `#resend`) answers as the last note of that
-        chain, which this client's outbox may no longer know (a profile made again under the same client id).
-        A successor counts only when it is the same operation and was recorded after the refusal it resends; a
-        successor whose attempt is still running is answered busy, one abandoned by a process that is gone is
-        passed over."""
+        `<base>#resend<n>` answers as the last note of that chain, which this client's outbox may no longer know
+        (a profile made again under the same client id). The chain is the client's: the key cut at its first
+        `#resend`, numbered from 1 after any number the client does not write itself. A successor counts only
+        when it carries the same request (resend sends it unchanged) and was recorded after the refusal it
+        resends. A successor whose attempt is still running is answered busy; one abandoned by a process that is
+        gone is run again under its own key, and its outcome answers."""
         reply = json.loads(row['reply'])
         if reply.get('ok') is not False:
             return dict(reply, replayed=True)
         base, mark, number = key.partition('#resend')
-        start = int(number) if mark and number.isdigit() else 0
+        written = mark and number.isdigit() and number == str(int(number)) and int(number) >= 1
+        start = int(number) if written else 0
         journal, before = self.service.journal, row
         for successor in itertools.count(start + 1):
-            request_key = _request_digest([self.client_id, f'{base}#resend{successor}'])
+            successor_key = f'{base}#resend{successor}'
+            request_key = _request_digest([self.client_id, successor_key])
             stored = journal.client_request(request_key)
-            if (stored is None or stored['op'] != before['op']
-                    or stored['created_at'] < (before['finished_at'] or before['created_at'])):
+            if (stored is None or stored['op'] != before['op'] or stored['fingerprint'] != before['fingerprint']
+                    or stored['created_at'] <= (before['finished_at'] or before['created_at'])):
                 break
             if stored['state'] != 'finished':
                 if self._attempt_running(request_key):
                     raise KelmoError('E_BUSY', 'The note this request was resent as is still running; it '
                                               'stays queued.')
-                break
+                # Its effect may be done: never answered with the refusal it resent. The archive deduplicates the
+                # key, so running it again is safe.
+                return dict(self._mutate(op, args, successor_key), replayed=True)
             before, reply = stored, json.loads(stored['reply'])
             if reply.get('ok') is not False:
                 break

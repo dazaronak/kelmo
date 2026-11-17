@@ -122,15 +122,20 @@ def test_the_old_key_waits_while_the_note_it_was_resent_as_is_still_running(shar
     assert answer['pending_reason'] == 'E_BUSY', answer
 
 
-def test_an_abandoned_resend_attempt_does_not_hold_the_old_key(shared, monkeypatch, tmp_path):
-    """The resend's attempt was claimed and its process is gone (no live lock): the old key is not held busy for
-    good; it answers with the last answer the chain has, the old refusal."""
+def test_an_abandoned_resend_attempt_is_taken_over_not_answered_with_the_old_refusal(shared, monkeypatch, tmp_path):
+    """The resend's attempt was claimed and its process is gone (no live lock): the old key neither waits for it for
+    good nor answers with the old refusal (the note may exist); the abandoned resend is run again under its own key
+    and the old key answers with its outcome."""
     _refuse_first(monkeypatch)
     first = shared.client()
     refused = _answer(lambda: first.submit('create', ARGS, 'old'))
     with _running(shared.hub.session('mac-a'), 'old#resend1', live=False):
         again = shared.client(root=tmp_path / 'client-mac-a-again')
-        assert _answer(lambda: again.submit('create', ARGS, 'old')) == refused
+        answer = _answer(lambda: again.submit('create', ARGS, 'old'))
+    assert answer != refused, 'an abandoned resend was answered with the refusal it resent'
+    assert isinstance(answer, dict) and 'operation' in answer, answer
+    sent = _answer(lambda: first.submit('create', ARGS, 'old#resend1'))
+    assert answer == sent, (answer, sent)
 
 
 def test_a_suffix_key_recorded_before_the_refusal_is_not_its_resend(shared, monkeypatch, tmp_path):
@@ -177,3 +182,58 @@ def test_a_chain_whose_last_note_was_refused_answers_with_that_refusal(shared, m
     assert last[:2] == ('refused', 'E_INPUT') and 'refusal 2' in last[2], last
     again = shared.client(root=tmp_path / 'client-mac-a-again')
     assert _answer(lambda: again.submit('create', ARGS, 'old')) == last
+
+
+def test_a_later_note_of_the_same_kind_under_a_resend_key_is_not_a_resend_of_another_request(shared, monkeypatch,
+                                                                                                tmp_path):
+    """`client resend` sends the refused request unchanged; a different note under `old#resend1` is not its resend,
+    so it never answers for the refusal of `old`."""
+    _refuse_first(monkeypatch)
+    first = shared.client()
+    refused = _answer(lambda: first.submit('create', ARGS, 'old'))
+    other = dict(ARGS, content='A different note sent later under a key that looks like a resend.')
+    assert isinstance(_answer(lambda: first.submit('create', other, 'old#resend1')), dict)
+    again = shared.client(root=tmp_path / 'client-mac-a-again')
+    assert _answer(lambda: again.submit('create', ARGS, 'old')) == refused
+
+
+def test_a_key_whose_resend_number_is_not_one_the_client_makes_finds_the_chain_the_client_made(shared, monkeypatch,
+                                                                                              tmp_path):
+    """`old#resend01` is not a number `client resend` writes: its resend goes out as `old#resend1`, and the server
+    follows that chain."""
+    _refuse_first(monkeypatch)
+    first = shared.client()
+    _answer(lambda: first.submit('create', ARGS, 'old#resend01'))
+    assert [item['resend_as'] for item in first.outbox.resend(('E_INPUT',), apply=True)] == ['old#resend1']
+    assert first.flush()['delivered'] == 1
+    sent = _answer(lambda: first.submit('create', ARGS, 'old#resend1'))
+    again = shared.client(root=tmp_path / 'client-mac-a-again')
+    assert _answer(lambda: again.submit('create', ARGS, 'old#resend01')) == sent
+
+
+def test_the_old_key_waits_while_the_state_core_runs_its_resend(shared, monkeypatch, tmp_path):
+    """In the state core a live attempt is the core's table of keys in flight, not a lock file."""
+    from kelmo.server import KeysInFlight, _request_digest
+    _refuse_first(monkeypatch)
+    first = shared.client()
+    _answer(lambda: first.submit('create', ARGS, 'old'))
+    session = shared.hub.session('mac-a')
+    session.keys_in_flight = KeysInFlight()
+    with _running(session, 'old#resend1', live=False), \
+            session.keys_in_flight.hold(_request_digest(['mac-a', 'old#resend1'])):
+        again = shared.client(root=tmp_path / 'client-mac-a-again')
+        answer = again.submit('create', ARGS, 'old')
+    assert answer['queued'] is True and answer['accepted'] is False, answer
+    assert answer['pending_reason'] == 'E_BUSY', answer
+
+
+def test_a_suffix_key_recorded_at_the_instant_of_the_refusal_is_not_its_resend(shared, monkeypatch, tmp_path):
+    """A resend is recorded strictly after the refusal it resends; a row with the same timestamp was sent before."""
+    import kelmo.journal
+    monkeypatch.setattr(kelmo.journal, 'now', lambda: '2026-11-17T03:00:00+00:00')
+    first = shared.client()
+    assert isinstance(_answer(lambda: first.submit('create', ARGS, 'old#resend1')), dict)
+    _refuse_first(monkeypatch)
+    refused = _answer(lambda: first.submit('create', ARGS, 'old'))
+    again = shared.client(root=tmp_path / 'client-mac-a-again')
+    assert _answer(lambda: again.submit('create', ARGS, 'old')) == refused

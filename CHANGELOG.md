@@ -22,9 +22,10 @@ entry here.
   old key always answered that the request was queued and would be delivered on the next contact, even after
   the resent note had been delivered or refused. A client that no longer holds the old entry (a profile made
   again under the same client id) gets the same answer from the server, which follows the resend chain
-  itself: the notes of the same kind sent under `<key>#resendN` after the refusal. While the resent note is
-  still running there, the request stays queued. A refusal answered as a duplicate of another note still gets
-  the old refusal from the server.
+  itself: the same request sent under `<key>#resendN` after the refusal. While the resent note is still
+  running there, the request stays queued; a resent note whose server process died before it settled is run
+  again under its own key and answers with its outcome. A refusal answered as a duplicate of another note
+  still gets the old refusal from the server.
 - `kelmo client resend` counts a refusal as a duplicate only of a queued or delivered note with the same
   request: the same project, text, rule change, new work page and pending flag. Before, a note of any project
   with that text answered for it, whatever its other arguments.
