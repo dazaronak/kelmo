@@ -8,6 +8,10 @@ entry here.
 
 ### Changed
 
+- A delivery pass no longer waits a minute for another process that holds the outbox file. Before it sends an
+  entry, its reads and the count of the attempt wait for the file no longer than the pass's deadline; then the
+  pass ends with `stopped: E_BUSY`, the entry stays pending and counts no attempt. An answer the server
+  already gave is still recorded, however long the file stays held.
 - A shared client's outbox gives its free space back again. Settled transcript pieces drop their bytes but
   leave their pages in `outbox.sqlite3`; since Kelmo 0.2.0 the edge daemon owns the outbox and only `kelmo
   client flush` compacted it, so the file only grew. A new outbox now gives pages back in small steps (SQLite

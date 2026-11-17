@@ -1400,25 +1400,54 @@ class SharedClient:
         finally:
             self.outbox._serial.release()
 
+    def _before_send(self, method, *args):
+        """An outbox read or write a pass makes before it sends: another process's lock on the file is waited for
+        no longer than the active deadline, then the pass ends with E_BUSY and nothing is sent. What follows a
+        server's answer (settle, cut, reset) keeps the outbox's own wait: an answer is never dropped."""
+        with self.outbox._serial:
+            try:
+                with self.outbox.waiting(self._seconds_left()):
+                    return method(*args)
+            except sqlite3.OperationalError as error:
+                if not sqlite_busy(error):
+                    raise  # a disk or I/O error is reported as itself
+                raise Unsent('E_BUSY', 'Another process held the outbox file past this pass\'s deadline; the entry '
+                                       'stays pending.') from error
+
     def _deliver(self):
         """One pass over what was queued when it began, one entry in memory at a time: an entry queued
         meanwhile waits for the next pass, so a pass never chases a steady writer."""
         delivered, refused, stopped, reached = 0, [], None, None
-        high, after = self.outbox.last_seq(), 0
-        while (entry := self.outbox.next_pending(after, high)) is not None:
+        try:
+            high = self._before_send(self.outbox.last_seq)
+        except Unsent as error:
+            return {'delivered': 0, 'refused': [], 'pending': None, 'stopped': error.code, 'reached': None}
+        after = 0
+        while True:
+            try:
+                entry = self._before_send(self.outbox.next_pending, after, high)
+            except Unsent as error:
+                stopped = error.code
+                break
+            if entry is None:
+                break
             after, key, args = entry['seq'], entry['idempotency_key'], None
             channel = None
             try:
                 channel = self._connect()
                 reached = True
-                self.outbox.attempt(key)
-                # The body is read only once a channel is open: a pass that reaches no server reads none.
-                args = json.loads(self.outbox.body(after))
+                # The body is read only once a channel is open: a pass that reaches no server reads none. It is
+                # read before the attempt is counted, so an entry whose body could not be read counts none.
+                args = json.loads(self._before_send(self.outbox.body, after))
+                self._before_send(self.outbox.attempt, key)
                 ok, value = self._send(channel, entry['op'], args, key)
             except Unbound as error:
                 if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
                     self._drop(channel)
-                self.outbox.note(key, error.code)
+                try:
+                    self._before_send(self.outbox.note, key, error.code)
+                except Unsent:
+                    pass  # the file is still held: the entry keeps its earlier note
                 stopped, reached = error.code, bool(reached)
                 break
             if ok:
@@ -1451,7 +1480,7 @@ class SharedClient:
                 # The server does not hold the bytes this piece followed: the next capture starts over.
                 self.outbox.reset_transcript(args['provider'], args['native_id'])
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
-        return {'delivered': delivered, 'refused': refused, 'pending': self.outbox.pending_count(),
+        return {'delivered': delivered, 'refused': refused, 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': reached}
 
     def _entry_result(self, entry):
