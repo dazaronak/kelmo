@@ -319,16 +319,29 @@ class CoreLink:
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
         # Closed only once no write is on the descriptor: a number closed under a write could be reused by another
-        # open before that write runs. kelmod has closed its end, so a write in progress ends at once; the bound
-        # only keeps a stuck one from holding the stop.
-        taken = self._write_lock.acquire(timeout=CLOSE_WAIT_SECONDS)
+        # open before that write runs. kelmod has closed its end, so a write in progress ends at once. One still stuck
+        # at the bound is made to fail by a shutdown, which keeps the number, and the descriptor is closed by a thread
+        # of its own once that write lets go: the stop does not wait for it.
+        if not self._write_lock.acquire(timeout=CLOSE_WAIT_SECONDS):
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            threading.Thread(target=self._close_when_free, name='kelmo-corelink-close', daemon=True).start()
+            return
         try:
             self.sock.close()
         except OSError:
             pass
         finally:
-            if taken:
-                self._write_lock.release()
+            self._write_lock.release()
+
+    def _close_when_free(self):
+        with self._write_lock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
 
     def _dispatch(self, header, body):
         kind = header['kind']

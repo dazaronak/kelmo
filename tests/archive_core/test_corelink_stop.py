@@ -679,6 +679,62 @@ def test_the_channel_is_closed_only_after_a_write_in_progress_has_ended():
         parent.close()
 
 
+def test_a_write_stuck_past_the_close_bound_still_ends_before_the_channel_closes(monkeypatch):
+    """A write stuck longer than CLOSE_WAIT_SECONDS: the stop returns at its bound, shuts the channel down so the
+    write fails, and the descriptor is closed only once that write has let go."""
+    from kelmo.core import corelink
+    monkeypatch.setattr(corelink, 'CLOSE_WAIT_SECONDS', 0.3)
+    parent, child = socket.socketpair()
+    events, writing, release = [], threading.Event(), threading.Event()
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+
+    class Stuck:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def sendall(self, data):
+            events.append('write')
+            writing.set()
+            release.wait(10)
+            events.append('written')
+
+        def shutdown(self, how):
+            events.append('shutdown')
+
+        def close(self):
+            events.append('close')
+            self.sock.close()
+
+        def __getattr__(self, name):
+            return getattr(self.sock, name)
+
+    link.sock = Stuck(link.sock)
+    caller = threading.Thread(target=link._reply, args=(uuid.uuid4().hex, {'status': 'ok'}), daemon=True)
+    owner_wait = link._wait_for_owner
+
+    def reply_while_the_owner_stops():
+        caller.start()
+        assert writing.wait(5)
+        owner_wait()
+
+    link._wait_for_owner = reply_while_the_owner_stops
+    stopper = threading.Thread(target=link._finish, daemon=True)
+    try:
+        stopper.start()
+        stopper.join(3)
+        assert not stopper.is_alive(), 'the stop waited past its bound for a stuck write'
+        assert 'close' not in events, f'the channel was closed under a write still in progress: {events}'
+        release.set()
+        caller.join(10)
+        stop = time.monotonic() + 5
+        while 'close' not in events and time.monotonic() < stop:
+            time.sleep(0.02)
+        assert events.index('written') < events.index('close'), events
+    finally:
+        release.set()
+        parent.close()
+
+
 def test_the_stop_flag_waits_for_a_write_already_past_its_check():
     """A call passed the stop check and is writing when the reader reaches the channel's end: `_finish` sets the stop
     only once that write is done, so no call checks the flag, finds it clear and writes after the stop."""
