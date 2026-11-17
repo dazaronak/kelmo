@@ -36,6 +36,10 @@ entry here.
   that the daemon runs under the same user, and refuse with `E_RUNTIME` before the hello if not, so a
   directory swapped in after the check cannot take the call. Without `XDG_RUNTIME_DIR` and `TMPDIR` the
   directory is under `/tmp`, where another local user could have created it first.
+- `kelmo dream` on a shared-client machine is refused the way other server commands are: `E_CAPABILITY`, "runs
+  on the server", where `dream status` and the other local actions used to answer `E_NOT_INITIALIZED` as if the
+  vault were missing. `dream run` and `dream apply` are no longer sent to the client's daemon, which has no dream
+  job; they get the same refusal.
 
 ## [0.3.2] - 2026-11-16
 

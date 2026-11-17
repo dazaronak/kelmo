@@ -155,7 +155,9 @@ def routed(args):
             return False
         return ClientProfile.selected(selected_root(args))
     if args.command == 'dream':
-        return args.action in ('run', 'apply')
+        # Dreaming runs on the server: a client root's daemon serves no dream job, and dispatch refuses it.
+        from .config import ClientProfile
+        return args.action in ('run', 'apply') and not ClientProfile.selected(selected_root(args))
     return True
 
 
@@ -412,6 +414,9 @@ def dispatch(args, commands):
         select(config, args.project, 'codex', target, current, hook_file=args.hook_file)
         return result
     if args.command == 'dream':
+        from .config import ClientProfile
+        if ClientProfile.selected(root):
+            raise KelmoError('E_CAPABILITY', '`kelmo dream` runs on the server; the shared client does not provide it.')
         from .dreaming_cli import dispatch as dream_dispatch
         return dream_dispatch(root, args)
     if args.command == 'sync':
