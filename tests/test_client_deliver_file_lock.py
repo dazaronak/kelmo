@@ -1,6 +1,7 @@
 """A delivery pass waits for another process's lock on the outbox file no longer than its deadline before it
 sends; once the server has answered, the answer is recorded whatever the wait."""
 
+import json
 import sqlite3
 import threading
 import time
@@ -69,31 +70,41 @@ def test_a_pass_whose_attempt_cannot_be_recorded_in_time_sends_nothing(shared):
     assert (entry['state'], entry['attempts']) == ('pending', 0), entry
 
 
-def test_an_answer_the_server_gave_is_recorded_even_after_the_deadline(shared):
-    """The server answered; another process then holds the file past the pass's deadline: the settle waits for it,
-    so the entry is delivered and is not sent again."""
+def test_an_answer_the_file_cannot_take_in_time_is_answered_again_under_its_key_with_no_second_effect(shared):
+    """The server answered; another process then holds the file past the pass's deadline: the pass ends within its
+    deadline with the entry pending, and the next pass gets the server's stored answer under the same key, so the
+    entry is delivered with the first answer and the server's effect happened once."""
     client = shared.client()
     client.outbox.enqueue('capture', ARGS, 'answered-late')
-    holders = []
+    holders, answers = [], []
     real = client._send
 
     def send(channel, op, args, key, *rest, **kwargs):
         answer = real(channel, op, args, key, *rest, **kwargs)
         if op == 'capture':
-            other = _holder(client, 'IMMEDIATE')
-            holders.append(other)
-            threading.Timer(1.5, other.rollback).start()
+            answers.append(answer)
+            if len(answers) == 1:
+                other = _holder(client, 'IMMEDIATE')
+                holders.append(other)
+                threading.Timer(1.5, other.rollback).start()
         return answer
 
     client._send = send
     try:
-        result, _took = _flush_within(client, 1.0)
+        result, took = _flush_within(client, 1.0)
+        assert took < 2.0, f'the pass waited {took:.2f} s to record an answer past its 1 s deadline'
+        assert result['stopped'] == 'E_BUSY' and result['reached'] is not True, result
+        assert client.outbox.get('answered-late')['state'] == 'pending'
+        time.sleep(max(0.0, 1.7 - took))  # the holder has let go
+        with client.deadline(5.0):
+            client.flush()
     finally:
         for other in holders:
             other.close()
     entry = client.outbox.get('answered-late')
     assert entry['state'] == 'delivered', (entry, result)
-    assert entry['attempts'] == 1, entry
+    assert len(answers) == 2 and answers[0] == answers[1], answers  # the stored answer, not a second effect
+    assert json.loads(entry['outcome']) == answers[0][1], entry
 
 
 def test_an_answer_is_recorded_though_the_file_stays_held_past_the_outbox_wait(shared):
@@ -293,12 +304,10 @@ def test_a_pass_whose_next_entry_is_held_back_by_its_own_outbox_does_not_report_
     assert result['reached'] is not True, result
 
 
-def test_an_answer_that_cannot_be_recorded_within_the_ceiling_ends_the_pass_and_stays_pending(shared, monkeypatch):
-    """Another process keeps the file past the ceiling for recording an answer: the pass gives up, ends with E_BUSY
-    and leaves the entry pending, so the server answers its key again on a later pass, instead of waiting for as long
-    as that process holds the file."""
-    import kelmo.client as client_module
-    monkeypatch.setattr(client_module, 'RECORD_GIVE_UP_SECONDS', 0.5)
+def test_an_answer_that_cannot_be_recorded_within_the_deadline_ends_the_pass_and_stays_pending(shared):
+    """Another process keeps the file past the pass's deadline for recording an answer: the pass gives up, ends with
+    E_BUSY and leaves the entry pending, so the server answers its key again on a later pass, instead of waiting for
+    as long as that process holds the file."""
     client = shared.client()
     client.outbox.conn.execute('PRAGMA busy_timeout = 100')  # the outbox's normal wait, made short
     client.outbox.enqueue('capture', ARGS, 'answered-never-recorded')
@@ -315,11 +324,11 @@ def test_an_answer_that_cannot_be_recorded_within_the_ceiling_ends_the_pass_and_
     client._send = send
     started = time.monotonic()
     try:
-        with client.deadline(5.0):
+        with client.deadline(0.5):
             result = client.flush()
     finally:
         took = time.monotonic() - started
     time.sleep(max(0.0, 3.2 - took))  # the holder's timer has let go
-    assert took < 2.0, f'the pass waited {took:.2f} s to record an answer past its 0.5 s ceiling'
+    assert took < 2.0, f'the pass waited {took:.2f} s to record an answer past its 0.5 s deadline'
     assert result['stopped'] == 'E_BUSY' and result['delivered'] == 0, result
     assert client.outbox.get('answered-never-recorded')['state'] == 'pending'

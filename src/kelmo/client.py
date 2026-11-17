@@ -154,9 +154,6 @@ OUTBOX_FILE_TRY_SECONDS = 0.5
 REFUSED_SHOWN = 20
 
 
-# How long an answer the server gave is retried into a held outbox file before the pass gives up and leaves the
-# entry pending; the server answers its key again on a later pass.
-RECORD_GIVE_UP_SECONDS = 300.0
 OUTBOX_STALL_SECONDS = 3600
 
 
@@ -191,7 +188,7 @@ def _serial(method):
     return guarded
 
 
-# What `_record` returns when the file stayed held past RECORD_GIVE_UP_SECONDS.
+# What `_record` returns when the file stayed held past the pass's time left.
 _GAVE_UP = object()
 
 # What a failed read names when it knows no channel of its own: `_drop` then leaves the current one alone.
@@ -451,11 +448,15 @@ class Outbox:
             self._rest_of_wait()
 
     @_serial
-    def settle(self, key, state, outcome):
+    def settle(self, key, state, outcome, reset=None):
+        """Settles a pending entry; `reset` (provider, native id) also forgets that transcript's sent position in
+        the same transaction, so a refusal of its base and the restart are recorded together or not at all."""
         with self.conn:
             self.conn.execute("UPDATE entries SET state=?, outcome=?, settled_at=? "
                               "WHERE idempotency_key=? AND state='pending'",
                               (state, canonical(outcome), utc_now(), key))
+            if reset is not None:
+                self._reset_transcript(*reset)
             row = self.conn.execute('SELECT seq, op FROM entries WHERE idempotency_key=?', (key,)).fetchone()
             if row is not None and row['op'] in TRANSCRIPT_OPS:
                 self._shed_transcript_bytes(row['seq'])
@@ -568,8 +569,11 @@ class Outbox:
         session starts from the beginning of the transcript. The restart count enters the next request keys,
         so the server applies the resent bytes instead of replaying the earlier answers for them."""
         with self.conn:
-            self.conn.execute("UPDATE transcripts SET sent_bytes=0, sent_sha256='', restarts=restarts+1 "
-                              "WHERE provider=? AND native_id=?", (provider, native_id))
+            self._reset_transcript(provider, native_id)
+
+    def _reset_transcript(self, provider, native_id):
+        self.conn.execute("UPDATE transcripts SET sent_bytes=0, sent_sha256='', restarts=restarts+1 "
+                          "WHERE provider=? AND native_id=?", (provider, native_id))
 
 
 class StdioChannel:
@@ -1441,18 +1445,13 @@ class SharedClient:
             self.outbox._serial.release()
 
     def _record(self, method, *args):
-        """What a server's answer changes in the outbox (settle, cut, reset): a lock on the file that outlasts the
-        outbox's own wait is waited for again, up to RECORD_GIVE_UP_SECONDS. Then `_GAVE_UP`: the entry stays
-        pending and the server, which keeps its answer under the key, answers it again on a later pass."""
-        give_up = time.monotonic() + RECORD_GIVE_UP_SECONDS
-        while True:
-            try:
-                return method(*args)
-            except sqlite3.OperationalError as error:
-                if not sqlite_busy(error):
-                    raise  # a disk or I/O error is reported as itself
-                if time.monotonic() >= give_up:
-                    return _GAVE_UP
+        """What a server's answer changes in the outbox (settle, cut): waited for no longer than the pass's time
+        left, as the steps before a send. Then `_GAVE_UP`: the entry stays pending, and the server, which keeps its
+        answer under the key, gives the same answer again on a later pass, with no second effect."""
+        try:
+            return self._before_send(method, *args)
+        except Unsent:
+            return _GAVE_UP
 
     def _note_if_free(self, key, code):
         """The code of a retryable answer, noted only while the file is free within the deadline: the entry
@@ -1533,16 +1532,14 @@ class SharedClient:
                 stopped = value['code']
                 break
             outcome = {'code': value['code'], 'message': value['message']}
-            if self._record(self.outbox.settle, key, 'refused', outcome) is _GAVE_UP:
+            # The server does not hold the bytes a refused piece followed: the next capture starts over, recorded
+            # with the refusal itself.
+            reset = ((args['provider'], args['native_id'])
+                     if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE' else None)
+            if self._record(self.outbox.settle, key, 'refused', outcome, reset) is _GAVE_UP:
                 stopped, reached = 'E_BUSY', False
                 break
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
-            if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
-                # The server does not hold the bytes this piece followed: the next capture starts over. Not
-                # recorded in time, the next piece meets the same refusal and tries again.
-                if self._record(self.outbox.reset_transcript, args['provider'], args['native_id']) is _GAVE_UP:
-                    stopped, reached = 'E_BUSY', False
-                    break
         return {'delivered': delivered, 'refused': refused, 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': reached}
 
