@@ -18,6 +18,10 @@ in four pytest processes (`tools/pytest_shards.py`) with `src` selected explicit
 
 The first three files describe retained isolation experiments requiring separate host acceptance. Installed-launcher tests run separately; the default launcher uses the caller's OS permissions.
 
+While the suite runs, the shard runner says how many cases it collected, then one `progress:` line as each of
+its processes ends, with the cases done so far. Before its summary line it says how many of the collected cases
+passed, and on GitHub it appends the same result to the job's step summary.
+
 The artifacts job runs after the Rust checks and every source lane pass, on every event. It builds one wheel
 per platform with maturin, each carrying the `kelmod` binary: Linux x86_64 and Linux aarch64 inside a
 `manylinux2014` image pinned by tag and digest, and macOS arm64 on `macos-26`. The x86_64 job also builds the
@@ -36,6 +40,7 @@ provider, model or real user profile; `release.yml` runs it on a tag and publish
 distribution it tested (see [releasing](RELEASING.md)).
 
 Every matrix uses `fail-fast: false`. Clean-machine bootstrap, native launchd/systemd lifecycle, real Claude/Codex acceptance, and broader OS/CPU support remain separate from these component and packaging checks.
+
 ## Standalone measurement gate
 
 Standalone source uses `bash run-tests.sh` as its test entry point. The bundled `tools/gate.py` reads

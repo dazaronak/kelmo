@@ -144,7 +144,7 @@ class TheStandaloneGate(unittest.TestCase):
                 shutil.copy2(source, target)
         self.env = dict(os.environ, GATE_PYTHON=sys.executable, PYTHONDONTWRITEBYTECODE='1')
         for name in ('KELMO_GATE_MODEL_DIR', 'KELMO_MODEL_DIR', 'KELMO_TEST_PREFIX',
-                     'GATE_WITHOUT', 'GATE_PIN', 'GATE_BASH32'):
+                     'GATE_WITHOUT', 'GATE_PIN', 'GATE_BASH32', 'GITHUB_STEP_SUMMARY'):
             self.env.pop(name, None)
 
     def run_gate(self, *args):
