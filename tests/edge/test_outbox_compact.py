@@ -814,7 +814,7 @@ def test_an_idle_rewrite_gives_way_to_a_caller_that_comes_meanwhile(legacy_edge,
         if not started:  # the rewrite is about to copy: a hook comes for the outbox now
             started.append(True)
             threading.Thread(target=caller, daemon=True).start()
-            assert _until(lambda: core._owner._waiting[True] > 0, 2), 'the caller never waited'
+            assert _until(lambda: bool(core._owner._waiting[True]), 2), 'the caller never waited'
         return result
 
     client.outbox.compaction_state = state_then_a_caller
