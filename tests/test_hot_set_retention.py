@@ -6,6 +6,8 @@ import os
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from kelmo.client import SharedClient, Unbound
 
 DAY = 86400
@@ -228,3 +230,50 @@ def test_a_set_a_session_was_pointed_at_stays_while_the_session_is_recent(tmp_pa
     client.generation = 4
     client.context(binding=dict(BINDING, work='third-task'))
     assert named not in _sets(hot), 'a set only a month-old session record named was kept'
+
+
+def test_an_installed_kelmo_hook_on_a_local_vault_records_its_delivery_once_the_output_is_out(tmp_path, capsys,
+                                                                                            monkeypatch):
+    """A vault with a server profile installs `kelmo hook`, not `kelmod hook`. With kelmod beside the launcher
+    it still runs in process, so the delivery record that keeps a session's set is written after the output."""
+    import io
+    from kelmo import cli, integration
+    from kelmo.core import daemon_client
+    from test_hot import config
+    selected = config(tmp_path, '[hot]\npages=["global.md"]\n')
+    launcher = tmp_path / 'bin' / 'kelmo'
+    launcher.parent.mkdir()
+    (launcher.parent / 'kelmod').write_text('')
+    monkeypatch.setattr(daemon_client, 'ensure', lambda *a, **k: pytest.fail('kelmo hook started a daemon'))
+    monkeypatch.setattr(daemon_client, 'call', lambda *a, **k: pytest.fail('kelmo hook went through the daemon'))
+    written = []
+
+    def hook(service, action, payload, *, acknowledge=None):
+        acknowledge(lambda: written.append(capsys.readouterr().out))
+        return {'hookSpecificOutput': {'additionalContext': 'delivered-context'}}
+
+    monkeypatch.setattr(integration, 'hook', hook)
+    monkeypatch.setattr('sys.stdin', io.StringIO('{}'))
+    assert cli.main(['hook', 'start', '--provider', 'claude', '--vault', str(selected.root)],
+                    executable=str(launcher)) == 0
+    assert len(written) == 1 and 'delivered-context' in written[0], written
+
+
+def test_a_sweep_that_fails_part_way_still_waits_a_day_before_the_next(tmp_path, monkeypatch):
+    """A set the sweep cannot rename must not make every later delivery read the cached contexts again."""
+    from kelmo import hub_delivery
+    hot = tmp_path / 'hot'
+    for index in range(12):
+        _old_set(hot, index + 10, days=5 + index)
+
+    def refuse(*_args):
+        raise OSError('rename refused')
+
+    monkeypatch.setattr(hub_delivery.os, 'rename', refuse)
+    reads = []
+    for _ in range(2):
+        try:
+            hub_delivery.prune_sets(hot, keep=lambda: reads.append(1) or ())
+        except OSError:
+            pass
+    assert len(reads) == 1, f'the sweep ran {len(reads)} times in one day'

@@ -147,6 +147,8 @@ def prune_sets(root, keep=None):
             return []
     except FileNotFoundError:
         pass
+    # Dated before the sweep runs: a sweep that fails part way waits a day too instead of costing every delivery.
+    marker.touch()
     # A sweep killed while it removed a set leaves that set under a trash name: it goes now, whatever its age.
     for path in root.iterdir():
         if path.name.startswith('.trash-') and path.is_dir() and not path.is_symlink():
@@ -165,7 +167,6 @@ def prune_sets(root, keep=None):
             os.rename(path, trash)
             shutil.rmtree(trash, ignore_errors=True)
             removed.append(path.name)
-    marker.touch()
     return removed
 
 
