@@ -6,6 +6,12 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- A promoted note that met a database held by another writer while it went through the editor no longer fails
+  with `E_PROCESSING` and loses an attempt. It waits its turn as `E_BUSY`, uncharged, as it already did before
+  the editor call.
+
 ## [0.3.2] - 2026-11-16
 
 ### Added
