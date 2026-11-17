@@ -286,8 +286,10 @@ class CoreLink:
             pass
 
     def _set_stopping(self):
-        """Sets the stop flag under the write lock: a call that passed its stop check finishes its write first, and
-        every call after it sees the stop, so no frame is written once the flag is up."""
+        """Sets the stop flag under the write lock, waiting for it at most STOP_WRITE_WAIT_SECONDS: a call that passed
+        its stop check finishes its write first, and every call after it sees the stop. Only a write stuck past
+        that bound (kelmod not reading) can end after the flag is up; its future fails all the same, failed by that
+        call itself or by `_finish`."""
         taken = self._write_lock.acquire(timeout=STOP_WRITE_WAIT_SECONDS)
         try:
             self._stopping.set()
