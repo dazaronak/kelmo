@@ -114,6 +114,7 @@ class CoreLink:
         self._outgoing = {}  # call id -> Future
         self._state = threading.Lock()
         self._stopping = threading.Event()
+        self._peer_gone = threading.Event()  # a write found kelmod's end gone: no later call is written or registered
         self._draining = threading.Event()  # admin.stop came: new calls are refused, replies still delivered
         self._owner_stop_lock = threading.RLock()  # held while begin_stop runs: no caller passes it before then
         self._owner_stop_asked = False
@@ -163,7 +164,7 @@ class CoreLink:
         with self._state:
             # Once the link stops, `_finish` has failed (or is about to fail) every call it knows; a call registered
             # after its snapshot would wait for a reply that cannot come, so it is refused here, under the same lock.
-            stopping = self._stopping.is_set()
+            stopping = self._stopping.is_set() or self._peer_gone.is_set()
             if not stopping:
                 self._outgoing[call_id] = future
         if stopping:
@@ -181,13 +182,13 @@ class CoreLink:
         try:
             with self._write_lock:
                 # The stop may have begun, and failed this call, since it was registered: then nothing is written.
-                refused = self._stopping.is_set()
+                refused = self._stopping.is_set() or self._peer_gone.is_set()
                 if not refused:
                     try:
                         self.sock.sendall(data)
                     except OSError as error:
                         if error.errno in PEER_GONE:
-                            self._stopping.set()  # under the write lock: no call after this one tries to write
+                            self._peer_gone.set()  # under the write lock: no call after this one tries to write
                         raise
         except Exception as error:  # noqa: BLE001 - a failed write fails this call; only a gone peer stops the core
             with self._state:
