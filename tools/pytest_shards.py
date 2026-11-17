@@ -88,6 +88,21 @@ def collect(args):
     return done, ids, (roots[-1] if roots else None)
 
 
+CASES = 'PYTEST_SHARDS_CASES'
+# Each shard names, as it goes, every case that got an outcome: its call report, or a setup that skipped or
+# failed. A case that passes and then errors in its teardown is one case, though pytest counts two outcomes; and
+# a shard that dies still leaves the cases it finished.
+SHARD = ('import os, sys, pytest\n'
+         'class Cases:\n'
+         '    def __init__(self, path):\n'
+         '        self.out = open(path, "a", encoding="utf-8")\n'
+         '    def pytest_runtest_logreport(self, report):\n'
+         '        if report.when == "call" or (report.when == "setup" and not report.passed):\n'
+         '            self.out.write(report.nodeid + "\\n")\n'
+         '            self.out.flush()\n'
+         'raise SystemExit(pytest.main(sys.argv[1:], plugins=[Cases(os.environ[%r])]))\n' % CASES)
+
+
 def counts(text):
     """The counts of the last pytest summary line in a shard's output."""
     found = {}
@@ -101,12 +116,16 @@ def counts(text):
 
 
 def run_shard(index, ids, options):
+    """(index, exit code, output, the number of its cases that got an outcome)."""
     # Bytes a case wrote that are not text in the locale must not cost the shard its summary.
-    with tempfile.TemporaryFile(mode='w+', errors='replace') as out:
-        code = subprocess.call([sys.executable, '-m', 'pytest', '-p', 'no:cacheprovider', *options, '--', *ids],
-                               stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
+    with tempfile.TemporaryFile(mode='w+', errors='replace') as out, \
+            tempfile.NamedTemporaryFile(mode='r', encoding='utf-8', errors='replace', suffix='.cases') as cases:
+        code = subprocess.call([sys.executable, '-c', SHARD, '-p', 'no:cacheprovider', *options, '--', *ids],
+                               stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                               env=dict(os.environ, **{CASES: cases.name}))
         out.seek(0)
-        return index, code, COLOUR.sub('', out.read())
+        finished = len(set(cases.read().splitlines()))
+        return index, code, COLOUR.sub('', out.read()), finished
 
 
 def main(args):
@@ -136,17 +155,18 @@ def main(args):
         running = {pool.submit(run_shard, index, shard, options): index for index, shard in enumerate(shards)}
         for future in as_completed(running):
             try:
-                index, code, text = future.result()
+                index, code, text, finished = future.result()
             except Exception as error:  # noqa: BLE001 - one shard the runner could not read is that shard's red
-                index, code, text = running[future], -1, 'the runner failed: %s: %s' % (type(error).__name__, error)
-            results.append((index, code, text))
-            # A shard can end before it ran every case it was dealt, so only the outcomes it reported count.
-            found = counts(text) or {}
-            done += min(len(shards[index]), sum(found.get(key, 0) for key in OUTCOMES))
+                index, code, finished = running[future], -1, 0
+                text = 'the runner failed: %s: %s' % (type(error).__name__, error)
+            results.append((index, code, text, finished))
+            # A shard can end before it ran every case it was dealt, so only the cases it finished count.
+            done += min(len(shards[index]), finished)
             print('progress: shard %d of %d ended with exit %d, %d of %d cases done'
                   % (index + 1, count, code, done, len(ids)), flush=True)
-    total, reports, failed, unreported = {}, [], False, 0
-    for index, code, text in sorted(results):
+    total, reports, failed, ran = {}, [], False, 0
+    for index, code, text, finished in sorted(results):
+        ran += min(len(shards[index]), finished)
         found = counts(text)
         if code != 0:
             failed = True
@@ -158,17 +178,15 @@ def main(args):
             tail = ' | '.join(text.strip().splitlines()[-3:]) or 'it printed nothing'
             reports.append('ERROR shard %d of %d ended without a pytest summary (exit %d): %s'
                            % (index + 1, count, code, tail))
-            total['error'] = total.get('error', 0) + 1
-            unreported += 1  # that error stands for the shard, not for one of its cases
+            total['error'] = total.get('error', 0) + 1  # it stands for the shard, not for one of its cases
             continue
         for key, value in found.items():
             total[key] = total.get(key, 0) + value
         reports.extend(line for line in text.splitlines() if REPORT.match(line))
-    ran = sum(total.get(key, 0) for key in OUTCOMES) - unreported
     if ran < len(ids):
-        # Every dealt id is one collected item, and each item ends as one of these outcomes at least once.
+        # Every dealt id is one collected item, and each item that ran named itself as it finished.
         failed = True
-        reports.append('ERROR the shards report %d outcome(s) for the %d case(s) they were dealt: '
+        reports.append('ERROR the shards report %d case(s) run for the %d case(s) they were dealt: '
                        '%d never ran or ran unreported'
                        % (ran, len(ids), len(ids) - ran))
     for line in reports:
