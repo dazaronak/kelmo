@@ -68,6 +68,11 @@ def hook(service, action, payload, *, acknowledge=None):
             context = f'Kelmo HOT {state} ({code}). No selected pages were delivered.'
             if code in ('E_BUDGET', 'E_GENERATION', 'E_BINDING'):
                 context += ' ' + str(error)
+        else:
+            # A local vault installs a set only when its context does not fit, which is where the daily sweep of
+            # old sets, session records and context references ran; the hook runs it itself.
+            from .hub_delivery import sweep
+            sweep(config.state / 'hot')
         return {'hookSpecificOutput': {'hookEventName': 'SessionStart' if action == 'start' else 'UserPromptSubmit',
                                       'additionalContext': context}}
     message = payload.get('last_assistant_message')
