@@ -115,3 +115,18 @@ def test_a_confined_channel_frame_cut_part_way_ends_the_channel(monkeypatch):
         monkeypatch.undo()
         parent.close()
         channel.close()
+
+
+def test_a_confined_channel_ended_for_writing_still_reads_the_replies_on_their_way():
+    """A frame cut short ends a confined channel for writing only: a reply kelmod already sent is still read."""
+    parent, child = socket.socketpair()
+    channel = corelink.DescriptorChannel(child.detach())
+    try:
+        parent.sendall(b'reply')
+        channel.shutdown(socket.SHUT_WR)
+        assert channel.recv(5) == b'reply', 'the reader took the write shutdown for the end of the channel'
+        channel.shutdown(socket.SHUT_RDWR)
+        assert channel.recv(5) == b'', 'a full shutdown still wakes the reader'
+    finally:
+        channel.close()
+        parent.close()

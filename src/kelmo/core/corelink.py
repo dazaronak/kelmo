@@ -60,8 +60,8 @@ def write_frame(sock, data):
 class DescriptorChannel:
     """The channel as a plain descriptor, for a core inside the Linux sandbox: its seccomp policy refuses every
     socket syscall (`getsockopt` already, which `socket.socket(fileno=...)` makes), while read, write and poll on
-    an inherited descriptor stay allowed. Offers the socket methods CoreLink uses; `shutdown` wakes the reader
-    through a pipe instead of `shutdown(2)`."""
+    an inherited descriptor stay allowed. Offers the socket methods CoreLink uses; `shutdown` of the read side wakes
+    the reader through a pipe instead of `shutdown(2)`, and a write shutdown does nothing."""
 
     def __init__(self, fd):
         self.fd = fd
@@ -91,7 +91,11 @@ class DescriptorChannel:
                     raise BrokenFrame(error) from error
                 raise
 
-    def shutdown(self, _how):
+    def shutdown(self, how):
+        if how == socket.SHUT_WR:
+            # No half-close without shutdown(2): writes already stop on `_peer_gone`, and replies on their way are
+            # still read until kelmod closes its end.
+            return
         try:
             os.write(self._wake_write, b'x')
         except OSError:
