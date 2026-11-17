@@ -596,3 +596,26 @@ def test_unverified_embed_selection_still_resends_every_turn(tmp_path, monkeypat
         out = hub_delivery.prepare(snapshot=snapshot(2, 1), **args)
         assert 'hub alpha' in out and 'kelmo hub import' in out
         acks.pop()()
+
+
+def test_a_resumed_session_with_no_delivery_record_is_told_its_earlier_context_is_unknown(tmp_path):
+    """A session idle past the record's 30 days has no delivery record left; when it resumes, Kelmo cannot tell
+    what it was given, so the whole context comes with a notice instead of silently."""
+    from kelmo.hub_delivery import prepare
+    acks = []
+    args = _hooks_only(tmp_path, acks, payload={'session_id': 'old', 'source': 'resume'})
+    resumed = prepare(snapshot=snapshot(2, 1), action='start', **args)
+    assert 'hub alpha' in resumed
+    assert 'restart the session' in resumed.lower(), resumed
+
+
+def test_a_new_session_or_a_resume_with_its_record_gets_no_unknown_context_notice(tmp_path):
+    from kelmo.hub_delivery import prepare
+    acks = []
+    fresh = prepare(snapshot=snapshot(2, 1), action='start',
+                    **_hooks_only(tmp_path, acks, payload={'session_id': 'new', 'source': 'startup'}))
+    assert 'restart' not in fresh.lower(), fresh
+    acks.pop()()
+    again = prepare(snapshot=snapshot(2, 1), action='start',
+                    **_hooks_only(tmp_path, acks, payload={'session_id': 'new', 'source': 'resume'}))
+    assert 'restart' not in again.lower(), again

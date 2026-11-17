@@ -135,8 +135,9 @@ says that no cached generation is left. The same sweep removes a cached context 
 delivery, online or from the cache, has used for 30 days: nobody has used its
 binding since, and that binding then has no offline fallback until its next
 delivery. It also removes a session's delivery record no delivery has written for 30
-days; such a session, if it resumes, gets the whole context once as a new one does,
-with no restart notice, since nothing records what it was given. A saved context
+days; such a session, if it resumes, gets the whole context once, after a notice that
+Kelmo has no record of what it was given and that a restart clears facts removed or
+contradicted since. A saved context
 reference that no delivery has shown for 30 days goes the same way; the one-line
 marker of an unchanged prompt shows none.
 

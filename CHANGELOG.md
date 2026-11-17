@@ -19,7 +19,8 @@ entry here.
   - A cached context no delivery, online or from the cache, has used for 30 days goes, and with it the
     hold on its set. That binding has no offline fallback until its next delivery.
   - A session's delivery record no delivery has written for 30 days goes. Such a session, if it resumes,
-    gets the whole context once as a new session does, with no restart notice.
+    gets the whole context once, after a notice that Kelmo has no record of what it was given and that a
+    restart clears facts removed or contradicted since.
   - A saved context reference no delivery has shown for 30 days goes. A delivery that shows it again counts
     as a use; the one-line marker of an unchanged prompt does not.
   - The sweep skips a `hub-sessions/` or `hub-context/` folder that is a link, and any file there that is
