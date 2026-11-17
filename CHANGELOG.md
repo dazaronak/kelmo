@@ -12,6 +12,9 @@ entry here.
   without being charged an attempt, as a stop met earlier in the same run already did, also when the editor
   answers busy. It used to be staged failed and charged: retried later for a transient code, needing a
   manual retry otherwise.
+- A core whose call to another core cannot be written because kelmod already closed its channel now
+  counts that failure as the stop's. The call used to fail before the core heard of the stop, so a promote
+  note whose editor call met it could still be charged an attempt.
 
 ## [0.3.1] - 2026-11-15
 

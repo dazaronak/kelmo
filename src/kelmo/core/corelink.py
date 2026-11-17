@@ -151,6 +151,11 @@ class CoreLink:
         except (OSError, ValueError, TypeError, KelmoError) as error:
             with self._state:
                 self._outgoing.pop(call_id, None)
+            if isinstance(error, OSError):
+                # The channel to kelmod is gone, though the reader may not have reached its end yet: the core
+                # hears of the stop before this call fails, as it does for the calls the reader fails.
+                self._stopping.set()
+                self._ask_owner_to_stop()
             future.set_exception(error if isinstance(error, KelmoError)
                                  else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
         return future

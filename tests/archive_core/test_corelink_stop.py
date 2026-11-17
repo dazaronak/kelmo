@@ -91,6 +91,33 @@ def test_when_kelmod_closes_the_channel_the_core_hears_of_the_stop_before_its_ca
     assert order == ['stop', 'failed']
 
 
+def test_a_call_that_cannot_be_sent_on_a_closed_channel_tells_the_core_of_the_stop_first():
+    """kelmod closed the channel and the reader has not reached its end yet: a call sent now fails on the write.
+    The core hears of the stop before that call fails, so the failure is counted as the stop's."""
+    parent, child = socket.socketpair()
+    order = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    parent.close()
+    future = link.call('archive.echo', {}, Context.local(uuid.uuid4().hex, 30))
+    future.add_done_callback(lambda _: order.append('failed'))
+    assert order == ['stop', 'failed'], order
+    assert future.exception().code == 'E_TRANSPORT'
+
+
+def test_a_call_that_cannot_be_encoded_does_not_stop_the_core():
+    parent, child = socket.socketpair()
+    order = []
+    link = CoreLink.from_descriptor(child.detach(), handlers={}, lanes={'read': 1})
+    link.begin_stop = lambda: order.append('stop')
+    try:
+        future = link.call('archive.echo', {'x': object()}, Context.local(uuid.uuid4().hex, 30))
+        assert future.exception() is not None
+        assert order == [], order
+    finally:
+        parent.close()
+
+
 def test_a_channel_closed_before_the_hello_still_stops_the_core_and_fails_its_calls():
     parent, child = socket.socketpair()
     order = []
