@@ -57,6 +57,24 @@ def test_every_line_kelmod_writes_while_it_serves_carries_its_time(start, monkey
     assert [line for line in lines if not stamped.match(line)] == [], log
 
 
+def test_a_kelmod_line_after_a_core_killed_mid_line_starts_on_a_line_of_its_own(start, monkeypatch):
+    """A core killed while it wrote to the shared log leaves its last line unfinished."""
+    import re
+    daemon = start_d58(start, monkeypatch, drain_timeout_ms=1000,
+                       state_argv=["--ignore-admin-stop", "--cut-stderr-at-stop"])
+    try:
+        daemon.proc.send_signal(signal.SIGTERM)
+        assert daemon.wait_exit(timeout=10) == 0
+    finally:
+        daemon.stop()
+    log = (daemon.spec_path.parent / "kelmod.log").read_text()
+    assert "core output cut short" in log, log
+    stamped = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z kelmod: ")
+    lines = [line for line in log.splitlines() if "kelmod: " in line]
+    assert any("drain time" in line for line in lines), log
+    assert [line for line in lines if not stamped.match(line)] == [], log
+
+
 def test_core_over_soft_budget_that_declines_recycle_is_kept(start, monkeypatch):
     daemon = start_d58(start, monkeypatch, sample_ms=100, state_budget={"soft_mb": 80},
                        state_argv=["--soft-trigger-once", "--decline-recycle"])

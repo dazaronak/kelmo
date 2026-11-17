@@ -14,8 +14,8 @@ pub mod sys;
 /// recycle can be dated from the log. A line separator or other control character inside the message is
 /// written escaped, and the whole line is handed to the log in one write, so a core writing to the same log
 /// does not split it as a rule. A failed write is dropped (logging never stops the daemon); after one cut part
-/// way the next line starts on a fresh line. Rust's own panic message is not written through here, and a line
-/// follows whatever a core left unfinished on the same log.
+/// way, or after a core that may have been writing was killed or failed (`log_was_cut`), the next line starts
+/// on a fresh line. Rust's own panic message is not written through here.
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {
@@ -23,10 +23,18 @@ macro_rules! logln {
     };
 }
 
+/// Set when the log may end inside a line: one of kelmod's own was cut, or a writer sharing the log ended.
+static LOG_CUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The line `logln!` writes: the time, a space, the message on one line, a line feed.
 pub fn write_log_line(message: &str) {
-    static BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    emit_log_line(&mut std::io::stderr().lock(), message, &BROKEN);
+    emit_log_line(&mut std::io::stderr().lock(), message, &LOG_CUT);
+}
+
+/// A process sharing the log (a core) was killed or failed and may have left its last line unfinished: the next
+/// line `logln!` writes starts with a line feed. Called after the process is gone, before kelmod logs about it.
+pub fn log_was_cut() {
+    LOG_CUT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// How many times a line waits a millisecond for a log that answers it would block.

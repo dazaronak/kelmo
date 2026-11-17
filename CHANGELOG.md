@@ -15,8 +15,10 @@ entry here.
   one write, so a core writing to the same log does not split it as a rule. A line that cannot be written is
   dropped and the daemon goes on; after one cut part way, the next line starts on a fresh line. Lines the
   cores write to the same log, Rust's own panic message, and an error that stops `kelmod` before it serves
-  (the client quotes those to the user) are written as before; a stamped line that follows a core's
-  unfinished line continues it.
+  (the client quotes those to the user) are written as before. After a core is killed or fails, the next line
+  starts on a fresh line, since the core may have died part way through one; a core killed at the end of its
+  drain time is now killed before `kelmod` writes that it was. The messages `kelmo` quotes from the log when
+  the daemon stops after it served carry the time too.
 
 ## [0.3.1] - 2026-11-15
 
