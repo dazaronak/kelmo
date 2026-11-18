@@ -43,7 +43,8 @@ resumes while one of its projects is still ready; what it left below
 not cut. A pass the daemon did not see end,
 because the core died under it, waits 15 minutes from its start, or two hours if
 none of its notes was published by then. Paused or deferred Dreaming waits until it can
-run. A server fence holds all scheduled jobs until it is lifted: no job starts,
+run; a daily run that met a usage limit whose reset time had already passed waits the same 15
+minutes. A server fence holds all scheduled jobs until it is lifted: no job starts,
 and a running backfill stops before its next batch. The daemon also refuses a job
 submitted by hand and any command that changes the vault (`worker run`,
 `queue retry`) with `E_FENCED`. It still answers `status`, `search` and other
@@ -116,6 +117,27 @@ dropping an alert; an undelivered alert is tried again on the next lost-login an
 command = ["/usr/bin/python3", "-I", "/opt/kelmo/telegram-alert.py", "/etc/kelmo/telegram.conf"]
 label = "Server Kelmo"
 ```
+
+The same command hears of every Dreaming run that Kelmo starts: the daemon's own
+daily run, and the runs of the timer `kelmo dream schedule` writes. A timer run
+that never reaches Kelmo, because its `kelmo.toml` cannot be read or its command is
+routed to an installed daemon service that is stopped, is not heard; its error
+stays in the timer's output. A run that fails (the findings pass answers `failed`, the run raises, or
+its lock file cannot be opened) is told once when it fails and once a calendar day
+for each error code while it keeps failing; the run is still tried again as before.
+The findings pass reads notes in the order they reached the archive, so a note
+still on its way holds nothing back. If it answers idle while archived notes it has
+not read wait behind its cursor anyway, it is told once the first of them has waited
+a day, with the time it reached the archive, then once a calendar day. An idle pass with nothing waiting is
+a quiet vault and tells nothing. The first run that completes after an alert sends
+one message that it is over; after an idle pass with nothing waiting, it says no
+note waits behind the cursor any more. An alert the command fails to take is sent
+again with the next failure or idle answer; while it runs, the daemon waits at
+least 15 minutes between such tries (a restarted daemon may try at once), and a
+timer tries once in each of its runs. When a run
+completes after a failure or a waiting alert that never went out, its one
+message names what was missed. The marker is `dream-watch.json` in the state
+directory.
 
 Wiki/Git persistence errors use the same bounded retry path as other resolution
 failures. A dirty managed page stays untouched, the operation remains visible,

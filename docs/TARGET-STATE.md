@@ -135,7 +135,7 @@ These hold everywhere, in every command and tool. A change that breaks one of th
 3. One Service, one journal, one worker. No second scheduler, queue database or publication path is added.
 4. Replay is safe. Retrying an operation reuses its source and archive receipt; it does not create a second archive record or a second wiki commit for the same change.
 5. Roles are declared, not authenticated. `collector` evidence never becomes a wiki fact without an explicit promotion by a `lead`.
-6. HOT delivers whole pages or nothing. No summaries, no truncation, no recursive imports, no symlinks.
+6. HOT delivers whole pages or nothing. No summaries, no truncation, no recursive imports, no symlinks. One exception to the bytes: a mandatory page's fact rows arrive without their fact and source labels; reading the page (`graph_read`, `kelmo page`) returns it as written.
 7. The graph is derived. It is rebuilt from the Markdown whenever the Markdown changes; it never carries facts of its own.
 8. Unmanaged Markdown is preserved. The engine edits only the managed `<!-- kb -->` sections and registry-owned frontmatter; everything else on a page is kept byte for byte.
 9. Degradation is explicit. Lexical fallback, empty HOT, stale graph and pending work are reported as such; nothing silently returns less.

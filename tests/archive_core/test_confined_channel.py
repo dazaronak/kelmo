@@ -118,3 +118,18 @@ def test_an_unconfined_core_keeps_its_socket(monkeypatch):
     finally:
         link.sock.close()
         parent.close()
+
+
+def test_a_shutdown_after_close_writes_to_no_descriptor(monkeypatch):
+    """`close` frees the channel's descriptors, and the process may hand their numbers to a file opened later; a
+    late `shutdown` (the reader's wake) must not write a byte into it."""
+    import os
+    parent, child = socket.socketpair()
+    channel = DescriptorChannel(child.detach())
+    channel.close()
+    writes = []
+    real_write = os.write
+    monkeypatch.setattr(corelink.os, 'write', lambda fd, data: writes.append(fd) or real_write(fd, data))
+    channel.shutdown(socket.SHUT_RDWR)
+    assert writes == [], f'shutdown after close wrote to descriptor(s) {writes}'
+    parent.close()

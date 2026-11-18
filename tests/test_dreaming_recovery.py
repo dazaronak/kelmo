@@ -29,7 +29,64 @@ def test_evidence_larger_than_budget_skipped(world):
         contexts=world.contexts(),
         budget_tokens=10,
     )
-    assert second == {'state': 'idle'}
+    assert second == {'state': 'idle', 'waiting': 0}
+
+
+def test_forgotten_evidence_is_skipped_and_never_holds_the_cursor(world):
+    """A record forgotten after it was archived is still in the findings pass's window; the pass skips it
+    instead of failing on it, and the cursor moves past it, so the next pass is not stuck behind it."""
+    world.service.forget(world.seed.archive_id)
+    executor = Scripted()
+    result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'finished', result
+    assert result['skipped'] == [{'archive_id': world.seed.archive_id, 'version': world.seed.version,
+                                  'reason': 'forgotten'}]
+    assert len(executor.jobs) == 0
+    second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert second == {'state': 'idle', 'waiting': 0}
+
+
+def test_forgotten_evidence_ahead_of_readable_evidence_lets_the_cursor_pass_both(world):
+    """The forgotten record comes first in the window and a readable one after it: the pass sends the readable
+    one, and the cursor moves past both, so the next pass reads neither again."""
+    from kelmo.config import Config
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[editor]\nmode = "nightly"\n', encoding='utf-8')
+    world.service.config = Config.load(world.root)
+    later = world.service.create('The export moves to a nightly window.', project='app')
+    world.service.run(later['id'])
+    world.service.forget(world.seed.archive_id)
+    executor = Scripted(ModelOutcome('proposal', {'findings': []}), ModelOutcome('proposal', {'findings': []}))
+    result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'finished', result
+    assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] != [world.seed.archive_id]
+    readable = world.service.journal.get(later['id'])['archive_id']
+    assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] == [readable], (
+        executor.jobs[0].payload['evidence'])
+    second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert second == {'state': 'idle', 'waiting': 0}, second
+    assert len(executor.jobs) == 1, 'the second pass read the same evidence again'
+
+
+def test_a_window_record_that_fails_to_read_for_another_reason_still_fails_the_run(world, monkeypatch):
+    """Only a forgotten record is skipped: any other read failure fails the run, and the cursor stays, so the next
+    run reads the record again."""
+    import json
+
+    def broken(*args, **kwargs):
+        raise KelmoError('E_IO', 'Synthetic archive read failure.')
+
+    monkeypatch.setattr(world.service, 'show', broken)
+    executor = Scripted(ModelOutcome('proposal', {'findings': []}))
+    result = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'failed', result
+    assert 'E_IO' in json.dumps(result), result
+    assert len(executor.jobs) == 0
+    monkeypatch.undo()
+    second = world.service.dreaming.run(executor, origin=world.origins['editor'], contexts=world.contexts())
+    assert second['state'] == 'finished', second
+    assert [item['archive_id'] for item in executor.jobs[0].payload['evidence']] == [world.seed.archive_id], (
+        'the failed read moved the cursor past the record')
 
 
 def test_link_publication_fails_once_stays_open_then_publishes(world, monkeypatch):
@@ -197,6 +254,46 @@ def test_link_citing_forgotten_evidence_settles_stale(world, monkeypatch):
     assert 'app-archive' not in world.registry()['pages'][NOTES]['links']
 
 
+def test_link_citing_purged_evidence_settles_stale(world, monkeypatch):
+    """A record an operator purged answers E_PURGED: like a forgotten one it is no evidence any more, so the
+    finding settles stale instead of staying open on that error at every later publish."""
+    finding = {
+        'kind': 'link',
+        'pages': [NOTES, OTHER],
+        'sources': [{'archive_id': world.seed.archive_id, 'version': world.seed.version}],
+        'reason': 'Seed evidence links notes and archive.',
+    }
+    real_edit = world.service.editor.edit
+    calls = 0
+
+    def failing_edit(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KelmoError('E_BUSY', 'editor is busy')
+        return real_edit(*args, **kwargs)
+
+    monkeypatch.setattr(world.service.editor, 'edit', failing_edit)
+    first_run = world.service.dreaming.run(
+        Scripted(ModelOutcome('proposal', {'findings': [finding]})),
+        origin=world.origins['editor'],
+        contexts=world.contexts(),
+    )
+    fp = first_run['new'][0]
+    assert world.service.dreaming._row(fp)['state'] == 'open'
+    real_show = world.service.show
+
+    def purged(archive_id, *args, **kwargs):
+        if archive_id == world.seed.archive_id:
+            raise KelmoError('E_PURGED', 'The record was purged.')
+        return real_show(archive_id, *args, **kwargs)
+
+    monkeypatch.setattr(world.service, 'show', purged)
+    result = world.service.dreaming.publish(fp, origin=world.origins['editor'], contexts=world.contexts())
+    assert result['state'] == 'stale', result
+    assert 'E_PURGED' in world.service.dreaming._row(fp)['detail']['reason']
+
+
 def test_merge_finding_pages_either_order_recorded_once(world):
     finding_order1 = {
         'kind': 'merge',
@@ -266,3 +363,82 @@ def test_malformed_finding_values_are_rejected_not_raised():
                    {'sources': [{'fact_key': [], 'revision': 'r1'}]},
                    {'sources': [{'archive_id': {'x': 1}, 'version': 1}]}):
         assert isinstance(Dreaming._problem(dict(good, **change), shown, facts, archived), str)
+
+
+def test_an_idle_findings_pass_names_the_notes_waiting_behind_its_cursor(world):
+    """The waiting count of an idle answer is the archived notes after the cursor that the pass has not read, with
+    the moment the first of them reached the archive. A capture that never reaches the archive has no place in
+    archive order and holds nothing back, so the next pass takes the notes behind it, and an idle pass after
+    that counts none."""
+    from kelmo.config import Config
+    from tests.test_editor_scoping import FEATURE
+    toml = world.root / 'kelmo.toml'
+    toml.write_text(toml.read_text(encoding='utf-8') + '\n[editor]\nmode = "nightly"\n', encoding='utf-8')
+    world.service.config = Config.load(world.root)
+    executor = Scripted()
+    dream = world.service.dreaming
+    first = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    assert first['state'] == 'finished'  # the seed is past the cursor now
+    cursor = dream._cursor()
+    world.service.create('A capture that never reaches the archive.', project='app', selected=[FEATURE])
+    notes = []
+    for text in ('Exports run at 01:00.', 'Exports run at 02:00.'):
+        notes.append(world.service.create(text, project='app', selected=[FEATURE])['id'])
+        world.service.run(notes[-1])
+    archived = world.service.journal.conn.execute(
+        "SELECT MIN(created_at) FROM events WHERE stage IN ('archived', 'applied') AND operation_id IN (?, ?)",
+        notes).fetchone()[0]
+    assert dream._waiting_evidence(cursor) == (2, archived)
+    taken = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    assert taken['state'] == 'finished'  # larger than the budget, so skipped: the capture held nothing back
+    assert sorted(item['archive_id'] for item in taken['skipped']) == sorted(row[0] for row in (
+        world.service.journal.conn.execute('SELECT archive_id FROM operations WHERE id IN (?, ?)', notes)))
+    idle = dream.run(executor, origin=world.origins['editor'], contexts=world.contexts(), budget_tokens=10)
+    assert idle == {'state': 'idle', 'waiting': 0}
+    assert executor.jobs == []
+
+
+def test_link_whose_evidence_read_fails_once_stays_open_then_publishes(world, monkeypatch):
+    """One transient read failure of the cited evidence is not a change of it: the finding stays open, with the
+    code, and a later publish links the pages."""
+    finding = {
+        'kind': 'link',
+        'pages': [NOTES, OTHER],
+        'sources': [{'archive_id': world.seed.archive_id, 'version': world.seed.version}],
+        'reason': 'Seed evidence links notes and archive.',
+    }
+    real_edit = world.service.editor.edit
+    edits = []
+
+    def busy_editor_once(*args, **kwargs):
+        edits.append(1)
+        if len(edits) == 1:
+            raise KelmoError('E_BUSY', 'editor is busy')
+        return real_edit(*args, **kwargs)
+
+    monkeypatch.setattr(world.service.editor, 'edit', busy_editor_once)
+    first_run = world.service.dreaming.run(
+        Scripted(ModelOutcome('proposal', {'findings': [finding]})),
+        origin=world.origins['editor'],
+        contexts=world.contexts(),
+    )
+    fp = first_run['new'][0]
+    assert world.service.dreaming._row(fp)['state'] == 'open'
+
+    real_show = world.service.show
+    reads = []
+
+    def busy_archive_once(archive_id, *args, **kwargs):
+        reads.append(archive_id)
+        if len(reads) == 1:
+            raise KelmoError('E_BUSY', 'synthetic busy archive')
+        return real_show(archive_id, *args, **kwargs)
+
+    monkeypatch.setattr(world.service, 'show', busy_archive_once)
+    second = world.service.dreaming.publish(fp, origin=world.origins['editor'], contexts=world.contexts())
+    row = world.service.dreaming._row(fp)
+    assert row['state'] == 'open', row
+    assert row['detail'].get('code') == 'E_BUSY', row
+    third = world.service.dreaming.publish(fp, origin=world.origins['editor'], contexts=world.contexts())
+    assert third['state'] == 'published', (second, third)
+    assert 'app-archive' in world.registry()['pages'][NOTES]['links']

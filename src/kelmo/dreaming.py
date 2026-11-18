@@ -131,29 +131,71 @@ class Dreaming:
 
     # Scope
 
-    def _changed_evidence(self, limit):
-        """Archived operations after the cursor, oldest first; Dreaming's own notes are never evidence."""
+    def _durable(self, where='', params=()):
+        """Every operation that became evidence and was not purged, with `first`: the journal sequence of its
+        first `archived` or `applied` event. Purge keeps the events, so a purged operation is left out by its
+        `purged` event."""
+        return self.journal.conn.execute(
+            'SELECT o.id, o.created_at, o.filename, o.archive_id, d.first, EXISTS (SELECT 1 FROM events e WHERE '
+            "e.operation_id = o.id AND e.stage IN ('failed', 'withdrawn') AND e.sequence < d.first) AS retried "
+            'FROM operations o JOIN (SELECT operation_id, MIN(sequence) AS first FROM events '
+            "WHERE stage IN ('archived', 'applied') GROUP BY operation_id) d ON d.operation_id = o.id "
+            "WHERE NOT EXISTS (SELECT 1 FROM events p WHERE p.operation_id = o.id AND p.stage = 'purged')"
+            + where + ' ORDER BY d.first', params).fetchall()
+
+    def _cursor(self):
+        """The evidence cursor, `{"sequence": N}` plus the upgrade's `seen` list while it still matters.
+
+        A cursor written by 0.3.1 is `[created_at, id]`: 0.3.1 read every operation up to it that was durable when
+        its window was scanned, and passed unread one that had failed. It is converted once and written at once:
+        the sequence stops just below the first operation that may still wait (any durable one after it, or one
+        at or before it that failed before it was archived and that no finding cites), and `seen` names the
+        others above that sequence, which 0.3.1 already read. A finding that cites a note proves it was read,
+        whatever became of the finding."""
         cursor = self._state('cursor')
+        if cursor is None:
+            return {'sequence': 0}
+        if isinstance(cursor, dict):
+            return cursor
+        old = (cursor[0], cursor[1])
+        rows = self._durable()
+        cited = self._cited() if any(row['retried'] for row in rows) else set()
+        waits = {row['id'] for row in rows if (row['created_at'], row['id']) > old
+                 or (row['retried'] and row['archive_id'] not in cited)}
+        firsts = [row['first'] for row in rows if row['id'] in waits]
+        sequence = min(firsts) - 1 if firsts else max((row['first'] for row in rows), default=0)
+        seen = [row for row in rows if row['first'] > sequence and row['id'] not in waits]
+        converted = {'sequence': sequence}
+        if seen:
+            converted.update(seen=[row['id'] for row in seen], seen_until=max(row['first'] for row in seen))
+        self._set_state('cursor', converted)
+        return converted
+
+    def _cited(self):
+        """Archive ids the recorded findings cite as sources, in any state."""
+        cited = set()
+        for (finding,) in self.journal.conn.execute('SELECT finding FROM dream_findings'):
+            sources = json.loads(finding).get('sources')
+            for source in sources if isinstance(sources, list) else ():
+                if isinstance(source, dict) and source.get('archive_id'):
+                    cited.add(source['archive_id'])
+        return cited
+
+    def _changed_evidence(self, limit):
+        """Operations that became evidence after the cursor, in the order they did; Dreaming's own notes are
+        never evidence. An operation not archived yet has no place in that order, so it holds nothing back: it
+        is read once it is archived."""
+        cursor = self._cursor()
         notes = {row[0] for row in self.journal.conn.execute(
             'SELECT note_operation_id FROM dream_findings WHERE note_operation_id IS NOT NULL')}
-        query = 'SELECT id, created_at, filename FROM operations'
-        params = ()
-        if cursor:
-            query += ' WHERE created_at > ? OR (created_at = ? AND id > ?)'
-            params = (cursor[0], cursor[0], cursor[1])
+        seen = set(cursor.get('seen', ()))
         found, last = [], cursor
-        for row in self.journal.conn.execute(query + ' ORDER BY created_at, id', params):
-            if row['id'] in notes or row['filename'].startswith(NOTE_PREFIX):
-                last = [row['created_at'], row['id']]
+        for row in self._durable(' AND d.first > ?', (cursor['sequence'],)):
+            last = {'sequence': row['first']}
+            if seen and row['first'] < cursor['seen_until']:
+                last.update(seen=cursor['seen'], seen_until=cursor['seen_until'])
+            if row['id'] in notes or row['id'] in seen or (row['filename'] or '').startswith(NOTE_PREFIX):
                 continue
-            operation = self.journal.get(row['id'])
-            if operation['durable_stage'] not in ('archived', 'applied'):
-                if not operation['terminal']:
-                    # Still on its way to the archive: the cursor never passes it.
-                    break
-                last = [row['created_at'], row['id']]
-                continue
-            last = [row['created_at'], row['id']]
             exact = self.journal.evidence_record(row['id'])
             if exact is None:
                 continue
@@ -161,6 +203,24 @@ class Dreaming:
             if len(found) >= limit:
                 break
         return found, last
+
+    def _waiting_evidence(self, cursor):
+        """How many archived operations after `cursor` the pass has not read, and when the first of them reached
+        the archive. They are the ones `_changed_evidence` would take: Dreaming's own notes, the upgrade's `seen`
+        and operations without an evidence receipt are left out. The pass reads in archive order and moves its
+        cursor past what it scanned, so an idle answer counts none unless a note was archived in between."""
+        notes = {row[0] for row in self.journal.conn.execute(
+            'SELECT note_operation_id FROM dream_findings WHERE note_operation_id IS NOT NULL')}
+        seen = set(cursor.get('seen', ()))
+        waiting = [row for row in self._durable(' AND d.first > ?', (cursor['sequence'],))
+                   if row['id'] not in notes and row['id'] not in seen
+                   and not (row['filename'] or '').startswith(NOTE_PREFIX)
+                   and self.journal.evidence_record(row['id']) is not None]
+        if not waiting:
+            return 0, None
+        first = min(row['first'] for row in waiting)
+        since = self.journal.conn.execute('SELECT created_at FROM events WHERE sequence = ?', (first,)).fetchone()[0]
+        return len(waiting), since
 
     def _related(self, registry, references, max_pages):
         """Non-person pages whose facts cite the evidence, then their neighbours, at most max_pages."""
@@ -192,7 +252,9 @@ class Dreaming:
         if not evidence:
             if last != self._state('cursor'):
                 self._set_state('cursor', last)
-            return {'state': 'idle'}
+            # A quiet vault answers idle with nothing waiting; a count means notes stay unread (alerts.DreamWatch).
+            waiting, since = self._waiting_evidence(last)
+            return {'state': 'idle', 'waiting': waiting, **({'waiting_since': since} if waiting else {})}
         run_id = _digest({'generation': generation.to_dict(), 'evidence': [item[0] for item in evidence]})[:16]
         with self.journal.conn:
             self.journal.conn.execute('INSERT OR REPLACE INTO dream_runs VALUES (?,?,NULL,?,NULL)',
@@ -270,7 +332,16 @@ class Dreaming:
         texts, skipped, included = [], [], []
         used = consumed = 0
         for _operation_id, reference, _position in evidence:
-            text = self.service.show(reference.archive_id)['content']
+            try:
+                text = self.service.show(reference.archive_id)['content']
+            except KelmoError as error:
+                if error.code not in ('E_FORGOTTEN', 'E_PURGED'):
+                    raise
+                # A record hidden after it was archived is no evidence any more, and it must not hold the cursor.
+                skipped.append({'archive_id': reference.archive_id, 'version': reference.version,
+                                'reason': 'forgotten'})
+                consumed += 1
+                continue
             item = {'archive_id': reference.archive_id, 'version': reference.version, 'text': text}
             cost = views._cost(item)
             if cost > budget_tokens:
@@ -404,7 +475,9 @@ class Dreaming:
 
     def _stale(self, row, own=None):
         """The pages, facts and evidence a finding cites, as they stand now, differ from what it was found
-        against. `own` maps a page to the revision Dreaming's own link left this run: not a change."""
+        against. `own` maps a page to the revision Dreaming's own link left this run: not a change. Evidence
+        forgotten or gone is a change; any other read failure is raised, since it says nothing about the
+        evidence."""
         registry = self.service.knowledge.registry_view(self.service.knowledge.generation())
         for target, revision in row['baseline']['pages'].items():
             current = (registry['pages'].get(target) or {}).get('revision')
@@ -418,6 +491,8 @@ class Dreaming:
             try:
                 record = self.service.show(source['archive_id'])
             except KelmoError as error:
+                if error.code not in ('E_FORGOTTEN', 'E_PURGED', 'E_NOT_FOUND'):
+                    raise
                 return 'evidence ' + source['archive_id'] + ' is no longer readable: ' + error.code
             if record['version'] != source['version'] or record.get('superseded_by'):
                 return 'evidence ' + source['archive_id'] + ' changed after the finding'
@@ -433,7 +508,11 @@ class Dreaming:
     def _publish(self, row, origin, contexts, budget_tokens, own=None):
         """One link through the editor, from an archived note naming the finding and its sources."""
         fingerprint, finding = row['fingerprint'], row['finding']
-        stale = self._stale(row, own)
+        try:
+            stale = self._stale(row, own)
+        except KelmoError as error:
+            # The evidence could not be read now: the finding stays open for a later publish().
+            return self._settle(fingerprint, 'open', {'code': error.code, 'reason': str(error)})
         if stale:
             return self._settle(fingerprint, 'stale', {'reason': stale})
         first, second = finding['pages']

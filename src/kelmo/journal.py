@@ -89,10 +89,12 @@ class Journal:
             self.guard()
         return self._conn
 
-    def __init__(self, path, *, create=False, read_only=False, check_same_thread=True):
+    def __init__(self, path, *, create=False, read_only=False, check_same_thread=True,
+                 wait_seconds=JOURNAL_WAIT_SECONDS):
         """`read_only`: a reader's connection (SQLite `mode=ro`) that runs no schema work and sees committed
         rows only; a write through it fails. `check_same_thread=False` is for the one writer connection the
-        state core's baton hands between threads."""
+        state core's baton hands between threads. `wait_seconds` bounds each wait for a lock the file's other
+        users hold, opening included."""
         if not create and not path.is_file():
             raise KelmoError('E_STATE', 'Operation journal is missing; run kelmo doctor.')
         if read_only and create:
@@ -103,9 +105,9 @@ class Journal:
         if read_only:
             from urllib.parse import quote
             self._conn = sqlite3.connect(f'file:{quote(str(path))}?mode=ro', uri=True,
-                                        timeout=JOURNAL_WAIT_SECONDS, check_same_thread=check_same_thread)
+                                        timeout=wait_seconds, check_same_thread=check_same_thread)
         else:
-            self._conn = sqlite3.connect(path, timeout=JOURNAL_WAIT_SECONDS, check_same_thread=check_same_thread)
+            self._conn = sqlite3.connect(path, timeout=wait_seconds, check_same_thread=check_same_thread)
         # Called on every use of the connection when set: the state core's baton check in a debug build.
         self.guard = None
         self.conn.row_factory = sqlite3.Row
@@ -134,6 +136,11 @@ class Journal:
             ''')
             self.conn.commit()
         with self.conn:
+            # Every per-operation read (an operation's stages, its events, one event of a stage) filters events
+            # by operation; without this index each one scans the whole table.
+            self.conn.execute('CREATE INDEX IF NOT EXISTS events_operation_stage ON events(operation_id, stage)')
+            # A record's operations, looked up for every search hit and list item (compat metadata) and by forget.
+            self.conn.execute('CREATE INDEX IF NOT EXISTS operations_archive ON operations(archive_id, created_at, id)')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS operation_origins (
                 operation_id TEXT PRIMARY KEY REFERENCES operations(id), origin TEXT NOT NULL
             )''')
@@ -307,6 +314,23 @@ class Journal:
                 write(self.conn, operation_id, *outcome)
             if terminal:
                 self.conn.execute('DELETE FROM claims WHERE operation_id=?', (operation_id,))
+
+    def withdraw(self, operation_ids):
+        """Stage every listed operation `withdrawn` (terminal) in one transaction, or none of them: any claim on
+        one of them refuses the whole call with E_CLAIM."""
+        if self.conn.in_transaction:
+            raise KelmoError('E_STATE', 'Journal stage transition requires an idle connection.')
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            if self.writer_check is not None:
+                self.writer_check()
+            for operation_id in operation_ids:
+                if self.conn.execute('SELECT 1 FROM claims WHERE operation_id=?', (operation_id,)).fetchone():
+                    raise KelmoError('E_CLAIM', f'Operation {operation_id} is claimed by an attempt.')
+            for operation_id in operation_ids:
+                self.conn.execute("UPDATE operations SET state='withdrawn', terminal=1, error_code=NULL WHERE id=?",
+                                  (operation_id,))
+                self.event(operation_id, 'withdrawn')
 
     def event(self, operation_id, stage, **details):
         details = {key: value for key, value in details.items() if value is not None}

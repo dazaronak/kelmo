@@ -1031,6 +1031,161 @@ def test_a_piece_whose_base_the_server_lost_restarts_the_transcript(shared, tmp_
     assert position['sent_bytes'] == len(grown) and position['generation'] == 1
 
 
+def test_a_spool_recreated_from_its_start_keeps_the_session_generation(shared, tmp_path, monkeypatch):
+    """A server spool that is gone (removed to free disk) is written again from offset 0 under a new inode;
+    the session keeps its generation and the next job starts after what was already scheduled, so a late
+    append does not extract the whole session a second time."""
+    from kelmo import client as module
+    from kelmo.client import hook
+    from kelmo.config import Config
+    from kelmo.sessions import Sessions
+    server_config(shared.world.root, sessions='archive-only')
+    shared.hub.reset()
+    monkeypatch.setattr(module, 'PIECE_BYTES', 64)
+    transcripts = tmp_path / 'projects'
+    transcripts.mkdir()
+    client = shared.client(sessions={'claude': [str(transcripts)]})
+    source = transcripts / 'session.jsonl'
+    first = _transcript([_user('Extracted once, before the spool was removed.')])
+    source.write_bytes(first)
+    payload = {'transcript_path': str(source), 'session_id': 'recreated-spool'}
+    hook(client, 'session-checkpoint', payload, 'claude')
+    earlier = _pieces(client)[-1]
+    assert earlier['outcome']['generation'] == 1 and earlier['outcome']['job_id']
+    [spool] = list((Config.load(shared.world.root).state / 'client-sessions').rglob('*.jsonl'))
+    spool.unlink()
+    grown = first + _transcript([_user('Written after the spool was removed.')])
+    source.write_bytes(grown)
+    hook(client, 'session-checkpoint', payload, 'claude')
+    rows = _pieces(client, earlier['seq'])
+    assert {row['outcome']['code'] for row in rows if row['state'] == 'refused'} == {'E_CAPTURE_BASE'}
+    final = rows[-1]
+    assert final['state'] == 'delivered' and final['outcome']['captured'] is True
+    assert spool.read_bytes() == grown
+    assert final['outcome']['generation'] == 1, 'a recreated spool started a new generation'
+    sessions = Sessions(Config.load(shared.world.root))
+    try:
+        job = sessions.job(final['outcome']['job_id'])
+        [recorded] = sessions.journal.conn.execute('SELECT file_identity FROM sessions').fetchall()
+    finally:
+        sessions.close()
+    assert (job['generation'], job['start_record']) == (1, earlier['outcome']['records'])
+    info = spool.stat()
+    assert recorded['file_identity'] == f'{info.st_dev}:{info.st_ino}', 'an older server compares the spool inode'
+
+
+def test_a_session_recorded_under_the_spool_inode_keeps_its_generation(shared, tmp_path, monkeypatch):
+    """A session an older server recorded under its spool's inode is continued, not extracted again, by the
+    first capture after the upgrade, which keeps recording the spool's inode."""
+    from kelmo import client as module
+    from kelmo.client import hook
+    from kelmo.config import Config
+    from kelmo.sessions import Sessions
+    server_config(shared.world.root, sessions='archive-only')
+    shared.hub.reset()
+    monkeypatch.setattr(module, 'PIECE_BYTES', 64)
+    transcripts = tmp_path / 'projects'
+    transcripts.mkdir()
+    client = shared.client(sessions={'claude': [str(transcripts)]})
+    source = transcripts / 'session.jsonl'
+    first = _transcript([_user('Recorded by the older server.')])
+    source.write_bytes(first)
+    payload = {'transcript_path': str(source), 'session_id': 'upgraded-spool'}
+    hook(client, 'session-checkpoint', payload, 'claude')
+    earlier = _pieces(client)[-1]
+    [spool] = list((Config.load(shared.world.root).state / 'client-sessions').rglob('*.jsonl'))
+    info = spool.stat()
+    source.write_bytes(first + _transcript([_user('Appended after the upgrade.')]))
+    hook(client, 'session-checkpoint', payload, 'claude')
+    final = _pieces(client, earlier['seq'])[-1]
+    assert final['state'] == 'delivered' and final['outcome']['generation'] == 1
+    sessions = Sessions(Config.load(shared.world.root))
+    try:
+        job = sessions.job(final['outcome']['job_id'])
+        [recorded] = sessions.journal.conn.execute('SELECT file_identity FROM sessions').fetchall()
+    finally:
+        sessions.close()
+    assert job['start_record'] == earlier['outcome']['records']
+    assert recorded['file_identity'] == f'{info.st_dev}:{info.st_ino}'
+
+
+def test_a_replaced_client_file_starts_a_new_generation_while_its_old_spool_remains(shared, tmp_path,
+                                                                                      monkeypatch):
+    """A client file replaced by another one (a new inode) is another transcript even when its content continues
+    the old one: its spool is a second file in the session's spool directory, the old spool is still there, and
+    the session starts a new generation from record 0."""
+    import os
+
+    from kelmo import client as module
+    from kelmo.client import hook
+    from kelmo.config import Config
+    from kelmo.sessions import Sessions
+    server_config(shared.world.root, sessions='archive-only')
+    shared.hub.reset()
+    monkeypatch.setattr(module, 'PIECE_BYTES', 64)
+    transcripts = tmp_path / 'projects'
+    transcripts.mkdir()
+    client = shared.client(sessions={'claude': [str(transcripts)]})
+    source = transcripts / 'session.jsonl'
+    first = _transcript([_user('The first file of this session.')])
+    source.write_bytes(first)
+    payload = {'transcript_path': str(source), 'session_id': 'replaced-file'}
+    hook(client, 'session-checkpoint', payload, 'claude')
+    earlier = _pieces(client)[-1]
+    assert earlier['outcome']['generation'] == 1
+    staged = transcripts / 'staged.jsonl'
+    staged.write_bytes(first + _transcript([_user('A second file that repeats the first one and goes on.')]))
+    os.replace(staged, source)
+    hook(client, 'session-checkpoint', payload, 'claude')
+    final = _pieces(client, earlier['seq'])[-1]
+    assert final['state'] == 'delivered' and final['outcome']['generation'] == 2, final
+    sessions = Sessions(Config.load(shared.world.root))
+    try:
+        job = sessions.job(final['outcome']['job_id'])
+    finally:
+        sessions.close()
+    assert job['start_record'] == 0
+    assert len(list((Config.load(shared.world.root).state / 'client-sessions').rglob('*.jsonl'))) == 2
+
+
+def test_an_older_server_continues_a_session_after_its_spool_was_recreated(shared, tmp_path, monkeypatch):
+    """Rolled back to a build that names a generation by the spool's inode alone, the server continues a session
+    whose spool this build recreated: the journal holds that spool's inode."""
+    from kelmo import client as module
+    from kelmo.client import hook
+    from kelmo.config import Config
+    from kelmo.sessions import Sessions
+    server_config(shared.world.root, sessions='archive-only')
+    shared.hub.reset()
+    monkeypatch.setattr(module, 'PIECE_BYTES', 64)
+    transcripts = tmp_path / 'projects'
+    transcripts.mkdir()
+    client = shared.client(sessions={'claude': [str(transcripts)]})
+    source = transcripts / 'session.jsonl'
+    first = _transcript([_user('Extracted before the spool was removed.')])
+    source.write_bytes(first)
+    payload = {'transcript_path': str(source), 'session_id': 'rolled-back'}
+    hook(client, 'session-checkpoint', payload, 'claude')
+    earlier = _pieces(client)[-1]
+    [spool] = list((Config.load(shared.world.root).state / 'client-sessions').rglob('*.jsonl'))
+    spool.unlink()
+    source.write_bytes(first + _transcript([_user('Written after the spool was removed.')]))
+    hook(client, 'session-checkpoint', payload, 'claude')
+    final = _pieces(client, earlier['seq'])[-1]
+    assert final['outcome']['generation'] == 1
+    sessions = Sessions(Config.load(shared.world.root))
+    try:
+        [row] = sessions.journal.conn.execute('SELECT native_id FROM sessions').fetchall()
+        # The call an older server makes: no `spool`, the generation follows the inode.
+        older = sessions.capture('claude', row['native_id'], spool, spool.parent, 'PreCompact',
+                                 capture_client_id=row['native_id'].split(':', 1)[0], time_budget=None)
+        [schema] = sessions.journal.conn.execute('SELECT version FROM session_schema').fetchall()
+    finally:
+        sessions.close()
+    assert older['generation'] == 1, older
+    assert schema['version'] == 2
+
+
 def test_a_lost_reply_to_a_piece_replays_without_a_second_write(shared, tmp_path, monkeypatch):
     from kelmo import client as module
     from kelmo.client import hook

@@ -28,6 +28,7 @@ def main():
     # serves kelmo-client/1 lines, one request at a time, to a client that opens with one.
     parser.add_argument('--authority')
     parser.add_argument('--die-once', help='Marker file: exit on the first request while it does not exist')
+    parser.add_argument('--stop-reading', action='store_true', help='After the hello, read nothing more')
     options = parser.parse_args()
 
     def result(request, key):
@@ -113,6 +114,10 @@ def main():
                     'operations': operations,
                 }, None)
                 if options.die_after == 0:
+                    return
+                if options.stop_reading:
+                    # The pipe to this peer fills, so a client's write waits for room that never comes.
+                    time.sleep(60)
                     return
             elif header['kind'] == 'call':
                 threading.Thread(target=answer, args=(header, body['request']), daemon=True).start()

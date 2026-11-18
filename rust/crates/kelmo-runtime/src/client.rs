@@ -15,6 +15,16 @@ pub struct Request<'a> {
     pub key: Option<&'a str>,
 }
 
+/// A call that failed: its message (`CODE: text`) and whether the caller may send it again. Nothing reached the
+/// daemon before the call frame was written, so such a call is retryable; from that write on an unkeyed call
+/// may have run and is not. A keyed call stays retryable, as the router answers for it: the key keeps an
+/// operation that replays by key from running twice, while an operation the cores never replay ignores it.
+#[derive(Debug)]
+pub struct CallError {
+    pub message: String,
+    pub retryable: bool,
+}
+
 fn random_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -43,20 +53,74 @@ async fn next_frame(
     }
 }
 
-/// Sends one call and returns (reply header, reply body).
-pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), String> {
-    let mut stream = UnixStream::connect(socket)
+/// Sends one call and returns (reply header, reply body). The call's deadline plus five seconds bounds the
+/// connection, the hello and the write of the call frame together, so a daemon that accepts the connection and
+/// then stalls ends the call with `E_DEADLINE`. The reply then gets the same window again, counted from the
+/// write.
+pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value), CallError> {
+    let end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
+    let keyed = request.key.is_some();
+    let unsent = |message: String| CallError {
+        message,
+        retryable: true,
+    };
+    let sent = |message: String| CallError {
+        message,
+        retryable: keyed,
+    };
+    // The socket is reached only through a directory this user owns and nobody else can write into, as the
+    // gateway checks it: another user could otherwise plant the socket and read the call. A directory that is
+    // not there (an empty `--runtime-dir` names none) means no daemon: the call ends without a connect, which a
+    // directory created meanwhile by someone else could otherwise answer.
+    if let Some(directory) = socket.parent() {
+        if let Err(error) = std::fs::symlink_metadata(directory) {
+            return Err(unsent(format!(
+                "E_TRANSPORT: {}: {error}",
+                socket.display()
+            )));
+        }
+        crate::ipc::trusted_directory(directory).map_err(|message| {
+            if std::fs::symlink_metadata(directory).is_err() {
+                // Gone since the look above: no daemon, as when it was never there.
+                unsent(format!(
+                    "E_TRANSPORT: {}: no such directory",
+                    socket.display()
+                ))
+            } else {
+                CallError {
+                    message: format!("E_RUNTIME: {message}"),
+                    retryable: false,
+                }
+            }
+        })?;
+    }
+    let mut stream = tokio::time::timeout_at(end, UnixStream::connect(socket))
         .await
-        .map_err(|e| format!("E_TRANSPORT: {}: {e}", socket.display()))?;
+        .map_err(|_| unsent("E_DEADLINE: no connection".to_owned()))?
+        .map_err(|e| unsent(format!("E_TRANSPORT: {}: {e}", socket.display())))?;
+    // The path is looked up again by the connect, so a directory swapped in after the check could hold another
+    // user's socket: the listener must run under this user before anything is sent.
+    if !crate::ipc::same_user(&stream) {
+        return Err(CallError {
+            message: format!(
+                "E_RUNTIME: {}: the socket belongs to another user",
+                socket.display()
+            ),
+            retryable: false,
+        });
+    }
     let mut reader = kelmo_wire::FrameReader::new();
     let hello = json!({"v": 2, "kind": "hello", "id": random_id(), "body_type": "json",
                        "protocols": ["kelmo/2"], "operations": []});
-    let bytes = kelmo_wire::encode(&hello, &Value::Null).map_err(|e| e.to_string())?;
-    stream
-        .write_all(&bytes)
+    let bytes = kelmo_wire::encode(&hello, &Value::Null).map_err(|e| unsent(e.to_string()))?;
+    tokio::time::timeout_at(end, stream.write_all(&bytes))
         .await
-        .map_err(|e| format!("E_TRANSPORT: {e}"))?;
-    next_frame(&mut stream, &mut reader).await?;
+        .map_err(|_| unsent("E_DEADLINE: no hello".to_owned()))?
+        .map_err(|e| unsent(format!("E_TRANSPORT: {e}")))?;
+    tokio::time::timeout_at(end, next_frame(&mut stream, &mut reader))
+        .await
+        .map_err(|_| unsent("E_DEADLINE: no hello".to_owned()))?
+        .map_err(unsent)?;
     let mut header = json!({"v": 2, "kind": "call", "id": random_id(), "op": request.op,
                             "deadline_ms": request.deadline.as_millis() as u64, "body_type": "json"});
     if let Some(lane) = request.lane {
@@ -65,15 +129,17 @@ pub async fn call(socket: &Path, request: Request<'_>) -> Result<(Value, Value),
     if let Some(key) = request.key {
         header["key"] = key.into();
     }
-    let bytes = kelmo_wire::encode(&header, &request.body).map_err(|e| e.to_string())?;
-    stream
-        .write_all(&bytes)
+    let bytes = kelmo_wire::encode(&header, &request.body).map_err(|e| unsent(e.to_string()))?;
+    // From here the daemon may have the call: part of a frame may have reached it even if the write fails.
+    tokio::time::timeout_at(end, stream.write_all(&bytes))
         .await
-        .map_err(|e| format!("E_TRANSPORT: {e}"))?;
-    tokio::time::timeout(
-        request.deadline + Duration::from_secs(5),
-        next_frame(&mut stream, &mut reader),
-    )
-    .await
-    .map_err(|_| "E_DEADLINE: no reply".to_owned())?
+        .map_err(|_| sent("E_DEADLINE: the daemon did not take the call".to_owned()))?
+        .map_err(|e| sent(format!("E_TRANSPORT: {e}")))?;
+    // The daemon counts the deadline from the moment it has the call, so the reply gets its own window from
+    // the write: a slow connect or hello does not eat the time the daemon was given.
+    let reply_end = tokio::time::Instant::now() + request.deadline + Duration::from_secs(5);
+    tokio::time::timeout_at(reply_end, next_frame(&mut stream, &mut reader))
+        .await
+        .map_err(|_| sent("E_DEADLINE: no reply".to_owned()))?
+        .map_err(sent)
 }

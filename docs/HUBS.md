@@ -126,7 +126,8 @@ not required by Kelmo. One repository assigned to several projects remains an er
 Keep explicit `[hot].pages` and `[hot.projects.NAME].pages` selections when adding hubs.
 Those selected pages travel whole alongside the generated view, including their frontmatter
 and historical rows. Mandatory pages selected by the registry retain their separate rendering
-rule: frontmatter and retired fact rows are omitted. `project add` reconciles the generated
+rule: frontmatter and retired fact rows are omitted, and fact rows lose their fact and source
+labels (their status labels stay). `project add` reconciles the generated
 set after configuration changes.
 
 Three limits serve different purposes: `hot.max_bytes` bounds the preview, `views_max_bytes`

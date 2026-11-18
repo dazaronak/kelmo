@@ -82,6 +82,16 @@ def test_a_second_serve_on_the_same_root_exits_75(start):
     assert daemon.all_ready()
 
 
+def test_an_error_that_stops_kelmod_before_it_serves_is_written_without_a_time(start):
+    """Errors before serving stay plain, as the changelog says; the client quotes those that end with another
+    code than 75 (daemon_client.ensure), and E_BUSY is the one a test can provoke without breaking the setup."""
+    daemon = start()
+    result = subprocess.run([str(KELMOD), "serve", "--spec", str(daemon.spec_path)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 75
+    assert result.stderr.startswith("E_BUSY: "), result.stderr
+
+
 def test_a_frozen_core_is_killed_after_missed_heartbeats_and_restarted(start):
     daemon = start(heartbeat_ms=100, heartbeat_misses=3)
     old_pid = daemon.core()["pid"]

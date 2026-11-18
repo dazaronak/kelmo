@@ -177,7 +177,7 @@ def test_a_pass_waiting_for_an_older_note_lets_go_of_the_baton(world):
     pass lets the baton go while it waits; holding it would stall them all until its wait budget is spent."""
     import threading
     from kelmo.core import baton as batons
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     nightly(world)
     older = world.service.create('Exports run at 11:00.', project='app', selected=[FEATURE])
     newer = world.service.create('Exports run at 12:00.', project='app', selected=[FEATURE])
@@ -197,10 +197,11 @@ def test_a_pass_waiting_for_an_older_note_lets_go_of_the_baton(world):
         thread.join(5)
         world.service.run(older['id'])  # the worker's write, which needed that baton
 
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     batons.install(baton)
     try:
         report = apply_pending(world.service, echo_export(world), sleep=sleep,
-                               step=lambda: baton.hold(interactive=False))
+                               step=lambda: baton.hold(interactive=False), boundary=boundary)
     finally:
         batons.install(None)
     assert report['applied'] == [older['id'], newer['id']] and report['stalled'] == []
@@ -214,7 +215,7 @@ def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch,
     import threading
     import time
     from kelmo.core import baton as batons
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     from kelmo.service import Service
     from kelmo.wiki import engine
     nightly(world)
@@ -222,6 +223,7 @@ def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch,
     world.service = Service(world.root, shared_journal=True)
     note = world.service.create('Exports run at 13:00.', project='app', selected=[FEATURE])
     world.service.run(note['id'])
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     baton = batons.Baton()
     entered, release, captured = threading.Event(), threading.Event(), threading.Event()
     real = getattr(engine, slow)
@@ -237,7 +239,7 @@ def test_a_capture_during_a_publication_does_not_wait_for_it(world, monkeypatch,
 
     def apply():
         outcome['report'] = apply_pending(world.service, echo_export(world),
-                                          step=lambda: baton.hold(interactive=False))
+                                          step=lambda: baton.hold(interactive=False), boundary=boundary)
 
     def capture():
         with baton.hold():
@@ -274,7 +276,7 @@ def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finis
     import threading
     import time
     from kelmo.core import baton as batons
-    from kelmo.creation import apply_pending
+    from kelmo.creation import apply_pending, capture_boundary
     from kelmo.publication import coordinator_lock
     from kelmo.service import Service
     from kelmo.wiki import engine
@@ -282,6 +284,7 @@ def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finis
     world.service = Service(world.root, shared_journal=True)
     note = world.service.create('Exports run at 15:00.', project='app', selected=[FEATURE])
     world.service.run(note['id'])
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     baton = batons.Baton()
     entered, release = threading.Event(), threading.Event()
     real = engine.publish_semantic
@@ -297,7 +300,7 @@ def test_a_writer_waiting_for_the_worker_lock_during_a_publication_lets_it_finis
 
     def apply():
         outcome['report'] = apply_pending(world.service, echo_export(world),
-                                          step=lambda: baton.hold(interactive=False))
+                                          step=lambda: baton.hold(interactive=False), boundary=boundary)
         order.append('pass')
 
     def writer():
@@ -337,6 +340,7 @@ def test_a_dream_apply_reaches_the_journal_only_inside_its_steps(world, tmp_path
     import sys
     from kelmo.core import baton as batons
     from kelmo.dreaming_cli import run_dream
+    from kelmo.creation import capture_boundary
     nightly(world)
     operation = world.service.create('Exports run at 16:00.', project='app', selected=[FEATURE])
     world.service.run(operation['id'])
@@ -348,11 +352,13 @@ def test_a_dream_apply_reaches_the_journal_only_inside_its_steps(world, tmp_path
                                                    'max_pages': 10, 'budget_tokens': 100000})
     world.service.dreaming._set_state('paused', False)
     vars(world.service).pop('_dreaming', None)
+    boundary = capture_boundary(world.service.journal.conn)  # as core.jobs, before the first step
     baton = batons.Baton()
     world.service.journal.guard = baton.check
     batons.install(baton)
     try:
-        result = run_dream(world.service, 'apply', step=lambda: baton.hold(interactive=False))
+        result = run_dream(world.service, 'apply', step=lambda: baton.hold(interactive=False),
+                           boundary=boundary)
     finally:
         batons.install(None)
         world.service.journal.guard = None
@@ -448,6 +454,196 @@ def test_a_note_captured_after_the_pass_began_waits_for_the_next_pass(world):
     report = apply_pending(world.service, Scripted(capture_during_the_pass))
     assert report['applied'] == [first['id']]
     assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
+
+
+def test_a_note_written_while_the_pass_waits_for_its_first_step_waits_for_the_next_pass(world):
+    """A scheduled pass waits for the journal's baton before its first step; an interactive capture that goes
+    ahead of it meanwhile was written after the pass began."""
+    from contextlib import contextmanager
+
+    from kelmo.creation import apply_pending, capture_boundary
+    nightly(world)
+    first = world.service.create('Exports run at 20:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    late = []
+
+    @contextmanager
+    def step():
+        if not late:  # the capture that held the baton while the pass waited for its first step
+            late.append(world.service.create('Exports run at 21:00.', project='app', selected=[FEATURE]))
+            world.service.run(late[0]['id'])
+        yield
+
+    # The scheduler reads the boundary before the first step waits for the journal (core.jobs).
+    report = apply_pending(world.service, echo_export(world), step=step,
+                           boundary=capture_boundary(world.service.journal.conn))
+    assert report['applied'] == [first['id']], 'a note written after the pass began joined it'
+    assert report['waiting'] == {}
+    assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
+    assert apply_pending(world.service, echo_export(world))['applied'] == [late[0]['id']]
+
+
+@pytest.mark.parametrize('entry', ['apply_pending', 'run_dream'])
+def test_a_pass_given_a_step_but_no_boundary_is_refused_before_it_enters_one(world, entry):
+    """A step may wait for the journal, and a boundary read inside it would be read after that wait: a caller
+    with a step reads the boundary first (capture_boundary), so the pass refuses to read it itself."""
+    from contextlib import contextmanager
+
+    from kelmo import creation, dreaming_cli
+    nightly(world)
+    note = world.service.create('Exports run at 05:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    entered = []
+
+    @contextmanager
+    def step():
+        entered.append(True)
+        yield
+
+    with pytest.raises(TypeError, match='boundary'):
+        if entry == 'apply_pending':
+            creation.apply_pending(world.service, echo_export(world), step=step)
+        else:
+            dreaming_cli.run_dream(world.service, 'apply', step=step)
+    assert entered == [], 'the pass entered a step before refusing'
+    assert world.service.journal.get(note['id'])['state'] == 'archived'
+
+
+def step_the_journal_clock_back(monkeypatch, seconds):
+    """From here on the journal's clock reads `seconds` earlier than real time, as after a backward NTP step: the
+    stamps of new records come from it. The apply pass itself reads no clock to pick its notes."""
+    from datetime import datetime, timedelta
+
+    from kelmo import journal
+
+    class Stepped(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) - timedelta(seconds=seconds)
+
+    monkeypatch.setattr(journal, 'datetime', Stepped)
+
+
+def test_a_note_captured_before_the_clock_stepped_back_is_applied_by_the_next_pass(world, monkeypatch):
+    from kelmo.creation import apply_pending, pending_operations
+    nightly(world)
+    note = world.service.create('Exports run at 19:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    step_the_journal_clock_back(monkeypatch, 3600)
+    report = apply_pending(world.service, echo_export(world))
+    assert report['applied'] == [note['id']], 'the pass after the clock stepped back left the note waiting'
+    assert world.fact('app.export')['text'] == 'Exports run at 19:00.'
+    assert pending_operations(world.service) == []
+
+
+def test_a_note_captured_during_the_pass_after_the_clock_stepped_back_holds_no_note_of_the_pass(world,
+                                                                                                monkeypatch):
+    """A capture stamped earlier than the pass's notes because the clock stepped back is still newer than all
+    of them: it never makes a note of the pass wait for it."""
+    import time
+    from kelmo.creation import ORDER_WAIT_SECONDS, apply_pending
+    nightly(world)
+    first = world.service.create('Exports run at 08:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    second = world.service.create('Exports run at 09:00.', project='app', selected=[FEATURE])
+    world.service.run(second['id'])
+    step_the_journal_clock_back(monkeypatch, 3600)
+    late = []
+
+    def capture_during_the_pass(job):
+        if not late:  # left in the intake: captured, not yet archived
+            late.append(world.service.create('Exports run at 22:00.', project='app', selected=[FEATURE]))
+        return world.propose(facts=[world.change('app.export', job.payload['source']['text'])])
+
+    now = [time.time()]
+    naps = []
+
+    def sleep(seconds):
+        naps.append(seconds)
+        now[0] += ORDER_WAIT_SECONDS / 2
+
+    report = apply_pending(world.service, Scripted(*[capture_during_the_pass for _ in range(3)]),
+                           clock=lambda: now[0], sleep=sleep)
+    assert report['applied'] == [first['id'], second['id']]
+    assert naps == [] and report['stalled'] == [], 'the pass waited for a note captured after it began'
+
+
+def test_a_note_written_while_the_pass_waits_stays_out_when_the_clock_then_steps_back(world, monkeypatch):
+    """A capture goes ahead of the pass while it waits for its first step, and the clock steps back before the
+    pass reads its notes: the note was still written after the pass began."""
+    from contextlib import contextmanager
+
+    from kelmo.creation import apply_pending, capture_boundary
+    nightly(world)
+    first = world.service.create('Exports run at 10:00.', project='app', selected=[FEATURE])
+    world.service.run(first['id'])
+    late = []
+
+    @contextmanager
+    def step():
+        if not late:
+            late.append(world.service.create('Exports run at 11:00.', project='app', selected=[FEATURE]))
+            world.service.run(late[0]['id'])
+            step_the_journal_clock_back(monkeypatch, 3600)
+        yield
+
+    # The scheduler reads the boundary before the first step waits for the journal (core.jobs).
+    report = apply_pending(world.service, echo_export(world), step=step,
+                           boundary=capture_boundary(world.service.journal.conn))
+    assert report['applied'] == [first['id']], 'a note written after the pass began joined it'
+    assert world.service.journal.get(late[0]['id'])['state'] == 'archived'
+
+
+def test_an_old_note_the_clock_catches_up_with_while_the_pass_waits_is_the_passs(world, monkeypatch):
+    """A note captured before the clock stepped back carries a stamp ahead of the pass's start; the clock passes
+    that stamp while the pass waits for its first step. The note existed before the pass and is applied by it."""
+    from contextlib import contextmanager
+
+    from kelmo.creation import apply_pending, capture_boundary
+    nightly(world)
+    note = world.service.create('Exports run at 12:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    step_the_journal_clock_back(monkeypatch, 60)
+    caught_up = []
+
+    @contextmanager
+    def step():
+        if not caught_up:
+            caught_up.append(True)
+            step_the_journal_clock_back(monkeypatch, 0)
+        yield
+
+    # The scheduler reads the boundary before the first step waits for the journal (core.jobs).
+    report = apply_pending(world.service, echo_export(world), step=step,
+                           boundary=capture_boundary(world.service.journal.conn))
+    assert report['applied'] == [note['id']], 'a note captured before the pass was left to the next one'
+
+
+def test_a_pass_keeps_capture_order_and_counts_only_its_own_notes(world):
+    from kelmo.creation import apply_pending
+    nightly(world)
+    before = []
+    texts = ['Exports run at 06:00.', 'Exports run at 06:30.', 'Exports run at 07:00.']
+    for text in texts:
+        operation = world.service.create(text, project='app', selected=[FEATURE])
+        world.service.run(operation['id'])
+        before.append(operation['id'])
+    late = []
+
+    def capture_during_the_pass(job):
+        if not late:
+            late.append(world.service.create('Exports run at 23:00.', project='app', selected=[FEATURE]))
+            world.service.run(late[0]['id'])
+        return world.propose(facts=[world.change('app.export', job.payload['source']['text'])])
+
+    executor = Scripted(*[capture_during_the_pass for _ in range(4)])
+    report = apply_pending(world.service, executor)
+    assert report['applied'] == before, 'the pass applies its own notes in capture order'
+    assert [job.payload['source']['text'] for job in executor.jobs] == texts
+    assert late[0]['id'] not in [entry['operation_id'] for entry in report['skipped']]
+    assert report['waiting'] == {}, 'the late note is not one the pass left behind'
+    assert world.fact('app.export')['text'] == 'Exports run at 07:00.'
+    assert apply_pending(world.service, echo_export(world))['applied'] == [late[0]['id']]
 
 
 def test_a_stale_generation_refusal_parks_without_spending_an_attempt(world):
@@ -637,7 +833,7 @@ def test_pending_lines_are_delivered_at_startup_until_the_note_is_applied(world)
         {'operation_id': first['id'], 'project': 'app', 'state': 'archived', 'pending': 'Export time moves to 10:00.'}]
     assert pending_summaries(world.service, 'other') == []
     block = pending_block(pending_summaries(world.service))
-    assert block.startswith('Pending wiki updates (archived, applied by the next Dreaming pass')
+    assert block.split('\n')[1].startswith('Pending wiki updates (archived, applied by the next Dreaming pass')
     assert '- Export time moves to 10:00. [app]' in block and 'Quiet note' not in block
     assert pending_block([]) == ''
     executor = Scripted(lambda job: world.propose(facts=[world.change('app.export', 'Exports run at 10:00.')]))
@@ -851,7 +1047,7 @@ def test_hook_start_appends_the_pending_block(world, monkeypatch):
     toml = world.root / 'kelmo.toml'
     toml.write_text(toml.read_text(encoding='utf-8') + '\n[hot]\npages = []\n', encoding='utf-8')
     context = hook(world.service, 'start', {})['hookSpecificOutput']['additionalContext']
-    assert context.rstrip().endswith('- Export time moves to 14:00. [app]')
+    assert context.rstrip().endswith('- Export time moves to 14:00. [app]\n</kelmo-pending-notes>')
     assert 'Pending wiki updates' in context
 
 
@@ -884,3 +1080,35 @@ def test_an_invalid_priority_in_open_work_is_a_repair_not_a_failure(world):
     assert executor.jobs[1].payload['refusal']['code'] == 'E_PROPOSAL'
     assert 'H1, H2 or H3' in executor.jobs[1].payload['refusal']['reason']
     assert world.registry()['pages'][target]['priority'] == ''
+
+
+@pytest.mark.parametrize('stepped_back', [True, False], ids=['clock-stepped-back', 'clock-steady'])
+def test_a_usage_limit_wait_holds_the_next_pass_only_while_the_clock_can_tell(world, stepped_back):
+    """A usage limit defers Dreaming until its reset. After the clock stepped back below the moment the deferral was
+    recorded, the wait no longer holds the next pass: it starts, and a limit still in force defers it again. With a
+    steady clock the wait holds as before."""
+    import time
+
+    from kelmo.dreaming_cli import run_dream
+    nightly(world)
+    note = world.service.create('Exports run at 03:00.', project='app', selected=[FEATURE])
+    world.service.run(note['id'])
+    recorded = time.time()
+    dream = world.service.dreaming
+    dream._set_state('settings', {'executor_config': '/nonexistent/editor.json', 'max_sources': 10,
+                                  'max_pages': 10, 'budget_tokens': 100000})
+    dream._set_state('paused', False)
+    dream._set_state('next_attempt', recorded + 1800)
+    dream._set_state('deferred_at', recorded)
+
+    class Started(Exception):
+        pass
+
+    def started():
+        raise Started()
+    now = recorded + 2400 - 3600 if stepped_back else recorded + 600
+    try:
+        result = run_dream(world.service, 'apply', clock=lambda: now, on_start=started)
+    except Started:
+        result = {'state': 'started'}
+    assert result['state'] == ('started' if stepped_back else 'deferred'), result

@@ -1,4 +1,5 @@
 import json
+import time
 import pytest
 from kelmo.config import Config
 from kelmo.errors import KelmoError
@@ -93,6 +94,107 @@ def test_capture_and_git_commit_after_cutover_make_rollback_check_raise_e_tail(c
     assert len(tail_data['operations']) > 0
 
 
+def snapshot_cli(capsys, ctl, action):
+    from kelmo.cli import call
+    code = call(['--vault', str(ctl), 'snapshot', action, '--json'])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def only_record(ctl):
+    with Service(ctl) as service:
+        return [row['id'] for row in service.list(limit=10)['items']]
+
+
+def test_a_record_forgotten_after_cutover_makes_the_rollback_check_refuse(cutover_vault, capsys):
+    ctl = cutover_vault['ctl_path']
+    [record] = only_record(ctl)
+    forget(capsys, ctl, record)
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 1, answer
+    message = answer['error']['message']
+    assert answer['error']['code'] == 'E_TAIL' and '1 forgotten records' in message, answer
+    assert 'Rollback would lose' in message and 'recover forward instead' in message
+    code, tail = snapshot_cli(capsys, ctl, 'tail')
+    assert code == 0 and tail['result']['hidden'] == [record] and tail['result']['empty'] is False, tail
+
+
+def test_a_record_forgotten_before_cutover_leaves_the_store_untouched(tmp_path, monkeypatch, capsys):
+    for key, value in {'GIT_AUTHOR_NAME': 'S', 'GIT_COMMITTER_NAME': 'S', 'GIT_AUTHOR_EMAIL': 's@example.invalid',
+                       'GIT_COMMITTER_EMAIL': 's@example.invalid', 'GIT_CONFIG_NOSYSTEM': '1',
+                       'GIT_CONFIG_GLOBAL': '/dev/null'}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr('kelmo.store.memory.store.embed', lambda *a, **k: (_ for _ in ()).throw(
+        __import__('kelmo.store.errors', fromlist=['x']).ArchiveEmbeddingError('off')))
+    old = tmp_path / 'old'
+    Service.initialize(old, 'node')
+    with Service(old) as service:
+        operation = service.run(service.capture('Evidence forgotten before the move.', 'one.md', 'implementer')['id'])
+        service.forget(operation['archive_id'])
+    # A cutover's `marked_at` has whole seconds; a forget in the same second counts as after it (the safe side).
+    time.sleep(1.1)
+    config = Config.load(old)
+    sources = {'archive': {'kind': 'sqlite', 'path': config.archive},
+               'journal': {'kind': 'sqlite', 'path': config.state / 'journal.sqlite3'},
+               'vault': {'kind': 'git', 'path': old}}
+    snap.take_snapshot(sources, tmp_path / 'snap')
+    ctl = tmp_path / 'ctl'
+    roots = {name: tmp_path / 'new' / name for name in ('state_root', 'archive_root', 'knowledge_git_root')}
+    snap.import_snapshot(tmp_path / 'snap', ctl, archive='archive', journal='journal', vault='vault', roots=roots,
+                         authority_id=config.vault_id, label=config.label)
+    snap.mark_cutover(ctl)
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 0, answer
+    assert answer['result']['hidden'] == [] and answer['result']['empty'] is True, answer
+    # A baseline written before markers were recorded: a marker older than the cutover is not new either.
+    drop_hidden(ctl)
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 0, answer
+    assert answer['result']['hidden'] == [] and answer['result']['empty'] is True, answer
+
+
+def drop_hidden(ctl):
+    baseline = json.loads((ctl / snap.CUTOVER).read_text(encoding='utf-8'))
+    baseline.pop('hidden', None)
+    (ctl / snap.CUTOVER).write_text(json.dumps(baseline), encoding='utf-8')
+
+
+def forget(capsys, ctl, record):
+    from kelmo.cli import call
+    code = call(['--vault', str(ctl), 'forget', record, '--json'])
+    answer = json.loads(capsys.readouterr().out)
+    assert code == 0, answer
+
+
+def test_a_baseline_without_markers_refuses_when_a_record_is_forgotten(cutover_vault, capsys):
+    ctl = cutover_vault['ctl_path']
+    drop_hidden(ctl)
+    [record] = only_record(ctl)
+    forget(capsys, ctl, record)
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 1 and answer['error']['code'] == 'E_TAIL', answer
+
+
+def test_a_baseline_without_markers_counts_a_forget_in_the_second_it_names(cutover_vault, capsys):
+    """A baseline written before markers were recorded names its cutover in whole seconds. A record forgotten in
+    that second cannot be told from one forgotten just after the cutover, so it counts: the check refuses and the
+    operator recovers forward, which loses nothing."""
+    ctl = cutover_vault['ctl_path']
+    [record] = only_record(ctl)
+    forget(capsys, ctl, record)
+    [[_, forgotten_at]] = snap.visibility_census(Config.load(ctl).archive)
+    baseline = json.loads((ctl / snap.CUTOVER).read_text(encoding='utf-8'))
+    baseline.pop('hidden', None)
+    baseline['marked_at'] = forgotten_at[:19] + forgotten_at[-6:]  # the same second, without its fraction
+    (ctl / snap.CUTOVER).write_text(json.dumps(baseline), encoding='utf-8')
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 1 and answer['error']['code'] == 'E_TAIL', answer
+    assert '1 forgotten records' in answer['error']['message'], answer
+
+
 def test_forward_recover_yields_vault_with_pre_and_post_cutover_records_and_head(tmp_path, cutover_vault):
     ctl = cutover_vault['ctl_path']
 
@@ -140,3 +242,20 @@ def test_forward_recover_yields_vault_with_pre_and_post_cutover_records_and_head
 
     # Verify step completed cleanly
     assert 'verify' in result['state']['steps']
+
+
+def test_a_baseline_without_markers_counts_a_forget_at_its_exact_moment(cutover_vault, capsys):
+    """A stamp written when the microseconds were zero has no fraction, so a marker can carry exactly the
+    baseline's `marked_at`. It is in the second the baseline names, so it counts."""
+    ctl = cutover_vault['ctl_path']
+    [record] = only_record(ctl)
+    forget(capsys, ctl, record)
+    [[_, forgotten_at]] = snap.visibility_census(Config.load(ctl).archive)
+    baseline = json.loads((ctl / snap.CUTOVER).read_text(encoding='utf-8'))
+    baseline.pop('hidden', None)
+    baseline['marked_at'] = forgotten_at
+    (ctl / snap.CUTOVER).write_text(json.dumps(baseline), encoding='utf-8')
+
+    code, answer = snapshot_cli(capsys, ctl, 'rollback-check')
+    assert code == 1 and answer['error']['code'] == 'E_TAIL', answer
+    assert '1 forgotten records' in answer['error']['message'], answer

@@ -3,14 +3,32 @@
 The caller owns transport and must acknowledge a refresh only after its output succeeds.
 """
 import fcntl
+from contextlib import contextmanager
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
+import time
 
 from .errors import KelmoError
+
+# Installed HOT sets kept besides the current one: every set younger than RETAIN_SECONDS (a session's context
+# can point at the set it was given) and the RETAIN_SETS newest whatever their age. Older ones are removed at
+# most once per SWEEP_SECONDS, when a new set is installed.
+RETAIN_SECONDS = 2 * 86400
+RETAIN_SETS = 8
+SWEEP_SECONDS = 86400
+# A set a session's delivery pointed at stays while that session's delivery record is younger than this: the
+# session may read the path days later.
+POINTED_RETAIN_SECONDS = 30 * 86400
+# The same sweep removes a session's delivery record (`hub-sessions/`, beside `hot/`) no delivery has written for
+# this long, and a context reference (`hub-context/`) no delivery has used for this long; that session, if it ever
+# prompts again, gets the whole context once.
+SESSION_RETAIN_SECONDS = 30 * 86400
 
 
 def _hash(raw):
@@ -121,7 +139,103 @@ def _metadata(snapshot):
     return result
 
 
-def install_set(root, snapshot):
+def prune_sets(root, keep=None):
+    """Remove installed sets past their retention (RETAIN_SECONDS, RETAIN_SETS), never the current one or a
+    set `keep()` names; at most once per SWEEP_SECONDS, and `keep` is only called when a sweep is due. Called
+    under the set lock. Returns the removed names."""
+    root = Path(root)
+    marker = root / '.pruned'
+    now = time.time()
+    try:
+        # A marker dated ahead (the clock was set back) does not hold the sweep off until the clock catches up.
+        if 0 <= now - marker.stat().st_mtime < SWEEP_SECONDS:
+            return []
+    except FileNotFoundError:
+        pass
+    # Dated before the sweep runs: a sweep that fails part way waits a day too instead of costing every delivery.
+    marker.touch()
+    # A sweep killed while it removed a set leaves that set under a trash name: it goes now, whatever its age.
+    for path in root.iterdir():
+        if path.name.startswith('.trash-') and path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+    current = os.readlink(root / 'current') if (root / 'current').is_symlink() else None
+    sets = sorted((path for path in root.iterdir()
+                   if path.name.startswith('.set-') and path.is_dir() and not path.is_symlink()),
+                  key=lambda path: path.stat().st_mtime, reverse=True)
+    protected = {current, *(keep() if keep is not None else ()), *(path.name for path in sets[:RETAIN_SETS]),
+                 *_pointed_sets(root.parent / 'hub-sessions', now)}
+    removed = []
+    for path in sets:
+        if path.name not in protected and now - path.stat().st_mtime > RETAIN_SECONDS:
+            # Renamed first: removing its files touches the folder, and a half-removed set must not look new.
+            trash = root / ('.trash-' + path.name[len('.set-'):])
+            os.rename(path, trash)
+            shutil.rmtree(trash, ignore_errors=True)
+            removed.append(path.name)
+    for folder in (root.parent / 'hub-sessions', root.parent / 'hub-context'):
+        # Kelmo makes these folders itself; behind a link, or as a link, a file is not its own to remove.
+        for record in (() if folder.is_symlink() else folder.glob('*.json')):
+            try:
+                if not record.is_symlink() and now - record.stat().st_mtime > SESSION_RETAIN_SECONDS:
+                    record.unlink()
+            except OSError:
+                continue
+    return removed
+
+
+def sweep(root, keep=None):
+    """The daily retention sweep for a delivery that installs no set (a local vault whose context fits): takes
+    the set lock and runs prune_sets when a sweep is due. Returns the removed names; never fails a delivery."""
+    root = Path(root)
+    try:
+        if 0 <= time.time() - (root / '.pruned').stat().st_mtime < SWEEP_SECONDS:
+            return []  # not due: no lock taken on every prompt
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return []
+    if not any(path.is_dir() for path in (root, root.parent / 'hub-sessions', root.parent / 'hub-context')):
+        return []
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / '.lock').open('a+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return prune_sets(root, keep)
+    except OSError:
+        return []
+
+
+def _pointed_sets(sessions, now):
+    """The sets the recent session delivery records name: a session was given a path into each."""
+    names = set()
+    for record in (() if sessions.is_symlink() else sessions.glob('*.json')):
+        try:
+            if record.is_symlink() or now - record.stat().st_mtime > POINTED_RETAIN_SECONDS:
+                continue
+            name = json.loads(record.read_bytes()).get('set')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(name, str):
+            names.add(name)
+    return names
+
+
+@contextmanager
+def reading(root):
+    """Held around a stale delivery's read of its cache record and set: the set lock taken shared, so another
+    process's install and its daily sweep wait until the read is done instead of removing what it reads."""
+    root = Path(root)
+    if not root.is_dir():
+        yield
+        return
+    with (root / '.lock').open('a+b') as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        yield
+
+
+def install_set(root, snapshot, keep=None):
+    """Install a verified set and make it current. `keep` returns the names of sets that must outlive the
+    retention sweep (the client's cached contexts name the sets they were delivered with)."""
     snapshot = _validate(snapshot)
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -177,6 +291,8 @@ def install_set(root, snapshot):
                 raise KelmoError('E_CACHE', 'Staged HOT set failed verification.')
         if (destination / 'set.json').read_bytes() != _encoded(metadata):
             raise KelmoError('E_CACHE', 'Staged HOT metadata failed verification.')
+        # A set installed again is as new as a fresh one for the sweep: its delivery has not cached its name yet.
+        os.utime(destination)
         fd, temporary_name = tempfile.mkstemp(prefix='.current-', dir=root)
         os.close(fd)
         temporary = Path(temporary_name)
@@ -186,6 +302,10 @@ def install_set(root, snapshot):
             os.replace(temporary, root / 'current')
         finally:
             temporary.unlink(missing_ok=True)
+        try:
+            prune_sets(root, keep)
+        except OSError:
+            pass  # the sweep never fails a delivery; the next install tries again
     return destination
 
 
@@ -213,14 +333,21 @@ def context_reference(root, data):
     return path
 
 
-def pending_text(pending):
-    """The pending block agents see: at most ten rows, then a count, under a digest of the whole set."""
+PENDING_ROWS = 10
+
+
+def pending_text(pending, more=None):
+    """The pending block agents see: at most ten rows, then a count, under a digest of the whole set. `more`
+    (a callable) names where the text of every note is when some are cut; it is called only then."""
+    from .hot import frame_pending, pending_row
     pending = pending or []
-    lines = [f"- {item['pending']} [{item.get('project') or '?'}" +
-             (' (retrying)' if item.get('state') == 'parked' else '') + ']' for item in pending[:10]]
-    if len(pending) > 10:
-        lines.append(f'+{len(pending) - 10} more')
-    return ('Pending wiki updates (digest ' + _hash(_encoded(pending)) + '):\n' + '\n'.join(lines)) if pending else ''
+    lines = [pending_row(item) for item in pending[:PENDING_ROWS]]
+    if len(pending) > PENDING_ROWS:
+        lines.append(f'+{len(pending) - PENDING_ROWS} more')
+    text = frame_pending('Pending wiki updates (digest ' + _hash(_encoded(pending)) + '):', lines) if pending else ''
+    if len(pending) > PENDING_ROWS and more is not None:
+        text += (f'\nThe text of all {len(pending)} pending notes: read ' + more() + '.')
+    return text
 
 
 def header_line(snapshot, stale=False):
@@ -244,7 +371,7 @@ MANDATORY_OMITTED = ('Mandatory pages exceed the hook limit and are not repeated
 def assemble(header, mandatory, hub, work, pending, *, provider, pointer, work_pointer=None, mandatory_pointer=None, pending_pointer=None, limit=10000):
     pending = pending or []
     pending_digest = _hash(_encoded(pending))
-    pending_block = pending_text(pending)
+    pending_block = pending_text(pending, more=pending_pointer if callable(pending_pointer) else None)
     full = '\n\n'.join(part for part in (header, mandatory, hub, work, pending_block) if part)
     if provider != 'claude' or len(full) <= limit:
         return full
@@ -314,17 +441,21 @@ def session_state(root, payload, provider):
 
 
 RESTART_WARNING = 'Kelmo context changed. Restart the session if removed or contradicted facts remain in context.\n\n'
+# A resumed session whose delivery record is gone (the sweep removes a record unwritten for 30 days): what it was
+# given before is unknown, so it is told so instead of silently getting the whole context as a new session does.
+RESUME_WARNING = ('Kelmo has no record of the context this resumed session was given. Restart the session if '
+                  'removed or contradicted facts remain in context.\n\n')
 
 
 def refresh(state_path, bundle, *, verified, stale=False, compacted=False, identity=None, core=None,
-            marker='', pending_only=''):
+            marker='', pending_only='', resumed=False):
     """Return context and a zero-argument acknowledgement to invoke after successful output.
 
     The session record holds the digest of the last delivered identity and, when `core` is given,
     of the identity without its pending block. A verified, unchanged bundle is replaced by `marker`
     (empty by default). A verified bundle whose only change is the pending block is replaced by
     `pending_only` when given. The restart warning precedes a bundle whose core changed; a pending
-    block alone removes or contradicts nothing.
+    block alone removes or contradicts nothing. A `resumed` session with no record gets RESUME_WARNING first.
     """
     state_path = Path(state_path)
     digest = _hash((bundle if identity is None else identity).encode('utf-8'))
@@ -332,8 +463,9 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
     try:
         record = json.loads(state_path.read_text(encoding='utf-8'))
         previous, previous_core = record.get('digest'), record.get('core')
+        pointed_before = record.get('set') if isinstance(record.get('set'), str) else None
     except (OSError, ValueError, AttributeError):
-        previous = previous_core = None
+        previous = previous_core = pointed_before = None
     changed = previous != digest
     core_changed = changed if core_digest is None else previous_core != core_digest
     forced = not verified or stale or compacted
@@ -345,13 +477,20 @@ def refresh(state_path, bundle, *, verified, stale=False, compacted=False, ident
         context = bundle
         if context and previous and changed and core_changed:
             context = RESTART_WARNING + context
+        elif context and previous is None and resumed:
+            context = RESUME_WARNING + context
 
-    def commit():
+    def commit(pointed=None):
+        """`pointed`: the set this delivery's answer gave a path into; a marker that gives none keeps the
+        set the session was pointed at before."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix='.delivery-', dir=state_path.parent)
+        written = {'digest': digest, 'core': core_digest}
+        if pointed or pointed_before:
+            written['set'] = pointed or pointed_before
         try:
             with os.fdopen(fd, 'wb') as out:
-                out.write(_encoded({'digest': digest, 'core': core_digest}))
+                out.write(_encoded(written))
             os.replace(name, state_path)
         finally:
             Path(name).unlink(missing_ok=True)
@@ -407,26 +546,36 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
         except (OSError, ValueError, AttributeError):
             pass
     reserve = sum(len(part) + 2 for part in (repair, notice) if part)
+    resumed = action == 'start' and payload.get('source') == 'resume'
     if previous and previous != _hash(identity.encode('utf-8')):
         reserve += len(RESTART_WARNING)
+    elif previous is None and resumed and state is not None and acknowledge is not None:
+        reserve += len(RESUME_WARNING)
     complete = provider != 'claude' or len(full) <= 10000 - reserve
+    reference = None
+
+    def omitted_source(field):
+        nonlocal reference
+        if reference is None:
+            from .hot import pending_block
+            reference = context_reference(config.state, {
+                'generation': snapshot['generation'], 'enrollment_revision': snapshot['enrollment_revision'],
+                'manifest_sha256': snapshot['manifest_sha256'], 'project': project, 'stale': stale,
+                'work': work, 'work_path': work_path, 'pending': pending_block(pending)})
+        return str(reference) + ' (' + field + ' field)'
+    if pending and (not complete or len(pending) > PENDING_ROWS):
+        # Notes past the block's ten rows, or a block that does not fit, are read from the reference file.
+        def pending_pointer():
+            return omitted_source('pending')
+        if complete and provider == 'claude':
+            # `full` left out the line that names that file; a context it tips over the limit is not complete.
+            line = f'\nThe text of all {len(pending)} pending notes: read ' + pending_pointer() + '.'
+            complete = len(full) + len(line) <= 10000 - reserve
     if not complete:
         current = current() if callable(current) else current
-        reference = None
-        def omitted_source(field):
-            nonlocal reference
-            if reference is None:
-                reference = context_reference(config.state, {
-                    'generation': snapshot['generation'], 'enrollment_revision': snapshot['enrollment_revision'],
-                    'manifest_sha256': snapshot['manifest_sha256'], 'project': project, 'stale': stale,
-                    'work': work, 'work_path': work_path, 'pending': pending})
-            return str(reference) + ' (' + field + ' field)'
         if work:
             def work_pointer():
                 return omitted_source('work')
-        if pending:
-            def pending_pointer():
-                return omitted_source('pending')
     else:
         current = None
     context = deliver(snapshot, project, work, pending, provider=provider, current=current, stale=stale,
@@ -445,29 +594,56 @@ def prepare(config, payload, snapshot, project, work, pending, *, provider, curr
         pending_only = ''
         if hook_mode:
             pending_only = '\n\n'.join(part for part in (
-                header_line(snapshot, stale), pending_text(pending) or 'Pending wiki updates: none remain.',
+                header_line(snapshot, stale), pending_text(pending, more=pending_pointer)
+                or 'Pending wiki updates: none remain.',
                 repair, notice) if part)
         update = refresh(state, context, verified=verified, stale=stale,
                          compacted=action == 'start' or payload.get('source') in ('compact', 'compaction'),
+                         resumed=resumed,
                          identity=identity, core=core_identity,
                          marker=unchanged_marker(snapshot, project, installed) if hook_mode else '',
                          pending_only=pending_only)
         context = update['context']
+        pointed = next((Path(path).name for path in (current, installed)
+                        if path is not None and not callable(path) and Path(path).name.startswith('.set-')
+                        and str(path) in context), None)
         if not sync_failed and settled:
-            acknowledge(update['commit'])
+            acknowledge(functools.partial(update['commit'], pointed))
+    if reference is not None and str(reference) in context:
+        _used(reference)
     return context
 
 
+def _used(reference):
+    """A delivery showed this reference's path: the sweep (prune_sets) counts its age from that use. A marker
+    that shows no path is no use."""
+    try:
+        os.utime(reference)
+    except OSError:
+        pass
+
+
+LEGACY_PENDING_ROWS = 20
+
+
 def legacy_delivery(root, delivered, pending, *, provider, action, notice=''):
-    """Budget the complete legacy response once, preserving every omitted byte."""
+    """Budget the complete legacy response once, preserving every omitted byte. The newest twenty pending
+    notes are listed; older ones are counted and their text is in the reference file."""
     from .hot import pending_block
     warning = ('Kelmo context refreshed; restart if earlier facts were removed or contradicted.'
                if action == 'prompt' else '')
-    context = '\n\n'.join(part for part in (warning, delivered['context'], pending_block(pending), notice) if part)
+    pending = list(pending or ())
+    listed = pending_block(pending[-LEGACY_PENDING_ROWS:])
+    if len(pending) > LEGACY_PENDING_ROWS:
+        older = context_reference(root, {'pending': pending_block(pending), 'generation': delivered.get('generation')})
+        listed += (f'\n{len(pending) - LEGACY_PENDING_ROWS} older pending notes are not listed; the text of all '
+                   f'{len(pending)}: read {older} (pending field).')
+    context = '\n\n'.join(part for part in (warning, delivered['context'], listed, notice) if part)
     if provider != 'claude' or len(context) <= 10000:
         return context
-    reference = context_reference(root, {'context': context, 'pending': pending,
+    reference = context_reference(root, {'context': context, 'pending': pending_block(pending),
                                          'generation': delivered.get('generation')})
+    _used(reference)
     pointer = ('Kelmo HOT exceeds the hook limit. Read the complete saved context and pending updates at '
                + str(reference) + ' (context and pending fields).')
     return '\n\n'.join(part for part in (warning, pointer, notice) if part)

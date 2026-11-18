@@ -102,6 +102,49 @@ def test_urgent_waiter_gets_the_lock_before_an_earlier_ordinary_waiter(monkeypat
     assert order == ['urgent', 'ordinary']
 
 
+def test_a_new_ordinary_caller_never_goes_ahead_of_a_woken_ordinary_waiter(monkeypatch):
+    """The holder releases; the ordinary waiter it woke has not yet taken the condition back when another ordinary
+    caller arrives. The newcomer must not take the lock ahead of the waiter."""
+    lock = OwnerLock()
+    arrived = threading.Semaphore(0)
+    woken, gate = threading.Event(), threading.Event()
+    wait = lock._condition.wait
+
+    def wait_then_pause_once(timeout=None):
+        arrived.release()
+        result = wait(timeout)
+        if not woken.is_set():
+            # Woken: give the condition up for a moment, as a scheduler may, before re-checking the turn.
+            woken.set()
+            lock._condition._lock.release()
+            gate.wait(5)
+            lock._condition._lock.acquire()
+        return result
+
+    monkeypatch.setattr(lock._condition, 'wait', wait_then_pause_once)
+    order = []
+
+    def take_and_record(name, timeout):
+        got = lock.acquire(timeout=timeout)
+        if got:
+            order.append(name)
+            lock.release()
+        return got
+
+    lock.acquire()
+    waiter = call_in_thread(take_and_record, 'waiter', 5)
+    assert arrived.acquire(timeout=5)
+    lock.release()
+    assert woken.wait(5)
+    newcomer = call_in_thread(take_and_record, 'newcomer', 0)
+    try:
+        assert newcomer() is False, order
+    finally:
+        gate.set()
+    assert waiter() is True
+    assert order == ['waiter']
+
+
 def test_timed_out_urgent_waiter_does_not_hold_back_ordinary_waiters(monkeypatch):
     lock = OwnerLock()
     arrived = count_waits(lock, monkeypatch)
@@ -203,3 +246,55 @@ def test_a_write_that_cannot_get_the_outbox_in_time_is_refused_as_busy(edge, mon
 
     assert isinstance(refused, KelmoError)
     assert (refused.code, refused.retryable) == ('E_BUSY', True)
+
+
+def test_a_waiter_woken_after_its_deadline_gives_up_though_the_lock_is_free(monkeypatch):
+    """The holder lets go just as the waiter's deadline passes: the waiter wakes to a free lock, too late. The
+    clock is the test's, so the moment is exact."""
+    import kelmo.core.edge_core as edge_core
+
+    lock = OwnerLock()
+    arrived = count_waits(lock, monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(edge_core.time, 'monotonic', lambda: clock[0])
+    lock.acquire()
+    waiter = call_in_thread(take, lock, timeout=1.0)
+    assert arrived.acquire(timeout=5)
+    clock[0] = 101.5  # its deadline (101.0) passed while it waited
+    lock.release()
+
+    assert waiter() is False
+
+
+def test_a_waiter_whose_time_ran_out_does_not_hold_back_a_newcomer_before_it_leaves():
+    """A waiter whose timeout passed stays queued until its thread gets the condition back and leaves; a newcomer
+    that comes to the free lock in that moment takes it, since the waiter can no longer."""
+    import time
+    lock = OwnerLock()
+    expired = object()
+    with lock._condition:
+        lock._waiting[False].append(expired)
+        lock._ends[expired] = time.monotonic() - 1
+    try:
+        assert take(lock, timeout=0) is True
+    finally:
+        with lock._condition:
+            lock._waiting[False].remove(expired)
+
+
+def test_a_waiter_woken_after_its_time_ran_out_does_not_take_the_lock(monkeypatch):
+    """The holder lets go while a waiter's timeout has already passed: the waiter that wakes then returns False
+    instead of taking the lock late and holding back a caller still within its time."""
+    from kelmo.core import edge_core
+    lock = OwnerLock()
+    lock._holder, lock._count = 'another thread', 1
+    clock = [100.0]
+    monkeypatch.setattr(edge_core.time, 'monotonic', lambda: clock[0])
+
+    def released_while_waiting(timeout=None):
+        clock[0] += 10  # the waiter's 1 s ran out while it waited
+        lock._holder, lock._count = None, 0
+
+    monkeypatch.setattr(lock._condition, 'wait', released_while_waiting)
+    assert lock.acquire(timeout=1) is False
+    assert lock._holder is None

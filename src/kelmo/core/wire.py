@@ -142,6 +142,8 @@ def _json(data, part):
         raise KelmoError('E_PROTOCOL', f'Frame {part} is not UTF-8 JSON.') from error
     except (UnicodeError, ValueError) as error:
         raise KelmoError('E_PROTOCOL', f'Frame {part} is not UTF-8 JSON.') from error
+    except RecursionError as error:
+        raise KelmoError('E_PROTOCOL', f'Frame {part} is nested too deeply.') from error
 
 
 def _protocol(message):
@@ -152,7 +154,7 @@ def validate_header(header):
     if not isinstance(header, dict):
         _protocol('Frame header is not an object.')
     kind = header.get('kind')
-    if kind not in KINDS:
+    if not isinstance(kind, str) or kind not in KINDS:
         _protocol('Frame kind is unknown.')
     for name in header:
         allowed = _FIELDS.get(name)
@@ -164,7 +166,7 @@ def validate_header(header):
     if header['v'] != VERSION or type(header['v']) is not int:
         _protocol('Frame version is not 2.')
     _match(ID, header['id'], 'id')
-    if header['body_type'] not in BODY_TYPES:
+    if not isinstance(header['body_type'], str) or header['body_type'] not in BODY_TYPES:
         _protocol('Frame body type is unknown.')
     if 'op' in header:
         _match(OP, header['op'], 'op')

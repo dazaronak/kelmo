@@ -324,16 +324,19 @@ def _cell(value):
     return '' if value is None else str(value).replace('|', '\\|')
 
 
-def _fact_row(fact):
-    labels = ['[f:' + fact['id'] + ']']
+def _fact_row(fact, evidence=True):
+    """A fact's row on its page. Without `evidence`, the row a mandatory page is delivered with: no fact or source
+    labels, the status label kept."""
+    labels = ['[f:' + fact['id'] + ']'] if evidence else []
     if fact['evidence_resolution'] == 'exact':
-        labels += ['[source:' + ref['source_id'] + ']' for ref in fact['evidence_refs']]
+        if evidence:
+            labels += ['[source:' + ref['source_id'] + ']' for ref in fact['evidence_refs']]
         if fact['status'] != 'active':
             labels.append('[status: ' + fact['status'] + ']')
     else:
         # The frozen file contract's label (file_contract projection check), not a new wording.
         labels.append('[unresolved legacy state; retained status: ' + fact['status'] + ']')
-    return '- ' + fact['text'] + ' ' + ' '.join(labels)
+    return '- ' + fact['text'] + ''.join(' ' + label for label in labels)
 
 
 def _label(kind):

@@ -13,13 +13,14 @@ asked to stop first, so the failures of its open calls count as the stop's, then
     link = CoreLink.from_descriptor(3, handlers={'state.status': (status, 'read')}, lanes={'read': 4})
     link.serve()          # blocks until the core has drained after admin.stop, or kelmod closed the channel
 """
+import errno
 import os
 import socket
 import sys
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 
 from ..errors import KelmoError
 from . import wire
@@ -28,17 +29,56 @@ from .context import Context
 CHANNEL_FD = 3
 
 
+class BrokenFrame(OSError):
+    """A write that failed after part of its frame went out: the stream now holds a frame cut short, and no frame
+    may follow it on that channel."""
+
+    def __init__(self, cause):
+        code = getattr(cause, 'errno', None)
+        message = f'The frame was cut short: {getattr(cause, "strerror", None) or cause}'
+        if code is None:
+            super().__init__(message)
+        else:
+            super().__init__(code, message)
+
+
+_SOCKET = socket.socket  # the class itself, taken at import: a sandboxed core may have socket.socket replaced
+
+
+def write_frame(sock, data):
+    """Writes one whole frame. A socket's `sendall` does not say how much it wrote before an error, so a socket is
+    written with `send`; a write that fails after part of the frame went out raises BrokenFrame. Any other channel
+    object writes through its own `sendall` (DescriptorChannel raises BrokenFrame itself)."""
+    if not isinstance(sock, _SOCKET):
+        sock.sendall(data)
+        return
+    view, sent = memoryview(data), 0
+    while sent < len(view):
+        try:
+            sent += sock.send(view[sent:])
+        except OSError as error:
+            if sent:
+                raise BrokenFrame(error) from error
+            raise
+
+
 class DescriptorChannel:
     """The channel as a plain descriptor, for a core inside the Linux sandbox: its seccomp policy refuses every
     socket syscall (`getsockopt` already, which `socket.socket(fileno=...)` makes), while read, write and poll on
-    an inherited descriptor stay allowed. Offers the socket methods CoreLink uses; `shutdown` wakes the reader
-    through a pipe instead of `shutdown(2)`."""
+    an inherited descriptor stay allowed. Offers the socket methods CoreLink uses; `shutdown` of the read side wakes
+    the reader through a pipe instead of `shutdown(2)`. A write shutdown cannot half-close the descriptor, so it
+    wakes the reader CONFINED_DRAIN_SECONDS later: replies already on their way are read meanwhile, then the channel
+    ends and is closed, and kelmod sees the end of the stream."""
 
     def __init__(self, fd):
         self.fd = fd
         os.set_blocking(fd, True)  # sendall's write loop expects a write to wait, not to fail with EAGAIN
         self._wake_read, self._wake_write = os.pipe()
         self._closed = False
+        # `close` frees the descriptors and the process may reuse their numbers at once: a wake after it must not
+        # write into whatever file got the number, so the two take turns.
+        self._closing = threading.Lock()
+        self._write_ended = False  # a write shutdown: replies on their way are read before the wake ends it
 
     def recv(self, size):
         import select
@@ -48,31 +88,83 @@ class DescriptorChannel:
         while True:
             ready = dict(poller.poll())
             if self._wake_read in ready:
+                if self._write_ended and self.fd in ready:
+                    return os.read(self.fd, size)  # a reply that came with the drain's end is still read
                 return b''
             if self.fd in ready:
                 return os.read(self.fd, size)  # POLLHUP or POLLERR: read returns b'' or raises OSError
 
     def sendall(self, data):
-        view = memoryview(data)
-        while view:
-            view = view[os.write(self.fd, view):]
+        view, sent = memoryview(data), 0
+        while sent < len(view):
+            try:
+                sent += os.write(self.fd, view[sent:])
+            except OSError as error:
+                if sent:
+                    raise BrokenFrame(error) from error
+                raise
 
-    def shutdown(self, _how):
-        try:
-            os.write(self._wake_write, b'x')
-        except OSError:
-            pass
+    def shutdown(self, how):
+        if how == socket.SHUT_WR:
+            # No half-close without shutdown(2): writes already stop on `_peer_gone`; kelmod's reader would wait for
+            # the rest of a cut frame for good, so the whole channel ends after the drain.
+            self._write_ended = True
+            timer = threading.Timer(CONFINED_DRAIN_SECONDS, self._wake)
+            timer.daemon = True
+            try:
+                timer.start()
+            except RuntimeError:  # no thread to be had: the channel ends now rather than never
+                self._wake()
+            return
+        self._wake()
+
+    def _wake(self):
+        # `close` frees the descriptors and the process may reuse their numbers at once: a wake after it must not
+        # write into whatever file got the number, so the two take turns.
+        with self._closing:
+            if self._closed:
+                return
+            try:
+                os.write(self._wake_write, b'x')
+            except OSError:
+                pass
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        fds, self.fd = (self.fd, self._wake_read, self._wake_write), -1  # a late write fails with EBADF
+        with self._closing:
+            if self._closed:
+                return
+            self._closed = True
+            fds = (self.fd, self._wake_read, self._wake_write)
+            self.fd = self._wake_write = -1  # a late write or wake fails with EBADF, never into a reused number
         for fd in fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+
+# How long a confined channel ended for writing still reads replies on their way before it ends whole.
+CONFINED_DRAIN_SECONDS = 1.0
+# How long the stop waits for a write in progress before it closes the channel anyway.
+CLOSE_WAIT_SECONDS = 5.0
+
+# A write that fails with one of these means kelmod's end of the channel is gone; any other error (no buffer space)
+# fails that call alone.
+PEER_GONE = frozenset({errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EBADF, errno.ESHUTDOWN})
+# How long the stop waits for a call already writing before it sets the stop flag: kelmod closed the channel, so
+# that write ends at once (it lands or fails); the bound is for a peer that keeps reading slowly.
+STOP_WRITE_WAIT_SECONDS = 5.0
+# How long a call whose write found kelmod gone waits for the reader to reach the channel's end before it asks
+# the owner to stop itself: replies kelmod sent before closing reach their calls first.
+GONE_READER_WAIT_SECONDS = 1.0
+
+
+def _fail(future, error):
+    """Fails `future` unless the stop already failed it (the reader reached the channel's end first)."""
+    try:
+        future.set_exception(error)
+    except InvalidStateError:
+        pass
 
 
 class CoreLink:
@@ -95,12 +187,15 @@ class CoreLink:
         self.pools = {lane: ThreadPoolExecutor(max_workers=size, thread_name_prefix=f'lane-{lane}')
                       for lane, size in lanes.items()}
         self._write_lock = threading.Lock()
+        self._write_wait_ran_out = False  # a stop step found a write stuck past its bound; later steps do not wait
         self._open = {}  # call id -> Context, for cancels
         self._outgoing = {}  # call id -> Future
+        self._closed = False  # set with the last swap of _outgoing: no reply can come any more
         self._state = threading.Lock()
         self._stopping = threading.Event()
+        self._peer_gone = threading.Event()  # a write found kelmod's end gone: no later call is written or registered
         self._draining = threading.Event()  # admin.stop came: new calls are refused, replies still delivered
-        self._owner_stop_lock = threading.Lock()
+        self._owner_stop_lock = threading.RLock()  # held while begin_stop runs: no caller passes it before then
         self._owner_stop_asked = False
         self.operations = sorted(handlers)
 
@@ -114,7 +209,25 @@ class CoreLink:
     def send(self, header, body=None):
         data = wire.encode(header, body)
         with self._write_lock:
-            self.sock.sendall(data)
+            self._write_locked(data)
+
+    def _write_locked(self, data):
+        """Writes one frame; the caller holds `_write_lock`. A frame cut short (BrokenFrame) or a gone peer ends the
+        channel for writing: nothing is written after it, and kelmod sees the channel end instead of a frame that
+        goes on."""
+        if self._peer_gone.is_set():
+            raise OSError(errno.EPIPE, 'The channel to kelmod ended for writing.')
+        try:
+            write_frame(self.sock, data)
+        except OSError as error:
+            if isinstance(error, BrokenFrame) or error.errno in PEER_GONE:
+                self._peer_gone.set()  # under the write lock: no write after this one
+            if isinstance(error, BrokenFrame):
+                try:
+                    self.sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            raise
 
     def _reply(self, call_id, body=None, error=None):
         try:
@@ -125,7 +238,7 @@ class CoreLink:
                 'code': 'E_PROCESSING', 'retryable': False, 'message': f'The reply could not be encoded: {failure}'}))
         try:
             with self._write_lock:
-                self.sock.sendall(data)
+                self._write_locked(data)
         except OSError:
             pass
 
@@ -133,7 +246,14 @@ class CoreLink:
 
     def call(self, op, body, context, *, lane=None, key=None):
         """Calls another core through kelmod. Returns a Future of the reply body; a refusal raises KelmoError
-        from `result()` with its code and its `retryable` verdict."""
+        from `result()` with its code and its `retryable` verdict, and a call that could not be sent or answered
+        (the channel to kelmod closing or gone) fails with E_TRANSPORT."""
+        if self._stopping.is_set() or self._peer_gone.is_set():
+            # A call made once the link stops fails at once, whatever its body, and never queues behind an
+            # earlier write that kelmod may no longer read.
+            if self._on_reader():
+                return self._leave_to_finish(uuid.uuid4().hex, Future())
+            return self._refuse_stopped(Future())
         call_id = uuid.uuid4().hex
         header = {'v': wire.VERSION, 'kind': 'call', 'id': call_id, 'op': op, 'body_type': 'json',
                   'deadline_ms': max(1, context.remaining_ms())}
@@ -145,14 +265,70 @@ class CoreLink:
             header['origin'] = context.origin.to_header()
         future = Future()
         with self._state:
-            self._outgoing[call_id] = future
+            closed = self._closed
+            if not closed:
+                self._outgoing[call_id] = future
+        if closed:
+            # The channel finished: nothing would ever answer, so the call fails now instead of at its deadline,
+            # after the owner heard of the stop, as for any call refused once the link stops.
+            return self._refuse_stopped(future)
         try:
-            self.send(header, body)
-        except (OSError, ValueError, TypeError, KelmoError) as error:
+            data = wire.encode(header, body)
+        except Exception as error:  # noqa: BLE001 - nothing was written: the call alone fails, whatever the encoder raised
             with self._state:
                 self._outgoing.pop(call_id, None)
-            future.set_exception(error if isinstance(error, KelmoError)
-                                 else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+            _fail(future, error if isinstance(error, KelmoError)
+                  else KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+            return future
+        try:
+            with self._write_lock:
+                # Once the link stops, `_finish` has failed (or is about to fail) every call it knows, this one among
+                # them if it was registered before; a call written now would wait for a reply that cannot come.
+                refused = self._stopping.is_set() or self._peer_gone.is_set()
+                if not refused:
+                    self._write_locked(data)
+        except Exception as error:  # noqa: BLE001 - a failed write fails this call; only a gone peer stops the core
+            with self._state:
+                self._outgoing.pop(call_id, None)
+            if isinstance(error, BrokenFrame) or (isinstance(error, OSError) and error.errno in PEER_GONE):
+                # The channel to kelmod is gone, or now carries a frame cut short, though the reader may not have
+                # reached its end yet: the reader goes on to the channel's end, so replies kelmod sent before
+                # closing still arrive, and the core hears of the stop from it (or after a short bound) before this
+                # call fails, as it does for the calls the reader fails.
+                if self._on_reader():
+                    return self._leave_to_finish(call_id, future)
+                self._leave_stop_to_reader()
+            _fail(future, KelmoError('E_TRANSPORT', f'The call could not be sent: {error}'))
+            return future
+        if refused and not self._on_reader():  # the reader's own call stays open for `_finish` to fail
+            with self._state:
+                self._outgoing.pop(call_id, None)
+            self._refuse_stopped(future)
+        return future
+
+    def _on_reader(self):
+        """True on the reader thread before it reaches `_finish`: a call made there (from a reply's callback) cannot
+        wait for the reader to reach the channel's end."""
+        return self._reader_ident == threading.get_ident() and not self._stopping.is_set()
+
+    def _leave_to_finish(self, call_id, future):
+        """A call the reader made while kelmod is gone stays open: the reader goes on to deliver the replies queued
+        behind the one whose callback made it, then `_finish` asks the owner to stop and fails it, as it fails the
+        core's other open calls."""
+        with self._state:
+            self._outgoing[call_id] = future
+        return future
+
+    def _leave_stop_to_reader(self):
+        """kelmod is gone for writing: wait briefly for the reader to deliver what kelmod sent before closing and
+        reach the channel's end (`_finish` asks the owner to stop), then ask the owner, once, in any case."""
+        if not self._stopping.is_set():
+            self._stopping.wait(GONE_READER_WAIT_SECONDS)
+        self._ask_owner_to_stop()
+
+    def _refuse_stopped(self, future):
+        self._leave_stop_to_reader()  # the owner hears of the stop before the call fails
+        _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod is closing; the call was not sent.'))
         return future
 
     # --- serving ---------------------------------------------------------------------------------------
@@ -160,6 +336,7 @@ class CoreLink:
     # True while the core is still starting: serve() reads replies to the core's own calls but does not say
     # hello, so kelmod sends it no calls until say_hello().
     hold_hello = False
+    _reader_ident = None  # the thread running serve(), which reads the channel
 
     def say_hello(self):
         self.send({'v': wire.VERSION, 'kind': 'hello', 'id': uuid.uuid4().hex, 'body_type': 'json',
@@ -171,6 +348,7 @@ class CoreLink:
         # `kill -USR1 <core pid>` writes every thread's stack to the core's stderr (kelmod's log).
         faulthandler.register(signal.SIGUSR1, all_threads=True)
         reader = wire.FrameReader()
+        self._reader_ident = threading.get_ident()
         try:
             if not self.hold_hello:
                 try:
@@ -184,22 +362,38 @@ class CoreLink:
                     break
                 if not data:
                     break
-                for header, body in reader.feed(data):
+                try:
+                    frames = reader.feed(data)
+                except KelmoError as error:
+                    # Bytes that are not a frame leave the stream with no next frame to find: the channel ends
+                    # as a closed one does, and the stop runs through _finish.
+                    print(f'kelmo core: the channel sent a bad frame ({error.code}: {error}); closing it',
+                          file=sys.stderr, flush=True)
+                    break
+                for header, body in frames:
                     self._dispatch(header, body)
         finally:
             self._finish()
 
     def _ask_owner_to_stop(self):
-        """`begin_stop`, once."""
+        """`begin_stop`, once. A caller on another thread that comes while it runs returns only after it has run,
+        so its own failure is counted as the stop's too; `begin_stop` does not wait, so neither does that caller for
+        long. A call `begin_stop` itself made would return at once (the lock is reentrant)."""
+        failure = None
         with self._owner_stop_lock:
             if self._owner_stop_asked:
                 return
             self._owner_stop_asked = True
-        if self.begin_stop is not None:
+            if self.begin_stop is not None:
+                try:
+                    self.begin_stop()
+                except Exception as error:  # noqa: BLE001 - the stop goes on
+                    failure = error
+        if failure is not None:  # reported outside the lock: a stuck stderr holds no other caller
             try:
-                self.begin_stop()
-            except Exception as error:  # noqa: BLE001 - the stop goes on
-                print(f'kelmo core: asking the core to stop failed ({type(error).__name__})', file=sys.stderr)
+                print(f'kelmo core: asking the core to stop failed ({type(failure).__name__})', file=sys.stderr)
+            except (OSError, ValueError):
+                pass
 
     def _wait_for_owner(self):
         if self.wait_stopped is not None:
@@ -215,29 +409,77 @@ class CoreLink:
         for pool in self.pools.values():
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
-        self._stopping.set()
+        self._set_stopping()
         try:
             self.sock.shutdown(socket.SHUT_RD)
         except OSError:
             pass
 
+    def _set_stopping(self):
+        """Sets the stop flag under the write lock, waiting for it at most STOP_WRITE_WAIT_SECONDS: a call that passed
+        its stop check finishes its write first, and every call after it sees the stop. Only a write stuck past
+        that bound (kelmod not reading) can end after the flag is up; its future fails all the same, failed by that
+        call itself or by `_finish`."""
+        taken = self._take_write_lock_for_stop(STOP_WRITE_WAIT_SECONDS)
+        try:
+            self._stopping.set()
+        finally:
+            if taken:
+                self._write_lock.release()
+
+    def _take_write_lock_for_stop(self, seconds):
+        """Takes the write lock for a step of the stop, waiting at most `seconds`. Once one step has waited its bound
+        out, the write in progress then is stuck (kelmod not reading), and the stop's later steps only try the lock:
+        one stuck write is waited for once, not once per step."""
+        if self._write_wait_ran_out:
+            return self._write_lock.acquire(blocking=False)
+        taken = self._write_lock.acquire(timeout=seconds)
+        if not taken:
+            self._write_wait_ran_out = True
+        return taken
+
     def _finish(self):
-        self._stopping.set()
+        self._set_stopping()
         # The owner hears of the stop before its open calls fail, so it counts those failures as the stop's.
         self._ask_owner_to_stop()
         # Outgoing calls next: no reply can arrive any more, and a handler waiting on one would hold the pool.
         with self._state:
             pending, self._outgoing = list(self._outgoing.values()), {}
+            self._closed = True
         for future in pending:
-            if not future.done():
-                future.set_exception(KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
+            # A call thread may fail its own future meanwhile; the stop goes on.
+            _fail(future, KelmoError('E_TRANSPORT', 'The channel to kelmod closed.'))
         for pool in self.pools.values():
             pool.shutdown(wait=True, cancel_futures=False)
         self._wait_for_owner()
+        # Closed only once no write is on the descriptor: a number closed under a write could be reused by another
+        # open before that write runs. A write still in progress at the bound (kelmod not reading) is cut short by a
+        # shutdown on a socket, which keeps the number; a confined channel has no shutdown(2), so its write goes on
+        # until kelmod reads or goes. Either way the descriptor is closed by a thread of its own once that write lets
+        # go, and this step does not wait for it.
+        if not self._take_write_lock_for_stop(CLOSE_WAIT_SECONDS):
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                threading.Thread(target=self._close_when_free, name='kelmo-corelink-close', daemon=True).start()
+            except RuntimeError:  # no thread to be had: the descriptor stays open for the process's exit
+                pass
+            return
         try:
             self.sock.close()
         except OSError:
             pass
+        finally:
+            self._write_lock.release()
+
+    def _close_when_free(self):
+        with self._write_lock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
 
     def _dispatch(self, header, body):
         kind = header['kind']

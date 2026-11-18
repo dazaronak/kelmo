@@ -430,7 +430,7 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         except sqlite3.Error as error:
             if not sqlite_busy(error):
                 raise
-            skipped.append({'operation_id': operation['id'], 'error_code': 'E_BUSY'})
+            skipped.append({'operation_id': operation['id'], 'error_code': 'E_BUSY', 'journal_busy': True})
             continue
         if state == 'exhausted':
             failed_attempts.append({'operation_id': operation['id'], 'error_code': 'E_ATTEMPTS',
@@ -488,7 +488,7 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
         except sqlite3.Error as error:
             if not sqlite_busy(error):
                 raise
-            skipped.append({'operation_id': operation_id, 'error_code': 'E_BUSY'})
+            skipped.append({'operation_id': operation_id, 'error_code': 'E_BUSY', 'journal_busy': True})
         except Stopping:
             break
     if not vault_failed and service.editor.vault_passed:
@@ -507,6 +507,48 @@ def tick(service, argv=None, *, max_attempts=3, timeout=120, open_service=None, 
                                      processed, skipped, failed_attempts)
 
 
+GIVE_BACK_TRIES = 3
+GIVE_BACK_PAUSE_SECONDS = 0.2
+# The give-back's share of kelmod's drain deadline. Another try starts only when one more try as long as the last
+# (a busy refusal waits out the journal's own 30 s timeout) still ends inside it.
+GIVE_BACK_SECONDS = 35.0
+
+
+def _give_back(queue, request):
+    """Returns a request the core's stop interrupted, uncharged. A journal busy past one wait is usually free a
+    moment later, so it is tried again while the stop has room; one that still refuses leaves the claim to
+    expire with its lease. The stop stays a stop either way."""
+    started = time.monotonic()
+    for attempt in range(1, GIVE_BACK_TRIES + 1):
+        tried = time.monotonic()
+        try:
+            queue.release_busy(request['id'], request['token'])
+            return
+        except Exception as error:  # noqa: BLE001 - the stop must reach the caller as itself
+            _end_open_transaction(queue)
+            now = time.monotonic()
+            if (sqlite_busy(error) and attempt < GIVE_BACK_TRIES
+                    and now - started + GIVE_BACK_PAUSE_SECONDS + (now - tried) < GIVE_BACK_SECONDS):
+                time.sleep(GIVE_BACK_PAUSE_SECONDS)
+                continue
+            try:
+                print(f'kelmo worker: resolution {request["id"]} not given back at the stop: '
+                      f'{type(error).__name__}', file=sys.stderr, flush=True)
+            except (OSError, ValueError):
+                pass  # no stderr to report on; the stop is still raised
+            return
+
+
+def _end_open_transaction(queue):
+    """A busy refusal at COMMIT leaves SQLite's transaction open; the next try must not start inside it."""
+    conn = getattr(queue, 'conn', None)
+    try:
+        if conn is not None and conn.in_transaction:
+            conn.rollback()
+    except sqlite3.Error:
+        pass
+
+
 def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, stopping, processed, skipped,
                           failed_attempts):
     from .resolution import Resolution
@@ -521,6 +563,9 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
         # the check itself.
         try:
             instructions_standing(argv, timeout, service.config, RESOLVE_TASKS, 'resolution requests')
+        except Stopping:
+            _give_back(queue, request)
+            raise
         except VaultFailure as error:
             queue.release_busy(request['id'], request['token'])
             skipped.append({'resolution_id': request['id'], 'error_code': error.code})
@@ -530,6 +575,11 @@ def _resolve_and_sessions(service, argv, timeout, max_attempts, open_service, st
             reply = request['response'] if request['response'] is not None else quota.checked(
                 execute(argv, request['payload'], timeout=timeout))
             queue.submit(request['id'], request['token'], reply)
+        except Stopping:
+            # The core's stop ended the call: the request goes back unanswered, its attempt given back, for the next
+            # start (stopping.py); without this it stayed claimed until its lease ran out, charged.
+            _give_back(queue, request)
+            raise
         except Exception as error:  # noqa: BLE001 - One failed request must not stop the worker.
             from .core.baton import BatonError
             if isinstance(error, BatonError):
@@ -638,7 +688,11 @@ def run(service, config_path, *, once=False, open_service=None):
                 continue
             if once:
                 return result
-            held = {item['operation_id'] for item in result.get('skipped', ())}
+            # Only an operation another attempt holds: a refused resolution request names no operation, and a
+            # note skipped for the executor, the vault or a busy journal is held by nobody.
+            held = {item['operation_id'] for item in result.get('skipped', ())
+                    if 'operation_id' in item and item.get('error_code') in ('E_BUSY', 'E_CLAIM')
+                    and not item.get('journal_busy')}
             if held - reported:
                 # A claim left by a dead worker blocks its operation until the lease expires; say so.
                 print('kelmo worker: skipped operations held by another attempt: '

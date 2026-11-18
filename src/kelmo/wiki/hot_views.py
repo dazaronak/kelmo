@@ -199,10 +199,31 @@ def over_budget(text):
     return int(match.group(1)) if match else None
 
 
-def render_mandatory(text):
-    """A mandatory page as delivered at startup: no frontmatter, no retired rows; everything else
-    byte for byte."""
-    return _RETIRED_ROW.sub('', _FRONTMATTER.sub('', text, 1))
+def strip_evidence(text, registry, target):
+    """`text`, the page `target`, without the fact and source labels of its fact rows: in its `<!-- kb -->`
+    regions, whole lines that are exactly the row the publisher writes for one of the page's registered facts
+    become that row without them. Status labels and every other line stay byte for byte, so no label is parsed
+    and a source id may hold any character, a line break included (the row then spans lines). Every line is
+    matched once, on the region as published, so a fact whose text ends like another fact's row stays itself."""
+    rows = {}
+    for fact in registry['facts'].values():
+        if fact['target'] == target:
+            rows[pages._fact_row(fact)] = pages._fact_row(fact, evidence=False)
+    if not rows:
+        return text
+    # A whole line, or lines for a row that spans them: a row another row starts with never takes its line.
+    whole = re.compile('(?<![^\\n])(?:' + '|'.join(map(re.escape, rows)) + ')(?![^\\n])')
+    parts, rest = [], text
+    while (start := rest.find(pages.KB_START)) >= 0 and (end := rest.find(pages.KB_END, start)) >= 0:
+        parts += [rest[:start], whole.sub(lambda match: rows[match.group(0)], rest[start:end])]
+        rest = rest[end:]
+    return ''.join(parts) + rest
+
+
+def render_mandatory(text, registry, target):
+    """The mandatory page `target` as delivered at startup: no frontmatter, no retired rows, no fact and source
+    labels; everything else byte for byte."""
+    return strip_evidence(_RETIRED_ROW.sub('', _FRONTMATTER.sub('', text, 1)), registry, target)
 
 
 def project_maps(registry):
@@ -240,7 +261,7 @@ def render_all(registry, rendered_pages, wiki_root, hot_root, max_bytes=DEFAULT_
             text = _page_text(rendered_pages, wiki_root, target)
             if text is None:
                 raise ValueError('Mandatory page is missing: ' + target)
-            mandatory.append(render_mandatory(text) if target in canonical_mandatory else text)
+            mandatory.append(render_mandatory(text, registry, target) if target in canonical_mandatory else text)
         body = '\n\n'.join(mandatory)
         if body and not body.endswith('\n'):
             body += '\n'
@@ -273,7 +294,8 @@ def render_all(registry, rendered_pages, wiki_root, hot_root, max_bytes=DEFAULT_
             aliases.setdefault(mandatory_name(target), []).append(target)
         for name, sources in aliases.items():
             result[hot_root / name] = header + '\n\n'.join(
-                render_mandatory(_page_text(rendered_pages, wiki_root, source)) for source in sources)
+                render_mandatory(_page_text(rendered_pages, wiki_root, source), registry, source)
+                for source in sources)
         return result
     for target in maps:
         text = _page_text(rendered_pages, wiki_root, target)
@@ -283,5 +305,5 @@ def render_all(registry, rendered_pages, wiki_root, hot_root, max_bytes=DEFAULT_
     for target in pages.mandatory_paths(registry, known):
         text = _page_text(rendered_pages, wiki_root, target)
         if text is not None:
-            result[hot_root / mandatory_name(target)] = render_mandatory(text)
+            result[hot_root / mandatory_name(target)] = render_mandatory(text, registry, target)
     return result

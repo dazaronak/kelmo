@@ -91,6 +91,46 @@ def test_auto_session_publishes_through_prepared_editor_intent(tmp_path, monkeyp
     assert 'session_applications' not in registry or not registry['session_applications']
 
 
+def test_session_note_forgotten_during_the_model_call_is_not_published(tmp_path, monkeypatch):
+    """The session note is archived, then forgotten while the worker waits for the reconcile call: nothing
+    from it reaches the wiki, and the job does not stay to retry."""
+    root, job_id = adopted_session(tmp_path, monkeypatch)
+    before = commits(root)
+    calls = []
+    inner = executor(calls)
+    forgotten = []
+
+    def execute(argv, payload, **kwargs):
+        if payload['task'] == 'reconcile_session':
+            with Service(root) as other:
+                archive_id = other.journal.get(note_operation(root, job_id))['archive_id']
+                forgotten.append(other.forget(archive_id))
+        return inner(argv, payload, **kwargs)
+
+    job = tick(root, ['/synthetic/executor'], execute=execute)['jobs'][0]
+    assert forgotten and forgotten[0]['forgotten'], forgotten
+    assert 'demo.session.0' not in engine.load_registry(root)['facts']
+    assert commits(root) == before
+    assert job['state'] == 'wiki_unchanged', job
+
+
+def test_session_note_forgotten_after_its_publication_replays_it(tmp_path, monkeypatch):
+    """A note whose publication already happened is forgotten, then the worker repeats the job after a crash:
+    the replay reports the finished publication and makes no second one."""
+    root, job_id = adopted_session(tmp_path, monkeypatch)
+    calls = []
+    assert tick(root, ['/synthetic/executor'], execute=executor(calls))['jobs'][0]['state'] == 'wiki_applied'
+    published = commits(root)
+    with Service(root) as service:
+        assert service.forget(service.journal.get(note_operation(root, job_id))['archive_id'])['forgotten']
+    db = sqlite3.connect(root / '.state' / 'journal.sqlite3')
+    with db:
+        db.execute("UPDATE session_jobs SET state='archived' WHERE id=?", (job_id,))
+    db.close()
+    assert tick(root, ['/synthetic/executor'], execute=executor(calls))['jobs'][0]['state'] == 'wiki_applied'
+    assert commits(root) == published
+
+
 def test_crash_after_publication_replays_without_a_second_publication(tmp_path, monkeypatch):
     root, job_id = adopted_session(tmp_path, monkeypatch)
     calls = []
@@ -135,3 +175,34 @@ def test_archive_only_never_reconciles_or_edits(tmp_path, monkeypatch):
     with Service(root) as service:
         operation = service.journal.get(note_operation(root, job_id))
     assert operation['durable_stage'] == 'archived', 'the whole note is still archived'
+
+
+def test_session_note_forgotten_after_an_unfinished_editor_request_is_not_published(tmp_path, monkeypatch):
+    """The first attempt records the editor's answer but stops before its publication is prepared; the note is
+    forgotten, then the job runs again: an open request is no started publication, so nothing is published."""
+    from kelmo.editor import Editor
+    root, job_id = adopted_session(tmp_path, monkeypatch)
+    before = commits(root)
+    calls = []
+
+    def busy(*args, **kwargs):
+        raise KelmoError('E_BUSY', 'Synthetic coordinator lock held.')
+
+    monkeypatch.setattr(Editor, '_settle', busy)
+    assert tick(root, ['/synthetic/executor'], execute=executor(calls))['jobs'][0]['state'] != 'wiki_applied'
+    monkeypatch.undo()
+    for key, value in GIT_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr('kelmo.store.memory.store.embed', unavailable)
+    monkeypatch.setattr('kelmo.store.memory.search.embed', unavailable)
+    with Service(root) as service:
+        assert service.forget(service.journal.get(note_operation(root, job_id))['archive_id'])['forgotten']
+    db = sqlite3.connect(root / '.state' / 'journal.sqlite3')
+    with db:
+        # The busy retry waits; the test does not.
+        db.execute('UPDATE session_processing SET eligible=0 WHERE job_id=?', (job_id,))
+    db.close()
+    job = tick(root, ['/synthetic/executor'], execute=executor(calls))['jobs'][0]
+    assert 'demo.session.0' not in engine.load_registry(root)['facts']
+    assert commits(root) == before
+    assert job['state'] == 'wiki_unchanged', job

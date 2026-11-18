@@ -99,6 +99,13 @@ RESERVED_INTAKE_PREFIXES = ('state-capture/', 'state-intake/')
 FAILED_OPERATIONS_REPORT = 20
 
 
+def _busy(message):
+    """A retryable refusal: the same call succeeds once what holds the note has let it go."""
+    error = KelmoError('E_BUSY', message)
+    error.retryable = True
+    return error
+
+
 class Service:
     @staticmethod
     def initialize(root, label, wiki_root=None, *, git_identity=None, project=None):
@@ -694,6 +701,18 @@ class Service:
             operation = self.journal.get(operation_id)
             if operation['durable_stage'] != 'archived' or not operation['archive_id']:
                 raise KelmoError('E_PERMISSION', 'A completed archive receipt is required before wiki changes.')
+            # A note forgotten before its publication started is never published. A request that is only open
+            # (answered, never prepared) has not started one: it is refused, so no later attempt settles it. A
+            # prepared publication is finished and a finished one replays.
+            from .publication import StateCoordinator
+            started = self.journal.action_request(
+                StateCoordinator._request_key('semantic', self._operation_origin(operation_id), application_id))
+            decided = started is not None and started['state'] in ('prepared', 'finished')
+            if not decided and self.archive_api.hidden_at(operation['archive_id']) is not None:
+                if started is not None and started['state'] == 'open':
+                    self.journal.refuse_open_semantic(operation_id, 'E_FORGOTTEN',
+                                                      'The note was forgotten before its publication started.')
+                return {'applied': False, 'replayed': False}
             source = self.source_path(operation).read_bytes().decode('utf-8')
             archived = self.archive_record(operation['archive_id'], operation_id=operation_id)
             if engine.digest(source) != operation['source_hash'] or archived['content'] != source:
@@ -989,8 +1008,16 @@ class Service:
                                  budget_tokens=promotion.BUDGET_TOKENS, rule_change=request['rule_change'],
                                  contexts=self.context_bindings)
             except Exception as error:  # noqa: BLE001 - Preserve failed operations across backend faults.
+                from . import stopping
+                if stopping.requested():
+                    # The core's stop caused it, as in `run`: the note waits, uncharged, and the claim is released.
+                    raise Stopping() from error
                 if isinstance(error, KelmoError) and error.code in ('E_BUSY', 'E_CLAIM'):
                     raise
+                if sqlite_busy(error):
+                    # Another writer holds the database: the note waits its turn, never charged.
+                    raise KelmoError('E_BUSY', 'Another writer holds the database; the note waits its turn.') \
+                        from error
                 code = error.code if isinstance(error, KelmoError) else 'E_PROCESSING'
                 # A refusal raised before the editor opened its request row has no recorded reason yet;
                 # a failed outcome store cannot hold one, so that failure is staged without it.
@@ -1166,6 +1193,25 @@ class Service:
     def _forget(self, memory_id, origin, *, reason=None, idempotency_key=None):
         if self.journal.conn.in_transaction:
             raise KelmoError('E_STATE', 'Journal event reconciliation requires an idle connection.')
+        # A note still waiting for the editor is withdrawn before the record is hidden, in the journal every
+        # reader of waiting notes reads: a failure after this point leaves it hidden from no one yet, but never
+        # published. A note the editor holds now, or whose publication it has already decided (the next pass
+        # finishes that whatever happens here), is refused rather than reported withdrawn. A failed note waits
+        # too: a retry would queue it again. Every note of the record is withdrawn together or none is.
+        waiting = [row['id'] for row in self.journal.conn.execute(
+            "SELECT id FROM operations WHERE archive_id=? AND intent='create' AND (terminal=0 OR state='failed') "
+            'ORDER BY created_at', (memory_id,))]
+        for operation_id in waiting:
+            if self.editor.publication_decided(operation_id):
+                raise _busy(f'Note {operation_id} already has a decided publication that the next pass completes; '
+                            'it cannot be withdrawn. Forget the record again once it is published.')
+        try:
+            self.journal.withdraw(waiting)
+        except KelmoError as error:
+            if error.code != 'E_CLAIM':
+                raise
+            raise _busy(f'A note of this record is being edited now; forget it again once that pass has '
+                        f'ended. {error}') from error
         # Each CLI call has a fresh identity; archive idempotency remains available to transports.
         receipt = self.archive_api.hide(memory_id, origin, idempotency_key or str(uuid.uuid4()), reason=reason)
         hidden = receipt.outcome == 'hidden'

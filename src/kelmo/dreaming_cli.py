@@ -41,7 +41,8 @@ def status(root):
             "SELECT run_id,state,started_at,finished_at FROM dream_runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone() if "dream_runs" in tables else None
     answer = {"settings": values.get("settings"), "paused": values.get("paused", not bool(values.get("settings"))),
-              "next_attempt": values.get("next_attempt", 0), "findings": counts,
+              "next_attempt": values.get("next_attempt", 0), "deferred_at": values.get("deferred_at", 0),
+              "findings": counts,
               "last_run": dict(recent) if recent else None}
     # What each executor command last said of the instructions it gives the model, once it was asked
     # (`creation.instructions_standing`): its name, `same`, `own`, `differs` or `unidentified`, when and why.
@@ -123,7 +124,41 @@ def prepare_schedule(root, args):
             "scheduler_started": False}
 
 
+UNCONFIGURED = "Configure Dreaming before running it."
+
+
 def dispatch(root, args):
+    """A `kelmo dream` call the CLI runs itself. A `run` here is a pass outside the daemon (a `--server-profile`
+    timer), told to the owner as the daemon's are: whatever ends it, from its service and lock to the pass."""
+    if args.action != "run":
+        return _dispatch(root, args)
+    try:
+        return _dispatch(root, args)  # what the pass ends with is told under the Dreaming lock
+    except _ToldUnderLock as told:
+        raise told.error from None
+    except Exception as error:
+        if not (isinstance(error, KelmoError) and error.code == "E_CONFIG" and str(error) == UNCONFIGURED):
+            # Before the lock: no run of this call set the start mark, so a pass that holds the lock keeps its own.
+            tell_dream_watch(_alert_config(root), failure_outcome(error), run_ended=False)
+        raise
+
+
+class _ToldUnderLock(Exception):
+    """A pass that raised under the Dreaming lock, already told to the owner; `dispatch` re-raises its error."""
+
+    def __init__(self, error):
+        super().__init__(error)
+        self.error = error
+
+
+def _alert_config(root):
+    try:
+        return Config.load(root)
+    except Exception:  # noqa: BLE001 - tell_dream_watch then reports the delivery as failed
+        return None
+
+
+def _dispatch(root, args):
     configured = None
     if args.action == "configure":
         for name in ("max_sources", "max_pages", "budget_tokens"):
@@ -176,17 +211,93 @@ def dispatch(root, args):
         if args.action == "findings":
             return {"findings": dream.findings(args.state)}
         if not settings:
-            raise KelmoError("E_CONFIG", "Configure Dreaming before running it.")
+            raise KelmoError("E_CONFIG", UNCONFIGURED)
         with service.config.internal(".state/dreaming.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {"state": "busy"}
-            return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            if args.action != "run":
+                return run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            # Told before the lock goes, answer or failure: a daemon pass that takes it next is told after this.
+            _dream_watch_starting(service.config)
+            try:
+                result = run_dream(service, args.action, contexts=contexts, ready=getattr(args, "ready", False))
+            except KeyboardInterrupt:
+                _dream_watch_ended(service.config)  # stopped at the terminal on purpose: nothing died
+                raise
+            except Exception as error:
+                tell_dream_watch(service.config, failure_outcome(error))
+                raise _ToldUnderLock(error) from error
+            tell_dream_watch(service.config, result)
+            return result
+
+
+def _dream_watch_starting(config):
+    from .alerts import DreamWatch
+    try:
+        DreamWatch.for_config(config).starting()
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
+
+
+def _dream_watch_ended(config):
+    from .alerts import DreamWatch
+    try:
+        DreamWatch.for_config(config).ended()
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
+
+
+def failure_outcome(error):
+    """A Dreaming run that raised, as the failed answer the owner hears of."""
+    return {"state": "failed", "code": getattr(error, "code", None) or type(error).__name__,
+            "reason": str(error) or type(error).__name__}
+
+
+def tell_dream_watch(config, result, run_ended=True):
+    """What the owner hears of a findings pass (`alerts.DreamWatch`), from the daemon's runs and the CLI's own.
+    `blocked` (an executor on another build's instructions) is told by `ExecutorWatch`; `deferred` and `paused`
+    are holds, not failures. Alerting never changes the run's answer or its tries."""
+    from .alerts import DreamWatch
+    state = result.get("state") if isinstance(result, dict) else None
+    try:
+        watch = DreamWatch.for_config(config)
+        if state == "finished":
+            watch.ran()
+        elif state == "idle":
+            watch.idle(result.get("waiting", 0), since=result.get("waiting_since"))
+        elif state == "failed":
+            watch.failed(result.get("code") or "E_FAILED", result.get("reason") or "no reason given")
+        # The start mark goes last: a process killed before the outcome is recorded leaves it for the next run.
+        if run_ended:
+            watch.ended()
+    except KeyboardInterrupt:
+        # Stopped at the terminal on purpose while the outcome was told: nothing died, as for a Ctrl-C in the run.
+        if run_ended:
+            _dream_watch_ended(config)
+        raise
+    except Exception as failure:  # noqa: BLE001 - Alerting must not turn a run into a failure.
+        print(json.dumps({"alert_delivery": "failed", "error": type(failure).__name__}), file=sys.stderr,
+              flush=True)
+
+
+def deferred_until(state, now):
+    """The reset time a usage limit set, while it still holds a pass at `now`, else 0. A clock read below the moment
+    the deferral was recorded (`deferred_at`) cannot tell how much of the wait is over, so it holds nothing: a pass
+    that meets a limit still in force is deferred again by the executor's own answer."""
+    reset, since = state.get("next_attempt", 0), state.get("deferred_at")
+    if not isinstance(reset, (int, float)) or isinstance(reset, bool) or reset <= now:
+        return 0
+    if isinstance(since, (int, float)) and not isinstance(since, bool) and now < since:
+        return 0
+    return reset
 
 
 def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None, should_stop=None, step=None,
-              ready=False):
+              ready=False, boundary=None):
     """One Dreaming `run` (waiting notes, then the findings pass) or `apply` (the waiting notes only).
     The caller makes sure no other Dreaming run is in progress.
 
@@ -196,7 +307,12 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
 
     `ready` belongs to `apply` alone: the owner's "run the editor now" over ready projects only (see
     `apply_pending`). `run` keeps draining everything, because the night pass is what publishes small
-    projects."""
+    projects. `boundary` is the apply pass's capture boundary, read by a caller before its first step waits;
+    a caller with a `step` must give it (TypeError otherwise, before any step)."""
+    if step is not None and boundary is None:
+        raise TypeError('A pass that enters a caller step needs its boundary: read capture_boundary '
+                        'before the first step, which may wait for the journal.')
+    caller_step = step
     step = step or nullcontext
     with step():
         # Built inside the step: its first use creates the Dreaming tables on the shared journal connection.
@@ -206,8 +322,9 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
             return {"state": "unconfigured"}
         if dream._state("paused", True):
             return {"state": "paused"}
-        reset = dream._state("next_attempt", 0)
-        if reset > clock():
+        reset = deferred_until({"next_attempt": dream._state("next_attempt", 0),
+                                "deferred_at": dream._state("deferred_at")}, clock())
+        if reset:
             return {"state": "deferred", "reset_at": reset}
         service.archive_api.assert_writer()
     if on_start is not None:
@@ -217,8 +334,8 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
     # Waiting notes go first, so the findings pass reads the pages they changed; `apply` alone
     # is the owner's "run the editor now".
     from .creation import apply_pending
-    applied = apply_pending(service, executor, should_stop=should_stop, step=step,
-                            ready=ready and action == "apply")
+    applied = apply_pending(service, executor, should_stop=should_stop, step=caller_step,
+                            ready=ready and action == "apply", boundary=boundary)
     if action == "apply":
         return {"state": "finished", "apply": applied}
     if should_stop is not None and should_stop():
@@ -239,5 +356,7 @@ def run_dream(service, action, *, contexts=None, clock=time.time, on_start=None,
         result = dream.run(executor, origin=service.origin, contexts=contexts,
                            **{name: settings[name] for name in ("max_sources", "max_pages", "budget_tokens")})
         service.archive_api.assert_writer()
-        dream._set_state("next_attempt", result.get("reset_at", 0) if result["state"] == "deferred" else 0)
+        deferred = result["state"] == "deferred"
+        dream._set_state("next_attempt", result.get("reset_at", 0) if deferred else 0)
+        dream._set_state("deferred_at", clock() if deferred else 0)
     return dict(result, apply=applied)

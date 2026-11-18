@@ -7,6 +7,7 @@ the archive process re-issues the same Origins from the enrollment its parent se
 import base64
 import contextvars
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -1714,14 +1715,15 @@ class ClientSession:
                 if stored['fingerprint'] != fingerprint:
                     raise KelmoError('E_IDEMPOTENCY', 'The idempotency key already identifies a different request.')
                 if stored['state'] == 'finished':
-                    return dict(json.loads(stored['reply']), replayed=True)
+                    return self._replay(op, args, key, stored)
             if self._fenced():
                 raise KelmoError('E_FENCED', 'This server is fenced; writes stay queued until the cutover completes.')
             self.service.archive_api.assert_writer()
             with self._request_lock(request_key) as release:
                 row, claimed = _ledger(journal.client_request_claim, request_key, self.client_id, op, fingerprint)
                 if claimed is None:
-                    return dict(json.loads(row['reply']), replayed=True)
+                    release()  # finished by another attempt meanwhile: the file goes, as after a settlement
+                    return self._replay(op, args, key, row)
                 try:
                     outcome = {'ok': True, 'result': getattr(self, 'write_' + op)(key=key, **args)}
                 except KelmoError as error:
@@ -1745,16 +1747,53 @@ class ClientSession:
             raise _verdict(KelmoError(_unsettled(error).code, 'The write did not settle; it is retried under '
                                                              'the same key.'), True) from error
 
+    def _replay(self, op, args, key, row):
+        """The stored reply of a finished request. A refusal that `kelmo client resend` sent again under
+        `<base>#resend<n>` answers as the last note of that chain, which this client's outbox may no longer know
+        (a profile made again under the same client id). The chain is the client's: the key cut at its first
+        `#resend`, then `#resend1`, `#resend2` and on while such a key is recorded (the client takes the lowest
+        number it finds free, so a number another note holds is passed over). A successor counts only when it
+        carries the same request (resend sends it unchanged) and was recorded after the refusal it resends. A successor still open is run under its own key: a live attempt of it is answered busy by the
+        row's lock, one abandoned by a process that is gone is run again, and its outcome answers."""
+        reply = json.loads(row['reply'])
+        if reply.get('ok') is not False:
+            return dict(reply, replayed=True)
+        base = key.partition('#resend')[0]
+        journal, before = self.service.journal, row
+        for successor in itertools.count(1):
+            successor_key = f'{base}#resend{successor}'
+            request_key = _request_digest([self.client_id, successor_key])
+            stored = journal.client_request(request_key)
+            if stored is None:
+                break
+            if (stored['op'] != before['op'] or stored['fingerprint'] != before['fingerprint']
+                    or stored['created_at'] <= (before['finished_at'] or before['created_at'])):
+                continue  # another note, or an earlier step of the chain (this key itself among them)
+            if stored['state'] != 'finished':
+                # Its effect may be done: never answered with the refusal it resent. The archive deduplicates the
+                # key, so running it again is safe.
+                return dict(self._mutate(op, args, successor_key), replayed=True)
+            before, reply = stored, json.loads(stored['reply'])
+            if reply.get('ok') is not False:
+                break
+        return dict(reply, replayed=True)
+
     @contextmanager
     def _request_lock(self, request_key):
         """The exclusive lock of one ledger row, refused at once (E_BUSY, retryable) while another live
         attempt holds it. The file is removed after the row is settled: a later opener of the old or a new
-        file then finds the finished row and replays it. In the state core, where one process executes
-        every write, the lock is the core's in-process table of keys in flight and no file is made."""
+        file then finds the finished row and replays it. Every server process takes the file, the state core
+        too, so a state core and a `kelmo serve-client` serving one client at once still run a key once; the
+        state core first refuses a key another of its threads runs (its table of keys in flight)."""
         if self.keys_in_flight is not None:
-            with self.keys_in_flight.hold(request_key):
-                yield lambda: None
+            with self.keys_in_flight.hold(request_key), self._file_lock(request_key) as release:
+                yield release
             return
+        with self._file_lock(request_key) as release:
+            yield release
+
+    @contextmanager
+    def _file_lock(self, request_key):
         import fcntl
         directory = self.service.config.internal('.state/client-requests')
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1771,8 +1810,8 @@ class ClientSession:
             if settled:
                 try:
                     path.unlink()
-                except FileNotFoundError:
-                    pass
+                except OSError:
+                    pass  # a file left behind only makes the next opener find the finished row
         finally:
             os.close(descriptor)
 
@@ -1898,9 +1937,16 @@ class ClientSession:
 
     def write_create(self, key, content, filename, project, selected=(), rule_change=False,
                      budget_tokens=None, new_work=None, pending=None):
+        scoped = self._scoped(key)
+        # Only a taken-over attempt finds its note captured: `_mutate` replays a settled request without coming
+        # here, and the ledger matched this request's fingerprint. The note the dead attempt captured is the answer,
+        # also when it would no longer pass the checks a first attempt makes (the registry changed meanwhile).
+        prior = self.service.journal.operation_for_request_key(self.service.capture_request_key(scoped))
+        if prior is not None and self.service.journal.origin_record(prior) == self.origin.to_dict():
+            return self._operation_result({'operation': self.service.journal.get(prior)})
         operation = self.service.create(content, filename, project=project, selected=selected,
                                         rule_change=rule_change, budget_tokens=budget_tokens,
-                                        idempotency_key=self._scoped(key), new_work=new_work, pending=pending)
+                                        idempotency_key=scoped, new_work=new_work, pending=pending)
         return self._operation_result({'operation': operation})
 
     def write_process(self, key, capture_key):
@@ -2101,8 +2147,9 @@ def session_capture(service, client_id, *, provider, native_id, event, content, 
     name = engine.digest(file_identity)
     spool = config.internal('.state/client-sessions/' + directory.name + '/' + name + '.jsonl')
     # One writer per spool from the write until the intake has read it. The spool is extended and rewritten
-    # in place, never replaced: the intake names a transcript generation by the file's inode, so a new
-    # inode per capture would start a new generation every time. The lock keeps any reader off a partial
+    # in place, never replaced, so the intake never reads a file another write is replacing. The intake names
+    # a transcript generation by the spool's inode; a spool that is gone names nothing, so one written again from
+    # offset 0 continues its session when its content does. The lock keeps any reader off a partial
     # file, and each written piece is read back from disk before the intake reads the spool.
     # In the state core every write runs on its one writer thread, which already gives that exclusion.
     with _spool_lock(config, directory, name, single_writer):
@@ -2119,7 +2166,7 @@ def session_capture(service, client_id, *, provider, native_id, event, content, 
         try:
             result = sessions.capture(provider, client_id + ':' + native_id, spool, directory, event,
                                       checkpoint_turns=settings['checkpoint_turns'], time_budget=None,
-                                      capture_client_id=client_id)
+                                      capture_client_id=client_id, spool=True)
             with sessions.journal.conn as db:
                 db.execute('''CREATE TABLE IF NOT EXISTS session_native_events (
                     provider TEXT NOT NULL,event TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(provider,event))''')
@@ -2233,7 +2280,8 @@ def _shared_context(service, profile, origin, config, reader, generation, *, rep
 
 
 def _published_work(reader, generation, page):
-    return reader.page(page, generation).content.decode('utf-8')
+    from .hot import published_work
+    return published_work(reader, generation, page)
 
 
 def serve_client(root, profile_path, client_id, stdin, stdout):

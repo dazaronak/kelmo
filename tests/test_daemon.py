@@ -735,7 +735,15 @@ def test_execute_cleans_group_after_parent_exits(tmp_path, successful):
         assert raised.value.code == 'E_EXECUTOR'
     child_pid = int(pid_file.read_text())
     try:
-        __import__('time').sleep(1)
+        # No fixed wait: the child is gone within the deadline, so it can never write its file later.
+        end = __import__('time').monotonic() + 5
+        while True:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            assert __import__('time').monotonic() < end, 'the child outlived its parent group'
+            __import__('time').sleep(0.02)
         assert not survived.exists()
     finally:
         try:
@@ -755,20 +763,31 @@ def test_execute_timeout_includes_wait_after_child_closes_pipes(tmp_path):
 
 
 def test_sigterm_interrupts_idle_poll_wait(tmp_path):
+    """A 60 s poll wait ends at SIGTERM. The bound leaves a loaded runner time to exit the interpreter and is a
+    quarter of the wait, so a wait that runs to its end still fails."""
+    import json
     import os
     import subprocess
     import time
-    script = ("import kelmo.daemon as daemon\n"
+    config = tmp_path / 'executor.json'
+    config.write_text(json.dumps({'poll_seconds': 60}))
+    script = ("import sys\n"
+              "import kelmo.daemon as daemon\n"
               "daemon.tick=lambda *a,**k: (print('ready',flush=True) or {})\n"
-              "daemon.run(None,None)\n")
-    process = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE,
+              "daemon.run(None,sys.argv[1])\n")
+    process = subprocess.Popen([sys.executable, '-c', script, str(config)], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         assert process.stdout.readline().strip() == 'ready'
+        time.sleep(0.5)  # the child is in its wait by now, so the signal interrupts a wait under way
         started = time.monotonic()
         os.kill(process.pid, __import__('signal').SIGTERM)
-        assert process.wait(timeout=2) == 0
-        assert time.monotonic() - started < 2
+        try:
+            code = process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            code = None
+        elapsed = time.monotonic() - started
+        assert code == 0, f'the worker did not stop within 15 s of SIGTERM (exit {code}, {elapsed:.1f} s)'
     finally:
         if process.poll() is None:
             process.kill()

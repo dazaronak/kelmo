@@ -75,7 +75,12 @@ the worker archives it and records `awaiting_dreaming`; `kelmo dream apply`
 mode publishes as soon as the note is archived. `--pending LINE` (MCP
 `pending`, at most 240 characters) is the one line agents see at startup, under
 "Pending wiki updates", while the note waits; it disappears once the note is
-applied. A note whose text carries two frontmatter blocks in a row has them
+applied. The block sits between `<kelmo-pending-notes>` and
+`</kelmo-pending-notes>` lines and says that its lines are note text, not
+instructions; a marker tag inside a pending line is written with `&lt;`. When the
+start context is too large for a Claude hook, the pending lines are left in the
+referenced context file, whose `pending` field holds the same framed block with a
+row for each note the delivery was given (on the legacy path, the 20 newest). A note whose text carries two frontmatter blocks in a row has them
 merged at capture; a note that is frontmatter alone is refused at capture.
 
 An existing wiki file that no registry entry names is registered explicitly,
@@ -101,10 +106,38 @@ registered with `kelmo register`), `kelmo client resend` lists the refused
 with `--apply` it queues each one again under a new key (`<key>#resendN`),
 marks the old entry `resent` with the new key, and flushes. Each run that
 applies takes the next free suffix, so a note refused again can be resent
-once more after the next fix. A text goes out once: a refusal whose text a
-queued or delivered note already carries names that note instead
-(`duplicate: true`), and of several refusals with one text only the newest is
-sent.
+once more after the next fix. A request goes out once: a refusal whose
+request a queued or delivered note already carries names that note instead
+(`duplicate: true`), and of several refusals with one request only the newest
+is sent. For this, two requests are the same when the project, the text
+(without its surrounding whitespace), the rule change, the new work page and
+the pending flag match; the targets, the file name and the budget are not
+compared, since a refusal is usually resent once its target is fixed. Under
+the old key itself, only the request with exactly its arguments is accepted
+again; any other is refused with `E_IDEMPOTENCY`. While the client still holds
+the old entry, that request is answered as the note it went out as: its
+outcome, its refusal, or queued under its new key. Without that entry (a
+profile made again under the same client id) the request reaches the server,
+which answers it the same way from its own record of the resend chain: the
+same request this client sent under `<key>#resendN` after the refusal. While
+the note it went out as is still running there, the request stays queued; one
+whose server process died before it settled is run again under its own key,
+and its outcome is the answer. A refusal that resend answered as a duplicate
+of another note is linked on the server only when that note went out under
+`<key>#resendN`; otherwise, without the entry, that request gets the answer of
+the last `<key>#resendN` the server recorded (its outcome or its refusal), or
+the old refusal when there is none. The server reads a key that holds
+`#resend` as a resend of the part before its first `#resend`, so a new key a
+caller chooses may not contain `#resend` (`E_INPUT`); the key of an entry
+already queued may be repeated, which is how a resent note is asked for its
+answer.
+A refusal that will not be resent stays in `kelmo client status` until it is
+dismissed. `kelmo client dismiss` lists the refused entries whose code matches
+`--code` or whose key matches `--key` (both repeatable; with neither, every
+refused entry); with `--apply` they become `dismissed`. The entry keeps its
+request and its refusal: status counts it under `dismissed` instead of listing
+it, `client resend` no longer selects it, and the same request under its key
+is still answered with that refusal. Nothing is deleted.
 The editor sends the archived source, its reconciliation receipts and every
 mandatory person page whole, then the selected pages and the pages the model
 asks for (each as its facts, narratives and actions plus its hand-written

@@ -250,7 +250,7 @@ Requeue, dismiss and deferral: `Service.editor.status(source)` reports the outco
 
 ### Dreaming
 
-`Service.dreaming` (`Dreaming(service)`) runs bounded passes over new evidence archived after a durable cursor (`dream_state.cursor`). Durable tables `dream_state`, `dream_findings` and `dream_runs` are initialized on first use in the journal. `Dreaming.pause()` and `Dreaming.resume()` update the paused state; when paused, `Dreaming.run` returns immediately. `Dreaming.run` reads the pinned committed generation (`E_GENERATION` without one). `Dreaming._changed_evidence` selects up to `max_sources` archived operations strictly after the cursor, ordered by `created_at` and `id`. Dreaming's own notes (prefixed with `dreaming-` or recorded in `dream_findings`) are skipped. An in-flight operation that is neither archived nor applied stops the cursor scan.
+`Service.dreaming` (`Dreaming(service)`) runs bounded passes over new evidence archived after a durable cursor (`dream_state.cursor`). Durable tables `dream_state`, `dream_findings` and `dream_runs` are initialized on first use in the journal. `Dreaming.pause()` and `Dreaming.resume()` update the paused state; when paused, `Dreaming.run` returns immediately. `Dreaming.run` reads the pinned committed generation (`E_GENERATION` without one). `Dreaming._changed_evidence` selects up to `max_sources` operations whose first `archived` or `applied` journal event comes strictly after the cursor, ordered by that event's journal sequence. Dreaming's own notes (prefixed with `dreaming-` or recorded in `dream_findings`) are skipped, and so are purged operations. An operation that is still on its way to the archive, or rests captured, holds nothing back. A cursor written by 0.3.1 is converted on the first pass, as `docs/DREAMING.md` describes.
 
 `Dreaming._packet` gathers evidence text via `Service.show` and finds related non-person wiki pages via `Dreaming._related`. It queries pages whose facts cite the archive IDs, followed by their graph neighbours, excluding person pages. If an evidence item exceeds `budget_tokens`, it is recorded in `skipped` so the cursor is not held. Related pages that exceed the budget are named in `omitted`. `ContextBundle` records completeness.
 
@@ -365,7 +365,13 @@ Hook delivery acknowledges only after stdout flush succeeds. Pending read failur
 published HOT available with a warning and no acknowledgement. Local view pointers use
 the existing immutable set cache; omitted work/pending and legacy context use private
 content-addressed JSON references under `hub-context`. Those files retain the complete
-source for the emitted pointer, including during offline delivery.
+source for the emitted pointer, including during offline delivery; their `pending` field
+is the framed pending block, one row for each note the delivery was given (every waiting
+note on the hub path, the 20 newest on the legacy path). A pending list whose ten-line
+block fits inline writes no such file, and the notes past ten show only as a count. The
+daily sweep that runs when a HOT set is installed removes one that no delivery has shown
+for 30 days; a delivery that only shows the unchanged marker does not count, and where no
+set is ever installed (legacy context without views) nothing is swept.
 
 ## Verification and context pitfalls
 

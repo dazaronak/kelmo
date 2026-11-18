@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 
@@ -155,7 +156,9 @@ def routed(args):
             return False
         return ClientProfile.selected(selected_root(args))
     if args.command == 'dream':
-        return args.action in ('run', 'apply')
+        # Dreaming runs on the server: a client root's daemon serves no dream job, and dispatch refuses it.
+        from .config import ClientProfile
+        return args.action in ('run', 'apply') and not ClientProfile.selected(selected_root(args))
     return True
 
 
@@ -220,9 +223,16 @@ def through_daemon(args, argv, launcher):
     path = daemon_client.ensure(root, kelmod=Path(launcher).parent / 'kelmod', launcher=launcher)
     from .config import ClientProfile
     op = 'edge.cli' if ClientProfile.selected(root) else 'state.cli'
-    return daemon_client.call(root, op, body, path=path,
+    # After a cut, a command that changes nothing, or one whose own key the server settles once, may go again.
+    resend = served_while_fenced(args) or (args.command in KEY_SETTLED_COMMANDS
+                                           and bool(getattr(args, 'idempotency_key', None)))
+    return daemon_client.call(root, op, body, path=path, resend=resend,
                               seconds=WAIT_CALL_SECONDS if getattr(args, 'wait', False) else 60.0)
 
+
+# Commands whose `state.cli` handler hands `--idempotency-key` to the service, which settles the key once: sent
+# again after a cut, they answer what the first send did. `register` takes the option for shared clients only.
+KEY_SETTLED_COMMANDS = frozenset({'create', 'add', 'promote'})
 
 # A `--wait` call follows the operation through its model calls.
 WAIT_CALL_SECONDS = 900.0
@@ -242,6 +252,11 @@ def served_while_fenced(args):
     return field is not None and getattr(args, field, None) in allowed
 
 
+# Standard output is process-wide: two borrowed parses at once silence it one after the other, or the second would
+# restore the first one's buffer. A parse error raises UsageError (`interface.Parser.error`) without printing.
+_SILENCED = threading.Lock()
+
+
 def run_borrowed(service, argv, sources=None, stdin=None, *, fenced=False, lease=None):
     """`state.cli` in the state core: parse and dispatch one CLI call over the core's own Service. `fenced`:
     the server profile is fenced, so only commands that change nothing are run. `lease(reads_only)`, when
@@ -249,7 +264,7 @@ def run_borrowed(service, argv, sources=None, stdin=None, *, fenced=False, lease
     need not wait for the writer, which a Dreaming pass can hold for minutes."""
     parser, commands = build_parser(__version__)
     try:
-        with redirect_stdout(io.StringIO()):
+        with _SILENCED, redirect_stdout(io.StringIO()):
             args = parser.parse_args(argv)
     except SystemExit as error:
         raise UsageError('Invalid command arguments.') from error
@@ -275,12 +290,24 @@ def _dispatch_borrowed(service, args, commands, sources, stdin):
         _BORROWED_SERVICE.reset(token)
 
 
+def borrowed_read_only(argv):
+    """True for `status` and `client status`: they read the outbox and ask the server, and change neither, so the
+    edge core runs them without holding the outbox; the reads take it only where they touch it."""
+    parser, _commands = build_parser(__version__)
+    try:
+        with _SILENCED, redirect_stdout(io.StringIO()):
+            args = parser.parse_args(argv)
+    except (SystemExit, UsageError):  # the borrowed run refuses it with its own error
+        return False
+    return args.command == 'status' or (args.command == 'client' and getattr(args, 'action', None) == 'status')
+
+
 def run_borrowed_client(client, argv, sources=None, stdin=None, *, root=None):
     """`edge.cli` in the edge core: parse and dispatch one CLI call over the core's own SharedClient, for the
     core's own client root only."""
     parser, commands = build_parser(__version__)
     try:
-        with redirect_stdout(io.StringIO()):
+        with _SILENCED, redirect_stdout(io.StringIO()):
             args = parser.parse_args(argv)
     except SystemExit as error:
         raise UsageError('Invalid command arguments.') from error
@@ -405,6 +432,9 @@ def dispatch(args, commands):
         select(config, args.project, 'codex', target, current, hook_file=args.hook_file)
         return result
     if args.command == 'dream':
+        from .config import ClientProfile
+        if ClientProfile.selected(root):
+            raise KelmoError('E_CAPABILITY', '`kelmo dream` runs on the server; the shared client does not provide it.')
         from .dreaming_cli import dispatch as dream_dispatch
         return dream_dispatch(root, args)
     if args.command == 'sync':

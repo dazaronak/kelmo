@@ -21,13 +21,14 @@ import subprocess
 import threading
 import time
 import uuid
+import weakref
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import CLIENT_FILE, ClientProfile
 from .core import wire
-from .errors import KelmoError
+from .errors import KelmoError, sqlite_busy
 from .server import NATIVE_ID, PROTOCOL, PipeReader, encode_frame
 
 # Only an unreachable or foreign server falls back to the labelled cache.
@@ -68,6 +69,11 @@ def utc_now():
     return datetime.now(UTC).isoformat(timespec='microseconds')
 
 
+_RLOCK = type(threading.RLock())
+# Cuts after which a keyed write is refused instead of sent again under its key.
+CUT_LIMIT = 3
+
+
 class Unbound(KelmoError):
     """No server verdict on this request: the launcher, the channel, hello, the authority pin, or a reply
     bound to no request. A queued write is never settled by one; it stays pending under its key."""
@@ -76,6 +82,18 @@ class Unbound(KelmoError):
 class Unsent(Unbound):
     """Refused here before a byte was written (a frame over the bound, an operation the connected server
     does not advertise); the channel stays healthy and the entry stays pending."""
+
+
+class Closed(Unsent):
+    """Nothing was written because another caller closed the channel while this request waited for its turn;
+    the channel is already dropped, and a read may go again over a new one."""
+
+
+class Late(Unsent):
+    """Nothing was written because the deadline passed while this request waited (for its deadline to be read,
+    or for another thread's write on a channel that carries several requests). A channel that carries several
+    requests stays healthy; a one-request channel whose deadline passed is closed."""
+
 
 
 def _atomic_write(path, data):
@@ -135,7 +153,19 @@ def prepare_profile(root, authority_id, command, *, sessions=None, timeout_secon
 
 
 COMPACT_MIN_FREE_BYTES = 16 * 1048576
+# A cached context no delivery has refreshed for this long is removed by the daily HOT sweep.
+CACHE_RETAIN_SECONDS = 30 * 86400
 OUTBOX_WAIT_SECONDS = 60
+# How long a compaction statement waits for another connection's lock on the outbox file: a short try, then the
+# compaction is left to a later pass.
+COMPACT_TRY_SECONDS = 0.01
+# Pages one incremental step gives back: about 11 ms of work measured on a 246.7 MB file.
+COMPACT_CHUNK_PAGES = 256
+# SQLite steps between two looks at the clock while a conversion runs.
+COMPACT_PROGRESS_STEPS = 1000
+# How long a delivery waits for the outbox file before the owner of the outbox: a writer holds it for
+# milliseconds, a rewrite longer.
+OUTBOX_FILE_TRY_SECONDS = 0.5
 REFUSED_SHOWN = 20
 
 
@@ -154,8 +184,13 @@ def outbox_stall_warning(summary, clock=None):
     if age <= OUTBOX_STALL_SECONDS:
         return None
     return (f"{summary['pending']} write(s) have waited {int(age // 60)} min to reach the server behind "
-            f"{head['op']} {head['idempotency_key']} (last refusal {head.get('last_error') or 'none'}); "
+            f"{head['op']} {head['idempotency_key']} (last reason {head.get('last_error') or 'none'}); "
             'check the server for a stuck lock or a stopped worker, then run kelmo client flush.')
+
+
+def _compaction_due(pages, free, size, min_free_bytes=COMPACT_MIN_FREE_BYTES):
+    """More than half of the file, and at least `min_free_bytes`, is free pages."""
+    return free * size >= min_free_bytes and free * 2 > pages
 
 
 def _serial(method):
@@ -168,23 +203,41 @@ def _serial(method):
     return guarded
 
 
+# What `_record` returns when the file stayed held past the pass's time left.
+_GAVE_UP = object()
+
+# What a failed read names when it knows no channel of its own: `_drop` then leaves the current one alone.
+_NO_CHANNEL = object()
+
+
 class Outbox:
     """The durable local queue; an entry exists before any byte is sent."""
 
     def __init__(self, directory):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._serial = threading.RLock()
+        # When the current `waiting` ends (monotonic), so a transaction's later lock waits share its time.
+        self._wait_until = None
         # A note is queued even while a compaction holds the file: waiting a minute beats refusing it.
         self.conn = sqlite3.connect(directory / 'outbox.sqlite3', timeout=OUTBOX_WAIT_SECONDS,
                                     check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA synchronous=FULL')
+        if self.conn.execute('PRAGMA page_count').fetchone()[0] == 0:
+            # A new outbox gives its free pages back in steps (`vacuum_step`), never by rewriting the whole file.
+            self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
         with self.conn:
+            # Another process may be opening the same older outbox: the schema is read and brought up to date
+            # under one write lock, so a column is added once.
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS entries (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE,
                 op TEXT NOT NULL, args TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at TEXT NOT NULL,
                 settled_at TEXT, outcome TEXT)''')
+            # How often kelmod's channel ended under an entry after it was sent (`SharedClient._deliver`).
+            if 'cuts' not in {row[1] for row in self.conn.execute('PRAGMA table_info(entries)')}:
+                self.conn.execute('ALTER TABLE entries ADD COLUMN cuts INTEGER NOT NULL DEFAULT 0')
             self.conn.execute('''CREATE TABLE IF NOT EXISTS transcripts (
                 provider TEXT NOT NULL, native_id TEXT NOT NULL, file_identity TEXT NOT NULL,
                 size INTEGER NOT NULL, generation INTEGER NOT NULL, PRIMARY KEY (provider, native_id))''')
@@ -200,6 +253,9 @@ class Outbox:
             self.conn.execute('''CREATE TABLE IF NOT EXISTS skips (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT, event TEXT NOT NULL,
                 native_id TEXT, reason TEXT NOT NULL, at TEXT NOT NULL)''')
+            # `state` sits after `args` in a row: without this index, counting or finding the pending head
+            # reads every queued body's pages.
+            self.conn.execute('CREATE INDEX IF NOT EXISTS entries_state ON entries (state, seq)')
             self._shed_transcript_bytes()
 
     def _shed_transcript_bytes(self, seq=None):
@@ -216,26 +272,107 @@ class Outbox:
 
     @_serial
     def compact(self, min_free_bytes=COMPACT_MIN_FREE_BYTES):
-        """Rewrite the file when more than half of it, and at least `min_free_bytes`, is free pages.
+        """Give back the free pages when more than half of the file, and at least `min_free_bytes`, is free; for
+        a client that runs on its own (`kelmo client flush` without an edge core), where nobody shares the outbox.
 
-        Settled transcript entries drop their bytes but SQLite keeps the pages, so the file only grows.
-        A busy file is left for the next flush.
-        Returns the bytes given back, 0 when nothing was due."""
-        pages, free, size = (self.conn.execute(f'PRAGMA {name}').fetchone()[0]
-                             for name in ('page_count', 'freelist_count', 'page_size'))
-        if free * size < min_free_bytes or free * 2 < pages:
+        Settled transcript entries drop their bytes but SQLite keeps the pages. An old file is rewritten once,
+        which also makes it give pages back in steps from then on; a converted one is drained. A busy file is left
+        for the next flush. Returns the bytes given back, 0 when nothing was due."""
+        # Another process's lock on the file, at any statement here, leaves the compaction to the next flush.
+        try:
+            with self.waiting(COMPACT_TRY_SECONDS):
+                pages, free, size, mode = self.compaction_state()
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise
+            return 0
+        if not _compaction_due(pages, free, size, min_free_bytes):
             return 0
         try:
-            self.conn.execute('VACUUM')
+            if mode != 2:
+                return self.convert()
+            with self.waiting(COMPACT_TRY_SECONDS):
+                self.conn.execute('PRAGMA incremental_vacuum').fetchall()
+                return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
         except sqlite3.OperationalError:
             return 0
-        return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
 
     @_serial
-    def record_skip(self, provider, event, native_id, reason):
-        with self.conn:
-            self.conn.execute('INSERT INTO skips (provider,event,native_id,reason,at) VALUES (?,?,?,?,?)',
-                              (provider, event, native_id, reason, utc_now()))
+    def compaction_state(self):
+        """(page_count, freelist_count, page_size, auto_vacuum) of the file."""
+        return tuple(self.conn.execute(f'PRAGMA {name}').fetchone()[0]
+                     for name in ('page_count', 'freelist_count', 'page_size', 'auto_vacuum'))
+
+    @_serial
+    def convert(self, copy_seconds=None, stop_when=None):
+        """Rewrite the file once in incremental mode, giving back every free page; any other caller's lock ends
+        it at once. With `copy_seconds`, a rewrite whose copy phase runs longer is stopped and rolled back
+        (SQLITE_INTERRUPT): its copy back into the file and its commit cannot be stopped, so the bound is on the
+        part that can. `stop_when`, a callable, stops the copy the same way once it answers true. Returns the
+        bytes given back."""
+        with self.waiting(COMPACT_TRY_SECONDS):
+            pages, _free, size, _mode = self.compaction_state()
+            self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+            checks = []
+            if copy_seconds is not None:
+                limit = time.monotonic() + copy_seconds
+                checks.append(lambda: time.monotonic() >= limit)
+            if stop_when is not None:
+                checks.append(stop_when)
+            if checks:
+                self.conn.set_progress_handler(lambda: any(check() for check in checks), COMPACT_PROGRESS_STEPS)
+            try:
+                self.conn.execute('VACUUM')
+            finally:
+                # Cleared before the busy timeout is set back, which the handler would interrupt too.
+                self.conn.set_progress_handler(None, 0)
+            return max(0, pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
+
+    @_serial
+    def vacuum_step(self, pages=COMPACT_CHUNK_PAGES):
+        """Give back up to `pages` free pages of a converted file; another caller's lock ends it at once. The step
+        and both counts of the free list are one transaction, so another process cannot change the list between
+        them. Returns (pages given back, free pages left)."""
+        with self.waiting(COMPACT_TRY_SECONDS), self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            before = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+            self.conn.execute(f'PRAGMA incremental_vacuum({int(pages)})').fetchall()
+            after = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+        return before - after, after
+
+    @contextmanager
+    def waiting(self, seconds):
+        """Wait at most `seconds` for another connection's lock on the file inside, then as long as before
+        (OUTBOX_WAIT_SECONDS outside any other `waiting`). Called with the outbox held."""
+        previous = self.conn.execute('PRAGMA busy_timeout').fetchone()[0]
+        outer, self._wait_until = self._wait_until, time.monotonic() + max(0, seconds)
+        self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
+        try:
+            yield
+        finally:
+            self._wait_until = outer
+            self.conn.execute(f'PRAGMA busy_timeout = {int(previous)}')
+
+    def _rest_of_wait(self):
+        """Inside `waiting`, the busy timeout cut to what is left of it: a write that waited for another writer's
+        lock waits for readers before its commit only as long as its wait has left."""
+        if self._wait_until is not None:
+            left = max(0.0, self._wait_until - time.monotonic())
+            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
+
+    def record_skip(self, provider, event, native_id, reason, seconds=OUTBOX_FILE_TRY_SECONDS):
+        """Records a session event this client deliberately did not capture. A skip is a record, never a
+        delivery: one the outbox cannot take within `seconds` (a rewrite holds it) is left out. True when
+        recorded."""
+        if not self._serial.acquire(timeout=seconds):
+            return False
+        try:
+            with self.waiting(seconds), self.conn:
+                self.conn.execute('INSERT INTO skips (provider,event,native_id,reason,at) VALUES (?,?,?,?,?)',
+                                  (provider, event, native_id, reason, utc_now()))
+            return True
+        finally:
+            self._serial.release()
 
     @_serial
     def close(self):
@@ -269,24 +406,72 @@ class Outbox:
         return [dict(row) for row in self.conn.execute("SELECT * FROM entries WHERE state='pending' ORDER BY seq")]
 
     @_serial
-    def attempt(self, key):
+    def pending_count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM entries WHERE state='pending'").fetchone()[0]
+
+    @_serial
+    def last_seq(self):
+        return self.conn.execute('SELECT COALESCE(MAX(seq), 0) FROM entries').fetchone()[0]
+
+    @_serial
+    def next_pending(self, after, through):
+        """The pending entry with the lowest seq in (after, through]: its seq, key and op, not its body."""
+        row = self.conn.execute("SELECT seq, idempotency_key, op FROM entries WHERE state='pending' "
+                                'AND seq>? AND seq<=? ORDER BY seq LIMIT 1', (after, through)).fetchone()
+        return dict(row) if row else None
+
+    @_serial
+    def body(self, seq):
+        return self.conn.execute('SELECT args FROM entries WHERE seq=?', (seq,)).fetchone()['args']
+
+    @_serial
+    def attempt(self, key, count=1):
         with self.conn:
-            self.conn.execute('UPDATE entries SET attempts=attempts+1 WHERE idempotency_key=?', (key,))
+            self.conn.execute('BEGIN IMMEDIATE')
+            self.conn.execute('UPDATE entries SET attempts=attempts+? WHERE idempotency_key=?', (count, key))
+            self._rest_of_wait()
+
+    @_serial
+    def cut(self, key):
+        """Counts one more cut under the entry and returns the count, read in the same transaction: a retry after
+        a busy file never counts one cut twice."""
+        with self.conn:
+            self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
+            cuts = self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
+            self._rest_of_wait()
+            return cuts
 
     @_serial
     def note(self, key, code):
         with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=?', (code, key))
+            self._rest_of_wait()
 
     @_serial
-    def settle(self, key, state, outcome):
+    def note_if_unset(self, key, code):
+        """The code as the entry's pending reason only when it has none: a server's refusal is never replaced."""
+        with self.conn:
+            self.conn.execute('BEGIN IMMEDIATE')
+            self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=? AND last_error IS NULL',
+                              (code, key))
+            self._rest_of_wait()
+
+    @_serial
+    def settle(self, key, state, outcome, reset=None):
+        """Settles a pending entry; `reset` (provider, native id) also forgets that transcript's sent position in
+        the same transaction, so a refusal of its base and the reset of that position are recorded together or
+        not at all; the transcript then goes again from its start with the session's next event."""
         with self.conn:
             self.conn.execute("UPDATE entries SET state=?, outcome=?, settled_at=? "
                               "WHERE idempotency_key=? AND state='pending'",
                               (state, canonical(outcome), utc_now(), key))
+            if reset is not None:
+                self._reset_transcript(*reset)
             row = self.conn.execute('SELECT seq, op FROM entries WHERE idempotency_key=?', (key,)).fetchone()
             if row is not None and row['op'] in TRANSCRIPT_OPS:
                 self._shed_transcript_bytes(row['seq'])
+            self._rest_of_wait()
 
     @_serial
     def resend(self, codes, *, apply=False):
@@ -297,11 +482,18 @@ class Outbox:
         `resent` and names its successor. Without `apply` nothing changes. The refusals are read under the
         write lock, so two runs at once never resend one note twice.
 
-        A note is sent once: a refusal whose text another queued or delivered note already carries is not
-        sent again but names that note (`duplicate`), and of several refusals with one text only the newest
-        goes out; the older ones name it too."""
+        A note is sent once: a refusal whose request another queued or delivered note already carries is not
+        sent again but names that note (`duplicate`), and of several refusals with one request only the newest
+        goes out; the older ones name it too. Two requests are the same when every argument matches, the text
+        compared without its surrounding whitespace. The targets, the file name and the budget are not
+        compared, since a refusal is often resent once its target is fixed; a different project, rule change,
+        new work page or pending flag makes another note."""
         def text(row):
-            return json.loads(row['args']).get('content', '').strip()
+            args = json.loads(row['args'])
+            same = {name: value for name, value in args.items()
+                    if name not in ('selected', 'filename', 'budget_tokens')}
+            same['content'] = args.get('content', '').strip()
+            return canonical(same)
 
         items = []
         with self.conn:
@@ -335,14 +527,62 @@ class Outbox:
                                       (canonical(dict(outcome, resent_as=key)), row['seq']))
         return [item for _, item in sorted(items, key=lambda pair: pair[0])]
 
+    def summary_within(self, seconds):
+        """The summary, or {'busy': True} when another caller holds the outbox, or another process its file,
+        longer than `seconds`."""
+        limit = time.monotonic() + max(0.0, seconds)
+        if not self._serial.acquire(timeout=max(0.0, seconds)):
+            return {'busy': True}
+        try:
+            left = max(0.0, limit - time.monotonic())
+            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
+            try:
+                # One read transaction: only its first read waits for another process's lock on the file, so
+                # the bound holds for every query of the summary.
+                self.conn.execute('BEGIN')
+                return self.summary()
+            except sqlite3.OperationalError as error:
+                if not sqlite_busy(error):
+                    raise
+                return {'busy': True}
+            finally:
+                if self.conn.in_transaction:
+                    self.conn.execute('ROLLBACK')
+                self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
+        finally:
+            self._serial.release()
+
+    @_serial
+    def dismiss(self, codes, keys, *, apply=False):
+        """Stop listing refusals the owner has read: they become `dismissed` and are never sent again.
+
+        A refusal matches when its code is in `codes` or its key in `keys`; with neither, every refusal
+        matches. Without `apply` nothing changes. The entry keeps its request, key and refusal, so the same
+        request under its key is still that entry and `resend` no longer selects it."""
+        items = []
+        with self.conn:
+            if apply:
+                self.conn.execute('BEGIN IMMEDIATE')
+            for row in self.conn.execute("SELECT * FROM entries WHERE state='refused' ORDER BY seq").fetchall():
+                outcome = json.loads(row['outcome'] or '{}')
+                if (codes or keys) and outcome.get('code') not in codes and row['idempotency_key'] not in keys:
+                    continue
+                items.append({'idempotency_key': row['idempotency_key'], 'op': row['op'],
+                              'code': outcome.get('code'), 'at': row['settled_at']})
+                if apply:
+                    self.conn.execute("UPDATE entries SET state='dismissed', outcome=? WHERE seq=?",
+                                      (canonical(dict(outcome, dismissed_at=utc_now())), row['seq']))
+        return items
+
     @_serial
     def summary(self):
         counts = {row['state']: row['n'] for row in self.conn.execute(
             'SELECT state, COUNT(*) AS n FROM entries GROUP BY state')}
         refused = [{'idempotency_key': row['idempotency_key'], 'op': row['op'], 'at': row['settled_at'],
                     **json.loads(row['outcome'])}
-                   for row in self.conn.execute("SELECT * FROM entries WHERE state='refused' ORDER BY seq DESC "
-                                                'LIMIT ?', (REFUSED_SHOWN,))][::-1]
+                   for row in self.conn.execute("SELECT idempotency_key, op, settled_at, outcome FROM entries "
+                                                "WHERE state='refused' ORDER BY seq DESC LIMIT ?",
+                                                (REFUSED_SHOWN,))][::-1]
         skipped = {row['reason']: row['n'] for row in self.conn.execute(
             'SELECT reason, COUNT(*) AS n FROM skips GROUP BY reason')}
         result = {'pending': counts.get('pending', 0), 'delivered': counts.get('delivered', 0),
@@ -354,6 +594,8 @@ class Outbox:
             result['oldest_pending'] = dict(head)
         if counts.get('resent'):
             result['resent'] = counts['resent']
+        if counts.get('dismissed'):
+            result['dismissed'] = counts['dismissed']
         if counts.get('refused', 0) > len(refused):
             # Refusals are final and only accumulate; the newest stay readable, the rest are counted.
             result['refused_total'] = counts['refused']
@@ -395,8 +637,11 @@ class Outbox:
         session starts from the beginning of the transcript. The restart count enters the next request keys,
         so the server applies the resent bytes instead of replaying the earlier answers for them."""
         with self.conn:
-            self.conn.execute("UPDATE transcripts SET sent_bytes=0, sent_sha256='', restarts=restarts+1 "
-                              "WHERE provider=? AND native_id=?", (provider, native_id))
+            self._reset_transcript(provider, native_id)
+
+    def _reset_transcript(self, provider, native_id):
+        self.conn.execute("UPDATE transcripts SET sent_bytes=0, sent_sha256='', restarts=restarts+1 "
+                          "WHERE provider=? AND native_id=?", (provider, native_id))
 
 
 class StdioChannel:
@@ -408,6 +653,7 @@ class StdioChannel:
         # The client sets `timeout` before each request, so one deadline bounds every reply.
         self.timeout = timeout
         self.grace = 5
+        self.ended = False  # set by close: a channel its own deadline ended is dropped by the client
         try:
             self.process = subprocess.Popen(list(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=subprocess.DEVNULL, close_fds=True)
@@ -419,21 +665,29 @@ class StdioChannel:
         os.set_blocking(self.process.stdin.fileno(), False)
 
     def request(self, frame):
-        # A frame too large to encode is refused here (E_LIMIT) before a byte is written, so the
-        # healthy channel stays open.
-        data = encode_frame(frame)
+        # The deadline starts before the frame is encoded, so a slow encode counts against it. A frame too large to
+        # encode is refused here (E_LIMIT) before a byte is written, so the healthy channel stays open.
         deadline = time.monotonic() + self.timeout
+        data = encode_frame(frame)
+        self.wrote = False  # set once the frame is out: a closed pipe after it is not "nothing written"
         try:
             self._write(data, deadline)
+            self.wrote = True
             return self.reader.frame(max(0.0, deadline - time.monotonic()))
         except OSError as error:
             self.grace = 0
             self.close()
+            if not self.wrote and getattr(error, 'partial', None) is False:
+                # The server was gone before a byte of the frame went out: the request is unsent.
+                raise Closed('E_TRANSPORT', 'The shared-memory channel closed before the request.') from error
             raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.') from error
         except KelmoError as error:
             # A channel that missed its deadline or broke framing is ended now, never waited for.
             self.grace = 0
             self.close()
+            if not self.wrote and getattr(error, 'partial', None) is False:
+                # Not a byte of the frame went out before the deadline: the request is unsent.
+                raise Late('E_TRANSPORT', 'The channel did not take the request before its deadline.') from error
             raise KelmoError('E_TRANSPORT', str(error)) from error
 
     def _write(self, data, deadline):
@@ -441,18 +695,27 @@ class StdioChannel:
         frame cut short is never followed by another on the same stream."""
         descriptor = self.process.stdin.fileno()
         view = memoryview(data)
+        written = 0
         with selectors.DefaultSelector() as selector:
             selector.register(descriptor, selectors.EVENT_WRITE)
             while view:
                 left = deadline - time.monotonic()
                 if left <= 0 or not selector.select(left):
-                    raise KelmoError('E_TRANSPORT', 'The channel did not accept the request before its deadline.')
+                    error = KelmoError('E_TRANSPORT', 'The channel did not accept the request before its deadline.')
+                    error.partial = written > 0
+                    raise error
                 try:
-                    view = view[os.write(descriptor, view):]
+                    count = os.write(descriptor, view)
+                    written += count
+                    view = view[count:]
                 except BlockingIOError:
                     continue
+                except OSError as error:
+                    error.partial = written > 0
+                    raise
 
     def close(self):
+        self.ended = True
         if self.process.poll() is None:
             try:
                 self.process.stdin.close()
@@ -477,6 +740,9 @@ class MuxChannel:
     # Requests in a row that ran out of time with no reply to anyone in between: the channel is then taken
     # for stuck and replaced, although its process still runs.
     STALL_TIMEOUTS = 3
+    # How long a write waits for room in the pipe before it looks again whether the channel was closed: the close
+    # takes the pipe only from a writer that has stopped, so it waits about this long for one.
+    WRITE_POLL_SECONDS = 0.05
 
     def __init__(self, command, timeout):
         self.timeout = timeout
@@ -485,6 +751,7 @@ class MuxChannel:
         self._state_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._flag_lock = threading.Lock()  # around setting `_closed` and each os.write that checked it
         self._waiters = {}
         self._hello = threading.Event()
         self._hello_result = None
@@ -547,8 +814,8 @@ class MuxChannel:
     def request(self, frame, timeout=None):
         duration = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + max(0.0, duration)
-        if not self.alive:
-            raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.')
+        if not self.alive:  # closed before this request: nothing of it is written
+            raise Closed('E_TRANSPORT', 'The shared-memory channel closed.')
         call_id = uuid.uuid4().hex
         has_key = 'idempotency_key' in frame
         key = frame.get('idempotency_key')
@@ -569,15 +836,21 @@ class MuxChannel:
         waiter = {'event': threading.Event(), 'header': None, 'body': None, 'error': None}
         with self._state_lock:
             if self._failed or self._closed:
-                raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.')
+                raise Closed('E_TRANSPORT', 'The shared-memory channel closed.')
             self._waiters[call_id] = waiter
         try:
             self._write(data, deadline)
+        except ValueError:  # the pipe was closed before the frame: nothing written, the caller may go again
+            with self._state_lock:
+                self._waiters.pop(call_id, None)
+            raise
         except OSError as error:
+            # The peer was gone before a byte of the frame went out (`_write` wraps an error after part of it):
+            # the request is unsent, and the channel is not used again.
             self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
             self.grace = 0
             self.close()
-            raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.') from error
+            raise Closed('E_TRANSPORT', 'The shared-memory channel closed before the request.') from error
         except KelmoError as error:
             if getattr(error, 'partial', False):
                 self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
@@ -586,7 +859,8 @@ class MuxChannel:
                 raise KelmoError('E_TRANSPORT', 'The shared-memory channel closed.') from error
             with self._state_lock:
                 self._waiters.pop(call_id, None)
-            raise KelmoError('E_TRANSPORT', 'The channel did not reply before its deadline.') from error
+            # Not a byte of this frame went out: the request is unsent and may go again.
+            raise Late('E_TRANSPORT', 'The channel did not take the request before its deadline.') from error
         if not waiter['event'].wait(max(0.0, deadline - time.monotonic())):
             with self._state_lock:
                 expired = self._waiters.pop(call_id, None) is not None
@@ -595,7 +869,7 @@ class MuxChannel:
                 cancel = {'v': wire.VERSION, 'kind': 'cancel', 'id': call_id, 'body_type': 'json'}
                 try:
                     self._write(wire.encode(cancel, None), time.monotonic() + 0.05)
-                except OSError:
+                except (OSError, ValueError):  # ValueError: another thread closed the pipe meanwhile
                     self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
                     self.grace = 0
                     self.close()
@@ -623,23 +897,58 @@ class MuxChannel:
         }
 
     def _write(self, data, deadline):
-        descriptor = self.process.stdin.fileno()
+        """Writes one frame within the deadline, the wait for another thread's write included. A deadline missed
+        before any byte went out raises E_TRANSPORT with `partial` False; the channel stays usable. The pipe's
+        descriptor is used only under the write lock, which `close` takes before it closes the pipe, so no byte goes
+        to a number another open may have taken; a close stops the write between two looks at the pipe."""
         view = memoryview(data)
-        written = 0
-        with self._write_lock, selectors.DefaultSelector() as selector:
-            selector.register(descriptor, selectors.EVENT_WRITE)
-            while view:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or not selector.select(remaining):
-                    error = KelmoError('E_TRANSPORT', 'The channel did not accept the request before its deadline.')
-                    error.partial = written > 0
-                    raise error
-                try:
-                    count = os.write(descriptor, view)
+        written, held = 0, False
+        try:
+            held = self._write_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+            if not held:
+                error = KelmoError('E_TRANSPORT', 'The channel was busy with another write past the deadline.')
+                error.partial = False
+                raise error
+            if self._closed:
+                raise ValueError('The channel was closed before the frame.')
+            descriptor = self.process.stdin.fileno()
+            with selectors.DefaultSelector() as selector:
+                selector.register(descriptor, selectors.EVENT_WRITE)
+                while view:
+                    if self._closed:
+                        if not written:
+                            raise ValueError('The channel was closed before the frame.')
+                        error = KelmoError('E_TRANSPORT', 'The channel was closed during the request.')
+                        error.partial = True
+                        raise error
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        error = KelmoError('E_TRANSPORT',
+                                           'The channel did not accept the request before its deadline.')
+                        error.partial = written > 0
+                        raise error
+                    if not selector.select(min(remaining, self.WRITE_POLL_SECONDS)) or self._closed:
+                        continue  # a close that came during the wait is seen at the top, before another byte
+                    with self._flag_lock:
+                        # `close` sets the flag under this lock: once it is set, no byte goes out.
+                        if self._closed:
+                            continue
+                        try:
+                            count = os.write(descriptor, view)
+                        except BlockingIOError:
+                            continue
                     written += count
                     view = view[count:]
-                except BlockingIOError:
-                    continue
+        except (ValueError, OSError) as error:
+            if not written:
+                raise  # closed before the frame: nothing written
+            # Closed under the frame after part of it went out: the server may hold a prefix.
+            partial = KelmoError('E_TRANSPORT', 'The channel closed while the request was being written.')
+            partial.partial = True
+            raise partial from error
+        finally:
+            if held:
+                self._write_lock.release()
 
     def _read(self):
         reader = wire.FrameReader()
@@ -693,23 +1002,25 @@ class MuxChannel:
         with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
+            with self._flag_lock:  # waits at most for one non-blocking os.write in progress
+                self._closed = True
             self._mark_dead(KelmoError('E_TRANSPORT', 'The shared-memory channel closed.'))
-            if self.process.poll() is None:
+            # A write in progress sees `_closed` within WRITE_POLL_SECONDS and lets the lock go.
+            with self._write_lock:
                 try:
                     self.process.stdin.close()
                 except (OSError, ValueError):
                     pass
+            if self.process.poll() is None:
                 try:
                     self.process.wait(timeout=self.grace)
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait()
-            for stream in (self.process.stdin, self.process.stdout):
-                try:
-                    stream.close()
-                except (OSError, ValueError):
-                    pass
+            try:
+                self.process.stdout.close()
+            except (OSError, ValueError):
+                pass
 
 
 def _git(cwd, *args, deadline=None):
@@ -874,8 +1185,19 @@ def _sealed(record, key, authority_id):
     return generation
 
 
+def _caller_key(key, client):
+    """A key the caller chose. `#resend` belongs to `kelmo client resend`, whose chains the server follows from a
+    refused key: a new key with it could answer that refusal with a note the client never linked to it. The key of
+    an entry already queued (a resend asked for its answer) is the caller's to repeat; only such a key is looked up
+    in `client`'s outbox."""
+    if key is not None and '#resend' in str(key) and client.outbox.get(key) is None:
+        raise KelmoError('E_INPUT', 'A new idempotency key may not contain `#resend`; `kelmo client resend` uses it.')
+    return key
+
+
 class Busy(KelmoError):
-    """The owner of the outbox did not free it within the caller's deadline; nothing was done."""
+    """The owner of the outbox did not free it within the caller's deadline. Nothing was done, unless the
+    message names what was."""
 
     def __init__(self, message):
         super().__init__('E_BUSY', message)
@@ -884,14 +1206,29 @@ class Busy(KelmoError):
 
 # How long a client that found a kelmo-client/1 server waits before it offers kelmo/2 again.
 LEGACY_RETRY_SECONDS = 300
+# A read cut under it reconnects for at most this long, pausing 0.25 s, then doubling up to 2 s between tries.
+RECONNECT_SECONDS = 15.0
+RECONNECT_FIRST_PAUSE = 0.25
+RECONNECT_LAST_PAUSE = 2.0
+
+
+def _replayable_read(op):
+    """Whether a request that went through `call` may be sent again after a cut: only an operation the
+    server's table marks as a read (some, such as `reconcile`, go through `call` and still write) and the
+    state core does not run as a write (`graph_rebuild` rewrites the graph index)."""
+    from .core.operations import REPLAY_READ, by_name
+    from .core.state_core import WRITES
+    found = by_name().get('state.' + op)
+    return found is not None and found.replay == REPLAY_READ and op not in WRITES
 
 
 class SharedClient:
     """One client root: its outbox, its cache and at most one open channel.
 
     `multiplex` (the edge core) opens a channel that carries several requests at once, when the server speaks
-    kelmo/2: reads then overlap on it, and only what touches the outbox takes `_lock`. Against a
-    kelmo-client/1 server, and without `multiplex`, every request takes `_lock` and they go one at a time."""
+    kelmo/2: reads then overlap on it. Against a kelmo-client/1 server, and without `multiplex`, requests take
+    turns on the channel. What touches the outbox takes `_lock`; a read takes it only to wait for its turn on a
+    channel that carries one request at a time (`call`), and the status reads (`read_aside`) never do."""
 
     def __init__(self, profile, channel_factory=None, *, multiplex=False):
         if not isinstance(profile, ClientProfile):
@@ -914,7 +1251,7 @@ class SharedClient:
         kelmo-client/1, which is remembered for a while so every reconnect does not start two processes."""
         if self._multiplex and time.monotonic() >= self._legacy_until:
             try:
-                return MuxChannel(self.profile.command, self.remaining())
+                return MuxChannel(self.profile.command, self._left_before_send())
             except KelmoError as error:
                 if not getattr(error, 'legacy', False):
                     raise
@@ -936,6 +1273,28 @@ class SharedClient:
     @property
     def _connecting(self):
         return self._guard('_connect_lock', threading.RLock)
+
+    def _turn_for(self, channel):
+        """Held around one request on `channel` when it carries one at a time. Each channel has its own, so a
+        probe's hello on its own channel never holds the client's channel."""
+        turns = self._guard('_turns', weakref.WeakKeyDictionary)
+        with self._guard('_turns_lock', threading.Lock):
+            turn = turns.get(channel)
+            if turn is None:
+                turn = turns[channel] = threading.RLock()
+        return turn
+
+    @contextmanager
+    def _waiting_for(self, lock, what):
+        """Holds `lock`, waiting no longer than the active deadline. A caller whose deadline passes while
+        another holds it is refused before a byte is written, so the channel stays as it is."""
+        seconds = self._left_before_send()  # passed before the wait began: nothing written, the channel stays
+        if not lock.acquire(timeout=seconds):
+            raise Unsent('E_BUSY', f'The deadline passed while another request {what}.')
+        try:
+            yield
+        finally:
+            lock.release()
 
     def pause(self, seconds):
         """How a wait sleeps between polls; the edge core replaces it to lend its owner lock out meanwhile."""
@@ -967,6 +1326,10 @@ class SharedClient:
         finally:
             self._deadline = previous
 
+    def time_left(self):
+        """Seconds left before the active deadline, not capped by the profile timeout; None without one."""
+        return None if self._deadline is None else max(0.0, self._deadline - time.monotonic())
+
     def remaining(self):
         """Seconds left before the active deadline (the profile timeout without one); refused at zero."""
         if self._deadline is None:
@@ -975,6 +1338,19 @@ class SharedClient:
         if left <= 0:
             raise Unbound('E_TRANSPORT', 'The deadline passed before the shared kelmo server answered.')
         return min(self.profile.timeout_seconds, left)
+
+    def _deadline_passed(self):
+        """True once the active deadline has passed; never without one."""
+        deadline = self._deadline
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _left_before_send(self):
+        """Seconds left before the active deadline, read before any byte of a request is written: a deadline that
+        already passed is `Late`, so a queued write keeps its attempts and its earlier refusal."""
+        try:
+            return self.remaining()
+        except Unbound as error:
+            raise Late(error.code, str(error)) from error
 
     def __enter__(self):
         return self
@@ -990,8 +1366,18 @@ class SharedClient:
     def _drop(self, failed=None):
         """Closes the open channel. With `failed`, the channel a request just failed on: one that carries
         several requests stays while it is alive and answering (one request's deadline is not the channel's
-        end), and a channel another thread has already replaced is left alone."""
-        with self._connecting:
+        end), and a channel another thread has already replaced is left alone. A caller with a failed channel
+        waits for another thread's connect no longer than its deadline: the channel is then marked so that no
+        caller is handed it again."""
+        if failed is None:
+            self._connecting.acquire()
+        elif not self._connecting.acquire(timeout=self._seconds_left()):
+            if getattr(failed, 'concurrent', False) and failed.alive and not failed.stalled:
+                return
+            failed.dropped = True
+            self._close_channel(failed)
+            return
+        try:
             channel = self._channel
             if channel is None or (failed is not None and channel is not failed):
                 return
@@ -999,11 +1385,46 @@ class SharedClient:
                     and not channel.stalled):
                 return
             self._channel = None
-        if isinstance(channel, StdioChannel) and self._deadline is not None:
-            channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
-        channel.close()
+        finally:
+            self._connecting.release()
+        self._close_channel(channel)
 
-    def _send(self, channel, op, args, key):
+    def _close_channel(self, channel):
+        """Closes a dropped channel, never under another thread's request on a one-request channel: that request
+        closes it when it ends, so the drop does not wait for it (a delivery drops under the owner of the outbox)."""
+        if hasattr(channel, 'grace') and self._deadline is not None:
+            channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
+        if getattr(channel, 'concurrent', False):
+            channel.close()
+            return
+        turn = self._turn_for(channel)
+        if not turn.acquire(blocking=False):
+            channel.close_when_free = True
+            self._close_if_marked(channel)  # the request may have let it go between the wait and the mark
+            return
+        try:
+            channel.close()
+            channel.close_when_free = False  # marked earlier: closed now, nobody closes it again
+        finally:
+            turn.release()
+
+    def _close_if_marked(self, channel):
+        """Closes a channel marked to be closed once free, if nobody's request is on it now."""
+        if not getattr(channel, 'close_when_free', False):
+            return
+        turn = self._turn_for(channel)
+        if not turn.acquire(blocking=False):
+            return  # a request is on it: that request closes it when it ends
+        try:
+            if not getattr(channel, 'close_when_free', False):
+                return  # another caller closed it between the look above and the turn
+            if not getattr(channel, 'closed', False):
+                channel.close()
+            channel.close_when_free = False  # a stdio channel keeps no `closed` flag: the mark says it is done
+        finally:
+            turn.release()
+
+    def _send(self, channel, op, args, key, *, server=None):
         """One request: (True, result) or (False, error) for a reply bound to it; Unbound otherwise.
 
         Only a reply naming this request ID carries a server verdict, and its refusal must say whether it
@@ -1014,7 +1435,8 @@ class SharedClient:
             frame['idempotency_key'] = key
         if op != 'hello':
             # Version skew: an operation the connected server does not advertise is never delivered.
-            offered = self.server.get('operations') if isinstance(self.server, dict) else None
+            server = self.server if server is None else server
+            offered = server.get('operations') if isinstance(server, dict) else None
             if not isinstance(offered, list) or op not in offered:
                 raise Unsent('E_CAPABILITY', f'The connected shared kelmo server does not offer `{op}`; '
                                              'nothing was sent and a queued write stays pending.')
@@ -1022,18 +1444,41 @@ class SharedClient:
             encode_frame(frame)
         except KelmoError as error:
             raise Unsent(error.code, str(error)) from error
+        if getattr(channel, 'dropped', False):
+            # Marked by a caller that could not wait for the connect, after `_connect` handed it out.
+            raise Closed('E_TRANSPORT', 'The shared-memory channel was dropped before the request.')
         try:
             if getattr(channel, 'concurrent', False):
                 # Several threads share the channel: each request carries its own deadline.
-                reply = channel.request(frame, timeout=self.remaining())
+                reply = channel.request(frame, timeout=self._left_before_send())
             else:
-                if isinstance(channel, StdioChannel):
-                    channel.timeout = self.remaining()
-                reply = channel.request(frame)
+                try:
+                    with self._waiting_for(self._turn_for(channel), 'held the channel'):
+                        if getattr(channel, 'dropped', False):  # marked while this request waited for the turn
+                            raise Closed('E_TRANSPORT', 'The shared-memory channel was dropped before the request.')
+                        try:
+                            if isinstance(channel, StdioChannel):  # nothing written yet: the channel stays
+                                channel.timeout = self._left_before_send()
+                            reply = channel.request(frame)
+                        finally:
+                            if getattr(channel, 'close_when_free', False):  # dropped while this request was on it
+                                if hasattr(channel, 'grace'):
+                                    channel.grace = max(0, min(channel.grace, self._seconds_left()))
+                                channel.close()
+                                channel.close_when_free = False  # closed: the check after the turn has nothing to do
+                finally:
+                    self._close_if_marked(channel)  # marked just after the check above
         except Unbound:
             raise
         except KelmoError as error:
             raise Unbound(error.code, str(error)) from error
+        except ValueError as error:
+            # A channel closed by another thread: before the frame went out, nothing was written and a read may go
+            # again; after it, the request may have reached the server and is not sent again.
+            self._drop(channel)
+            if getattr(channel, 'wrote', False):
+                raise Unbound('E_TRANSPORT', 'The shared-memory channel closed after the request was sent.') from error
+            raise Closed('E_TRANSPORT', 'The shared-memory channel was closed before the request.') from error
         if (not isinstance(reply, dict) or set(reply) - REPLY_FIELDS or reply.get('protocol') != PROTOCOL
                 or type(reply.get('ok')) is not bool):
             raise Unbound('E_TRANSPORT', 'The shared-memory reply is outside the protocol.')
@@ -1048,63 +1493,155 @@ class SharedClient:
         if not isinstance(error.get('code'), str) or type(error.get('retryable')) is not bool:
             raise Unbound('E_TRANSPORT', 'The refusal names no server code or retryability.')
         return False, {'code': error['code'], 'message': str(error.get('message', '')),
-                       'retryable': error['retryable']}
+                       'retryable': error['retryable'], 'cut': error.get('cut') is True}
 
     def _connect(self):
-        # One thread connects; the others wait for its channel instead of starting their own.
-        with self._connecting:
+        # One thread connects; the others wait for its channel instead of starting their own, each no longer than
+        # its own deadline.
+        with self._waiting_for(self._connecting, 'was connecting'):
             channel = self._channel
+            if channel is not None and getattr(channel, 'dropped', False):
+                self._channel = channel = None  # dropped by a caller that could not wait for the connect
             if channel is not None and getattr(channel, 'concurrent', False) and not channel.alive:
                 # It ended between two requests: the next one starts a new channel, as after a failed request.
                 self._channel = channel = None
             if channel is None:
-                self.remaining()
-                try:
-                    channel = self._factory()
-                except Unbound:
-                    raise
-                except KelmoError as error:
-                    raise Unbound(error.code, str(error)) from error
-                except OSError as error:
-                    raise Unbound('E_TRANSPORT',
-                                  'The configured shared-memory channel could not be started.') from error
-                try:
-                    ok, hello = self._send(channel, 'hello', {}, None)
-                    if not ok:
-                        raise Unbound(hello['code'], hello['message'])
-                    if not isinstance(hello, dict) or hello.get('authority_id') != self.profile.authority_id:
-                        raise Unbound('E_AUTHORITY', 'The channel reached a different memory authority than '
-                                                     'this client is pinned to; nothing was sent.')
-                except BaseException:
-                    if isinstance(channel, StdioChannel):
-                        channel.grace = 0
-                    channel.close()
-                    raise
-                self._channel, self.server = channel, hello
+                channel, hello = self._hello_channel()
+                # The hello first: a status read takes the channel without the connect lock, and the channel's
+                # operations must already be known when it sees the channel.
+                self.server = hello
+                self._channel = channel
             return channel
+
+    def _hello_channel(self):
+        """A new channel whose hello named this client's authority, and that hello; closed on any failure."""
+        self._left_before_send()
+        try:
+            channel = self._factory()
+        except Unbound:
+            raise
+        except KelmoError as error:
+            raise (Late if self._deadline_passed() else Unbound)(error.code, str(error)) from error
+        except OSError as error:
+            raise Unbound('E_TRANSPORT', 'The configured shared-memory channel could not be started.') from error
+        try:
+            ok, hello = self._send(channel, 'hello', {}, None)
+            if not ok:
+                raise Unbound(hello['code'], hello['message'])
+            if not isinstance(hello, dict) or hello.get('authority_id') != self.profile.authority_id:
+                raise Unbound('E_AUTHORITY', 'The channel reached a different memory authority than '
+                                             'this client is pinned to; nothing was sent.')
+        except BaseException as error:
+            if isinstance(channel, StdioChannel):
+                channel.grace = 0
+            channel.close()
+            if isinstance(error, Unbound) and not isinstance(error, Unsent) and self._deadline_passed():
+                # The hello ran out of the deadline: nothing of a queued write was sent.
+                raise Late(error.code, str(error)) from error
+            raise
+        return channel, hello
 
     def call(self, op, args=None):
         """A read: no outbox, and a transport failure is reported, never answered from the cache. Over a
-        channel that carries several requests it does not wait for the owner of the outbox."""
+        channel that carries several requests it does not wait for the owner of the outbox; on one that carries
+        a single request it keeps the owner while it waits, so a hook queued meanwhile goes before a delivery.
+        `kelmo status` reads with `read_aside` instead.
+
+        A read whose channel fails under it (the server's kelmod restarting, the bridge to it cut) is sent
+        once more within the active deadline: a read has no effect to repeat. Reconnecting starts the
+        profile's command again, so it is tried with a growing pause for at most RECONNECT_SECONDS."""
+        limit = time.monotonic() + self.remaining()
+        try:
+            return self._read_once(op, args)
+        except KelmoError as error:
+            if (isinstance(error, Unsent) or error.code != 'E_TRANSPORT' or time.monotonic() >= limit
+                    or not _replayable_read(op)):
+                raise
+            failed = error
+        # Only the channel this read failed on: another thread may already have opened the next one.
+        self._drop(getattr(failed, 'channel', None) or _NO_CHANNEL)
+        window, pause = min(limit, time.monotonic() + RECONNECT_SECONDS), RECONNECT_FIRST_PAUSE
+        while True:
+            try:
+                with self.deadline(window - time.monotonic()):
+                    self._connect()
+                break
+            except Unbound as error:
+                if error.code != 'E_TRANSPORT':  # a refusal (another authority, a bad profile) stays one
+                    raise
+                failed = error
+                if time.monotonic() + pause >= window:
+                    raise failed from None
+                self.pause(pause)
+                pause = min(pause * 2, RECONNECT_LAST_PAUSE)
+        with self.deadline(limit - time.monotonic()):
+            return self._read_once(op, args, resend=True)
+
+    def _read_once(self, op, args, resend=False):
         if self._multiplex:
             channel = self._connect()
             if getattr(channel, 'concurrent', False):
                 return self._read(op, args, channel)
-        with self._lock:
-            return self._read(op, args)
-
-    def _read(self, op, args, channel=None):
+        if not resend or not isinstance(self._lock, _RLOCK):  # the edge core's gate bounds its own wait
+            with self._lock:
+                return self._read(op, args)
+        # The resend waits for another request only until the deadline the first try left it.
+        if not self._lock.acquire(timeout=self.remaining()):
+            raise Unsent('E_TRANSPORT', 'The deadline passed while another request held the shared client.')
         try:
-            if channel is None:
-                channel = self._connect()
-            ok, value = self._send(channel, op, args or {}, None)
-        except Unbound as error:
-            if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
-                self._drop(channel)
-            raise
+            return self._read(op, args)
+        finally:
+            self._lock.release()
+
+    def read_aside(self, op, args=None):
+        """A read that must not make the client's writes wait for it (`kelmo status`): over the open kelmo/2
+        channel, which carries several requests at once, when there is one; otherwise over a channel of its own,
+        closed after, so it holds neither the connect nor the turn of the channel a delivery needs."""
+        channel = self._channel
+        if (channel is not None and getattr(channel, 'concurrent', False) and channel.alive
+                and not getattr(channel, 'dropped', False)):
+            try:
+                return self._read(op, args, channel=channel)
+            except Closed:
+                pass  # closed under this read before it went out: once more, on a channel of its own
+            except Unbound:
+                if channel.alive:
+                    raise
+                # The channel ended under this read after it went out: a read is safe to repeat, on a channel of
+                # its own.
+        channel, hello = self._hello_channel()
+        try:
+            ok, value = self._send(channel, op, args or {}, None, server=hello)
+        finally:
+            if hasattr(channel, 'grace'):
+                channel.grace = max(0, min(channel.grace, self._seconds_left()))
+            channel.close()
         if ok:
             return value
         raise KelmoError(value['code'], value['message'])
+
+    def _read(self, op, args, channel=None):
+        given = channel is not None
+        try:
+            if channel is None:
+                channel = self._connect()
+            try:
+                ok, value = self._send(channel, op, args or {}, None)
+            except Closed:
+                if given:
+                    raise
+                # Closed under this read while it waited for its turn: once more, over a new channel.
+                channel = self._connect()
+                ok, value = self._send(channel, op, args or {}, None)
+        except Unbound as error:
+            if channel is not None and (not isinstance(error, Unsent) or getattr(channel, 'ended', False)):
+                self._drop(channel)  # a local refusal leaves the channel healthy, unless it ended the channel
+            raise
+        if ok:
+            return value
+        refused = KelmoError(value['code'], value['message'])
+        refused.channel = channel  # SharedClient.call drops this channel, and only this one, before a resend
+        raise refused
 
     def submit(self, op, args, key):
         """Persist first, then deliver everything queued in order; report this entry's state."""
@@ -1136,90 +1673,248 @@ class SharedClient:
                     time.sleep(0.05)
             yield True
 
-    def flush(self):
+    def flush(self, *, wait_for_holder=True):
         """Deliver pending entries in order. A bound refusal the server calls final settles its entry; a
         retryable one, or no verdict at all (launcher, channel, hello, a reply bound to no request), leaves
-        it and everything after it pending and stops. `reached` says whether a channel was open."""
-        if self._multiplex and not self.outbox.pending():
-            # Nothing to deliver: a read that only wants its own writes sent first does not wait for the
-            # owner of the outbox. Whoever is delivering holds entries that are still pending.
-            return {'delivered': 0, 'refused': [], 'pending': 0, 'stopped': None, 'reached': None}
+        it and everything after it pending and stops. `reached` says whether a channel was open. `pending`
+        is None when the outbox stayed held. Without `wait_for_holder` (a background pass), the outbox is taken
+        with one try: an outbox another caller holds, or waits for, ends the call with `E_BUSY` at once, leaving
+        the delivery to that caller."""
+        if self._multiplex:
+            pending = self._pending_within()
+            if pending == 0:
+                # Nothing to deliver: a read that only wants its own writes sent first does not wait for the
+                # owner of the outbox. Whoever is delivering holds entries that are still pending.
+                return {'delivered': 0, 'refused': [], 'pending': 0, 'stopped': None, 'reached': None}
+            if pending is None and not wait_for_holder:
+                return {'delivered': 0, 'refused': [], 'pending': None, 'stopped': 'E_BUSY', 'reached': None}
+        if not wait_for_holder:
+            if not self._lock.acquire(blocking=False):
+                return {'delivered': 0, 'refused': [], 'pending': pending if self._multiplex else None,
+                        'stopped': 'E_BUSY', 'reached': None}
+            try:
+                result = self._flush_owned()
+            finally:
+                self._lock.release()
+        else:
+            try:
+                with self._lock:
+                    result = self._flush_owned()
+            except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
+                result = 'E_BUSY'
+        if isinstance(result, str):
+            # Stopped before delivering: the pending count is read with the owner released, so a caller queued for
+            # it does not wait for that read.
+            return {'delivered': 0, 'refused': [], 'pending': self._pending_within(), 'stopped': result,
+                    'reached': None}
+        return result
+
+    def _flush_owned(self):
+        """The delivery once the owner of the outbox is held: one flusher per client root across processes.
+        Returns the delivery's result, or the code it stopped on before delivering."""
         try:
-            with self._lock:
-                try:
-                    with self._flush_lock() as acquired:
-                        if acquired:
-                            return self._deliver()
-                        stopped = 'E_BUSY'
-                except Unbound as error:  # the deadline passed before the lock was even tried
-                    stopped = error.code
-        except Busy:  # another owner of the outbox is delivering; the entries stay pending for it
-            stopped = 'E_BUSY'
-        return {'delivered': 0, 'refused': [], 'pending': len(self.outbox.pending()),
-                'stopped': stopped, 'reached': None}
+            with self._flush_lock() as acquired:
+                if acquired:
+                    return self._deliver()
+                return 'E_BUSY'
+        except Unbound as error:  # the deadline passed before the lock was even tried
+            return error.code
+
+    def _pending_within(self):
+        """The number of pending entries, waiting for the outbox only briefly and never past the active deadline.
+        None when another caller keeps it (a rewrite in this process, or another process's lock on the file)."""
+        wait = min(OUTBOX_FILE_TRY_SECONDS, self._seconds_left())
+        if not self.outbox._serial.acquire(timeout=wait):
+            return None
+        try:
+            with self.outbox.waiting(wait):
+                return self.outbox.pending_count()
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise  # a disk or I/O error is reported as itself
+            return None
+        finally:
+            self.outbox._serial.release()
+
+    def _before_send(self, method, *args):
+        """An outbox read or write a pass makes before it sends, or a note it may skip: another thread in the
+        outbox, or another process's lock on the file, is waited for no longer than the active deadline, then
+        the pass ends with E_BUSY and nothing is sent."""
+        if not self.outbox._serial.acquire(timeout=self._seconds_left()):
+            raise Unsent('E_BUSY', 'Another caller held the outbox past this pass\'s deadline; the entry stays '
+                                   'pending.')
+        try:
+            with self.outbox.waiting(self._seconds_left()):
+                return method(*args)
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise  # a disk or I/O error is reported as itself
+            raise Unsent('E_BUSY', 'Another process held the outbox file past this pass\'s deadline; the entry '
+                                   'stays pending.') from error
+        finally:
+            self.outbox._serial.release()
+
+    def _record(self, method, *args):
+        """What a server's answer changes in the outbox (settle, cut): waited for no longer than the pass's time
+        left, as the steps before a send. Then `_GAVE_UP`: the entry stays pending, and the server, which keeps its
+        answer under the key, gives the same answer again on a later pass, with no second effect."""
+        try:
+            return self._before_send(method, *args)
+        except Unsent:
+            return _GAVE_UP
+
+    def _if_free(self, method, *args):
+        """A note or a correction of the attempt count, made only while the file is free within the deadline: the
+        entry stays pending either way, so a held file never keeps the pass past its deadline."""
+        try:
+            self._before_send(method, *args)
+        except Unsent:
+            pass  # the file is still held: the entry keeps what it had
+
+    def _note_if_free(self, key, code):
+        """The code of a retryable answer, noted only while the file is free within the deadline."""
+        self._if_free(self.outbox.note, key, code)
 
     def _deliver(self):
+        """One pass over what was queued when it began, one entry in memory at a time: an entry queued
+        meanwhile waits for the next pass, so a pass never chases a steady writer."""
         delivered, refused, stopped, reached = 0, [], None, None
-        for entry in self.outbox.pending():
-            key = entry['idempotency_key']
-            channel = None
+        try:
+            high = self._before_send(self.outbox.last_seq)
+        except Unsent as error:
+            return {'delivered': 0, 'refused': [], 'pending': None, 'stopped': error.code, 'reached': None}
+        after = 0
+        while True:
+            try:
+                entry = self._before_send(self.outbox.next_pending, after, high)
+            except Unsent as error:
+                # Our own held outbox may hide a write of ours still queued: no reached server, as below.
+                stopped, reached = error.code, False if reached else reached
+                break
+            if entry is None:
+                break
+            after, key, args = entry['seq'], entry['idempotency_key'], None
+            channel, attempted, sending = None, False, False
             try:
                 channel = self._connect()
                 reached = True
-                self.outbox.attempt(key)
-                ok, value = self._send(channel, entry['op'], json.loads(entry['args']), key)
+                # The body is read only once a channel is open: a pass that reaches no server reads none. It is
+                # read before the attempt is counted, so an entry whose body could not be read counts none.
+                args = json.loads(self._before_send(self.outbox.body, after))
+                self._before_send(self.outbox.attempt, key)
+                attempted = sending = True
+                ok, value = self._send(channel, entry['op'], args, key)
             except Unbound as error:
-                if not isinstance(error, Unsent) and channel is not None:  # a local refusal leaves the channel healthy
-                    self._drop(channel)
-                self.outbox.note(key, error.code)
-                stopped, reached = error.code, bool(reached)
+                if channel is not None and (not isinstance(error, Unsent) or getattr(channel, 'ended', False)):
+                    self._drop(channel)  # a local refusal leaves the channel healthy, unless it ended the channel
+                if isinstance(error, (Closed, Unsent)) and attempted:
+                    self._if_free(self.outbox.attempt, key, -1)  # refused here before a byte went out: no attempt
+                held = isinstance(error, Unsent) and error.code == 'E_BUSY'
+                if isinstance(error, (Closed, Late)):
+                    # A channel closed or dropped before the request, or a deadline that passed before it went out:
+                    # nothing about this entry failed, so an earlier refusal stays. When no channel came up in time
+                    # (the server's hello did not answer), an entry with no refusal is told why it still waits.
+                    if channel is None:
+                        self._if_free(self.outbox.note_if_unset, key, error.code)
+                elif held:
+                    # A busy turn or a busy outbox keeps no refusal either. A pass that gave up while another
+                    # caller's hello did not answer (no channel came up for it) tells an entry with no refusal why
+                    # it still waits.
+                    if channel is None:
+                        self._if_free(self.outbox.note_if_unset, key, 'E_TRANSPORT')
+                else:
+                    self._note_if_free(key, error.code)
+                # Our own held outbox kept our queued writes back: no reached server, so the session hook serves
+                # the cache rather than a context that may predate them.
+                stopped, reached = error.code, bool(reached) and not (held and not sending)
                 break
             if ok:
-                self.outbox.settle(key, 'delivered', value)
+                if self._record(self.outbox.settle, key, 'delivered', value) is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False  # our own held outbox: the entry stays pending
+                    break
                 delivered += 1
                 continue
-            if value['retryable']:
-                self.outbox.note(key, value['code'])
+            if value['cut']:
+                # The bridge lost its server after the write was sent and ended: the next pass opens a new
+                # bridge and sends it again under its key. A write that ends the channel every time it is
+                # delivered would hold every write behind it, so on its CUT_LIMIT-th cut it is refused with its
+                # effect unknown, as a cut write was before.
+                self._drop(channel)
+                cuts = self._record(self.outbox.cut, key)
+                if cuts is _GAVE_UP:
+                    stopped, reached = 'E_BUSY', False
+                    break
+                if cuts < CUT_LIMIT:
+                    self._note_if_free(key, value['code'])
+                    stopped = value['code']
+                    break
+                value = dict(value, message=f'{value["message"]} It was cut {CUT_LIMIT} times and is not sent '
+                                            'again.')
+            elif value['retryable']:
+                if value['code'] == 'E_TRANSPORT':
+                    # The bridge may have lost its server and ended: the next pass opens a new one. A server's
+                    # own retryable E_TRANSPORT is no cut and leaves the write pending.
+                    self._drop(channel)
+                self._note_if_free(key, value['code'])
                 stopped = value['code']
                 break
             outcome = {'code': value['code'], 'message': value['message']}
-            self.outbox.settle(key, 'refused', outcome)
-            if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE':
-                # The server does not hold the bytes this piece followed: the next capture starts over.
-                args = json.loads(entry['args'])
-                self.outbox.reset_transcript(args['provider'], args['native_id'])
+            # The server does not hold the bytes a refused piece followed: the next capture starts over, recorded
+            # with the refusal itself.
+            reset = ((args['provider'], args['native_id'])
+                     if entry['op'] == 'session_append' and value['code'] == 'E_CAPTURE_BASE' else None)
+            if self._record(self.outbox.settle, key, 'refused', outcome, reset) is _GAVE_UP:
+                stopped, reached = 'E_BUSY', False
+                break
             refused.append(dict(outcome, idempotency_key=key, op=entry['op']))
-        return {'delivered': delivered, 'refused': refused, 'pending': len(self.outbox.pending()),
+        return {'delivered': delivered, 'refused': refused, 'pending': self._pending_within(),
                 'stopped': stopped, 'reached': reached}
 
     def _entry_result(self, entry):
+        # A resent refusal is answered as the note it went out as (`client resend`), down a chain of resends.
+        seen = set()
+        while entry['state'] == 'resent' and entry['idempotency_key'] not in seen:
+            seen.add(entry['idempotency_key'])
+            successor = self.outbox.get(json.loads(entry['outcome'] or '{}').get('resent_as') or '')
+            if successor is None:
+                break
+            entry = successor
         if entry['state'] == 'delivered':
             return json.loads(entry['outcome'])
-        if entry['state'] == 'refused':
+        if entry['state'] in ('refused', 'dismissed'):
             outcome = json.loads(entry['outcome'])
             raise KelmoError(outcome['code'], outcome['message'])
         return {'queued': True, 'accepted': False, 'op': entry['op'], 'idempotency_key': entry['idempotency_key'],
                 'pending_reason': entry['last_error'],
-                'next_step': 'Stored in the local outbox; it is delivered under the same key on the next '
-                             'successful contact and is not accepted until then.'}
+                'next_step': 'Stored in the local outbox; it is delivered, or the server\'s answer to it is '
+                             'recorded, under the same key on the next successful contact.'}
 
     def local_status(self):
-        return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary()}
+        return {'profile': self.profile.as_dict(), 'outbox': self.outbox.summary_within(self._seconds_left())}
+
+    def _seconds_left(self):
+        """Seconds left before the active deadline, 0 once it has passed (never raises)."""
+        try:
+            return self.remaining()
+        except Unbound:
+            return 0.0
 
     def probe(self):
-        """Verify a fresh channel's identity without flushing any queued write."""
+        """Verify a fresh channel's identity without flushing any queued write. The probe opens a channel of
+        its own and closes it, so it neither waits for the owner of the outbox nor replaces the channel the
+        client's requests use."""
         began = time.monotonic()
-        with self._lock:
-            self._drop()
-            self._connect()
-            hello = self.server
-            return {'verified': True, 'authority_id': hello['authority_id'],
-                    'client_id': hello.get('client_id'), 'machine_tag': hello.get('machine_tag'),
-                    'fenced': hello.get('fenced'), 'writer_id': hello.get('writer_id'),
-                    'writer_epoch': hello.get('writer_epoch'),
-                    'archive': hello.get('archive'),
-                    'elapsed_ms': round((time.monotonic() - began) * 1000, 1),
-                    'writes_flushed': False}
+        channel, hello = self._hello_channel()
+        if hasattr(channel, 'grace') and self._deadline is not None:
+            channel.grace = max(0, min(channel.grace, self._deadline - time.monotonic()))
+        channel.close()
+        return {'verified': True, 'authority_id': hello['authority_id'],
+                'client_id': hello.get('client_id'), 'machine_tag': hello.get('machine_tag'),
+                'fenced': hello.get('fenced'), 'writer_id': hello.get('writer_id'),
+                'writer_epoch': hello.get('writer_epoch'),
+                'archive': hello.get('archive'),
+                'elapsed_ms': round((time.monotonic() - began) * 1000, 1),
+                'writes_flushed': False}
 
     # Context delivery
 
@@ -1283,25 +1978,51 @@ class SharedClient:
                                        'was cached.') from failure
         if hub_set is not None:
             from .hub_delivery import install_set
-            directory = install_set(self.profile.state / 'hot', hub_set)
+            directory = install_set(self.profile.state / 'hot', hub_set, keep=self._cached_set_names)
             record['hub_set_name'] = directory.name
             result['hub_directory'] = str(directory)
         _atomic_write(self._cache_path(key), canonical(record).encode('utf-8'))
         return result
 
+    def _cached_set_names(self):
+        """The HOT sets the cached contexts were delivered with: a stale delivery reads its set by name. Run by
+        the daily HOT sweep, it also removes a cached context no delivery, online or from the cache, has used for
+        CACHE_RETAIN_SECONDS: its binding has not been used since, and its set loses the hold."""
+        names, now = set(), time.time()
+        for path in (self.profile.state / 'cache').glob('context-*.json'):
+            try:
+                if now - path.stat().st_mtime > CACHE_RETAIN_SECONDS:
+                    path.unlink()
+                    continue
+                name = json.loads(path.read_bytes()).get('hub_set_name')
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(name, str):
+                names.add(name)
+        return names
+
     def _stale(self, key, binding, error):
-        with self.files:
+        from .hub_delivery import reading
+        with self.files, reading(self.profile.state / 'hot'):
             return self._cached(key, binding, error)
 
     def _cached(self, key, binding, error):
         path = self._cache_path(key)
         reason = ('the connected shared kelmo server does not advertise the required capability'
                   if error.code == 'E_CAPABILITY' else 'the shared kelmo server could not be reached')
+        missing = KelmoError(error.code, reason[0].upper() + reason[1:] + '; this repository has no '
+                             'cached generation, so nothing was delivered.')
         if not path.is_file():
-            raise KelmoError(error.code, reason[0].upper() + reason[1:] + '; this repository has no '
-                            'cached generation, so nothing was delivered.')
+            raise missing
         try:
-            record = json.loads(path.read_bytes())
+            data = path.read_bytes()
+        except FileNotFoundError:
+            raise missing from None  # another process's daily sweep removed it after the look above
+        except OSError as failure:
+            raise KelmoError('E_CACHE', 'The cached generation failed its hash or binding check; '
+                                       'nothing was delivered.') from failure
+        try:
+            record = json.loads(data)
             generation = _sealed(record, key, self.profile.authority_id)
         except (OSError, KeyError, TypeError, ValueError, UnicodeError) as failure:
             raise KelmoError('E_CACHE', 'The cached generation failed its hash or binding check; '
@@ -1332,7 +2053,16 @@ class SharedClient:
             _, current = _set_metadata(self.profile.state / 'hot', 'current')
             if current['enrollment_revision'] != record['hub_revision']:
                 raise KelmoError('E_CACHE', 'Cached context predates the latest enrollment revision.')
-            snapshot = read_set(self.profile.state / 'hot', record.get('hub_set_name', 'current'))
+            name = record.get('hub_set_name', 'current')
+            try:
+                snapshot = read_set(self.profile.state / 'hot', name)
+            except KelmoError:
+                if name == 'current' or os.path.lexists(self.profile.state / 'hot' / name):
+                    raise
+                # The retention sweep removed the set this cached context names: no cached generation is left.
+                raise KelmoError(error.code, reason[0].upper() + reason[1:] + '; the HOT set of this '
+                                 "repository's cached generation was removed, so there is no cached generation "
+                                 'and nothing was delivered.') from None
             if (snapshot['generation'] != record['hub_generation']
                     or snapshot['enrollment_revision'] != record['hub_revision']
                     or snapshot['manifest_sha256'] != generation.manifest_sha256):
@@ -1341,6 +2071,10 @@ class SharedClient:
                           pending=record['pending'],
                           hub_directory=str(self.profile.state / 'hot' / record.get('hub_set_name', 'current')),
                           hub_work_pointer=str(path) + ' (hub_work field; STALE CACHE)')
+        try:
+            os.utime(path)  # used now: the daily sweep measures a cached context's age from its last use
+        except OSError:
+            pass
         return result
 
     # Transcript capture
@@ -1460,7 +2194,7 @@ class ClientService:
             args['new_work'] = new_work
         if pending is not None:
             args['pending'] = pending
-        key = idempotency_key or digest(canonical(['create', args]))
+        key = _caller_key(idempotency_key, self.client) or digest(canonical(['create', args]))
         result = self.client.submit('create', args, key)
         return self.wait(result, wait_timeout) if wait and 'operation' in result else result
 
@@ -1510,7 +2244,14 @@ class ClientService:
                 if ((not following['terminal'] or (following['state'] == 'failed'
                                                    and following.get('error_code') == 'E_BUSY'))
                         and following['state'] != 'captured'):
-                    self.client.pause(max(0, min(0.25, limit - time.monotonic())))
+                    try:
+                        self.client.pause(max(0, min(0.25, limit - time.monotonic())))
+                    except Busy as error:
+                        if limit - time.monotonic() <= 0:
+                            continue  # the wait's own deadline ended it: reported as a timed-out wait
+                        raise Busy(f'{error} Operation {operation["id"]} was accepted; kelmo trace '
+                                   f'{operation["id"]} shows it, and the same command again reuses its '
+                                   'idempotency key.') from error
 
     def _capture(self, content, filename, role, intent, idempotency_key, supersedes):
         if intent not in ('archive', 'promote'):
@@ -1518,7 +2259,8 @@ class ClientService:
         if not isinstance(content, str):
             raise KelmoError('E_INPUT', 'Source must contain text within the one MiB intake limit.')
         # The same identity a local capture without a key derives from its input.
-        key = idempotency_key or digest(canonical(['capture', digest(content), filename, role, intent, supersedes]))
+        key = _caller_key(idempotency_key, self.client) or digest(
+            canonical(['capture', digest(content), filename, role, intent, supersedes]))
         return self.client.submit('capture', {'content': content, 'filename': filename, 'role': role,
                                               'promote': intent == 'promote', 'supersedes': supersedes}, key), key
 
@@ -1536,7 +2278,8 @@ class ClientService:
         args = {'targets': list(targets), 'kind': kind, 'summary': summary}
         if not apply:
             return self.client.call('register_preview', args)
-        return self.client.submit('register', args, idempotency_key or digest(canonical(['register', args])))
+        return self.client.submit('register', args,
+                                  _caller_key(idempotency_key, self.client) or digest(canonical(['register', args])))
 
     def page_index(self, projects=None):
         return self.client.call('pages', {'projects': projects})
@@ -1549,7 +2292,8 @@ class ClientService:
                                                   'selected': list(selected)})
 
     def status(self):
-        return dict(self.client.call('status'), outbox=self.client.outbox.summary())
+        server = self.client.read_aside('status')
+        return dict(server, outbox=self.client.outbox.summary_within(self.client._seconds_left()))
 
     def trace(self, operation_id):
         return self.client.call('trace', {'operation_id': operation_id})
@@ -1584,7 +2328,7 @@ class ClientService:
             checked = ActionUpdate.from_dict(update).to_dict()
         except (TypeError, ValueError) as error:
             raise KelmoError('E_INPUT', 'Provide a complete ActionUpdate with an exact evidence reference.') from error
-        return self.client.submit('state_apply', {'update': checked}, idempotency_key)
+        return self.client.submit('state_apply', {'update': checked}, _caller_key(idempotency_key, self.client))
 
     def graph_query(self, **kwargs):
         return self.client.call('graph_query', {'params': kwargs})
@@ -1675,7 +2419,8 @@ def hook(client, action, payload, provider=None, *, flusher=None, acknowledge=No
                     # No open channel after the flush stopped (unreachable, lock held elsewhere, deadline,
                     # a dropped channel): the cache, not a second attempt.
                     unreachable = Unbound(flushed['stopped'], 'The shared kelmo server could not be reached '
-                                                              'in time, or the local outbox could not be read.')
+                                                              'in time, or the local outbox was busy or could not '
+                                                              'be read.')
                 delivered = client.context(payload.get('cwd'), unreachable=unreachable, binding=binding)
                 context = _session_context(client, payload, delivered, binding, provider, acknowledge, action)
         except (KelmoError, OSError, ValueError, sqlite3.Error) as error:
@@ -1771,11 +2516,20 @@ def dispatch(root, args, read_source, client=None):
             if args.action == 'flush':
                 # The detached flusher, outside any hook deadline, also gives back the space settled
                 # transcript pieces left behind.
+                # Under an edge core its deliverer gives the space back in steps, never under this command's
+                # hold on the outbox; a client running on its own compacts here.
+                edge = getattr(client, 'compactor', None)
+                if edge is not None:
+                    edge.wake()
+                    return dict(client.flush(), compacted=0)
                 return dict(client.flush(), compacted=client.outbox.compact())
             if args.action == 'resend':
                 items = client.outbox.resend(tuple(args.code or ('E_INPUT',)), apply=args.apply)
                 result = {'applied': args.apply, 'resent': items}
                 return dict(result, flushed=client.flush()) if args.apply and items else result
+            if args.action == 'dismiss':
+                return {'applied': args.apply,
+                        'dismissed': client.outbox.dismiss(tuple(args.code), tuple(args.key), apply=args.apply)}
             result = client.local_status()
             if getattr(args, 'probe', False):
                 result['connection'] = client.probe()

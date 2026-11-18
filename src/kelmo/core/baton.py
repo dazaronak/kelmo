@@ -6,6 +6,7 @@ it again (re-entrant). Every release checks that no journal transaction is open,
 spans two holders; `released()` lets go for a model call and takes it back afterwards.
 """
 import threading
+import time
 from contextlib import contextmanager, nullcontext
 
 
@@ -27,21 +28,29 @@ class Baton:
         """True when the calling thread holds the baton."""
         return self._holder == threading.get_ident()
 
-    def _take(self, interactive):
+    def _take(self, interactive, until=None):
+        """Takes the baton; with `until` (monotonic) only until then, answering whether it was taken."""
         me = threading.get_ident()
         with self._condition:
             if self._holder == me:
                 self._depth += 1
-                return
+                return True
             if interactive:
                 self._interactive_waiting += 1
             try:
                 while self._holder is not None or (not interactive and self._interactive_waiting):
-                    self._condition.wait()
+                    if until is None:
+                        self._condition.wait()
+                        continue
+                    left = until - time.monotonic()
+                    if left <= 0:
+                        return False
+                    self._condition.wait(left)
             finally:
                 if interactive:
                     self._interactive_waiting -= 1
             self._holder, self._depth = me, 1
+            return True
 
     def _give(self):
         with self._condition:
@@ -60,9 +69,12 @@ class Baton:
             raise BatonError('A journal transaction was open when the baton was released; it was rolled back.')
 
     @contextmanager
-    def hold(self, *, interactive=True):
-        """Holds the baton for the block. `interactive=False` for a job step, which yields to writers."""
-        self._take(interactive)
+    def hold(self, *, interactive=True, until=None):
+        """Holds the baton for the block. `interactive=False` for a job step, which yields to writers. With
+        `until` (monotonic), a baton still held by another thread then is E_BUSY."""
+        if not self._take(interactive, until):
+            from ..errors import KelmoError
+            raise KelmoError('E_BUSY', 'The state core\'s writer stayed busy past this call\'s deadline; retry.')
         try:
             yield
         finally:

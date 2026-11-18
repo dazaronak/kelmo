@@ -274,7 +274,7 @@ The foundation is extended as follows:
   - Request settlement and its source outcome commit in one journal transaction.
   - A budget refusal predictable at admission is diagnosed before an intent is prepared, and stays retryable. A later environment change can still block recovery until repaired.
   - Installing the live harness hook that calls capture, and a shared transport, belong to later work.
-- **Mandatory delivery.** Startup context (HOT and `KnowledgeReader.context`) delivers whole, once, every person page and every page holding a mandatory record, selected by one helper. The `person` project listing keeps its own meaning. Overflow refuses.
+- **Mandatory delivery.** Startup context (HOT and `KnowledgeReader.context`) delivers whole, once, every person page and every page holding a mandatory record, selected by one helper; HOT drops the fact and source labels of their fact rows, and the editor's context keeps them. The `person` project listing keeps its own meaning. Overflow refuses.
 - **Pinned history.** A historical generation is found only in manifests reachable from HEAD. A commit that deleted the manifest is skipped; matching but invalid evidence and an unmeasured pin both refuse.
 
 Current integration boundaries:
@@ -361,12 +361,16 @@ Bounded, source-backed discovery over newly archived evidence and the committed 
 Journal tables `dream_state`, `dream_findings` and `dream_runs` are initialized on first use,
 preserving the journal schema for vaults that never dream.
 
-- Bounded evidence intake: `Dreaming._changed_evidence` reads operations strictly after a durable
-  cursor (`dream_state.cursor`), ordered by `created_at` and `id`. Only operations in durable stage
-  `archived` or `applied` are admitted. In-flight operations that are neither archived nor applied
-  stop the cursor scan; the cursor never passes incomplete intake. Dreaming's own notes (filename
-  starting with `dreaming-` or recorded in `dream_findings.note_operation_id`) are skipped and never
-  treated as evidence.
+- Bounded evidence intake: `Dreaming._changed_evidence` reads operations in the order of their
+  first `archived` or `applied` journal event (`events.sequence`), strictly after a durable cursor
+  (`dream_state.cursor`, `{"sequence": N}`). An operation without such an event has no place in that
+  order, so in-flight or resting intake never holds the cursor; it is read once it is archived.
+  Purged operations (a `purged` event) are left out, and `_packet` passes a forgotten or purged
+  record. Dreaming's own notes (filename starting with `dreaming-` or recorded in
+  `dream_findings.note_operation_id`) are skipped and never treated as evidence. A 0.3.1 cursor
+  `[created_at, id]` is converted once, with a `seen` list of operations that build already read; an
+  operation at or before it with a `failed` event before its first durable event is not in `seen` and is
+  read again, since 0.3.1 may have passed it unread.
 - Pinned context and budget: `Dreaming._packet` gathers evidence text via `Service.show` and calls
   `Dreaming._related` to find related non-person pages citing the evidence archive IDs, followed
   by their graph neighbours. Evidence items whose cost exceeds `budget_tokens` are recorded in
@@ -502,9 +506,11 @@ disposition tracking, step-by-step verified import into schema-2 vaults, and tai
   raise `E_IMPORT`.
 - Cutover baseline and tail: `snapshot.mark_cutover(control)` requires verified import completion and
   writes `.import/cutover.json`, recording snapshot ID, archive record census, Git HEAD, journal
-  operations, action requests and timestamp. `snapshot.tail(control)` inspects writes accepted after
-  cutover: new archive record versions, Git commits beyond the baseline HEAD, and new or updated journal
-  operations and action requests.
+  operations, action requests, session state, visibility markers (`hidden`, the forgotten records) and
+  timestamp. `snapshot.tail(control)` inspects writes accepted after cutover: new archive record versions,
+  Git commits beyond the baseline HEAD, new or updated journal operations and action requests, changed
+  session tables, and records forgotten after the cutover (`hidden`; for a baseline without `hidden`, the
+  markers later than its timestamp).
 - Rollback prevention and forward recovery: `snapshot.rollback_check(control)` raises `KelmoError('E_TAIL', ...)`
   when any post-cutover writes exist, refusing rollback to the pre-cutover snapshot. Post-cutover
   disaster recovery uses `snapshot.forward_recover(control, snapshot, destination, roots=...)`. It
@@ -587,7 +593,6 @@ here retain the reviewed proposal names. StateAPI publication,
 full retrieval/backfill, scoped semantic publication and shared transport are
 implemented. Native isolation, installed-client delivery and deployment acceptance
 need their own target-environment receipts.
-
 
 Chunk-index maintenance is exposed through `kelmo admin backfill` and `reembed`;
 it is not run implicitly after model selection. A broker service must report
