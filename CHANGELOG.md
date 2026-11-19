@@ -329,6 +329,13 @@ entry here.
   transcript piece's base and the reset of that transcript's sent position are recorded together; the
   transcript goes again from its start with the session's next event. A session start whose writes were held
   back this way gets the cached context, as when the server cannot be reached.
+- These waits for the outbox file, and a capture hook's wait for the journal, are now timed by the clock.
+  SQLite's own lock timeout adds up the pauses it asks for, not the time that passed, so where the system wakes
+  sleeping processes late (macOS does this to a process running in the background) a 1 second wait could last
+  more than 2 seconds. A wait now ends at the first look at the clock after its time is up. A write whose
+  commit meets a reader keeps its place in line while it tries again, so a reader that comes later cannot get
+  in first. A session end that has no time left for another attempt answers at once instead of after one more
+  pause.
 - The edge daemon's delivery pass no longer waits for a caller that holds the outbox. With writes pending, it
   takes the outbox only while nobody holds it or waits for it; otherwise it ends at once, leaving the writes
   to that caller, and looks again a second later. Before, it waited up to five seconds each pass behind a long

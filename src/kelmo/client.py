@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .config import CLIENT_FILE, ClientProfile
 from .core import wire
-from .errors import KelmoError, sqlite_busy
+from .errors import KelmoError, retry_busy, sqlite_busy
 from .server import NATIVE_ID, PROTOCOL, PipeReader, encode_frame
 
 # Only an unreachable or foreign server falls back to the labelled cache.
@@ -203,6 +203,20 @@ def _serial(method):
     return guarded
 
 
+def _unit(method):
+    """A `_serial` call that is one read, or one whole transaction committed through `_commit_within`. Inside
+    `waiting`, where SQLite does not wait, one that meets another connection's lock is run again, whole, until the
+    wait ends: its transaction rolled back first, so running it again repeats nothing."""
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._serial:
+            until = self._wait_until
+            if until is None:
+                return method(self, *args, **kwargs)
+            return retry_busy(lambda: method(self, *args, **kwargs), until)
+    return guarded
+
+
 # What `_record` returns when the file stayed held past the pass's time left.
 _GAVE_UP = object()
 
@@ -291,28 +305,37 @@ class Outbox:
         try:
             if mode != 2:
                 return self.convert()
+
+            def drain():  # one transaction, as a drain step: its commit keeps its claim on the file while it waits
+                with self.conn:
+                    self.conn.execute('BEGIN IMMEDIATE')
+                    self.conn.execute('PRAGMA incremental_vacuum').fetchall()
+                    left = self.conn.execute('PRAGMA page_count').fetchone()[0]
+                    self._commit_within()
+                return (pages - left) * size
+
             with self.waiting(COMPACT_TRY_SECONDS):
-                self.conn.execute('PRAGMA incremental_vacuum').fetchall()
-                return (pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
+                return self._within(drain)
         except sqlite3.OperationalError:
             return 0
 
-    @_serial
+    @_unit
     def compaction_state(self):
         """(page_count, freelist_count, page_size, auto_vacuum) of the file."""
         return tuple(self.conn.execute(f'PRAGMA {name}').fetchone()[0]
                      for name in ('page_count', 'freelist_count', 'page_size', 'auto_vacuum'))
 
-    @_serial
     def convert(self, copy_seconds=None, stop_when=None):
         """Rewrite the file once in incremental mode, giving back every free page; any other caller's lock ends
         it at once. With `copy_seconds`, a rewrite whose copy phase runs longer is stopped and rolled back
         (SQLITE_INTERRUPT): its copy back into the file and its commit cannot be stopped, so the bound is on the
         part that can. `stop_when`, a callable, stops the copy the same way once it answers true. Returns the
-        bytes given back."""
-        with self.waiting(COMPACT_TRY_SECONDS):
+        bytes given back. Held like a `_serial` call, but never run again whole: it is several statements."""
+        with self._serial, self.waiting(COMPACT_TRY_SECONDS):
+            # Each statement is tried again on its own: a VACUUM that met a lock has not begun, and one that ran is
+            # never run again for a later read that meets one.
             pages, _free, size, _mode = self.compaction_state()
-            self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+            self._within(lambda: self.conn.execute('PRAGMA auto_vacuum=INCREMENTAL'))
             checks = []
             if copy_seconds is not None:
                 limit = time.monotonic() + copy_seconds
@@ -322,54 +345,82 @@ class Outbox:
             if checks:
                 self.conn.set_progress_handler(lambda: any(check() for check in checks), COMPACT_PROGRESS_STEPS)
             try:
-                self.conn.execute('VACUUM')
+                # VACUUM runs in no transaction of ours: a lock refuses it whole, before it copies anything, and it
+                # starts again from the beginning without holding the file between tries.
+                self._within(lambda: self.conn.execute('VACUUM'))
             finally:
                 # Cleared before the busy timeout is set back, which the handler would interrupt too.
                 self.conn.set_progress_handler(None, 0)
-            return max(0, pages - self.conn.execute('PRAGMA page_count').fetchone()[0]) * size
+            left = self._within(lambda: self.conn.execute('PRAGMA page_count').fetchone()[0])
+            return max(0, pages - left) * size
 
     @_serial
     def vacuum_step(self, pages=COMPACT_CHUNK_PAGES):
         """Give back up to `pages` free pages of a converted file; another caller's lock ends it at once. The step
         and both counts of the free list are one transaction, so another process cannot change the list between
         them. Returns (pages given back, free pages left)."""
-        with self.waiting(COMPACT_TRY_SECONDS), self.conn:
-            self.conn.execute('BEGIN IMMEDIATE')
-            before = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
-            self.conn.execute(f'PRAGMA incremental_vacuum({int(pages)})').fetchall()
-            after = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
-        return before - after, after
+        def step():
+            with self.conn:
+                self.conn.execute('BEGIN IMMEDIATE')
+                before = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+                self.conn.execute(f'PRAGMA incremental_vacuum({int(pages)})').fetchall()
+                after = self.conn.execute('PRAGMA freelist_count').fetchone()[0]
+                self._commit_within()
+            return before - after, after
+
+        with self.waiting(COMPACT_TRY_SECONDS):
+            return self._within(step)
 
     @contextmanager
     def waiting(self, seconds):
-        """Wait at most `seconds` for another connection's lock on the file inside, then as long as before
-        (OUTBOX_WAIT_SECONDS outside any other `waiting`). Called with the outbox held."""
+        """Wait at most `seconds`, by the clock, for another connection's lock on the file inside, never past an
+        enclosing `waiting`; then as long as before (OUTBOX_WAIT_SECONDS outside any `waiting`). SQLite itself
+        does not wait meanwhile (busy timeout 0): an outbox call is run again until the wait ends (`_serial`),
+        and a commit that meets a reader is tried again on its own (`_commit_within`). Called with the outbox
+        held."""
         previous = self.conn.execute('PRAGMA busy_timeout').fetchone()[0]
-        outer, self._wait_until = self._wait_until, time.monotonic() + max(0, seconds)
-        self.conn.execute(f'PRAGMA busy_timeout = {max(0, int(seconds * 1000))}')
+        limit = time.monotonic() + max(0, seconds)
+        outer = self._wait_until
+        self.conn.execute('PRAGMA busy_timeout = 0')
         try:
+            self._wait_until = limit if outer is None else min(outer, limit)
             yield
         finally:
             self._wait_until = outer
             self.conn.execute(f'PRAGMA busy_timeout = {int(previous)}')
 
-    def _rest_of_wait(self):
-        """Inside `waiting`, the busy timeout cut to what is left of it: a write that waited for another writer's
-        lock waits for readers before its commit only as long as its wait has left."""
+    def _within(self, step):
+        """`step()` run again, inside `waiting`, after each lock it meets until the wait ends; outside, once."""
+        if self._wait_until is None:
+            return step()
+        return retry_busy(step, self._wait_until)
+
+    def _commit_within(self):
+        """Inside `waiting`, the open transaction's commit, made here and not as the `with` ends: a commit that
+        meets a reader stays open with the writer's claim on the file, so trying it again waits for that reader
+        alone and lets no new reader in, until the wait ends. Outside `waiting`, nothing: the transaction commits
+        as its `with` ends, SQLite waiting as before."""
         if self._wait_until is not None:
-            left = max(0.0, self._wait_until - time.monotonic())
-            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
+            retry_busy(self.conn.commit, self._wait_until)
 
     def record_skip(self, provider, event, native_id, reason, seconds=OUTBOX_FILE_TRY_SECONDS):
         """Records a session event this client deliberately did not capture. A skip is a record, never a
         delivery: one the outbox cannot take within `seconds` (a rewrite holds it) is left out. True when
         recorded."""
-        if not self._serial.acquire(timeout=seconds):
+        limit = time.monotonic() + max(0.0, seconds)
+        if not self._serial.acquire(timeout=max(0.0, seconds)):
             return False
-        try:
-            with self.waiting(seconds), self.conn:
+
+        def insert():
+            with self.conn:
                 self.conn.execute('INSERT INTO skips (provider,event,native_id,reason,at) VALUES (?,?,?,?,?)',
                                   (provider, event, native_id, reason, utc_now()))
+                self._commit_within()
+
+        try:
+            # What waiting for another thread in the outbox took counts against the same `seconds`.
+            with self.waiting(max(0.0, limit - time.monotonic())):
+                self._within(insert)
             return True
         finally:
             self._serial.release()
@@ -396,68 +447,68 @@ class Outbox:
         self.conn.execute('INSERT INTO entries (idempotency_key,op,args,fingerprint,state,created_at) '
                           "VALUES (?,?,?,?, 'pending', ?)", (key, op, canonical(args), fingerprint, utc_now()))
 
-    @_serial
+    @_unit
     def get(self, key):
         row = self.conn.execute('SELECT * FROM entries WHERE idempotency_key=?', (key,)).fetchone()
         return dict(row) if row else None
 
-    @_serial
+    @_unit
     def pending(self):
         return [dict(row) for row in self.conn.execute("SELECT * FROM entries WHERE state='pending' ORDER BY seq")]
 
-    @_serial
+    @_unit
     def pending_count(self):
         return self.conn.execute("SELECT COUNT(*) FROM entries WHERE state='pending'").fetchone()[0]
 
-    @_serial
+    @_unit
     def last_seq(self):
         return self.conn.execute('SELECT COALESCE(MAX(seq), 0) FROM entries').fetchone()[0]
 
-    @_serial
+    @_unit
     def next_pending(self, after, through):
         """The pending entry with the lowest seq in (after, through]: its seq, key and op, not its body."""
         row = self.conn.execute("SELECT seq, idempotency_key, op FROM entries WHERE state='pending' "
                                 'AND seq>? AND seq<=? ORDER BY seq LIMIT 1', (after, through)).fetchone()
         return dict(row) if row else None
 
-    @_serial
+    @_unit
     def body(self, seq):
         return self.conn.execute('SELECT args FROM entries WHERE seq=?', (seq,)).fetchone()['args']
 
-    @_serial
+    @_unit
     def attempt(self, key, count=1):
         with self.conn:
             self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET attempts=attempts+? WHERE idempotency_key=?', (count, key))
-            self._rest_of_wait()
+            self._commit_within()
 
-    @_serial
+    @_unit
     def cut(self, key):
         """Counts one more cut under the entry and returns the count, read in the same transaction: a retry after
         a busy file never counts one cut twice."""
         with self.conn:
             self.conn.execute('UPDATE entries SET cuts=cuts+1 WHERE idempotency_key=?', (key,))
             cuts = self.conn.execute('SELECT cuts FROM entries WHERE idempotency_key=?', (key,)).fetchone()[0]
-            self._rest_of_wait()
+            self._commit_within()
             return cuts
 
-    @_serial
+    @_unit
     def note(self, key, code):
         with self.conn:
             self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=?', (code, key))
-            self._rest_of_wait()
+            self._commit_within()
 
-    @_serial
+    @_unit
     def note_if_unset(self, key, code):
         """The code as the entry's pending reason only when it has none: a server's refusal is never replaced."""
         with self.conn:
             self.conn.execute('BEGIN IMMEDIATE')
             self.conn.execute('UPDATE entries SET last_error=? WHERE idempotency_key=? AND last_error IS NULL',
                               (code, key))
-            self._rest_of_wait()
+            self._commit_within()
 
-    @_serial
+    @_unit
     def settle(self, key, state, outcome, reset=None):
         """Settles a pending entry; `reset` (provider, native id) also forgets that transcript's sent position in
         the same transaction, so a refusal of its base and the reset of that position are recorded together or
@@ -471,7 +522,7 @@ class Outbox:
             row = self.conn.execute('SELECT seq, op FROM entries WHERE idempotency_key=?', (key,)).fetchone()
             if row is not None and row['op'] in TRANSCRIPT_OPS:
                 self._shed_transcript_bytes(row['seq'])
-            self._rest_of_wait()
+            self._commit_within()
 
     @_serial
     def resend(self, codes, *, apply=False):
@@ -533,22 +584,24 @@ class Outbox:
         limit = time.monotonic() + max(0.0, seconds)
         if not self._serial.acquire(timeout=max(0.0, seconds)):
             return {'busy': True}
-        try:
-            left = max(0.0, limit - time.monotonic())
-            self.conn.execute(f'PRAGMA busy_timeout = {int(left * 1000)}')
+
+        def read():
+            # One read transaction: only its first read waits for another process's lock on the file, so the
+            # bound holds for every query of the summary.
             try:
-                # One read transaction: only its first read waits for another process's lock on the file, so
-                # the bound holds for every query of the summary.
                 self.conn.execute('BEGIN')
                 return self.summary()
-            except sqlite3.OperationalError as error:
-                if not sqlite_busy(error):
-                    raise
-                return {'busy': True}
             finally:
                 if self.conn.in_transaction:
                     self.conn.execute('ROLLBACK')
-                self.conn.execute(f'PRAGMA busy_timeout = {OUTBOX_WAIT_SECONDS * 1000}')
+
+        try:
+            with self.waiting(max(0.0, limit - time.monotonic())):
+                return self._within(read)
+        except sqlite3.OperationalError as error:
+            if not sqlite_busy(error):
+                raise
+            return {'busy': True}
         finally:
             self._serial.release()
 
@@ -574,7 +627,7 @@ class Outbox:
                                       (canonical(dict(outcome, dismissed_at=utc_now())), row['seq']))
         return items
 
-    @_serial
+    @_unit
     def summary(self):
         counts = {row['state']: row['n'] for row in self.conn.execute(
             'SELECT state, COUNT(*) AS n FROM entries GROUP BY state')}
@@ -1724,10 +1777,12 @@ class SharedClient:
         """The number of pending entries, waiting for the outbox only briefly and never past the active deadline.
         None when another caller keeps it (a rewrite in this process, or another process's lock on the file)."""
         wait = min(OUTBOX_FILE_TRY_SECONDS, self._seconds_left())
+        limit = time.monotonic() + wait
         if not self.outbox._serial.acquire(timeout=wait):
             return None
         try:
-            with self.outbox.waiting(wait):
+            # What waiting for another thread in the outbox took counts against the same wait.
+            with self.outbox.waiting(max(0.0, limit - time.monotonic())):
                 return self.outbox.pending_count()
         except sqlite3.OperationalError as error:
             if not sqlite_busy(error):

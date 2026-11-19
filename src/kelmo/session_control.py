@@ -127,9 +127,7 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
         # The first attempt runs whenever any time is left; another one only when a pause still fits and the time
         # left is not shorter than the last attempt took, which may have overrun its budget on work, not a lock.
         if left<=0 or last is not None and left<max(SESSION_END_PAUSE,took):
-            if last is not None and last.code!='E_BUSY':
-                raise last
-            raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
+            break
         began=time.monotonic()
         try:
             _bounded_attempt(config,journal,provider,native_id,source,selected,event,left,budget)
@@ -141,7 +139,14 @@ def capture_hook(root,provider,action,payload,*,internal_job=None,journal=None,d
             if error.code not in ('E_BUSY','E_CAPTURE_RETRY'):
                 raise
             last=error
+        # The same check, made before the pause: a hook that will not try again after it answers now, not one pause
+        # past its deadline.
+        if until-time.monotonic()-SESSION_END_PAUSE<max(SESSION_END_PAUSE,took):
+            break
         time.sleep(SESSION_END_PAUSE)
+    if last is not None and last.code!='E_BUSY':
+        raise last
+    raise KelmoError('E_BUSY','Session journal stayed busy until the hook had no time left; retry capture.')
 
 
 def _bounded_attempt(config,journal,provider,native_id,source,selected,event,left,budget=CAPTURE_BUDGET):
