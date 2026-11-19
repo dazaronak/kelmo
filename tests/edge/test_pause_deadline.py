@@ -17,8 +17,9 @@ from kelmo.core.edge_core import EdgeCore
 from kelmo.errors import KelmoError
 
 OPERATION = 'op-synthetic-1'
-SLACK = 0.1  # starting the command's thread and joining it
-LOADED_SLACK = 0.6  # the same, with the threads starved of CPU under parallel shards; well below any hold here
+# Starting the command's thread and joining it, with the threads starved of CPU under parallel shards, or their
+# sleeps and waits woken late where the system coalesces timers (a macOS runner); well below any hold here.
+LOADED_SLACK = 0.6
 
 
 class Context:
@@ -140,7 +141,10 @@ def waiters(core, monkeypatch):
     return arrived
 
 
-def start(function, *args):
+COMMAND = 'the create --wait command'
+
+
+def start(function, *args, name=None):
     """Runs the call in a daemon thread; returns the thread and a list that gets its result or exception."""
     outcome = []
 
@@ -150,7 +154,7 @@ def start(function, *args):
         except Exception as error:  # noqa: BLE001 - the test asserts on what the call did
             outcome.append(error)
 
-    thread = threading.Thread(target=run, daemon=True)
+    thread = threading.Thread(target=run, daemon=True, name=name)
     thread.start()
     return thread, outcome
 
@@ -161,13 +165,37 @@ def create_wait(core, deadline, wait_timeout=30):
     return core.handle_cli(Context(deadline), {'argv': argv})
 
 
-def hold_past_the_deadline(core, client, deadline, hold, wait_timeout=30):
+def lent_to_the_test(core, client, monkeypatch):
+    """Returns `take()`, which takes the owner lock the command (started with `name=COMMAND`) lends out after its
+    first poll. The command waits, right after lending it, until the test holds it: the test then holds the outbox
+    through the command's whole pause however late its own thread runs, instead of racing the pause's sleep for it.
+    Only the command's own release is held back, never another thread's."""
+    lent, taken = threading.Event(), threading.Event()
+    release = core._owner.release
+
+    def lend():
+        release()
+        if (threading.current_thread().name == COMMAND and client.polls >= 1 and core._owner._holder is None
+                and not lent.is_set()):
+            lent.set()
+            taken.wait(5)
+
+    def take():
+        assert lent.wait(5), 'the command never lent the outbox out'
+        assert core._owner.acquire(timeout=5), 'the test could not take the lent outbox'
+        taken.set()
+
+    monkeypatch.setattr(core._owner, 'release', lend)
+    return take
+
+
+def hold_past_the_deadline(core, client, monkeypatch, deadline, hold, wait_timeout=30):
     """Starts `create --wait`, takes the owner lock once the command lent it out after its first poll, and holds
     it until the command ends or `hold` seconds pass. Returns the command's outcome and how long it ran."""
+    take = lent_to_the_test(core, client, monkeypatch)
     began = time.monotonic()
-    thread, outcome = start(create_wait, core, deadline, wait_timeout)
-    assert client.polled.wait(5), 'the command made no poll'
-    assert core._owner.acquire(timeout=5), 'the command never lent the outbox out'
+    thread, outcome = start(create_wait, core, deadline, wait_timeout, name=COMMAND)
+    take()
     try:
         thread.join(hold)
         ended = time.monotonic() - began
@@ -178,9 +206,9 @@ def hold_past_the_deadline(core, client, deadline, hold, wait_timeout=30):
     return outcome[0], ended
 
 
-def test_a_paused_cli_wait_that_cannot_take_the_outbox_back_fails_busy_inside_its_deadline(profile):
+def test_a_paused_cli_wait_that_cannot_take_the_outbox_back_fails_busy_inside_its_deadline(profile, monkeypatch):
     with edge_core(profile) as (core, client):
-        result, ended = hold_past_the_deadline(core, client, deadline=0.6, hold=3.0)
+        result, ended = hold_past_the_deadline(core, client, monkeypatch, deadline=0.6, hold=3.0)
 
     assert isinstance(result, KelmoError), result
     assert (result.code, result.retryable) == ('E_BUSY', True)
@@ -192,7 +220,7 @@ def test_a_paused_cli_wait_that_cannot_take_the_outbox_back_fails_busy_inside_it
 
 def test_after_a_paused_caller_gives_up_the_outbox_is_free_for_the_next_caller(profile, monkeypatch):
     with edge_core(profile) as (core, client):
-        result, _ = hold_past_the_deadline(core, client, deadline=0.6, hold=3.0)
+        result, _ = hold_past_the_deadline(core, client, monkeypatch, deadline=0.6, hold=3.0)
 
         assert isinstance(result, KelmoError) and result.code == 'E_BUSY', result
         assert (core._owner._holder, core._owner._count) == (None, 0)
@@ -330,39 +358,41 @@ def test_a_take_back_that_reaches_a_free_outbox_after_the_deadline_fails_busy(pr
     assert client.polls == 1
 
 
-def test_a_wait_timeout_bounds_the_wait_while_the_outbox_is_held(profile):
+def test_a_wait_timeout_bounds_the_wait_while_the_outbox_is_held(profile, monkeypatch):
     """`--wait-timeout` limits the wait (docs/USAGE.md): a held outbox does not stretch it."""
     with edge_core(profile) as (core, client):
-        result, ended = hold_past_the_deadline(core, client, deadline=10.0, hold=3.0, wait_timeout=0.3)
+        result, ended = hold_past_the_deadline(core, client, monkeypatch, deadline=10.0, hold=3.0, wait_timeout=0.3)
 
     assert not isinstance(result, Exception), result
     assert result['wait_timed_out'] is True
     assert result['operation']['id'] == OPERATION
-    assert ended < 0.3 + SLACK, ended
+    # It ends at the 0.3 s wait, not when the holder lets go 3 s later; the margin is the system's, not the wait's.
+    assert ended < 0.3 + LOADED_SLACK, ended
 
 
-def test_a_wait_timeout_nearer_than_a_short_request_deadline_ends_timed_out_on_time(profile):
+def test_a_wait_timeout_nearer_than_a_short_request_deadline_ends_timed_out_on_time(profile, monkeypatch):
     """Criterion 1 holds while the request's deadline is the nearer one; when `--wait-timeout` ends first, the
     command answers `wait_timed_out` with the operation (docs/USAGE.md), not E_BUSY at the request's deadline."""
     with edge_core(profile) as (core, client):
-        result, ended = hold_past_the_deadline(core, client, deadline=1.0, hold=3.0, wait_timeout=0.3)
+        result, ended = hold_past_the_deadline(core, client, monkeypatch, deadline=2.0, hold=3.0, wait_timeout=0.3)
 
     assert not isinstance(result, Exception), result
     assert result['wait_timed_out'] is True
     assert result['processing_deferred'] is True
     assert result['operation']['id'] == OPERATION
-    assert ended < 0.3 + SLACK, ended
+    assert ended < 0.3 + LOADED_SLACK, ended  # the 0.3 s wait, well before the 2 s deadline or the 3 s hold
 
 
 def test_a_wait_timeout_shorter_than_the_request_deadline_still_ends_timed_out(profile, monkeypatch):
     with edge_core(profile) as (core, client):
         arrived = waiters(core, monkeypatch)
-        thread, outcome = start(create_wait, core, 10.0, 0.3)
-        assert client.polled.wait(5), 'the command made no poll'
-        assert core._owner.acquire(timeout=5), 'the command never lent the outbox out'
+        take = lent_to_the_test(core, client, monkeypatch)
+        # A 1 s wait leaves the test's own thread time to take the outbox before the wait ends, even woken late.
+        thread, outcome = start(create_wait, core, 10.0, 1.0, name=COMMAND)
+        take()
         try:
             assert arrived(thread.ident).wait(5), 'the command did not wait to take the outbox back'
-            thread.join(1.0)  # held past the 0.3 s wait, well inside the 10 s request deadline
+            thread.join(2.0)  # held past the 1 s wait, well inside the 10 s request deadline
         finally:
             core._owner.release()
         thread.join(10)

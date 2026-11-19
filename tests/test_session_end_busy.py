@@ -359,6 +359,35 @@ def test_a_session_end_with_little_time_left_still_makes_one_attempt(tmp_path, m
     assert len(final_jobs(root)) == 1
 
 
+def test_a_session_end_that_could_not_try_again_after_the_pause_answers_at_once(tmp_path, monkeypatch):
+    """A busy attempt took 0.3 s and leaves about 0.35 s: after a 0.1 s pause, less would be left than the attempt
+    took, so no second attempt would be made. The hook answers busy then, with neither the pause nor another try."""
+    import types
+
+    from kelmo import session_control
+    root, source = prepared(tmp_path)
+    attempts, pauses = [], []
+
+    def busy_attempt(*args, **kwargs):
+        time.sleep(0.3)
+        attempts.append(time.monotonic())
+        raise KelmoError('E_BUSY', 'Session journal is busy; retry capture.')
+
+    monkeypatch.setattr(session_control, '_bounded_attempt', busy_attempt)
+    # The hook's own clock, with its pauses recorded instead of judged by wall time.
+    monkeypatch.setattr(session_control, 'time', types.SimpleNamespace(
+        monotonic=time.monotonic, sleep=lambda seconds: (pauses.append(seconds), time.sleep(seconds))))
+    try:
+        outcome = capture_hook(root, 'claude', 'session-end', payload(source), internal_job=False,
+                               deadline=time.monotonic() + 0.65)
+    except KelmoError as error:
+        outcome = error
+
+    assert isinstance(outcome, KelmoError) and outcome.code == 'E_BUSY', outcome
+    assert len(attempts) == 1, attempts
+    assert pauses == [], pauses  # no pause after the last attempt
+
+
 def test_a_commit_that_meets_a_reader_late_in_an_attempt_ends_inside_its_deadline(tmp_path):
     """The capture transaction opens late (a writer holds the journal) and its commit then meets a reader: the
     commit waits only for what is left of the attempt, so the hook still answers by its deadline."""

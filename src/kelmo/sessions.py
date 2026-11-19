@@ -18,7 +18,7 @@ import stat
 import time
 import uuid
 
-from .errors import KelmoError
+from .errors import KelmoError, retry_busy
 from .journal import Journal, now
 from .session_transcripts import _check_deadline, parse
 from .wiki import engine
@@ -159,16 +159,22 @@ class Sessions:
         db = self.journal.conn
         _check_deadline(deadline)
         previous_timeout = db.execute('PRAGMA busy_timeout').fetchone()[0]
-        remaining_ms = previous_timeout if deadline is None else max(1, int((deadline - time.monotonic()) * 1000))
-        db.execute(f'PRAGMA busy_timeout={remaining_ms}')
+        if deadline is not None:
+            # Under a deadline SQLite does not wait: the clock does (`retry_busy`), so coalesced timers cannot
+            # stretch the wait past it.
+            db.execute('PRAGMA busy_timeout=0')
         try:
             with db:
-                db.execute('BEGIN IMMEDIATE')
+                if deadline is None:
+                    db.execute('BEGIN IMMEDIATE')
+                else:
+                    retry_busy(lambda: db.execute('BEGIN IMMEDIATE'), deadline)
                 yield
                 _check_deadline(deadline)
                 if deadline is not None:
-                    # The commit may wait for a reader: only for what is left, not a fresh budget.
-                    db.execute(f'PRAGMA busy_timeout={max(1, int((deadline - time.monotonic()) * 1000))}')
+                    # A commit that meets a reader stays open with its claim on the file and is tried again for
+                    # what is left of the deadline, not a fresh budget.
+                    retry_busy(db.commit, deadline)
         except sqlite3.OperationalError as error:
             if getattr(error, 'sqlite_errorcode', 0) & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                 raise KelmoError('E_BUSY', 'Session journal is busy; retry capture.') from error

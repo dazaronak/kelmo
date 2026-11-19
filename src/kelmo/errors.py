@@ -1,5 +1,9 @@
 """Stable errors shared by the CLI and service."""
 import sqlite3
+import time
+
+# The sleeps of SQLite's own busy handler, in seconds; after the last one, the last again.
+BUSY_PAUSES = (0.001, 0.002, 0.005, 0.01, 0.015, 0.02, 0.025, 0.025, 0.025, 0.05, 0.05, 0.1)
 
 
 def sqlite_busy(error):
@@ -8,6 +12,39 @@ def sqlite_busy(error):
     if isinstance(code, int):
         return code & 0xff in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
     return isinstance(error, sqlite3.OperationalError) and ('locked' in str(error) or 'busy' in str(error))
+
+
+def _passes(error):
+    """Whether a lock error goes away once another connection lets go: SQLITE_BUSY does. SQLITE_LOCKED (a conflict
+    inside this connection) and a commit refused while this connection's own statements run do not, so waiting for
+    them would only spend the deadline; SQLite's busy handler is not called for them either."""
+    code = getattr(error, 'sqlite_errorcode', None)
+    if isinstance(code, int):
+        return code & 0xff == sqlite3.SQLITE_BUSY and 'statements in progress' not in str(error)
+    return sqlite_busy(error)
+
+
+def retry_busy(step, until, *, sleep=time.sleep):
+    """`step()`, run again after each lock it meets until the monotonic time `until`, then the last lock error.
+
+    For a connection whose busy timeout is 0. SQLite's own timeout adds up the sleeps it asks for, not the time
+    that passed: where timers are coalesced (a background process on macOS, a loaded VM) every short sleep runs
+    long, and a 1 s timeout waited more than 2 s. Here the clock decides: the wait ends at the first look at it
+    after `until`, one pause past it however long the system lets that pause run. `step` must be safe to run
+    again after a lock: a read, a whole transaction that rolls back when it fails, or a COMMIT, which a lock
+    leaves open with the writer still holding its claim on the file."""
+    tries = 0
+    while True:
+        try:
+            return step()
+        except sqlite3.OperationalError as error:
+            if not _passes(error):
+                raise
+            left = until - time.monotonic()
+            if left <= 0:
+                raise
+            sleep(min(BUSY_PAUSES[min(tries, len(BUSY_PAUSES) - 1)], left))
+            tries += 1
 
 
 class KelmoError(Exception):
