@@ -76,15 +76,19 @@ class ScriptedDaemon:
             except OSError:
                 return
             self.connections += 1
-            self._one(conn, connection)
+            # A daemon between two lives is unbound before the client sees its connection end: a client that
+            # reconnects at once must find no socket, not a listener about to close under it.
+            self._one(conn, connection, before_close=self._unbind if connection.gone else None)
             if connection.gone:
-                self.server.close()
-                self.path.unlink()
                 if self.closing.wait(connection.gone):  # the test ended meanwhile: never rebind
                     return
                 self.server = self._listen()
 
-    def _one(self, conn, connection):
+    def _unbind(self):
+        self.server.close()
+        self.path.unlink(missing_ok=True)
+
+    def _one(self, conn, connection, before_close=None):
         reader = wire.FrameReader()
         try:
             hello = self._frame(conn, reader)
@@ -114,6 +118,8 @@ class ScriptedDaemon:
         except OSError:
             return
         finally:
+            if before_close is not None:
+                before_close()
             conn.close()
 
     def close(self):
